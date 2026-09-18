@@ -935,6 +935,12 @@ struct TableRun {
     /// which is seconds before `table_over_at` at the boundary. No game
     /// against the search's limit from then on.
     done_here: bool,
+    /// `S1-HS`: how many seats this founder gave back before the set, for
+    /// the search's judgement of its own table.
+    gave_back: u32,
+    /// `S1-HV`: what this founder waits for before the set, for the
+    /// search's window; `None` while nothing is waited for.
+    forming_note: Option<String>,
     /// `S1-FY`: what the player joined this table with, kept to ask for the
     /// seat again when the founder gives it back before the table starts.
     join_asked: Option<JoinAsked>,
@@ -1237,6 +1243,8 @@ impl TableRun {
             tournament_started: false,
             table_over_at: None,
             done_here: false,
+            gave_back: 0,
+            forming_note: None,
             join_asked: None,
             rejoin_key: None,
             rejoin_at: None,
@@ -2883,6 +2891,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 "seat {seat} {why} and the seat is free again"
                             )))
                             .await;
+                        // `S1-HS`: counted for the search's judgement of this table.
+                        $t.gave_back += 1;
                         // `S1-FY`: said at the table, as a certificate is.
                         let _ = events.send(NodeEvent::SeatReleased { seat, why: why.clone() }).await;
                         // **D-019: out of the roster is out of the group.** Asked for
@@ -3161,6 +3171,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.tournament_started = false;
             $t.table_over_at = None;
             $t.done_here = false;
+            $t.gave_back = 0;
+            $t.forming_note = None;
             $t.ever_dealt = false;
             $t.hand = None;
             $t.late_cert_said = None;
@@ -8611,6 +8623,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             t.mesh_trouble.retain(|s, _| marks.iter().any(|m| m.0 == *s));
                             t.ready_stall.retain(|s, _| marks.iter().any(|m| m.0 == *s));
+                            // `S1-HV`: what the founder waits for, for the search's window.
+                            t.forming_note = marks
+                                .iter()
+                                .find(|(_, cannot, by, stalling, _, speaking)| {
+                                    in_hearing_trouble(*cannot, *by, *speaking) || *stalling
+                                })
+                                .map(|(x, cannot, by, _, _, _)| {
+                                    let since = t
+                                        .mesh_trouble
+                                        .get(x)
+                                        .or_else(|| t.ready_stall.get(x))
+                                        .map_or(0, |at| at.elapsed().as_secs());
+                                    if cannot + by > 0 {
+                                        format!("seat {x} cannot hear {cannot} seat(s), unheard by {by} ({since} s)")
+                                    } else {
+                                        format!("seat {x} has not said it is ready ({since} s)")
+                                    }
+                                });
                             // A seat that no longer speaks goes first -- the seats that
                             // cannot hear it are not in trouble of their own -- then the
                             // most troubled, then the later seated.
@@ -11078,6 +11108,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .founder_gone
                             .filter(|_| x.table.as_ref().is_some_and(|f| f.session().is_none()))
                             .map(|at| at.elapsed().as_secs()),
+                        gave_back: x.gave_back,
+                        forming: x.forming_note.clone(),
                     })
                     .collect();
                 // AutoNAT's verdict is read only once it could have been given: a

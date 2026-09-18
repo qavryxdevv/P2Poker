@@ -682,6 +682,11 @@ pub fn search_modal(ctx: &egui::Context, s: &super::lobby::SearchView) -> Option
                         .color(theme::TEXT_DIM)
                         .size(14.0),
                     );
+                    // `S1-HV`: what the founder waits for, so a forming table
+                    // never reads as frozen.
+                    if let Some(n) = x.note.as_ref() {
+                        ui.label(RichText::new(format!("        {n}")).color(theme::WARN).size(13.0));
+                    }
                 }
             }
             let games = r.map_or("\u{2026}".to_string(), |r| format!("{} / {}", r.running, r.limit));
