@@ -5914,3 +5914,20 @@ table window's own style (`D-048`), with everything technical kept but moved out
    (`D-002`), the four-tab settings, `D-043`'s *Your tables*, and every rule the pane carried before -- a table
    whose rules changed is not joinable and says why; a password's warning is said. The window still takes the
    node's word for every game fact.
+
+**Amended the same day -- the search's window, and the word that a table was found.** The owner, on a
+screenshot of the search: *improve it under the same prompt*. The window (`render::search_modal`) is now in the
+table's style with nothing red in it: a gold spinner and clock; the seats of the table closest to starting
+**drawn** as they fill, in place of a bar (`closest_table`); *Estimated wait* from the search's own estimate, this
+profile's history, or *measuring…* (`eta_words`); *Also looking* in a person's words -- *finding out…* while the
+queue's silence has not been heard (`S1-HK`), *nobody else right now* for a heard zero, *3 other players (waiting
+01:10 on average)* (`queue_words`); the seats held, each table with its seats drawn and its word (`held_words`,
+`reservation_words`), and what the search does when none holds one; the node's phase and its one warning; one
+line on what happens next; and a quiet *Cancel search* -- a search is not a fault and its cancel is a choice, not
+an alarm. Its width follows the window and its body scrolls under the button, so 200 % text in the smallest window
+holds it. **A table found is said once**, for `FOUND_TOAST_MS` (4.5 s): a card on the felt at the top of the lobby
+with the table's name -- *your seat is taken; the table's window is open* -- faded in and out, nothing to press,
+never repeated (`AppState::search_found`, set from `SearchEnded`'s started slots and taken down by the next
+search; `LobbyView::found`). Measured on the LAN: a headless seeker and the window both searching heads-up found
+each other in 46 s, the window said *2 of 2 seated · yours · ready*, then *a table is about to start*, and the
+card showed on the lobby as the table's window opened (`found_run.ps1`, photographed every two seconds).

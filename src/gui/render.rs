@@ -438,6 +438,10 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
             asked = Some(what);
         }
     }
+    // `D-067`: the word that the search found a game, for a moment.
+    if let Some(f) = view.found.as_ref() {
+        found_toast(ui.ctx(), f);
+    }
     // The chat box is in a column drawn inside a closure, so what it produced
     // is carried out here rather than assigned through a borrow the closure
     // does not have.
@@ -722,150 +726,165 @@ pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Opt
     action
 }
 
-/// `D-064`: the search's window -- a modal over the lobby, with the clock, the
-/// estimate, the queue, the seats held, the games running, the network's one
-/// warning, and the one button, which cancels on the click.
+/// `D-064`, restyled under `D-067`: the search's window -- a modal over the
+/// lobby in the table's style. The clock, the seats of the table closest to
+/// starting drawn as they fill, the estimate, who else is looking, the seats
+/// held, the node's phase and its one warning, a line on what happens next,
+/// and the one quiet button, which cancels on the click. Nothing here is red:
+/// a search is not a fault, and the cancel is a choice, not an alarm.
 ///
 /// Repainted four times a second while it is up: the spinner turns, the clock
 /// counts, and the node's word arrives once a second on its own.
 pub fn search_modal(ctx: &egui::Context, s: &super::lobby::SearchView) -> Option<LobbyAction> {
-    use super::lobby::clock;
     let mut action = None;
     egui::Modal::new(egui::Id::new("search-modal"))
         .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
-                .stroke(Stroke::new(1.0, theme::LINE))
+                .stroke(Stroke::new(1.0, theme::GOLD_EDGE))
                 .corner_radius(12.0)
                 .inner_margin(22.0),
         )
         .show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(26.0).color(theme::ACCENT));
-                ui.add_space(6.0);
-                ui.label(RichText::new("Searching for a game").color(theme::TEXT).size(21.0).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(clock(s.elapsed_s))
-                            .color(theme::ACCENT)
-                            .size(24.0)
-                            .strong()
-                            .monospace(),
-                    );
-                });
-            });
-            ui.label(
-                RichText::new(format!(
-                    "{} \u{00b7} {} game{} at once",
-                    s.format,
-                    s.games,
-                    if s.games == 1 { "" } else { "s" }
-                ))
-                .color(theme::TEXT_DIM)
-                .size(14.0),
-            );
-            ui.add_space(8.0);
-            // The bar animates only while it has nothing to show: egui draws the
-            // animation inside the bar, where it sat over the words.
-            let (fraction, text) = search_progress(s);
-            ui.add(egui::ProgressBar::new(fraction).animate(fraction <= 0.0).fill(theme::OK));
-            ui.label(RichText::new(text).color(theme::TEXT_DIM).size(14.0));
-            ui.add_space(10.0);
-
-            let r = s.report.as_ref();
-            let eta = r
-                .and_then(|r| r.eta_s)
-                .map(|e| format!("about {}", clock(e)))
-                .or_else(|| s.typical_s.map(|t| format!("usually about {}", clock(u64::from(t)))))
-                .unwrap_or_else(|| "measuring\u{2026}".to_string());
-            stat_row(ui, "Estimated wait", &eta, theme::TEXT);
-            let queue = match r {
-                // `S1-HK`: the queue's silence before it could be heard is not a zero.
-                Some(r) if !r.queue_known => "measuring\u{2026}".to_string(),
-                Some(r) => match r.queue_wait_s {
-                    Some(w) => format!("{} (waiting {} on average)", r.queue, clock(w)),
-                    None => r.queue.to_string(),
-                },
-                None => "\u{2026}".to_string(),
-            };
-            stat_row(ui, "Players searching", &queue, theme::TEXT);
-            let reserved = r.map_or("\u{2026}".to_string(), |r| {
-                format!(
-                    "{} table{} (looking at up to {})",
-                    r.reservations.len(),
-                    if r.reservations.len() == 1 { "" } else { "s" },
-                    r.looking_at
-                )
-            });
-            stat_row(ui, "Reserved at", &reserved, theme::OK);
-            if let Some(r) = r {
-                for x in &r.reservations {
-                    ui.label(
-                        RichText::new(format!(
-                            "    {} \u{2014} {}/{} seated, starts at {}{}{}",
-                            x.name,
-                            x.players,
-                            x.seats,
-                            x.capacity,
-                            if x.mine { " \u{00b7} yours" } else { "" },
-                            if x.armed { " \u{00b7} ready" } else { "" }
-                        ))
-                        .color(theme::TEXT_DIM)
-                        .size(14.0),
-                    );
-                    // `S1-HV`: what the founder waits for, so a forming table
-                    // never reads as frozen.
-                    if let Some(n) = x.note.as_ref() {
-                        ui.label(RichText::new(format!("        {n}")).color(theme::WARN).size(13.0));
-                    }
-                }
-            }
-            let games = r.map_or("\u{2026}".to_string(), |r| format!("{} / {}", r.running, r.limit));
-            stat_row(ui, "Games running", &games, theme::STACK);
-            if let Some(r) = r {
-                ui.add_space(4.0);
-                ui.label(RichText::new(&r.phase).color(theme::TEXT_DIM).size(14.0));
-                if let Some(w) = r.warning.as_ref() {
-                    ui.label(RichText::new(w).color(theme::WARN).strong());
-                }
-            }
-            ui.add_space(16.0);
+            // Never wider or taller than the window: at 200 % text in a small
+            // window the whole of it is 450 points across and 300 down, so the
+            // width follows the window and the body scrolls, with the button
+            // kept under it.
+            let room = ctx.content_rect();
+            ui.set_width((room.width() - 60.0).clamp(240.0, 470.0));
+            let body_height = (room.height() - 150.0).max(120.0);
+            scroller(egui::ScrollArea::vertical())
+                .id_salt("search-body")
+                .max_height(body_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| search_body(ui, s));
+            ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("CANCEL SEARCH").color(theme::TEXT).size(18.0).strong())
-                            .fill(theme::DANGER)
-                            .min_size(egui::vec2(320.0, 50.0)),
+                        egui::Button::new(RichText::new("Cancel search").color(theme::TEXT))
+                            .fill(theme::PANEL_LIGHT)
+                            .min_size(egui::vec2(200.0, 40.0)),
                     )
                     .clicked()
                 {
                     action = Some(LobbyAction::CancelSearch);
                 }
             });
-            crate::gui::table::paint_again(ctx, std::time::Duration::from_millis(250));
+            super::table::paint_again(ctx, std::time::Duration::from_millis(250));
         });
     action
 }
 
-/// `D-064`: how far the search is, as a bar: the fullest seat held against the
-/// seats its table needs to start; nothing yet while no seat is held.
-fn search_progress(s: &super::lobby::SearchView) -> (f32, String) {
-    let Some(r) = s.report.as_ref() else {
-        return (0.0, "starting".to_string());
-    };
-    let best = r
-        .reservations
-        .iter()
-        .filter(|x| x.capacity > 0)
-        .max_by_key(|x| (u32::from(x.players) * 1_000 / u32::from(x.capacity), x.players));
-    match best {
-        Some(x) => (
-            (f32::from(x.players) / f32::from(x.capacity)).clamp(0.0, 1.0),
-            format!("{} of {} seats at the closest table", x.players.min(x.capacity), x.capacity),
-        ),
-        None => (0.0, "looking for tables".to_string()),
+/// What the search's window says, above its one button.
+fn search_body(ui: &mut egui::Ui, s: &super::lobby::SearchView) {
+    use super::lobby::{clock, closest_table, eta_words, held_words, queue_words, reservation_words};
+    ui.horizontal(|ui| {
+        ui.add(egui::Spinner::new().size(26.0).color(theme::GOLD_ACTION));
+        ui.add_space(6.0);
+        ui.label(RichText::new("Finding you a game").color(theme::TEXT).size(21.0).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(clock(s.elapsed_s))
+                    .color(theme::GOLD_ACTION)
+                    .size(24.0)
+                    .strong()
+                    .monospace(),
+            );
+        });
+    });
+    ui.label(
+        RichText::new(format!(
+            "{} \u{00b7} {} game{} at once",
+            s.format,
+            s.games,
+            if s.games == 1 { "" } else { "s" }
+        ))
+        .color(theme::TEXT_DIM)
+        .size(14.0),
+    );
+    ui.add_space(12.0);
+
+    let r = s.report.as_ref();
+    // The seats of the table closest to starting, drawn as they fill: what
+    // the player is waiting for, shown as the thing itself rather than as a
+    // bar.
+    ui.horizontal(|ui| match closest_table(r) {
+        Some(x) => {
+            dots(ui, egui::Id::new(("search-dots", s.id)), x.players, x.seats, theme::GOLD_ACTION, 16.0);
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{} at {}", reservation_words(x), x.name))
+                        .color(theme::TEXT)
+                        .size(15.0),
+                )
+                .wrap(),
+            );
+        }
+        None => {
+            dots(ui, egui::Id::new(("search-dots", s.id)), 0, 6, theme::GOLD_ACTION, 16.0);
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(if r.is_some() { "looking for tables" } else { "starting" })
+                    .color(theme::TEXT_DIM)
+                    .size(15.0),
+            );
+        }
+    });
+    ui.add_space(12.0);
+    stat_row(ui, "Estimated wait", &eta_words(r.and_then(|r| r.eta_s), s.typical_s), theme::TEXT);
+    stat_row(ui, "Also looking", &queue_words(r), theme::TEXT);
+    // Games at once matter only when more than one was asked for, or one has
+    // started.
+    if let Some(r) = r.filter(|r| r.limit > 1 || r.running > 0) {
+        stat_row(ui, "Games", &format!("{} of {} started", r.running, r.limit), theme::STACK);
     }
+    ui.add_space(8.0);
+
+    // The seats held: each table with its seats drawn and its word.
+    let held = r.map_or(0, |r| r.reservations.len());
+    ui.add(
+        egui::Label::new(
+            RichText::new(held_words(held))
+                .color(if held > 0 { theme::OK } else { theme::TEXT_DIM })
+                .size(14.0),
+        )
+        .wrap(),
+    );
+    if let Some(r) = r {
+        for (i, x) in r.reservations.iter().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(8.0);
+                dots(ui, egui::Id::new(("held-dots", s.id, i)), x.players, x.seats, theme::GOLD_EDGE, 10.0);
+                ui.label(RichText::new(&x.name).color(theme::TEXT).size(14.0).strong());
+                ui.label(RichText::new(reservation_words(x)).color(theme::TEXT_DIM).size(14.0));
+            });
+            // `S1-HV`: what the founder waits for, so a forming table never
+            // reads as frozen.
+            if let Some(n) = x.note.as_ref() {
+                ui.add(egui::Label::new(RichText::new(format!("        {n}")).color(theme::WARN).size(13.0)).wrap());
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new(&r.phase).color(theme::TEXT_DIM).size(13.0));
+        if let Some(w) = r.warning.as_ref() {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, theme::WARN);
+                ui.add(egui::Label::new(RichText::new(w).color(theme::WARN).size(14.0)).wrap());
+            });
+        }
+    }
+    ui.add_space(10.0);
+    ui.add(
+        egui::Label::new(
+            RichText::new("You are seated the moment a table starts; its window opens by itself.")
+                .color(theme::TEXT_DIM)
+                .size(13.0),
+        )
+        .wrap(),
+    );
 }
 
 /// One line of the search's window: a dim label, then the value.
@@ -877,6 +896,63 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
         );
         ui.label(RichText::new(value).color(colour).strong());
     });
+}
+
+/// `D-067`: the word that the search found a game -- a card in the table's
+/// felt at the top of the lobby, faded in and out over `FOUND_TOAST_MS`, with
+/// nothing to press: the table's window has opened by itself. Said once and
+/// then not again; no blink, no second helping.
+fn found_toast(ctx: &egui::Context, f: &super::lobby::FoundView) {
+    use super::lobby::FOUND_TOAST_MS;
+    let age = f.age_ms as f32;
+    let alpha = (age / 300.0)
+        .min((FOUND_TOAST_MS as f32 - age) / 600.0)
+        .clamp(0.0, 1.0);
+    egui::Area::new(egui::Id::new("found-toast"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 110.0))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::FELT_MID.gamma_multiply(alpha))
+                .stroke(Stroke::new(1.0, theme::GOLD_EDGE.gamma_multiply(alpha)))
+                .corner_radius(12.0)
+                .inner_margin(egui::Margin::symmetric(18, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+                        let p = ui.painter();
+                        p.circle_filled(rect.center(), 17.0, Color32::from_black_alpha((150.0 * alpha) as u8));
+                        p.circle_stroke(rect.center(), 16.0, Stroke::new(1.5, theme::GOLD_EDGE.gamma_multiply(alpha)));
+                        p.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "\u{2660}",
+                            FontId::proportional(20.0),
+                            theme::GOLD_ACTION.gamma_multiply(alpha),
+                        );
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(
+                                RichText::new("Table found")
+                                    .color(theme::GOLD_ACTION.gamma_multiply(alpha))
+                                    .size(18.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} \u{2014} your seat is taken; the table's window is open.",
+                                    f.table
+                                ))
+                                .color(theme::TEXT.gamma_multiply(alpha))
+                                .size(14.0),
+                            );
+                        });
+                    });
+                });
+        });
+    super::table::paint_again(ctx, std::time::Duration::from_millis(80));
 }
 
 /// The create and sit-down dialogs, which are the only two places this client
@@ -1590,37 +1666,41 @@ fn badge(ui: &mut egui::Ui, text: &str, colour: Color32) -> egui::Response {
 /// seat. A seat taken since the last frame fills over a third of a second
 /// (`D-067`: a table filling is a thing to watch, and it is the truth).
 fn seat_dots(ui: &mut egui::Ui, row: &TableRow) {
-    let seats = row.seats.clamp(1, 10);
-    let d = 10.0;
-    let gap = 3.0;
-    let width = f32::from(seats) * (d + gap) - gap;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 16.0), egui::Sense::hover());
-    let shown = ui
-        .ctx()
-        .animate_value_with_time(egui::Id::new(("seats", row.key)), f32::from(row.seated), 0.35);
     let colour = if row.state.joinable() { theme::GOLD_ACTION } else { theme::TEXT_DIM };
+    dots(ui, egui::Id::new(("seats", row.key)), row.seated, row.seats, colour, 10.0)
+        .on_hover_text(format!("{} of {} seats taken", row.seated, row.seats));
+    ui.label(
+        RichText::new(format!("{}/{}", row.seated, row.seats))
+            .color(theme::TEXT_DIM)
+            .size(13.0),
+    );
+}
+
+/// Seats drawn, `d` points across: a disc per player, a ring per empty seat.
+/// A seat taken since the last frame fills over a third of a second. The
+/// ring of an empty seat is a half-strength dim, which shows on the list's
+/// field and on a selected row's green alike (the line colour vanished on
+/// the green).
+fn dots(ui: &mut egui::Ui, id: egui::Id, filled: u8, total: u8, colour: Color32, d: f32) -> egui::Response {
+    let total = total.clamp(1, 10);
+    let gap = d * 0.3;
+    let width = f32::from(total) * (d + gap) - gap;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, d + 6.0), egui::Sense::hover());
+    let shown = ui.ctx().animate_value_with_time(id, f32::from(filled.min(total)), 0.35);
     let p = ui.painter();
-    for i in 0..seats {
+    for i in 0..total {
         let c = egui::pos2(rect.left() + d / 2.0 + f32::from(i) * (d + gap), rect.center().y);
         let fill = (shown - f32::from(i)).clamp(0.0, 1.0);
         if fill > 0.0 {
             p.circle_filled(c, d / 2.0 * (0.6 + 0.4 * fill), colour.gamma_multiply(0.5 + 0.5 * fill));
         }
-        // An empty seat's ring in a half-strength dim, which shows on the
-        // list's field and on a selected row's green alike; the line colour
-        // vanished on the green.
         p.circle_stroke(
             c,
             d / 2.0 - 0.5,
             Stroke::new(1.0, if fill > 0.0 { colour } else { theme::TEXT_DIM.gamma_multiply(0.55) }),
         );
     }
-    resp.on_hover_text(format!("{} of {} seats taken", row.seated, row.seats));
-    ui.label(
-        RichText::new(format!("{}/{}", row.seated, row.seats))
-            .color(theme::TEXT_DIM)
-            .size(13.0),
-    );
+    resp
 }
 
 /// The empty list: an invitation in the middle of the space, with the suits

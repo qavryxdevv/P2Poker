@@ -711,6 +711,8 @@ pub struct LobbyView {
     /// `D-067`: this player's own record, from the profile; `None` while the
     /// window has not read it.
     pub record: Option<crate::storage::results::Summary>,
+    /// `D-067`: the search just found a game, for the word about it.
+    pub found: Option<FoundView>,
 }
 
 /// `D-064`: the search under way, as the modal window shows it.
@@ -730,6 +732,85 @@ pub struct SearchView {
 /// Seconds as `mm:ss`: the search clock's face.
 pub fn clock(secs: u64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+/// `D-067`: the search found a game -- said once, for a moment, in the
+/// table's style, and then not again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundView {
+    /// The table's name, as the node said it.
+    pub table: String,
+    /// How long ago the game started.
+    pub age_ms: u64,
+}
+
+/// How long the word about a found game stays: long enough to read twice,
+/// short enough that nobody waits for it to go.
+pub const FOUND_TOAST_MS: u64 = 4_500;
+
+/// The search window's estimate, in the order of what is known: the search's
+/// own, this profile's history, or an honest *measuring…*.
+pub fn eta_words(eta_s: Option<u64>, typical_s: Option<u32>) -> String {
+    match (eta_s, typical_s) {
+        (Some(e), _) => format!("about {}", clock(e)),
+        (None, Some(t)) => format!("usually about {}", clock(u64::from(t))),
+        (None, None) => "measuring\u{2026}".to_string(),
+    }
+}
+
+/// Who else is looking, in a person's words. The queue's silence before it
+/// could be heard is not a zero (`S1-HK`), so it is *finding out…*; a heard
+/// zero is *nobody else right now*, which is true and is not an apology.
+pub fn queue_words(report: Option<&crate::net::matchmaker::SearchReport>) -> String {
+    match report {
+        None => "finding out\u{2026}".to_string(),
+        Some(r) if !r.queue_known => "finding out\u{2026}".to_string(),
+        Some(r) if r.queue == 0 => "nobody else right now".to_string(),
+        Some(r) => {
+            let who = if r.queue == 1 { "1 other player".to_string() } else { format!("{} other players", r.queue) };
+            match r.queue_wait_s {
+                Some(w) => format!("{who} (waiting {} on average)", clock(w)),
+                None => who,
+            }
+        }
+    }
+}
+
+/// The seats held, as a heading: how many tables hold one for this player,
+/// or -- when none does -- what the search does about that.
+pub fn held_words(held: usize) -> String {
+    match held {
+        0 => "No table holds a seat for you yet. If nothing turns up, the search founds one.".to_string(),
+        1 => "A seat is held for you at 1 table".to_string(),
+        n => format!("A seat is held for you at {n} tables"),
+    }
+}
+
+/// The table closest to starting among the seats held: the fullest against
+/// what it needs, and the most players at a tie. `None` while no seat is held.
+pub fn closest_table(
+    report: Option<&crate::net::matchmaker::SearchReport>,
+) -> Option<&crate::net::matchmaker::ReservationView> {
+    report?
+        .reservations
+        .iter()
+        .filter(|x| x.capacity > 0)
+        .max_by_key(|x| (u32::from(x.players) * 1_000 / u32::from(x.capacity), x.players))
+}
+
+/// One held table's line: the seats and when it starts.
+pub fn reservation_words(x: &crate::net::matchmaker::ReservationView) -> String {
+    let mut s = format!("{} of {} seated", x.players, x.seats);
+    if x.capacity > 0 && x.capacity < x.seats {
+        s.push_str(&format!(" \u{00b7} starts at {}", x.capacity));
+    }
+    if x.mine {
+        s.push_str(" \u{00b7} yours");
+    }
+    if x.armed {
+        s.push_str(" \u{00b7} ready");
+    }
+    s
 }
 
 /// One line of lobby chat.
@@ -761,6 +842,7 @@ impl LobbyView {
             searching: 0,
             session_s: 0,
             record: None,
+            found: None,
         }
     }
 
@@ -1102,6 +1184,61 @@ mod tests {
         assert!(known.contains("6-max usually take about 01:15"));
         assert!(known.ends_with("1 player is searching right now."));
         assert!(hero_note(Some(75), Format::HeadsUp, 3).ends_with("3 players are searching right now."));
+    }
+
+    /// `D-067`: the search window's words say what is known and no more --
+    /// the queue's silence is not a zero, a heard zero is not an apology,
+    /// and no table held is what the search does about it.
+    #[test]
+    fn the_search_windows_words_say_only_what_is_known() {
+        use crate::net::matchmaker::{ReservationView, SearchReport};
+        assert_eq!(eta_words(Some(80), Some(200)), "about 01:20", "the search's own estimate first");
+        assert_eq!(eta_words(None, Some(168)), "usually about 02:48");
+        assert_eq!(eta_words(None, None), "measuring\u{2026}");
+
+        let report = |queue: u32, known: bool, wait: Option<u64>| SearchReport {
+            id: 1,
+            format: Format::Any,
+            elapsed_s: 5,
+            eta_s: None,
+            queue,
+            queue_known: known,
+            queue_wait_s: wait,
+            reservations: Vec::new(),
+            looking_at: 4,
+            running: 0,
+            limit: 1,
+            warning: None,
+            phase: String::new(),
+        };
+        assert_eq!(queue_words(None), "finding out\u{2026}");
+        assert_eq!(queue_words(Some(&report(0, false, None))), "finding out\u{2026}", "silence is not a zero");
+        assert_eq!(queue_words(Some(&report(0, true, None))), "nobody else right now");
+        assert_eq!(queue_words(Some(&report(1, true, None))), "1 other player");
+        assert_eq!(queue_words(Some(&report(3, true, Some(70)))), "3 other players (waiting 01:10 on average)");
+
+        assert!(held_words(0).contains("founds one"));
+        assert_eq!(held_words(1), "A seat is held for you at 1 table");
+        assert_eq!(held_words(2), "A seat is held for you at 2 tables");
+
+        let table = |name: &str, players: u8, capacity: u8, seats: u8, mine: bool, armed: bool| ReservationView {
+            slot: None,
+            key: None,
+            name: name.into(),
+            players,
+            capacity,
+            seats,
+            armed,
+            mine,
+            note: None,
+        };
+        let mut r = report(0, true, None);
+        assert!(closest_table(Some(&r)).is_none(), "no seat held, no closest table");
+        r.reservations = vec![table("Far", 1, 6, 6, false, false), table("Near", 3, 4, 6, true, true)];
+        assert_eq!(closest_table(Some(&r)).map(|x| x.name.as_str()), Some("Near"));
+        assert_eq!(reservation_words(&r.reservations[1]), "3 of 6 seated \u{00b7} starts at 4 \u{00b7} yours \u{00b7} ready");
+        assert_eq!(reservation_words(&r.reservations[0]), "1 of 6 seated");
+        assert!(FOUND_TOAST_MS >= 3_000 && FOUND_TOAST_MS <= 6_000, "long enough to read, short enough to not wait for");
     }
 
     /// `D-067`: the words about fairness claim what the cryptography gives and

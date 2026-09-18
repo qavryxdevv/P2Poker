@@ -558,6 +558,9 @@ pub struct AppState {
     /// `D-067`: the places this player finished in since the window last
     /// wrote them to the profile's record (`storage::results`).
     pub results_owed: Vec<crate::storage::results::Entry>,
+    /// `D-067`: the search found a game -- the table's name and when -- for
+    /// the lobby's word about it, shown for a moment and then not again.
+    pub search_found: Option<(String, std::time::Instant)>,
     /// `D-064`: what past searches took, from the profile, for the window's
     /// word before a search has measured anything.
     pub search_settings: crate::storage::settings::SearchSettings,
@@ -1949,6 +1952,20 @@ impl AppState {
                     let took = u32::try_from(s.since.elapsed().as_secs()).unwrap_or(u32::MAX);
                     self.search_hidden.extend(s.reserved.iter().copied().filter(|slot| !started.contains(slot)));
                     if !started.is_empty() {
+                        // `D-067`: the lobby's word that a table was found, with
+                        // the table's name as the slot that started has it.
+                        let name = started
+                            .iter()
+                            .find_map(|slot| {
+                                let seat = if *slot == self.active_slot {
+                                    self.seated.as_ref()
+                                } else {
+                                    self.background.get(slot).and_then(|t| t.seated.as_ref())
+                                };
+                                seat.map(|t| t.name.trim().to_string()).filter(|n| !n.is_empty())
+                            })
+                            .unwrap_or_else(|| "your table".to_string());
+                        self.search_found = Some((name, std::time::Instant::now()));
                         let code = s.request.format.code();
                         self.search_history.push((code, took));
                         self.search_settings.remember(code, took);
@@ -3329,6 +3346,7 @@ impl AppState {
         });
         self.search_again = None;
         self.search_again_due = false;
+        self.search_found = None;
         self.note(format!(
             "search: looking for a {} game, {} at once{}",
             req.format.label(),
@@ -3521,6 +3539,13 @@ impl AppState {
         // `D-064`: the search, and the queue's size.
         v.search = self.search_view();
         v.searching = self.searching;
+        // `D-067`: the table the search found, while the word about it stands.
+        v.found = self
+            .search_found
+            .as_ref()
+            .map(|(name, at)| (name, u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)))
+            .filter(|(_, age)| *age < crate::gui::lobby::FOUND_TOAST_MS)
+            .map(|(name, age_ms)| crate::gui::lobby::FoundView { table: name.clone(), age_ms });
         v.seated = {
             let mut who: Vec<String> = self
                 .players
@@ -3579,6 +3604,24 @@ mod tests {
         s.apply(NodeEvent::SearchEnded { id, why: "a game started".into(), started: vec![1] });
         assert!(s.shows_window_for(1));
         assert!(s.search.is_none());
+        // `D-067`: the lobby's word that a table was found, for a moment, and
+        // gone with the next search.
+        let found = s.view().found.expect("the word that a game was found");
+        assert!(!found.table.is_empty(), "named, or called your table");
+        assert!(found.age_ms < crate::gui::lobby::FOUND_TOAST_MS);
+        let _ = s.begin_search(SearchRequest { id: 0, format: Format::Any, tables: 1, again: false });
+        assert!(s.view().found.is_none(), "a new search takes the old word down");
+    }
+
+    /// `D-067`: a search that ended without a game says nothing about one.
+    #[test]
+    fn a_search_that_ended_without_a_game_shows_no_found_word() {
+        use crate::net::matchmaker::{Format, SearchRequest};
+        let mut s = AppState::new();
+        let _ = s.begin_search(SearchRequest { id: 0, format: Format::Any, tables: 1, again: false });
+        let id = s.search.as_ref().expect("a search").request.id;
+        s.apply(NodeEvent::SearchEnded { id, why: "cancelled".into(), started: Vec::new() });
+        assert!(s.view().found.is_none());
     }
 
     fn peer() -> PeerId {
