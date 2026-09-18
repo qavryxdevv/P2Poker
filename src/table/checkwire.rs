@@ -38,17 +38,16 @@ pub struct StateHash {
     /// This peer's own hash of `PublicTableState` (§6.1).
     #[cbor(n(1), with = "minicbor::bytes")]
     pub state_hash: [u8; 32],
-    /// `TERMINAL(k)` — on the settled path, the `HAND_COMPLETE` stage hash.
+    /// `TERMINAL(k)` — on the settled path, the `HAND_COMPLETE` stage hash: the
+    /// hand's last completed stage at the checkpoint, the same value in every
+    /// reconciliation round (§4.9, as corrected on 2026-09-18, `S1-CJ`).
     ///
     /// **This is NOT the same value as `PublicTableState`'s field of the same
-    /// name, and both carried §6.1's one sentence** (`S1-CJ`). The hashed one
-    /// is the stage the settlement chains **from**, one stage earlier, and it
-    /// cannot be anything else. This one is filled from `Hand::checkpoint8`'s
-    /// terminal (`table::hand`) and from `Boundary::terminal`
-    /// (`table::boundary`).
-    ///
-    /// Which of the two §6.1 means is the owner's, under §10.2's pre-release
-    /// deadline. Neither comment is a licence to change the value.
+    /// name.** The hashed one is the stage the settlement chains **from**, one
+    /// stage earlier, because `HAND_COMPLETE`'s own body carries it; §4.9 and
+    /// §6.1 now say which is which, where one sentence used to describe both.
+    /// This one is filled from `Hand::checkpoint8`'s terminal (`table::hand`)
+    /// and from `Boundary::terminal` (`table::boundary`).
     #[cbor(n(2), with = "minicbor::bytes")]
     pub transcript_head: [u8; 32],
 }

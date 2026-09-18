@@ -900,8 +900,9 @@ All clean, and four are worth naming. `level`, `small_blind` and `big_blind` are
 **derived from `hand_id` in closed form** rather than incremented, which is the
 single most common place a poker protocol admits a per-receiver quantity and which
 this document closed before the rule existed. `transcript_head` is the `stage_hash`
-of the last completed stage, and every checkpoint is itself a collective stage, so
-every emitter has completed the same prefix. And the flag vector **was five and is
+the event carrying the hash chains from (§6.1's row says which that is at the
+boundary), and every checkpoint is itself a collective stage, so every emitter has
+completed the same prefix. And the flag vector **was five and is
 now four**: `absent` is deleted (§6.1, J5). `signed_this_hand` is the fourth worth
 naming and is **new here (L2)**: it is a `Vec<bool>` by seat like the four flags
 and is emphatically not a fifth one — it is `P(k)` (§3.2), whose per-receiver
@@ -3691,7 +3692,13 @@ subject digest; a redelivery is inert.
 Codes `0x0700`–`0x07FF`. Semantics in §6.
 
 **`0x0701 STATE_HASH`** — collective stage. `n(0) checkpoint: u16`,
-`n(1) state_hash: bytes[32]`, `n(2) transcript_head: bytes[32]`.
+`n(1) state_hash: bytes[32]`, `n(2) transcript_head: bytes[32]`. `transcript_head`
+here is the `stage_hash` of the hand's last completed stage at the checkpoint -- at
+checkpoint 8, `TERMINAL(k)`, the `HAND_COMPLETE` stage hash on the settled path --
+and every reconciliation round of the checkpoint (§6.3) carries the same value. It
+is **one stage later** than §6.1's field of the same name inside `state_hash`, which
+`HAND_COMPLETE`'s own body carries at checkpoint 8 and which therefore cannot hold
+that stage's hash (`S1-CJ`).
 
 **Its required emitter set is `P(k-1)`, the same set as `HAND_INIT`'s** (§3.2,
 §4.4), at checkpoints `2` to `7` of hand `k`; at checkpoint 1, which sits in the
@@ -4126,7 +4133,7 @@ could not agree here either, and §6.1 records what that cost.
 
 The twenty-eight remaining fields still make agreement hard to reach from a
 forked chain rather than impossible to reach only from a matching one.
-`transcript_head` is the `stage_hash` of the last completed stage; `roster`
+`transcript_head` is the `stage_hash` the settlement chains from; `roster`
 carries every seat's final stack; `deck_commitment` and the board carry the
 hand's cryptography; and `GENESIS(k)` commits to `participants` = `R(k)`
 (§3.1), so a fork in the *required* set forks the chain outright and cannot
@@ -5867,7 +5874,7 @@ state_hash = h("p2p-poker v1 state", [ canonical_cbor(PublicTableState) ])
 | `pots` | derived `Vec<PotView { size, eligible }>` [RULES A7] |
 | `deck_commitment` | `final_deck_hash` from `DECK_COMMIT`, or 32 zero bytes before it |
 | `ledger_in`, `ledger_out` | `u64` each; the running totals of accepted buy-ins and of removed stacks (§4.4's `ledger_delta`). They are inside `state_hash` because otherwise two peers could disagree about the ledger and never detect it (C-9) |
-| `transcript_head` | `stage_hash` of the last completed stage |
+| `transcript_head` | the `stage_hash` the event carrying this state hash chains from -- its `previous_event_hash`. At checkpoints 2 to 7 that is the last completed stage. At checkpoint 8 the state is hashed inside `HAND_COMPLETE`'s own body, which cannot contain its own stage's hash, so it is the last stage completed **before** the settlement: the stage the settlement chains from. The `STATE_HASH` frame's field of the same name is one stage later, `TERMINAL(k)` (§4.9). Corrected 2026-09-18 (`S1-CJ`): this row read *the last completed stage*, which no implementation could satisfy at checkpoint 8; the value every peer hashes is unchanged |
 
 **`signed_this_hand` WAS field 28 of this struct, and it is deleted. The
 argument for it was sound and its premise was false, and the difference was only

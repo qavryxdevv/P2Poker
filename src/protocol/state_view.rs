@@ -162,18 +162,18 @@ pub struct PublicTableState {
 
     /// The stage hash the settlement **chains from**.
     ///
-    /// **§6.1 calls this *“the stage hash of the last completed stage”* and it
-    /// cannot be that** (`S1-CJ`). This value is `slot.previous_event_hash`
-    /// read while `HandComplete` is being **built** — `state_hash` is a field
-    /// of that struct — so the `HAND_COMPLETE` stage has not been sealed, let
-    /// alone completed. A field cannot carry the hash of the stage that
-    /// carries it, so no implementation can satisfy the sentence.
+    /// The `stage_hash` the event carrying this state hash chains from — its
+    /// `previous_event_hash` (§6.1, as corrected on 2026-09-18, `S1-CJ`). At
+    /// the boundary checkpoint the state is hashed while `HandComplete` is
+    /// being **built** — `state_hash` is a field of that struct — so this is
+    /// the last stage completed **before** the settlement, the stage the
+    /// settlement chains from: a body cannot carry its own stage's hash.
     ///
-    /// It is harmless because every peer computes it identically, and the
-    /// comment is corrected rather than the code: which of the two moves is a
-    /// wire-format decision under §10.2's pre-release deadline and belongs to
-    /// the owner. The `STATE_HASH` frame's field of the same name carries
-    /// `TERMINAL(k)` instead, one stage later — see `table::checkwire`.
+    /// §6.1 used to say *"the stage hash of the last completed stage"*, which
+    /// no implementation could satisfy here; the sentence was corrected to the
+    /// value every peer computes, and the value did not change. The
+    /// `STATE_HASH` frame's field of the same name is one stage later,
+    /// `TERMINAL(k)` — see `table::checkwire`.
     #[cbor(n(27), with = "minicbor::bytes")]
     pub transcript_head: [u8; 32],
 }
