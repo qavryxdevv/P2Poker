@@ -289,6 +289,9 @@ pub struct NetworkStatus {
     pub listening: Vec<String>,
     pub dht_announced: bool,
     pub relay: Option<RelayStatus>,
+    /// `D-002` point 3 (`S1-FK`): this client's own relay -- the poker clients
+    /// holding a reservation on it, and the circuits crossing it now.
+    pub relaying: (usize, usize),
     pub public: Option<bool>,
     /// `S1-EH`: this client's line to the Tox network -- `udp`, `tcp` or
     /// `offline`; `None` before any table rode it.

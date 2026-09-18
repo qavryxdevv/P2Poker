@@ -44,6 +44,7 @@ fn node() -> Swarm<PokerBehaviour> {
         // satisfy that assertion and the test would pass for the wrong reason.
         local_discovery: false,
         relay_role: RelayRole::Volunteer,
+        relay_admits: Default::default(),
     })
     .expect("the stack builds")
 }

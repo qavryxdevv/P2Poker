@@ -1596,6 +1596,21 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
             );
         }
 
+        // `D-002` point 3 (`S1-FK`): what this client's own line carries for
+        // other players, shown whenever it carries anything.
+        let (reserved, circuits) = s.relaying;
+        if reserved > 0 || circuits > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "relaying for {reserved} player{}, {circuits} connection{}",
+                    if reserved == 1 { "" } else { "s" },
+                    if circuits == 1 { "" } else { "s" }
+                ))
+                .color(theme::TEXT_DIM)
+                .size(14.0),
+            );
+        }
+
         if s.failed_dials > 0 {
             // Counted rather than listed: most dials fail on an open DHT, and a
             // log of them buries what matters — but with no count at all, "most

@@ -37,12 +37,19 @@ use libp2p::futures::StreamExt;
 use libp2p::{identity, multiaddr::Protocol, relay, swarm::SwarmEvent, Multiaddr, PeerId, Swarm};
 
 use p2p_poker::net::relay::{adequate, Adequacy};
-use p2p_poker::net::swarm::{self, NodeConfig, PokerBehaviour, PokerBehaviourEvent, RelayRole};
+use p2p_poker::net::swarm::{self, NodeConfig, PokerBehaviour, PokerBehaviourEvent, RelayAdmits, RelayRole};
 use p2p_poker::protocol::constants::{HAND_DEADLINE_CAP_MS, MAX_SEATS};
 
 const PATIENCE: Duration = Duration::from_secs(60);
 
 fn node(role: RelayRole) -> Swarm<PokerBehaviour> {
+    node_admitting(role, RelayAdmits::default())
+}
+
+/// A node whose relay reserves slots for the peers in `admits` (`S1-FK`): the
+/// node loop fills that set from `identify`, and a test with no loop names the
+/// peer itself.
+fn node_admitting(role: RelayRole, admits: RelayAdmits) -> Swarm<PokerBehaviour> {
     swarm::build(NodeConfig {
         identity: identity::Keypair::generate_ed25519(),
         // Off. These dial a loopback address and then assert two peers met;
@@ -50,6 +57,7 @@ fn node(role: RelayRole) -> Swarm<PokerBehaviour> {
         // satisfy that assertion and the test would pass for the wrong reason.
         local_discovery: false,
         relay_role: role,
+        relay_admits: admits,
     })
     .expect("the stack builds")
 }
@@ -101,12 +109,16 @@ async fn a_connection_goes_through_a_relay() {
 }
 
 async fn run() -> Outcome {
-    let mut relay_node = node(RelayRole::Volunteer);
+    let admits = RelayAdmits::default();
+    let mut relay_node = node_admitting(RelayRole::Volunteer, admits.clone());
     let mut reserver = node(RelayRole::Declined);
     let mut caller = node(RelayRole::Declined);
 
     let relay_id = *relay_node.local_peer_id();
     let reserver_id = *reserver.local_peer_id();
+    // The relay reserves only for poker clients (`S1-FK`); `identify` would name
+    // the reserver one, and this test names it itself.
+    admits.write().expect("the admission set").insert(reserver_id);
 
     relay_node
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse::<Multiaddr>().unwrap())
@@ -231,9 +243,13 @@ async fn a_relay_that_knows_no_address_of_its_own_grants_an_empty_reservation() 
 
 /// Whether the reserving node was ever given a circuit address.
 async fn no_external_address() -> bool {
-    let mut relay_node = node(RelayRole::Volunteer);
+    let admits = RelayAdmits::default();
+    let mut relay_node = node_admitting(RelayRole::Volunteer, admits.clone());
     let mut reserver = node(RelayRole::Declined);
     let relay_id = *relay_node.local_peer_id();
+    // Admitted (`S1-FK`), so what this proves is the missing address and not
+    // the admission.
+    admits.write().expect("the admission set").insert(*reserver.local_peer_id());
 
     relay_node
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse::<Multiaddr>().unwrap())
@@ -305,6 +321,54 @@ async fn declined() -> bool {
                     return true;
                 }
             }
+        }
+    }
+}
+
+/// `S1-FK`, D-002 point 2: a volunteer relay with a confirmed address refuses a
+/// reservation to a peer the node never named a poker client -- the stranger
+/// that made every reachable client an open relay for the libp2p world.
+#[tokio::test]
+async fn a_relay_refuses_a_stranger_a_reservation() {
+    let refused = tokio::time::timeout(Duration::from_secs(30), stranger_asks()).await;
+    assert_eq!(
+        refused.ok(),
+        Some(true),
+        "the relay granted a stranger a reservation, or never answered it"
+    );
+}
+
+/// Whether the relay refused the stranger (`true`) or granted it (`false`).
+async fn stranger_asks() -> bool {
+    let mut relay_node = node_admitting(RelayRole::Volunteer, RelayAdmits::default());
+    let mut stranger = node(RelayRole::Declined);
+    let relay_id = *relay_node.local_peer_id();
+    let stranger_id = *stranger.local_peer_id();
+    relay_node
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse::<Multiaddr>().unwrap())
+        .unwrap();
+    let relay_addr = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = relay_node.select_next_some().await {
+            break address;
+        }
+    };
+    relay_node.add_external_address(relay_addr.clone());
+    let circuit: Multiaddr = relay_addr
+        .with(Protocol::P2p(relay_id))
+        .with(Protocol::P2pCircuit);
+    let _ = stranger.listen_on(circuit);
+    loop {
+        tokio::select! {
+            event = relay_node.select_next_some() => match event {
+                SwarmEvent::Behaviour(PokerBehaviourEvent::RelayServer(
+                    relay::Event::ReservationReqDenied { src_peer_id, .. },
+                )) if src_peer_id == stranger_id => return true,
+                SwarmEvent::Behaviour(PokerBehaviourEvent::RelayServer(
+                    relay::Event::ReservationReqAccepted { src_peer_id, .. },
+                )) if src_peer_id == stranger_id => return false,
+                _ => {}
+            },
+            _ = stranger.select_next_some() => {}
         }
     }
 }

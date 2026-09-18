@@ -1123,6 +1123,9 @@ impl AppState {
                     }
                 ));
             }
+            NodeEvent::Relaying { reserved, circuits } => {
+                self.status.relaying = (reserved, circuits);
+            }
             NodeEvent::NoRelayFound { cycles } => {
                 self.note(format!(
                     "no relay after {cycles} searches; if nobody anywhere is reachable there is no game"

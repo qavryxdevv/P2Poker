@@ -540,6 +540,10 @@ pub enum NodeEvent {
         seconds: Option<u64>,
         adequate: bool,
     },
+    /// `D-002` point 3 (`S1-FK`): what this client's own relay carries now --
+    /// how many poker clients hold a reservation on it, and how many circuits
+    /// cross it. Sent when either changes.
+    Relaying { reserved: usize, circuits: usize },
     /// No relay could be found, after looking for long enough that this is a
     /// finding rather than impatience.
     ///
@@ -714,6 +718,7 @@ impl NodeEvent {
             | Self::Reachability { .. }
             | Self::ToxLine { .. }
             | Self::Reserved { .. }
+            | Self::Relaying { .. }
             | Self::NoRelayFound { .. }
             // Both change a pane a player is looking at, and a line of chat
             // that arrived three seconds ago is a line nobody answers.

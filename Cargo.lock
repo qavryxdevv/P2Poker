@@ -4165,6 +4165,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing-subscriber",
+ "web-time",
  "wgpu",
  "windows-sys 0.61.2",
  "winresource",

@@ -50,6 +50,10 @@ libp2p = { version = "0.57.0", features = [
     "serde",
 ] }
 libp2p-stream = "0.5.0-alpha"
+# `Instant` in `libp2p::relay::RateLimiter`'s signature, which the relay's
+# admission control implements (D-002 point 2, `S1-FK`). Already in the tree
+# through libp2p, so this adds nothing to the lockfile but the edge.
+web-time = "1"
 # For this crate's own async traits (`table::transport`, the Tox carrier).
 # `libp2p::request_response::Codec` was one too until libp2p 0.57, whose trait
 # returns its futures directly.

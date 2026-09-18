@@ -1114,6 +1114,11 @@ const AVOID_FOR: std::time::Duration = std::time::Duration::from_secs(300);
 /// table, is alive: its silence in the group is the group's or this client's line,
 /// not its absence.
 const FOUNDER_ANSWER_FRESH_MS: u64 = 75_000;
+/// `S1-HZ`: the longest a founder alive on the lobby's line goes between two
+/// answers -- one asking (`AD_REBROADCAST_MS`), the founder asked first, and ten
+/// seconds for the answer's way. An answer older than this and than the
+/// founder's silence in the group was made before the silence began.
+const FOUNDER_ANSWER_GAP_MS: u64 = crate::protocol::constants::AD_REBROADCAST_MS + 10_000;
 /// `S1-GS`: ...unless it has been out of the group's hearing this long: a founder
 /// with its lobby link up and its line to the group down for good would hold its
 /// seats for ever otherwise.
@@ -1319,7 +1324,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     } = cfg;
     // Advisory events are offered, not waited for. See `Events`.
     let events = Events::new(events);
+    // `D-002` point 2 (`S1-FK`): who may hold a reservation on this client's
+    // relay -- the poker peers `identify` named, kept beside `poker_peers`.
+    let relay_admits = swarm::RelayAdmits::default();
     let mut swarm = swarm::build(NodeConfig {
+        relay_admits: relay_admits.clone(),
         identity,
         // Capacity from the start; the ANNOUNCE is what AutoNAT gates (D-002).
         // `relay::Config` cannot be changed after the swarm is built, and
@@ -1723,8 +1732,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // made after the table's advert that does not name the table is the
     // founder's own word that it offers the table no more -- it left, its
     // client lives on in the lobby answering every ping, its friendship
-    // lingers, and the group may never have held it.
-    let mut answers: std::collections::HashMap<Vec<u8>, (Vec<[u8; 32]>, u64)> =
+    // lingers, and the group may never have held it. `S1-HZ`: and when it
+    // reached this client, on this client's clock -- how long ago an answer
+    // came is read on one clock, the machines' clocks differ.
+    let mut answers: std::collections::HashMap<Vec<u8>, (Vec<[u8; 32]>, u64, u64)> =
         std::collections::HashMap::new();
     let mut alive: std::collections::HashMap<
         PeerId,
@@ -1925,6 +1936,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut relay_inadequate = false;
     let mut relayed_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // `D-002` point 3, `S1-FK`: what this client's own relay carries -- the
+    // peers holding a reservation here, the circuits open through it, and the
+    // strangers refused one -- for the network panel and the log.
+    let mut serving: std::collections::HashSet<libp2p::PeerId> = std::collections::HashSet::new();
+    let mut serving_circuits: usize = 0;
+    let mut strangers_refused: u64 = 0;
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
     let mut relay_searches: u32 = 0;
@@ -4075,6 +4092,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // actually went anywhere, and seventeen
                         // direct-connection events for eight arrivals.
                         if num_established == 0 && poker_peers.remove(&peer_id) {
+                            if let Ok(mut known) = relay_admits.write() {
+                                known.remove(&peer_id);
+                            }
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: true })
                                 .await;
@@ -4131,6 +4151,48 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 adequate,
                             })
                             .await;
+                    }
+                    // `D-002` point 3, `S1-FK`: this client's own relay, counted --
+                    // who holds a reservation here and how many circuits cross it,
+                    // for the network panel; and every stranger its admission
+                    // refused, which no log could show before.
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::RelayServer(ev)) => {
+                        use libp2p::relay::Event as R;
+                        let before = (serving.len(), serving_circuits);
+                        match ev {
+                            R::ReservationReqAccepted { src_peer_id, renewed } => {
+                                if serving.insert(src_peer_id) && !renewed {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "relay: a reservation here for the poker client {src_peer_id} ({} held, {} circuit(s) open)",
+                                            serving.len(),
+                                            serving_circuits
+                                        )))
+                                        .await;
+                                }
+                            }
+                            R::ReservationReqDenied { src_peer_id, .. } if !poker_peers.contains(&src_peer_id) => {
+                                strangers_refused += 1;
+                                if strangers_refused == 1 || strangers_refused % 20 == 0 {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "relay: a reservation refused to {src_peer_id}, which is not a poker client -- {strangers_refused} refused so far (D-002)"
+                                        )))
+                                        .await;
+                                }
+                            }
+                            R::ReservationClosed { src_peer_id } | R::ReservationTimedOut { src_peer_id } => {
+                                serving.remove(&src_peer_id);
+                            }
+                            R::CircuitReqAccepted { .. } => serving_circuits += 1,
+                            R::CircuitClosed { .. } => serving_circuits = serving_circuits.saturating_sub(1),
+                            _ => {}
+                        }
+                        if (serving.len(), serving_circuits) != before {
+                            let _ = events
+                                .send(NodeEvent::Relaying { reserved: serving.len(), circuits: serving_circuits })
+                                .await;
+                        }
                     }
                     // `D-040`: a lobby question, or an answer to this client's.
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Snapshot(
@@ -4348,7 +4410,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // (`run192317-3`: the first question beat the hosting by a
                                 // second, and its empty answer withdrew the table for 29 s).
                                 let pb = peer.to_bytes();
-                                answers.insert(pb.clone(), (named.clone(), answered_at));
+                                answers.insert(pb.clone(), (named.clone(), answered_at, super::node::now_unix_ms()));
                                 let gone: Vec<([u8; 32], String)> = state
                                     .lobby
                                     .tables()
@@ -5388,6 +5450,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if info.protocol_version == super::swarm::IDENTIFY_PROTOCOL
                             && poker_peers.insert(peer_id)
                         {
+                            // `S1-FK`: and one this client's relay may reserve for.
+                            if let Ok(mut known) = relay_admits.write() {
+                                known.insert(peer_id);
+                            }
                             poker_line_since.get_or_insert_with(std::time::Instant::now);
                             // Never subject to the cap. The whole point of a
                             // cap is to keep strangers from crowding out the
@@ -8877,7 +8943,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .joined_ad
                                             .as_ref()
                                             .and_then(|ad| answers.get(&ad.founder_peer_id))
-                                            .is_some_and(|(_, at)| super::node::now_unix_ms().saturating_sub(*at) < FOUNDER_ANSWER_FRESH_MS);
+                                            .is_some_and(|(_, _, heard)| super::node::now_unix_ms().saturating_sub(*heard) < FOUNDER_ANSWER_FRESH_MS);
                                         if founder_answers {
                                             if let Some(k) = t.rejoin_key.take() {
                                                 t.rejoin_at = None;
@@ -8978,8 +9044,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // which is a founder alive with the group's line in trouble,
                             // for `FOUNDER_TOX_DEAD_S`; past that the table cannot form
                             // and the seats go on.
-                            let founder_alive = answers.get(f.founder_peer_id()).is_some_and(|(named, at)| {
-                                named.contains(&f.table_id()) && super::node::now_unix_ms().saturating_sub(*at) < FOUNDER_ANSWER_FRESH_MS
+                            // `S1-HZ`: past one gap between two of a live founder's
+                            // answers, an answer is the founder alive only if it came
+                            // after the group last heard the founder. One from before
+                            // the silence says nothing about it, and held fresh for
+                            // 75 s it kept a founder whose line had died alive until
+                            // the library timed it out of the group (~72 s of silence)
+                            // where `QUIET_LIMIT_S` would have done.
+                            let founder_quiet = founder_line.and_then(|k| t.tox_sink.quiet_line(&k));
+                            let founder_connected = founder_peer.is_some_and(|p| swarm.is_connected(&p));
+                            let founder_alive = answers.get(f.founder_peer_id()).is_some_and(|(named, _, heard)| {
+                                named.contains(&f.table_id())
+                                    && founder_answer_counts(
+                                        super::node::now_unix_ms().saturating_sub(*heard),
+                                        founder_quiet,
+                                        founder_connected,
+                                    )
                             });
                             let stuck_long = founder_line.and_then(|k| t.tox_sink.quiet_line(&k)).is_some_and(|q| q >= FOUNDER_TOX_DEAD_S)
                                 || (never_in
@@ -9019,7 +9099,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 && !founder_line.is_some_and(|k| t.tox_sink.in_group_line(&k))
                                 && answers
                                     .get(f.founder_peer_id())
-                                    .is_some_and(|(named, at)| !named.contains(&f.table_id()) && *at > f.advert_time());
+                                    .is_some_and(|(named, at, _)| !named.contains(&f.table_id()) && *at > f.advert_time());
                             let released = f.released_before_the_first_hand();
                             let set = f.session().is_some();
                             // `S1-FY`: a client that hears no seat at a table of three or
@@ -11363,12 +11443,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `D-040`, §7.5: every `AD_REBROADCAST_MS`, ask every poker peer
                 // on the line what it offers. Bounded by the number of poker
                 // peers, which is small, and by one question per peer per tick.
+                // `S1-HZ`: the founders of the tables this client sits at before
+                // their start first -- their answers tell a founder alive from one
+                // gone -- and then everybody else, up to the bound.
                 {
-                    let peers: Vec<libp2p::PeerId> = poker_peers
+                    let founders: Vec<libp2p::PeerId> = tables
+                        .iter()
+                        .filter_map(|t| t.table.as_ref())
+                        .filter(|f| !f.is_founder() && f.session().is_none())
+                        .filter_map(|f| PeerId::from_bytes(f.founder_peer_id()).ok())
+                        .filter(|p| swarm.is_connected(p))
+                        .collect();
+                    let peers: Vec<libp2p::PeerId> = founders
                         .iter()
                         .copied()
-                        .filter(|p| swarm.is_connected(p))
-                        .take(SNAPSHOT_ASKS_PER_TICK)
+                        .chain(poker_peers.iter().copied().filter(|p| swarm.is_connected(p) && !founders.contains(p)))
+                        .take(SNAPSHOT_ASKS_PER_TICK.max(founders.len()))
                         .collect();
                     for p in peers {
                         ask_lobby!(p);
@@ -13422,6 +13512,20 @@ fn stop_at_hand_due(hand_id: u64) -> bool {
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
     *at == Some(hand_id)
+}
+
+/// `S1-HZ`: whether the founder's lobby answer naming the table, `ago_ms` old on
+/// this client's clock, still says the founder is alive while the table's group
+/// has not heard it for `quiet_s` seconds (`None`: the group holds no reading
+/// of it). Fresh for `FOUNDER_ANSWER_FRESH_MS` at most; past one gap between two
+/// of a live founder's answers (`FOUNDER_ANSWER_GAP_MS`), only an answer that
+/// came after the silence began, and only while this client is still
+/// `connected` to the founder -- a founder the lobby's line lost too answers
+/// nobody, and its last answer says nothing about it now.
+fn founder_answer_counts(ago_ms: u64, quiet_s: Option<u64>, connected: bool) -> bool {
+    ago_ms < FOUNDER_ANSWER_FRESH_MS
+        && (connected || ago_ms < FOUNDER_ANSWER_GAP_MS)
+        && quiet_s.is_none_or(|q| ago_ms < q.saturating_mul(1000).max(FOUNDER_ANSWER_GAP_MS))
 }
 
 /// `D-066`: whether this client's own line was down at any moment of the last
@@ -16586,7 +16690,7 @@ fn reachable(addr: &libp2p::Multiaddr) -> bool {
         //
         // That was harmless while the client bound no IPv6 socket at all. It
         // stopped being harmless in the same commit that added one: this
-        // machine's own v6 addresses are `fdc9:6d69:…`, a ULA, and without
+        // machine's own v6 addresses are ULAs (`fd…`), and without
         // these two masks a LAN-only address would be offered as a relay
         // endpoint and, if anything ever confirmed it, published in a provider
         // record for strangers to fail to dial.
@@ -16878,7 +16982,7 @@ mod tests {
     fn a_private_ipv6_address_is_not_reachable_from_outside() {
         let yes = |s: &str| reachable(&s.parse::<Multiaddr>().expect("a literal"));
         // Real addresses this machine was measured to bind, 2026-09-02.
-        assert!(!yes("/ip6/fdc9:6d69:ed51:0:2081:e457:503:2311/tcp/33774"), "a ULA is a LAN address");
+        assert!(!yes("/ip6/fd12:3456:789a:1::1/tcp/33774"), "a ULA is a LAN address");
         assert!(!yes("/ip6/fe80::1/tcp/1"), "link-local");
         assert!(!yes("/ip6/::1/tcp/1"), "loopback");
         assert!(!yes("/ip6/::/tcp/1"), "the wildcard bind is not an address");
@@ -17828,6 +17932,28 @@ mod a_joiner_before_the_first_hand {
         assert!(joiner_leaves_because(false, false, None, false, true, false, true).is_some_and(|w| w.contains("silent")));
         assert!(joiner_leaves_because(false, false, None, false, false, false, true).is_some_and(|w| w.contains("answered nothing for 90 s")));
         assert_eq!(joiner_leaves_because(false, false, None, false, false, false, false), None);
+    }
+
+    /// `S1-HZ`: a founder's lobby answer keeps it alive through its silence in the
+    /// group only when it came after the silence began -- within one gap between
+    /// two answers it is given the benefit of the doubt, and with no reading of
+    /// the group at all the old freshness stands.
+    #[test]
+    fn a_founders_answer_from_before_its_silence_does_not_keep_it_alive() {
+        // Killed 5 s after its last answer: alive within the gap, then not.
+        assert!(founder_answer_counts(25_000, Some(20), true), "within one gap");
+        assert!(!founder_answer_counts(41_000, Some(36), true), "made before the silence, past the gap");
+        // A live founder whose line to the group is down answers every asking.
+        assert!(founder_answer_counts(10_000, Some(90), true), "made after the silence began");
+        assert!(founder_answer_counts(70_000, Some(100), true), "S1-GS: still alive until FOUNDER_TOX_DEAD_S");
+        assert!(!founder_answer_counts(80_000, Some(100), true), "never past FOUNDER_ANSWER_FRESH_MS");
+        // No group reading of the founder: freshness while connected to it...
+        assert!(founder_answer_counts(50_000, None, true));
+        assert!(!founder_answer_counts(80_000, None, true));
+        // ...and one gap once the lobby's line to it is gone as well.
+        assert!(founder_answer_counts(30_000, None, false), "a gap is a gap");
+        assert!(!founder_answer_counts(50_000, None, false), "a founder nobody reaches answers nobody");
+        assert!(!founder_answer_counts(50_000, Some(90), false));
     }
 
     /// `S1-GG`: a table goes on only while a seat other than this client and its

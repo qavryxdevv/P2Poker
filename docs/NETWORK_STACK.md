@@ -1123,8 +1123,8 @@ price §3.3 says is worth paying — but the user is the one paying it.
   whatever IP it holds that day. The Mainline announce disclosed an address and
   forgot who you were; this one remembers.
 
-* **It leaks more addresses than it publishes — through one door now, where there
-  were two.** The outgoing `ADD_PROVIDER` carries confirmed *external* addresses
+* **It leaked more addresses than it published, through two doors, and both are
+  shut (2026-09-02 and 2026-09-18).** The outgoing `ADD_PROVIDER` carries confirmed *external* addresses
   only (`behaviour.rs:1563`). But when this node **answers** a `GET_PROVIDERS`
   about a key it provides, `libp2p-kad` fills in its own record with
   `listen_addresses ∪ external_addresses` (`behaviour.rs:1267-1274`, the listen set
@@ -1139,10 +1139,17 @@ price §3.3 says is worth paying — but the user is the one paying it.
   is; but `listen_addresses` is the raw bound set. `S1-Z` closed the `identify`
   door the same day — `net::swarm::build` sets `with_hide_listen_addrs(true)` —
   and this bullet went on saying *this project never sets it* until 2026-09-15.
-  **The `libp2p-kad` door is still open**: the identify setting does not reach it,
-  so a stranger who asks this client, while it serves the DHT, who provides the
-  lobby key learns this player's LAN topology and which hypervisor they run.
-  `S1-FJ`.
+  **The `libp2p-kad` door stayed open until 2026-09-18** (`S1-FJ`): the identify
+  setting does not reach it, so a stranger who asked this client, while it served
+  the DHT, who provides the lobby key learned this player's LAN topology and which
+  hypervisor they run. `net::swarm::Bogonless` — the wrapper around the public
+  DHT's behaviour — now withholds from it every `NewListenAddr` and
+  `ExpiredListenAddr` for an address its bogon filter refuses to dial (§4.5), so
+  the listen set `libp2p-kad` fills its own record from holds only public
+  addresses and relay circuits. mDNS (§9.8) is a separate behaviour and keeps the
+  LAN; the DHT's own bootstrap on a new listen address is not needed, because the
+  node bootstraps it itself. A unit test feeds the wrapper home and public
+  addresses and asserts which reach the inner behaviour.
 
 * **The same connections announce what this software is.** `identify` sends
   `protocol_version = "/p2p-poker/1"` and `agent_version = "p2p-poker/<version>"`
@@ -1251,13 +1258,14 @@ price §3.3 says is worth paying — but the user is the one paying it.
    `stop_providing` is local, tell them plainly that leaving does not take the
    record back;
 4. keep LAN and virtual-adapter addresses out of **both** the identify banner and
-   the provider record. **Half built**: `with_hide_listen_addrs(true)` has closed
-   the identify half since 2026-09-02 (`S1-Z`) — this item, and the heading above
-   it, went on listing it as not implemented until 2026-09-15. It does not reach
+   the provider record. **Built**: `with_hide_listen_addrs(true)` has closed the
+   identify half since 2026-09-02 (`S1-Z`) — this item, and the heading above it,
+   went on listing it as not implemented until 2026-09-15. It does not reach
    `libp2p-kad`, which fills this client's own record from the listen set when it
-   answers a lookup, so the provider-record half is open (`S1-FJ`). §5.6's publish
-   filter is already applied on the external-address path and needs no change
-   there; what leaks is the listen half. The cost of hiding it is a delay rather
+   answers a lookup; that half closed on 2026-09-18 (`S1-FJ`), when
+   `Bogonless` stopped telling the public DHT's behaviour of any listen address
+   its bogon filter refuses. §5.6's publish filter is already applied on the
+   external-address path and needs no change there. The cost of hiding it is a delay rather
    than a loss — a genuinely public host's address is advertised once AutoNAT
    confirms it, and the LAN case is served by mDNS (§9.8), which does not go
    through `identify` at all;
@@ -2713,17 +2721,28 @@ reservation through you.*
 Slot and bandwidth ceilings are user-visible and user-settable, and the network
 status panel shows how many peers are currently being relayed.
 
-> **The client is not this section, checked 2026-09-15 (`S1-FK`).** Every client
-> is built with `RelayRole::Volunteer`, and there is no setting, no disclosure
-> and no count of relayed peers. `swarm::relay_config` pushes no
-> `PokerPeersOnly` — nothing in `src/` implements `libp2p::relay::RateLimiter` —
-> so the crate's own per-peer and per-IP limiters are the whole of the
-> admission. Its numbers are 128 reservations (4 per peer), 64 circuits (4 per
-> peer, `RELAY_MAX_CIRCUITS_PER_PEER`), an hour per circuit
-> (`RELAY_RESERVATION`) and `RELAY_MAX_CIRCUIT_BYTES`, not the block below. A
-> client with a confirmed external address therefore serves any libp2p peer
-> within those numbers: the open relay the next paragraph describes. What
-> follows is what D-002 requires, not what runs.
+> **The client is only partly this section (`S1-FK`, checked 2026-09-15, half
+> built 2026-09-18).** *Built:* admission. `swarm::relay_config` pushes a
+> `PokerPeersOnly` into `reservation_rate_limiters`, holding the set of peers
+> `identify` named poker clients (`swarm::RelayAdmits`, kept by the node loop
+> beside its `poker_peers`), so a reservation goes to one of ours and to nobody
+> else — and a circuit can end only at a peer holding a reservation, so nobody
+> else's traffic crosses the user's line. `circuit_src_rate_limiters` keeps the
+> crate's own limiters and no admission of its own, against the next paragraph's
+> *both*: a newcomer's first dial through a relay it has never met opens its
+> circuit half a round trip before the relay has its `identify`, and a source
+> gate would refuse exactly the new player trying to reach a table. *Built:* the
+> count — the node counts the peers holding a reservation and the circuits
+> open, the lobby's network strip says *relaying for N players, M connections*,
+> and every refused stranger is logged. *Not built, the owner's:* the default
+> and the setting. Every client is still built with `RelayRole::Volunteer`, with
+> no setting, no first-run disclosure and no user-settable ceilings — a client
+> behind a NAT that reaches its game only through another client's relay is
+> why turning it off by default is not a change to make without a ruling. The
+> build's numbers are 128 reservations (4 per peer), 64 circuits (4 per peer,
+> `RELAY_MAX_CIRCUITS_PER_PEER`), an hour per circuit (`RELAY_RESERVATION`) and
+> `RELAY_MAX_CIRCUIT_BYTES`, not the block below. What follows is what D-002
+> requires.
 
 **The trap: Circuit Relay v2 is not protocol-selective.** `HOP_PROTOCOL_NAME` and
 `STOP_PROTOCOL_NAME` are compile-time constants

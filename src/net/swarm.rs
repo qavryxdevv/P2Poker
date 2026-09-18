@@ -109,6 +109,33 @@ pub const RELAY_MAX_CIRCUIT_BYTES: u64 =
 /// How many circuits one peer may hold on this client at once.
 pub const RELAY_MAX_CIRCUITS_PER_PEER: usize = 4;
 
+/// `D-002` point 2, `S1-FK`: the peers this client's relay serves -- poker
+/// clients, as `identify` named them, kept by the node loop beside its own
+/// `poker_peers`. Shared, because `relay::Config` is fixed when the swarm is
+/// built and the set is not.
+pub type RelayAdmits = std::sync::Arc<std::sync::RwLock<std::collections::HashSet<PeerId>>>;
+
+/// `D-002` point 2, `S1-FK`: a **reservation** only for a peer `identify` named a
+/// poker client. Without it a client with a confirmed external address was a
+/// relay for the whole libp2p world, IPFS traffic included, on its player's
+/// line. Our own clients ask for a reservation only once the relay's `identify`
+/// reached them (`run`, the reservation request), and the relay's reading of
+/// theirs is on its way at the same moment, so they are known when they ask.
+///
+/// **Circuits are not gated on their source**, where `NETWORK_STACK.md` §9.6
+/// asked for both: a circuit can end only at a peer holding a reservation here,
+/// which the gate above makes one of ours -- nobody else's traffic can cross
+/// this client -- and a newcomer's first dial through a relay it has never met
+/// opens the circuit half a round trip before the relay has its `identify`, so a
+/// source gate would refuse exactly the new player trying to reach a table.
+struct PokerPeersOnly(RelayAdmits);
+
+impl relay::RateLimiter for PokerPeersOnly {
+    fn try_next(&mut self, peer: PeerId, _addr: &libp2p::Multiaddr, _now: web_time::Instant) -> bool {
+        self.0.read().is_ok_and(|known| known.contains(&peer))
+    }
+}
+
 /// How long a join request may go unanswered before it is a failure.
 ///
 /// A founder that has to be dialled through a relay is slow, and a joiner that
@@ -292,8 +319,23 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Bog
             .handle_established_outbound_connection(id, peer, addr, role, port_use)
     }
 
+    /// **The second method that is not a delegation** (`S1-FJ`). `libp2p-kad`
+    /// fills this client's own provider record, when it answers a lookup of a
+    /// key it provides, from every listen address the swarm reported -- the
+    /// wildcard listeners' loopback, LAN, hypervisor-switch and ULA addresses,
+    /// the topology `S1-Z` hid from `identify`. So an address this filter would
+    /// refuse to dial is never reported to the inner behaviour as one it listens
+    /// on: its record holds public addresses and relay circuits, and a stranger
+    /// who asks for the lobby's providers learns no home network. mDNS is its
+    /// own behaviour and keeps the LAN; `run` bootstraps the DHT itself, so the
+    /// inner's bootstrap on a new listen address is not needed.
     fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
-        self.inner.on_swarm_event(event)
+        use libp2p::swarm::FromSwarm;
+        match event {
+            FromSwarm::NewListenAddr(e) if !not_a_bogon(e.addr) => {}
+            FromSwarm::ExpiredListenAddr(e) if !not_a_bogon(e.addr) => {}
+            other => self.inner.on_swarm_event(other),
+        }
     }
 
     fn on_connection_handler_event(
@@ -490,6 +532,9 @@ pub struct NodeConfig {
     /// discovery over the DHT works, since mDNS would answer first and the
     /// proof would be of nothing.
     pub local_discovery: bool,
+    /// `D-002` point 2 (`S1-FK`): who may hold a reservation on this client's
+    /// relay. The node loop fills it; an empty set refuses everybody.
+    pub relay_admits: RelayAdmits,
 }
 
 /// Build the node.
@@ -508,6 +553,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
     let local_discovery = config.local_discovery;
     let local_peer_id = PeerId::from(config.identity.public());
     let relay_role = config.relay_role;
+    let relay_admits = config.relay_admits.clone();
 
     let swarm = SwarmBuilder::with_existing_identity(config.identity)
         .with_tokio()
@@ -605,7 +651,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 autonat_server: autonat::v2::server::Behaviour::default(),
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 relay_client,
-                relay_server: relay::Behaviour::new(local_peer_id, relay_config(relay_role)),
+                relay_server: relay::Behaviour::new(local_peer_id, relay_config(relay_role, &relay_admits)),
                 conn_limits: connection_limits::Behaviour::new(
                     connection_limits(MAX_CONNECTIONS),
                 ),
@@ -807,18 +853,25 @@ pub fn gossipsub_config() -> Result<gossipsub::Config, Box<dyn std::error::Error
 /// When this client is not publicly reachable the limits are set to zero
 /// circuits, which is the honest form of "not a relay": it does not advertise a
 /// way through that it cannot provide.
-pub fn relay_config(role: RelayRole) -> relay::Config {
+///
+/// A volunteer's reservations go only to the peers in `admits` ([`PokerPeersOnly`],
+/// `S1-FK`), on top of the crate's own per-peer and per-address limiters.
+pub fn relay_config(role: RelayRole, admits: &RelayAdmits) -> relay::Config {
     match role {
-        RelayRole::Volunteer => relay::Config {
-            max_reservations: 128,
-            max_reservations_per_peer: 4,
-            reservation_duration: RELAY_RESERVATION,
-            max_circuits: 64,
-            max_circuits_per_peer: RELAY_MAX_CIRCUITS_PER_PEER,
-            max_circuit_duration: RELAY_RESERVATION,
-            max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
-            ..Default::default()
-        },
+        RelayRole::Volunteer => {
+            let mut c = relay::Config {
+                max_reservations: 128,
+                max_reservations_per_peer: 4,
+                reservation_duration: RELAY_RESERVATION,
+                max_circuits: 64,
+                max_circuits_per_peer: RELAY_MAX_CIRCUITS_PER_PEER,
+                max_circuit_duration: RELAY_RESERVATION,
+                max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
+                ..Default::default()
+            };
+            c.reservation_rate_limiters.push(Box::new(PokerPeersOnly(admits.clone())));
+            c
+        }
         RelayRole::Declined => relay::Config {
             max_reservations: 0,
             max_reservations_per_peer: 0,
@@ -857,7 +910,7 @@ mod tests {
             "/ip4/100.64.0.1/tcp/4001",      // RFC 6598, carrier-grade NAT
             "/ip4/100.127.255.255/tcp/4001", // the top of that /10
             "/ip6/::1/tcp/4001",
-            "/ip6/fdc9:6d69:ed51:0:2081:e457:503:2311/tcp/4001", // a real ULA from this machine
+            "/ip6/fd12:3456:789a:1::1/tcp/4001", // a ULA, as a home router hands out
             "/ip6/fe80::1/tcp/4001",
             "/ip6/2001:db8::1/tcp/4001",
             "/ip6/ff02::1/tcp/4001",
@@ -901,6 +954,91 @@ mod tests {
         )));
     }
 
+    /// `S1-FJ`: the wrapped behaviour is told of the addresses this client
+    /// listens on only where a stranger may learn them -- a public address or a
+    /// circuit through a public relay -- and of nothing on the home network, so
+    /// the provider record `libp2p-kad` fills from its listen set holds none.
+    #[test]
+    fn the_wrapped_dht_never_learns_a_home_address_it_listens_on() {
+        use libp2p::core::transport::ListenerId;
+        use libp2p::swarm::{ExpiredListenAddr, FromSwarm, NetworkBehaviour, NewListenAddr};
+
+        /// Records every listen address it is told of, and does nothing else.
+        #[derive(Default)]
+        struct Heard(Vec<(bool, libp2p::Multiaddr)>);
+        impl NetworkBehaviour for Heard {
+            type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+            type ToSwarm = std::convert::Infallible;
+            fn handle_established_inbound_connection(
+                &mut self,
+                _: libp2p::swarm::ConnectionId,
+                _: PeerId,
+                _: &libp2p::Multiaddr,
+                _: &libp2p::Multiaddr,
+            ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+                Ok(libp2p::swarm::dummy::ConnectionHandler)
+            }
+            fn handle_established_outbound_connection(
+                &mut self,
+                _: libp2p::swarm::ConnectionId,
+                _: PeerId,
+                _: &libp2p::Multiaddr,
+                _: libp2p::core::Endpoint,
+                _: libp2p::core::transport::PortUse,
+            ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+                Ok(libp2p::swarm::dummy::ConnectionHandler)
+            }
+            fn on_swarm_event(&mut self, event: FromSwarm) {
+                match event {
+                    FromSwarm::NewListenAddr(e) => self.0.push((true, e.addr.clone())),
+                    FromSwarm::ExpiredListenAddr(e) => self.0.push((false, e.addr.clone())),
+                    _ => {}
+                }
+            }
+            fn on_connection_handler_event(
+                &mut self,
+                _: PeerId,
+                _: libp2p::swarm::ConnectionId,
+                e: libp2p::swarm::THandlerOutEvent<Self>,
+            ) {
+                match e {}
+            }
+            fn poll(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        let a = |s: &str| s.parse::<libp2p::Multiaddr>().expect("a literal");
+        let mut b = super::Bogonless::new(Heard::default());
+        let id = ListenerId::next();
+        let home = [
+            "/ip4/192.168.0.10/tcp/50390",
+            "/ip4/127.0.0.1/udp/58742/quic-v1",
+            "/ip4/172.20.0.1/tcp/50390",
+            "/ip6/fd00::1/tcp/50391",
+            "/ip6/::1/tcp/50391",
+        ];
+        let public = [
+            "/ip4/1.1.1.1/tcp/4001",
+            "/ip4/147.75.87.27/tcp/4001/p2p/12D3KooWLZ18MNzm9xu7GZRQ16c6k3CZLN529CbUqrYaWNqyYko9/p2p-circuit",
+        ];
+        for s in home.iter().chain(public.iter()) {
+            let addr = a(s);
+            b.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr { listener_id: id, addr: &addr }));
+            b.on_swarm_event(FromSwarm::ExpiredListenAddr(ExpiredListenAddr { listener_id: id, addr: &addr }));
+        }
+        let told: Vec<String> = b.0.iter().map(|(_, x)| x.to_string()).collect();
+        for s in home {
+            assert!(!told.iter().any(|t| t == s), "{s} reached the DHT's listen set");
+        }
+        for s in public {
+            assert_eq!(told.iter().filter(|t| *t == s).count(), 2, "{s}: its listening and its end both reach it");
+        }
+    }
+
     /// The counter starts at zero and the handle is shared, so a status line can
     /// read it without borrowing the swarm.
     #[test]
@@ -929,6 +1067,7 @@ mod tests {
             identity: keypair(),
             local_discovery: false,
             relay_role: RelayRole::Declined,
+            relay_admits: RelayAdmits::default(),
         })
         .expect("the stack builds");
         assert_eq!(swarm.connected_peers().count(), 0);
@@ -938,10 +1077,36 @@ mod tests {
     /// says. That is a preference and it outranks a measurement.
     #[test]
     fn a_client_that_declined_accepts_no_reservations() {
-        let off = relay_config(RelayRole::Declined);
+        let off = relay_config(RelayRole::Declined, &RelayAdmits::default());
         assert_eq!(off.max_reservations, 0);
         assert_eq!(off.max_circuits, 0);
         assert_eq!(off.max_circuits_per_peer, 0);
+    }
+
+    /// `S1-FK`, D-002 point 2: a volunteer reserves a slot only for a poker
+    /// client the node has named -- a stranger is refused by the first limiter
+    /// that says no, whatever the crate's own limiters allow -- and a peer is
+    /// admitted the moment the node adds it. Circuits keep the crate's limiters.
+    #[test]
+    fn a_volunteer_reserves_only_for_poker_peers() {
+        let admits = RelayAdmits::default();
+        let mut c = relay_config(RelayRole::Volunteer, &admits);
+        let addr: libp2p::Multiaddr = "/ip4/1.1.1.1/tcp/4001".parse().expect("a literal");
+        let stranger = PeerId::random();
+        let ours = PeerId::random();
+        admits.write().expect("the admission set").insert(ours);
+        let mut asks = |peer: PeerId| {
+            let now = web_time::Instant::now();
+            c.reservation_rate_limiters.iter_mut().all(|l| l.try_next(peer, &addr, now))
+        };
+        assert!(!asks(stranger), "a stranger holds no reservation here");
+        assert!(asks(ours), "a poker peer does");
+        let circuits = relay_config(RelayRole::Volunteer, &admits).circuit_src_rate_limiters.len();
+        assert_eq!(
+            circuits,
+            relay::Config::default().circuit_src_rate_limiters.len(),
+            "circuit sources keep the crate's own limiters and no more"
+        );
     }
 
     /// The relay this client offers must pass the test this client applies.
@@ -952,7 +1117,7 @@ mod tests {
     /// was wrong on its own; nothing compared them.
     #[test]
     fn our_own_relay_is_one_our_own_client_would_accept() {
-        let c = relay_config(RelayRole::Volunteer);
+        let c = relay_config(RelayRole::Volunteer, &RelayAdmits::default());
         assert_eq!(
             crate::net::relay::adequate(
                 crate::protocol::constants::MAX_SEATS,
@@ -971,7 +1136,7 @@ mod tests {
     /// the defaults cannot silently move ours.
     #[test]
     fn the_relay_limits_are_ours_and_not_the_librarys() {
-        let ours = relay_config(RelayRole::Volunteer);
+        let ours = relay_config(RelayRole::Volunteer, &RelayAdmits::default());
         let theirs = relay::Config::default();
 
         assert!(
@@ -989,7 +1154,7 @@ mod tests {
     /// Lending a stranger this client's bandwidth has to have an edge.
     #[test]
     fn a_volunteer_relay_is_still_bounded() {
-        let c = relay_config(RelayRole::Volunteer);
+        let c = relay_config(RelayRole::Volunteer, &RelayAdmits::default());
         assert!(c.max_circuits > 0 && c.max_circuits <= 256);
         assert!(c.max_circuits_per_peer <= c.max_circuits);
         assert!(c.max_reservations_per_peer <= c.max_reservations);
