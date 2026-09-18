@@ -4793,6 +4793,11 @@ message exists for the voluntary case and as an explicit record. A seat that is
 sitting out keeps its stack, pays its blinds and antes, takes no cards, and drains
 until it busts.
 
+> **This client never sends it** (`S1-BZ`, closed 2026-09-18). A seat of this
+> build says it sits out by §7.9's member status, which needs no boundary and
+> changes no rule, and the window records a received `PLAYER_SIT_OUT` and reads it
+> for nothing. A peer that sends one is conforming and loses nothing by it.
+
 **`0x0804 PLAYER_SIT_IN`** — single-writer stage in the boundary window defined
 above: `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + seat`, parent
 `TERMINAL(k)`. No fields beyond the envelope. Takes effect from the next
@@ -4863,6 +4868,11 @@ there, in the window defined above. `n(0) reason: u16` (`1` voluntary, `2` clien
 shutting down). A leave is never *required*: a client that vanishes must be
 handled identically, because a departing peer announcing anything can never be a
 precondition. [NAT §7.3]
+
+> **This client never sends it** (`S1-BZ`, closed 2026-09-18). A player of this
+> build who leaves says so by `TABLE_LEAVE` (§7.10), unchained, at any moment of a
+> hand or before the table is set, and its seat is voted out at once (`D-063`); a
+> received `PLAYER_LEAVE` is recorded in the window and read for nothing, as below.
 
 **It removes no seat from `roster_hash` and it counts into no `P` (K2, §3.1,
 §3.2).** The seat keeps its row in the roster vector for the life of the table —
