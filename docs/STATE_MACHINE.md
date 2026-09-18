@@ -1860,6 +1860,12 @@ matching row is a `Rejection` and leaves the state bit-identical (I21, I13).
 is `V(S)` = the dealt-in seats less `S` less the already certified, and it is legal only when `|V(S)| >= 2` and
 `|V(S)| > |S|`; `V(subject)` below is the case `|S| = 1`. Q3 is answered with `PROTOCOL.md` Q-02 (§8.3, §8.4 there).
 
+**D-065 (2026-09-18) makes that unanimity reachable.** A voter of the round that has said nothing about it within the
+round's air -- no vote about every seat of `S`, or no copy of the certificate -- is voted about in turn with `cause = 2`
+and named in `S` beside the seats the stage waits on, under the same floor. What it loses is its veto for the rest of
+the hand -- it leaves `V` of every later certificate -- and nothing else: no strike, no effect on `R(k+1)`, not
+attributed by the abort (`PROTOCOL.md` §4.8, §8.3).
+
 **`V(subject)` appears in no guard in this table, and that is D-015.** The required voter set of
 §8.4 was read by six rows and by nothing else; with those rows deleted there is no guard left
 that needs it, no guard that reads `certified_subjects`, and no guard that reads a certificate

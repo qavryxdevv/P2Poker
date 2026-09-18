@@ -193,7 +193,13 @@ pub fn open(
 ///   stage. The comparison is against this receiver's own retained value, so a
 ///   forged one is refused by the comparison and a replayed one is idempotent.
 ///
-/// No fourth caller may be added without a clause of its own.
+/// * `Hand::vote_asks` (`D-065`): a `TIMEOUT_VOTE` read as a **question** --
+///   which frame of which stage its voter lacks -- by a receiver that may have
+///   left that stage long ago, which is the case the question is for. Nothing
+///   in the hand is changed by it; the answer is frames this receiver already
+///   accepted under their own authors' signatures, said again.
+///
+/// No fifth caller may be added without a clause of its own.
 pub fn open_in_hand(
     bytes: &[u8],
     cap: usize,

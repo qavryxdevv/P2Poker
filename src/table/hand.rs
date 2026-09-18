@@ -63,7 +63,7 @@ use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
     DealPrivate, DeckCommit, DeckInit, Field, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
     Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep, TimeoutCert,
-    TimeoutVote, CertSubject, CAUSE_FLOOD};
+    TimeoutVote, CertSubject, CAUSE_FLOOD, CAUSE_SILENT_VOTER};
 use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 
@@ -72,6 +72,21 @@ use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_V
 pub enum Send {
     /// To every seat of the table.
     Broadcast(Vec<u8>),
+}
+
+/// `D-065`: what a `TIMEOUT_VOTE` asks of the seats that hear it -- read by
+/// [`Hand::vote_asks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoteAsk {
+    /// The seat that voted.
+    pub voter: SeatIdx,
+    /// The seat the vote is about.
+    pub seat: SeatIdx,
+    /// The stage the vote is about.
+    pub sequence: u64,
+    /// Named as a voter silent about the round: what the voter lacks is that
+    /// seat's votes and its copy, not a frame of the stage.
+    pub silent: bool,
 }
 
 /// Why a step did not happen.
@@ -847,6 +862,10 @@ pub struct CertFact {
     /// D-036: every seat the certificate names, ascending.
     pub subject_seats: Vec<SeatIdx>,
     pub kind: u16,
+    /// `D-065`: the seats it names that the stage waited on -- every seat but
+    /// the voters named silent about the round. What an abort resting on it
+    /// attributes: a silent voter lost its veto and did not stall the stage.
+    pub quiet: Vec<SeatIdx>,
 }
 
 /// What became of an event offered for holding.
@@ -1705,9 +1724,10 @@ pub struct Hand {
     resigned: BTreeSet<SeatIdx>,
     /// `S1-HA`: the seats the node reads as gone from the table's group -- out
     /// of it, or silent there for `QUIET_LIMIT_S` -- as of the last tick. A
-    /// voter among them cannot complete the vote round this client is party
-    /// to, so no certificate is reachable in this hand and the local abort
-    /// waits for none.
+    /// voter among them cannot vote in the round this client is party to, so
+    /// since `D-065` it is voted about at once as a silent voter; where the
+    /// floor fails with it named, no certificate is reachable in this hand and
+    /// the local abort waits for none.
     gone_from_group: BTreeSet<SeatIdx>,
     /// `D-051`: the seats this client has voted about at the stage now open,
     /// whatever the cause -- one vote about one seat at one stage, so a
@@ -1852,6 +1872,20 @@ pub struct Hand {
     /// copies of a vote this client has just sent, and they start when it is
     /// sent. Cleared with the rest of the stage's vote state in `mark_stage`.
     own_vote_at: Option<u64>,
+    /// `D-065`: when this client last voted about a seat the open stage waits
+    /// on -- not about a silent voter -- which is what a voter's silence about
+    /// the round is measured from. Cleared in `mark_stage`.
+    quiet_vote_at: Option<u64>,
+    /// `D-065`: when this client sealed its own copy of the certificate now
+    /// open here, which is what a voter's missing copy is measured from.
+    /// Cleared in `mark_stage`.
+    sealed_at: Option<u64>,
+    /// `D-065`: the voters a certificate this hand named with
+    /// `CAUSE_SILENT_VOTER`. Their veto is gone for the rest of the hand -- no
+    /// certificate here needs their vote or their copy -- and nothing else is:
+    /// no strike, no roster effect. Per hand, and derived from certificates
+    /// every seat holds alike, as `certified` is.
+    vetoless: BTreeSet<SeatIdx>,
     /// The certificate stage now open, if one is.
     certifying: Option<Certifying>,
     /// Seats a completed certificate has named.
@@ -2286,6 +2320,9 @@ impl Hand {
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
                 own_vote_at: None,
+                quiet_vote_at: None,
+                sealed_at: None,
+                vetoless: BTreeSet::new(),
                 certifying: None,
                 certified: Vec::new(),
                 strikes: vec![0; usize::from(o.max_players)],
@@ -5752,7 +5789,8 @@ impl Hand {
                     });
                 }
                 // D-036: every seat the certificate names, in seat order.
-                let names = self.keys_of(&fact.subject_seats);
+                // `D-065`: the seats it waited on -- not the voters named silent.
+                let names = self.keys_of(&fact.quiet);
                 if body.attributed != names {
                     return Err(Failed::Elsewhere {
                         seat,
@@ -6255,15 +6293,43 @@ impl Hand {
         // stage that has spent the hand's entire budget would have its backstop
         // deferred by a vote round — and that budget is the one deadline the
         // protocol makes unconditional.
-        // `S1-HA`: no air for a round a voter gone from the group cannot close.
+        // `S1-HA`: no air for a round a voter gone from the group cannot close
+        // -- and since `D-065` such a voter is named with the round's seats, so
+        // that is a round whose floor fails once it is.
         if self.certificate_possible()
-            && !self.a_voter_is_gone()
+            && self.certificate_reachable()
             && !(self.long_past_stage(now_ms)
                 && (!self.crypto_stage() || self.round_has_had_air(now_ms)))
         {
             return false;
         }
         true
+    }
+
+    /// `D-065`: whether a certificate can still close the round this hand
+    /// waits on once the voters the node reads as gone from the table's group
+    /// are named with it as silent voters -- both floors of `D-036`, asked of
+    /// the quiet seats and of those voters together. `S1-HA` said *no
+    /// certificate* for any voter gone; since `D-065` such a voter costs the
+    /// round nothing but a place in the named set.
+    fn certificate_reachable(&self) -> bool {
+        let quiet: Vec<SeatIdx> = self
+            .waiting_for()
+            .into_iter()
+            .filter(|s| *s != self.open.my_seat && self.mine.dealt_in.contains(s))
+            .collect();
+        if quiet.is_empty() {
+            return false;
+        }
+        let mut named = quiet.clone();
+        named.extend(
+            self.voters_of(&quiet)
+                .into_iter()
+                .filter(|v| *v != self.open.my_seat && self.gone_from_group.contains(v)),
+        );
+        named.sort_unstable();
+        named.dedup();
+        self.admissible_for(self.voters_of(&named).len(), &named)
     }
 
     /// Whether a certificate could still end the stage this hand is waiting on.
@@ -6370,11 +6436,20 @@ impl Hand {
     /// emit one.
     fn sealable_set(&self) -> Option<(CertSubject, Vec<SeatIdx>)> {
         let mut about: BTreeMap<SeatIdx, (TimeoutVote, BTreeSet<SeatIdx>)> = BTreeMap::new();
+        let waiting = self.waiting_for();
         for (digest, held) in &self.votes {
             let Some(subject) = self.subject_of(digest) else {
                 continue;
             };
             if !self.mine.dealt_in.contains(&subject.subject_seat) {
+                continue;
+            }
+            // `D-065`: one subject per seat, the one this client's own view
+            // names it by -- quiet where the stage waits on it here, a silent
+            // voter where it does not. A peer's vote under the other name is
+            // a view this client does not share, and counts for nothing here.
+            let silent = subject.cause == Some(CAUSE_SILENT_VOTER);
+            if silent == waiting.contains(&subject.subject_seat) {
                 continue;
             }
             about.insert(subject.subject_seat, (subject, held.keys().copied().collect()));
@@ -6394,6 +6469,11 @@ impl Hand {
             set = kept;
         }
         if set.is_empty() || set.contains(&self.open.my_seat) {
+            return None;
+        }
+        // `D-065`: silent voters alone are about nothing -- a certificate is
+        // about the seats its stage waits on, and the voters ride along.
+        if set.iter().all(|s| about[s].0.cause == Some(CAUSE_SILENT_VOTER)) {
             return None;
         }
         let named: Vec<SeatIdx> = set.iter().copied().collect();
@@ -6476,6 +6556,8 @@ impl Hand {
         self.voted.clear();
         self.voted_about.clear();
         self.own_vote_at = None;
+        self.quiet_vote_at = None;
+        self.sealed_at = None;
     }
 
     /// `GENESIS(k)`: what this hand's first stage hangs off.
@@ -6604,14 +6686,15 @@ impl Hand {
 
     /// D-036: the voter set for a certificate naming these seats: everybody
     /// dealt in but them, less the seats a completed certificate has already
-    /// named. Ascending.
+    /// named -- as absent, or (`D-065`) as a voter silent about a round.
+    /// Ascending.
     fn voters_of(&self, named: &[SeatIdx]) -> Vec<SeatIdx> {
         let mut v: Vec<SeatIdx> = self
             .mine
             .dealt_in
             .iter()
             .copied()
-            .filter(|s| !named.contains(s) && !self.certified.contains(s))
+            .filter(|s| !named.contains(s) && !self.certified.contains(s) && !self.vetoless.contains(s))
             .collect();
         v.sort_unstable();
         v
@@ -6720,6 +6803,7 @@ impl Hand {
         self.certificate_possible()
             && self.mine.dealt_in.contains(&self.open.my_seat)
             && !self.certified.contains(&self.open.my_seat)
+            && !self.vetoless.contains(&self.open.my_seat)
     }
 
     /// Whether the vote round open at this stage has had its budget of air.
@@ -6753,8 +6837,10 @@ impl Hand {
             return true;
         };
         let budget = u64::from(self.next_deadline_for(owed));
+        // `D-065`: a round whose floor fails with its gone voters named has
+        // nothing to gather, as a round with no certificate possible.
         now_ms.saturating_sub(self.stage_at_ms) >= budget.saturating_mul(3)
-            || !self.certificate_possible()
+            || !self.certificate_reachable()
             || self
                 .own_vote_at
                 .is_some_and(|t| now_ms.saturating_sub(t) >= budget)
@@ -6895,6 +6981,7 @@ impl Hand {
             // it, because the lever cannot withhold a vote past
             // `long_past_stage`.
             self.own_vote_at = Some(now_ms);
+            self.quiet_vote_at = Some(now_ms);
             self.take_vote(digest, self.open.my_seat, bytes.clone(), subject);
             self.tally = Some((
                 seat,
@@ -6905,7 +6992,142 @@ impl Hand {
             out.push(Send::Broadcast(bytes));
             out.append(&mut self.certify_if_unanimous(key, now_ms)?);
         }
+        // `D-065`: and about the voters of the round that have said nothing
+        // about it.
+        out.append(&mut self.vote_on_silent_voters(key, now_ms, owed)?);
         Ok(out)
+    }
+
+    /// `D-065`, the owner's ruling of 2026-09-18 on `S1-AQ`: **a vote that does
+    /// not come stops being a veto.** A certificate needs every voter, so one
+    /// voter that says nothing -- gone, stalled, or a client that plays every
+    /// turn and never votes -- held every certificate about anybody else: a
+    /// crypto stage ended on its deadline naming nobody, hand after hand with
+    /// the same seats, and a betting stage stood until the hand's own budget,
+    /// half an hour and more.
+    ///
+    /// So a voter of the round this client is party to that has said nothing
+    /// about it -- no vote about every seat the round names, or no copy of the
+    /// certificate this client sealed -- is voted about in turn, with
+    /// `CAUSE_SILENT_VOTER`: once the round has had its air, one stage budget
+    /// after this client's last vote about the round's seats (`S1-BT`'s air)
+    /// and after its own copy; a voter the node reads as gone from the table's
+    /// group (`S1-HA`) at once. D-036 then seals the round's seats and the
+    /// silent voters together, unanimously among the rest, under both floors.
+    ///
+    /// What the table takes from a silent voter is its veto for the rest of
+    /// the hand and nothing else -- no strike, no roster effect: a seat merely
+    /// slow loses nothing it needs, and one that is really gone is named by the
+    /// next hand's opening as any quiet seat is.
+    fn vote_on_silent_voters(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+        owed: EventType,
+    ) -> Result<Vec<Send>, Failed> {
+        let Some(voted_at) = self.quiet_vote_at else {
+            return Ok(Vec::new());
+        };
+        let waiting = self.waiting_for();
+        // The round: the seats this client voted about that the stage still
+        // waits on.
+        let round: Vec<SeatIdx> = self
+            .voted_about
+            .iter()
+            .copied()
+            .filter(|s| waiting.contains(s))
+            .collect();
+        if round.is_empty() {
+            return Ok(Vec::new());
+        }
+        let budget = u64::from(self.next_deadline_for(owed));
+        let since = self.sealed_at.map_or(voted_at, |s| s.max(voted_at));
+        let aired = now_ms.saturating_sub(since) >= budget;
+        // The copies this client's own sealed certificate still lacks, if it
+        // sealed one.
+        let copy_missing: Vec<SeatIdx> = match &self.certifying {
+            Some(c) if c.stage.heard(self.open.my_seat).is_some() => c.stage.waiting_for(),
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        for voter in self.voters_of(&round) {
+            if voter == self.open.my_seat || self.voted_about.contains(&voter) {
+                continue;
+            }
+            if !aired && !self.gone_from_group.contains(&voter) {
+                continue;
+            }
+            let voted_all = round.iter().all(|s| {
+                self.subject_now(*s).is_some_and(|v| {
+                    self.votes
+                        .get(&v.subject_digest())
+                        .is_some_and(|m| m.contains_key(&voter))
+                })
+            });
+            if voted_all && !copy_missing.contains(&voter) {
+                continue;
+            }
+            let Some(subject) = self.silent_subject_now(voter) else {
+                continue;
+            };
+            let digest = subject.subject_digest();
+            if self.voted.contains(&digest) {
+                continue;
+            }
+            // Both floors, asked of the round's seats and of every voter named
+            // with them: no vote towards a set that could never be sealed.
+            let mut named: Vec<SeatIdx> = self.voted_about.iter().copied().collect();
+            named.push(voter);
+            named.sort_unstable();
+            named.dedup();
+            let need = self.voters_of(&named).len();
+            if !self.admissible_for(need, &named) {
+                continue;
+            }
+            if !self.voters(voter).contains(&self.open.my_seat) {
+                continue;
+            }
+            let bytes = self.say_at(
+                EventType::TimeoutVote,
+                &subject,
+                TIMEOUT_VOTE_CAP,
+                key,
+                now_ms,
+            )?;
+            self.voted.insert(digest);
+            self.voted_about.insert(voter);
+            // The round's air starts again from this vote: what has to fit in
+            // it now is the other seats' votes about the silent voter.
+            self.own_vote_at = Some(now_ms);
+            self.cert_note.push(format!(
+                "seat {voter} has said nothing about the vote on seat(s) {round:?} for {} s{}: voted about it as a silent voter; a certificate naming it takes its veto for the rest of this hand and nothing else (D-065)",
+                now_ms.saturating_sub(since) / 1_000,
+                if self.gone_from_group.contains(&voter) { ", and it is gone from the table's group" } else { "" }
+            ));
+            self.take_vote(digest, self.open.my_seat, bytes.clone(), subject);
+            self.tally = Some((
+                voter,
+                self.votes.get(&digest).map(|m| m.len()).unwrap_or(0),
+                need,
+                digest,
+            ));
+            out.push(Send::Broadcast(bytes));
+            out.append(&mut self.certify_if_unanimous(key, now_ms)?);
+        }
+        Ok(out)
+    }
+
+    /// `D-065`: the subject this client votes about a voter silent about the
+    /// round by -- the stage's own subject with that seat and
+    /// `CAUSE_SILENT_VOTER`. `None` for a seat the stage waits on: that seat is
+    /// quiet, and a vote about it is the ordinary one.
+    fn silent_subject_now(&self, seat: SeatIdx) -> Option<TimeoutVote> {
+        if self.waiting_for().contains(&seat) {
+            return None;
+        }
+        let mut v = self.subject_now(seat)?;
+        v.cause = Some(CAUSE_SILENT_VOTER);
+        Some(v)
     }
 
     /// Record one vote, whoever it came from.
@@ -6940,7 +7162,15 @@ impl Hand {
                 what: "its vote named a cause this catalogue defines",
             });
         }
-        let Some(mine) = self.subject_now(body.subject_seat) else {
+        // `D-065`: a vote about a voter silent about the round is judged
+        // against that subject, which only a seat the stage does not wait on
+        // can have.
+        let mine = if body.cause == Some(CAUSE_SILENT_VOTER) {
+            self.silent_subject_now(body.subject_seat)
+        } else {
+            self.subject_now(body.subject_seat)
+        };
+        let Some(mine) = mine else {
             return Err(Failed::NotYet);
         };
         if !mine.same_subject(&body) {
@@ -7027,6 +7257,8 @@ impl Hand {
         let bytes = self.seal_certificate(&subject, &voters, key, now_ms)?;
         let hash = self.opened(&bytes, EventType::TimeoutCert)?.event_hash;
         self.note_own_certificate(hash, &bytes, &subject);
+        // `D-065`: a voter's missing copy is measured from here.
+        self.sealed_at = Some(now_ms);
         let complete = match self.certifying.as_mut() {
             Some(c) => {
                 c.stage.hear(self.open.my_seat, hash);
@@ -7036,10 +7268,26 @@ impl Hand {
         };
         // The one line worth an operator's attention: from here the table has
         // said something about a seat with everybody's signature behind it.
+        // `D-065`: the silent voters are said apart, since what the table
+        // takes from them is their veto and not their seat.
+        let silent: Vec<SeatIdx> = subject
+            .subject_seats
+            .iter()
+            .copied()
+            .filter(|s| subject.names_silent(*s))
+            .collect();
         self.cert_note.push(format!(
-            "the table has certified {}'s timeout, unanimously among {:?}",
-            Self::seats_words(&subject.subject_seats),
-            voters
+            "the table has certified {}'s timeout, unanimously among {:?}{}",
+            Self::seats_words(&subject.quiet_seats()),
+            voters,
+            if silent.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", and takes the veto of {} for the rest of this hand: silent about the vote (D-065)",
+                    Self::seats_words(&silent)
+                )
+            }
         ));
         let mut out = vec![Send::Broadcast(bytes)];
         if complete {
@@ -7091,10 +7339,13 @@ impl Hand {
         // anything about the seat, so it is all seats or none; that is a
         // property of the current `stage_type`, not a rule anybody stated, and
         // it is not worth resting a security check on.
+        // `D-065`: and the subject naming a seat as a voter silent about the
+        // round, which a seat the stage does not wait on can have.
         self.mine
             .dealt_in
             .iter()
-            .filter_map(|seat| self.subject_now(*seat))
+            .flat_map(|seat| [self.subject_now(*seat), self.silent_subject_now(*seat)])
+            .flatten()
             .find(|s| s.subject_digest() == *digest)
     }
 
@@ -7578,7 +7829,17 @@ impl Hand {
                 what: "the kind matched the stage type",
             });
         }
-        if betting && subject.subject_seats.len() != 1 {
+        // `D-065`: a certificate is about the seats its stage waits on -- at a
+        // betting stage the one seat to act -- and the voters named silent
+        // about the round ride along.
+        let quiet = subject.quiet_seats().len();
+        if quiet == 0 {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "a certificate named a seat its stage waits on",
+            });
+        }
+        if betting && quiet != 1 {
             return Err(Failed::Elsewhere {
                 seat: emitter,
                 what: "a betting stage named the one seat to act",
@@ -7686,8 +7947,12 @@ impl Hand {
         if self.settled() || self.banked.len() >= BANKED_CAP {
             return false;
         }
-        // `D-047`: the word, kept by the seats it names.
+        // `D-047`: the word, kept by the seats it names -- as absent. `D-065`:
+        // a voter named silent keeps its seat, and there is nothing to tell it.
         for seat in &subject.subject_seats {
+            if subject.names_silent(*seat) {
+                continue;
+            }
             self.words.insert(*seat, raw.to_vec());
             // `D-063`: named with its own word: out for good, not absent.
             if self.leave_words.contains_key(seat) {
@@ -7699,6 +7964,7 @@ impl Hand {
             CertFact {
                 subject_seats: subject.subject_seats.clone(),
                 kind: subject.kind,
+                quiet: subject.quiet_seats(),
             },
         );
         if self.proof.is_none() {
@@ -7710,6 +7976,12 @@ impl Hand {
         // D-036: every seat named leaves R(k+1); one strike per seat per
         // stage, however many sets at this stage name it.
         for seat in &subject.subject_seats {
+            // `D-065`: but a voter named silent about the round loses its veto
+            // for the rest of the hand and nothing else.
+            if subject.names_silent(*seat) {
+                self.vetoless.insert(*seat);
+                continue;
+            }
             // `D-051`: named with the flood cause by every voter -- the digest
             // commits to it -- the seat is out of the table for good.
             if subject.cause_of(*seat) == Some(CAUSE_FLOOD) {
@@ -7750,6 +8022,12 @@ impl Hand {
     fn commit_certificate(&mut self, subject: &CertSubject) {
         self.certifying = None;
         for seat in &subject.subject_seats {
+            // `D-065`: a silent voter is not heard by being named, and is not
+            // struck: its veto goes, and nothing else.
+            if subject.names_silent(*seat) {
+                self.vetoless.insert(*seat);
+                continue;
+            }
             self.note_signed(*seat);
             // The same rule as `bank`: a settled hand's roster does not move.
             if self.settled() || self.certified.contains(seat) {
@@ -7915,7 +8193,7 @@ impl Hand {
                 // Convergent: `abort_terminal(k)` is a function of `GENESIS(k)`
                 // and of nothing in the middle of the hand, so a peer ending the
                 // hand from anywhere ends it where everyone else does.
-                let named = self.keys_of(&c.subject.subject_seats);
+                let named = self.keys_of(&c.subject.quiet_seats());
                 let proof = self.proof.as_ref().map(|(h, _)| *h);
                 return self.abort_named(named, proof, key, now_ms);
             }
@@ -8027,8 +8305,11 @@ impl Hand {
             // aborts and nothing waits.
             1 => {
                 // One seat: a betting stage has one seat to act, and
-                // `verify_certificate` refuses a kind-1 certificate naming more.
-                let seat = subject.subject_seats[0];
+                // `verify_certificate` refuses a kind-1 certificate naming
+                // another -- `D-065`: the voters named silent ride along.
+                let Some(seat) = subject.quiet_seats().first().copied() else {
+                    return Err(Failed::NothingFurther);
+                };
                 let action = {
                     let Phase::Playing { play, .. } = &self.phase else {
                         return Err(Failed::NothingFurther);
@@ -8076,7 +8357,9 @@ impl Hand {
                 self.commit_certificate(&subject);
                 self.slot = self.slot.then(parent);
                 self.mark_stage(now_ms);
-                let named = self.keys_of(&subject.subject_seats);
+                // `D-065`: the seats the stage waited on; the voters named
+                // silent lost their veto and are not the abort's to name.
+                let named = self.keys_of(&subject.quiet_seats());
                 // The **certificate**, not the stage: §4.10 says `cert_hash`
                 // is the `event_hash` of a `TIMEOUT_CERT`. This client's own
                 // copy is the one it can prove it holds.
@@ -9459,6 +9742,69 @@ impl Hand {
         }
     }
 
+    /// `D-065`, the first half of the owner's ruling on `S1-AQ`: **a vote is
+    /// also a question.** A `TIMEOUT_VOTE` says *"I have accepted nothing from
+    /// that seat at this stage"* -- which is exactly what a seat that holds the
+    /// frame can answer by saying it again under its author's signature. Votes
+    /// that split over who is late (`split182531-10`: one seat voting about 0
+    /// and 5, the rest about 1 and 7) are a table whose seats hold different
+    /// frames, and the certificate is the wrong tool for that: the frame is.
+    ///
+    /// Read without a position (`chained::open_in_hand`), because a vote about
+    /// a stage this client has left is the one that most needs an answer.
+    /// `None` for anything but a well-signed vote of this hand, from a seat of
+    /// this table, about another dealt-in seat.
+    pub fn vote_asks(&self, bytes: &[u8]) -> Option<VoteAsk> {
+        // The frame's cap, as `opened` reads a vote; the payload's own below.
+        let opened = chained::open_in_hand(
+            bytes,
+            FRAME_CAP,
+            EventType::TimeoutVote,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .ok()?;
+        let voter = self.seat_of(&opened.sender).ok()?;
+        let body: TimeoutVote = chained::payload(&opened, TIMEOUT_VOTE_CAP).ok()?;
+        if body.subject_seat == voter || !self.mine.dealt_in.contains(&body.subject_seat) {
+            return None;
+        }
+        Some(VoteAsk {
+            voter,
+            seat: body.subject_seat,
+            sequence: body.subject_sequence,
+            silent: body.cause == Some(CAUSE_SILENT_VOTER),
+        })
+    }
+
+    /// `D-065`: the frames this hand accepted at stage `sequence` -- from
+    /// `from` alone, or from every seat -- for a peer whose vote says it lacks
+    /// them. This client's own frames are not here: the node keeps those
+    /// (`said`).
+    pub fn frames_at(&self, sequence: u64, from: Option<SeatIdx>) -> Vec<Vec<u8>> {
+        let key = match from {
+            Some(seat) => match self.key_of(seat) {
+                Some(k) => Some(k),
+                None => return Vec::new(),
+            },
+            None => None,
+        };
+        self.transcript
+            .iter()
+            .filter(|b| {
+                chained::peek(b, PEEK_CAP).is_ok_and(|(_, _, s)| s == sequence)
+                    && key.is_none_or(|k| chained::sender_of(b, FRAME_CAP) == Some(k))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// `D-065`: the votes this client holds from `voter` at the stage now
+    /// open, for a peer whose vote names that voter silent about the round.
+    pub fn votes_from(&self, voter: SeatIdx) -> Vec<Vec<u8>> {
+        self.votes.values().filter_map(|m| m.get(&voter).cloned()).collect()
+    }
+
     /// Which seats the stage now open is still waiting for.
     /// The application key seated at `seat` in this hand.
     ///
@@ -10069,22 +10415,6 @@ impl Hand {
     /// `QUIET_LIMIT_S`, as the node reads them now -- the whole set each time.
     pub fn note_gone_from_group(&mut self, seats: &[SeatIdx]) {
         self.gone_from_group = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
-    }
-
-    /// `S1-HA`: whether a voter of the certificate this hand waits on is gone
-    /// from the table's group. A vote round needs every voter's vote; a voter
-    /// that acted at the stage and then lost its line is quiet at no stage and
-    /// so is named by nobody, and the round stood until the hand's budget ran
-    /// out -- one hand of six seats lasted 62 s and the next 92 s after the
-    /// founder and a far seat were cut together (`churn134826-6`). The hand
-    /// ends at the deadline instead, and the next hand names both.
-    fn a_voter_is_gone(&self) -> bool {
-        let quiet: Vec<SeatIdx> = self
-            .waiting_for()
-            .into_iter()
-            .filter(|s| *s != self.open.my_seat && self.mine.dealt_in.contains(s))
-            .collect();
-        !quiet.is_empty() && self.voters_of(&quiet).iter().any(|v| self.gone_from_group.contains(v))
     }
 
     pub fn note_flooders(&mut self, seats: &[SeatIdx]) {
@@ -16091,6 +16421,254 @@ mod tests {
         assert!(hands[0].may_abandon(t1 + 1_000), "voter 1 gone from the group: no certificate can close, the deadline ends it");
         hands[0].note_gone_from_group(&[]);
         assert!(!hands[0].may_abandon(t1 + 1_000), "back in the group: the air again");
+    }
+
+    /// `D-065`: seats 0 to `present - 1` of an `n`-seat table open the hand and
+    /// hear each other; the rest never say anything. The hands and the keys.
+    fn present_and_quiet(n: u8, present: u8) -> (Vec<Hand>, Vec<SigningKey>) {
+        let keys: Vec<SigningKey> = (0..n).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..present {
+            let (h, from) =
+                Hand::open(opening_n(n, seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        for i in 0..usize::from(present) {
+            for j in 0..usize::from(present) {
+                if i != j {
+                    let _ = deliver(&mut hands[i], &inits[j], &keys[i]);
+                }
+            }
+        }
+        let quiet: Vec<SeatIdx> = (present..n).collect();
+        for h in &hands {
+            assert_eq!(h.waiting_for(), quiet, "stage 0 waits on the quiet seats");
+        }
+        (hands, keys)
+    }
+
+    /// Deliver every frame of `out[j]` to every hand of `to` but `j`, and
+    /// return what each said in answer.
+    fn cross(hands: &mut [Hand], keys: &[SigningKey], to: &[usize], out: &[Vec<Vec<u8>>], at: u64) -> Vec<Vec<Vec<u8>>> {
+        let mut said: Vec<Vec<Vec<u8>>> = vec![Vec::new(); hands.len()];
+        for &i in to {
+            for (j, frames) in out.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                for f in frames {
+                    if let Ok(o) = hands[i].on_event(f, &keys[i], at) {
+                        said[i].extend(bytes_of_sends(o));
+                    }
+                }
+            }
+        }
+        said
+    }
+
+    /// `D-065`, the owner's ruling on `S1-AQ`: seat 3 plays and never votes.
+    /// Before it, the certificate about the quiet seat 4 needed seat 3's vote
+    /// and no certificate about anybody could ever complete -- every hand died
+    /// on its deadline with the same five seats. Now the round gets its air,
+    /// then the three voters vote about seat 3 as a silent voter, and one
+    /// certificate names seat 4 and seat 3 unanimously among 0, 1 and 2: the
+    /// hand ends, seat 4 leaves the roster, and seat 3 keeps its seat -- what
+    /// it loses is its veto, and nothing else.
+    #[test]
+    fn a_voter_that_never_votes_is_named_silent_and_the_round_closes_without_it() {
+        let (mut hands, keys) = present_and_quiet(5, 4);
+        let voters = [0usize, 1, 2];
+        let t1 = NOW + 30_000;
+        let mut votes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+        for &i in &voters {
+            votes[i] = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap());
+            assert_eq!(votes[i].len(), 1, "seat {i} votes about the quiet seat");
+        }
+        let sealed = cross(&mut hands, &keys, &[0, 1, 2, 3], &votes, t1 + 500);
+        for &i in &voters {
+            assert!(sealed[i].is_empty(), "seat {i}: seat 3 has not voted, nothing is sealed");
+            assert!(!hands[i].may_abandon(t1 + 1_000), "seat {i}: a voter in the group, the round gets its air");
+        }
+        // Inside the air nobody is named.
+        for &i in &voters {
+            assert!(bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1 + 29_000, 0).unwrap()).is_empty());
+        }
+        let t2 = t1 + 30_000;
+        let mut silent: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+        for &i in &voters {
+            silent[i] = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t2, 0).unwrap());
+            assert_eq!(silent[i].len(), 1, "seat {i} votes about seat 3 as a silent voter");
+            assert!(!hands[i].may_abandon(t2 + 1_000), "seat {i}: the round has its air again, from that vote");
+        }
+        let copies = cross(&mut hands, &keys, &[0, 1, 2, 3], &silent, t2 + 500);
+        for &i in &voters {
+            assert_eq!(copies[i].len(), 1, "seat {i} seals the round's seat and the silent voter together");
+            let note = hands[i].take_cert_note().expect("said");
+            assert!(note.contains("certified seat 4's timeout") && note.contains("takes the veto of seat 3"), "{note}");
+        }
+        let _ = cross(&mut hands, &keys, &[0, 1, 2, 3], &copies, t2 + 1_000);
+        for i in 0..4 {
+            assert_eq!(hands[i].aborted(), Some(Abort::Told { cause: 1 }), "seat {i}: ended by the certificate");
+            assert!(!hands[i].took_part(4), "seat {i}: the quiet seat leaves the roster");
+            assert!(hands[i].took_part(3), "seat {i}: the silent voter keeps its seat");
+        }
+        let nexts: Vec<Opening> = (0..4).map(|i| hands[i].next_hand().expect("a successor")).collect();
+        for n in &nexts {
+            assert_eq!(n.required, vec![0, 1, 2, 3], "{:?}", n.required);
+            assert_eq!(n.genesis, nexts[0].genesis, "one GENESIS(k+1), the silent voter's own included");
+        }
+    }
+
+    /// `D-065`: a voter the node reads as gone from the table's group is named
+    /// silent at once, with the vote about the quiet seat -- and the round it
+    /// can now close keeps its air, where `S1-HA` gave the hand up at the
+    /// deadline. Where naming it breaks the floor, the deadline ends the hand,
+    /// as `S1-HA` did.
+    #[test]
+    fn a_voter_gone_from_the_group_is_named_silent_at_once() {
+        let (mut hands, keys) = present_and_quiet(6, 5);
+        let voters = [0usize, 1, 2, 3];
+        for &i in &voters {
+            hands[i].note_gone_from_group(&[4, 5]);
+        }
+        let t1 = NOW + 30_000;
+        let mut votes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 5];
+        for &i in &voters {
+            votes[i] = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap());
+            assert!(votes[i].len() >= 2, "seat {i} votes about seat 5 and, at once, about seat 4: {}", votes[i].len());
+            assert!(!hands[i].may_abandon(t1 + 1_000), "seat {i}: the round can close, so it keeps its air");
+        }
+        let mut copies = cross(&mut hands, &keys, &voters, &votes, t1 + 500);
+        for &i in &voters {
+            copies[i].retain(|b| chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::TimeoutCert));
+            assert_eq!(copies[i].len(), 1, "seat {i} seals seats 4 and 5 together");
+        }
+        let _ = cross(&mut hands, &keys, &voters, &copies, t1 + 1_000);
+        for &i in &voters {
+            assert!(hands[i].aborted().is_some(), "seat {i}: the certificate ended the hand");
+            assert!(!hands[i].took_part(5) && hands[i].took_part(4), "seat {i}: the quiet seat out, the gone voter kept");
+        }
+
+        // Three present of four, seat 3 quiet and voter 2 gone: named, it would
+        // be two voters for two seats -- the floor fails, and the deadline ends
+        // the hand as `S1-HA` did.
+        let (mut small, keys) = present_and_quiet(4, 3);
+        small[0].note_gone_from_group(&[2]);
+        let out = bytes_of_sends(small[0].vote_on_timeouts(&keys[0], t1, 0).unwrap());
+        assert_eq!(out.len(), 1, "the quiet seat alone: naming seat 2 too would break the floor");
+        assert!(small[0].may_abandon(t1 + 1_000), "no certificate can close: the deadline ends it");
+    }
+
+    /// `D-065`: one voter's word that another is silent seals nothing while
+    /// the rest heard that voter -- the floor and unanimity are asked of the
+    /// silent vote as of any -- and the votes a peer's copy carries give the
+    /// odd voter what it lacked, so the ordinary certificate completes.
+    #[test]
+    fn one_voters_word_that_another_is_silent_names_nobody() {
+        let (mut hands, keys) = present_and_quiet(5, 4);
+        let t1 = NOW + 30_000;
+        let mut votes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+        for i in 0..4 {
+            votes[i] = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap());
+        }
+        // Seat 3's vote never reaches seat 0; everything else arrives.
+        let mut to_zero = votes.clone();
+        to_zero[3].clear();
+        let mut sealed = cross(&mut hands, &keys, &[0], &to_zero, t1 + 500);
+        sealed = {
+            let rest = cross(&mut hands, &keys, &[1, 2, 3], &votes, t1 + 500);
+            sealed.iter().zip(rest).map(|(a, b)| a.iter().cloned().chain(b).collect()).collect()
+        };
+        assert!(sealed[0].is_empty(), "seat 0 lacks seat 3's vote");
+        for i in 1..4 {
+            assert_eq!(sealed[i].len(), 1, "seat {i} holds every vote and seals");
+        }
+        // Seat 0's air runs out before any copy reaches it: it says seat 3 is silent.
+        let word = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], t1 + 30_000, 0).unwrap());
+        assert_eq!(word.len(), 1, "seat 0 votes about seat 3 as a silent voter");
+        let mut from_zero: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+        from_zero[0] = word;
+        let answers = cross(&mut hands, &keys, &[1, 2, 3], &from_zero, t1 + 30_500);
+        for i in 1..4 {
+            assert!(answers[i].is_empty(), "seat {i} heard seat 3 and seals nothing about it");
+        }
+        // The copies reach seat 0: they carry seat 3's vote, and the certificate about seat 4 alone completes.
+        let mut all = sealed.clone();
+        all[0].clear();
+        let mut mine = cross(&mut hands, &keys, &[0], &all, t1 + 31_000);
+        mine[0].retain(|b| chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::TimeoutCert));
+        assert_eq!(mine[0].len(), 1, "seat 0 seals seat 4 alone from the carried votes");
+        // Every copy to seats 1, 2 and 3: seat 0's and each other's.
+        let mut last = sealed.clone();
+        last[0] = mine[0].clone();
+        let _ = cross(&mut hands, &keys, &[1, 2, 3], &last, t1 + 31_500);
+        for i in 0..4 {
+            assert!(hands[i].aborted().is_some(), "seat {i}: ended by the certificate");
+            assert!(!hands[i].took_part(4) && hands[i].took_part(3), "seat {i}: seat 4 out, seat 3 kept");
+        }
+    }
+
+    /// `D-065`: a voter that votes and keeps its copy of the certificate back
+    /// holds the certificate stage as surely as one that never votes. One air
+    /// after this client's own copy the others name it silent, and the larger
+    /// certificate -- the quiet seat and the silent voter -- completes among
+    /// the rest.
+    #[test]
+    fn a_voter_that_keeps_its_copy_back_is_named_silent() {
+        let (mut hands, keys) = present_and_quiet(5, 4);
+        let t1 = NOW + 30_000;
+        let mut votes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+        for i in 0..4 {
+            votes[i] = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap());
+        }
+        let mut copies = cross(&mut hands, &keys, &[0, 1, 2, 3], &votes, t1 + 500);
+        for i in 0..4 {
+            assert_eq!(copies[i].len(), 1, "seat {i} seals");
+        }
+        // Seat 3 keeps its copy back.
+        copies[3].clear();
+        let _ = cross(&mut hands, &keys, &[0, 1, 2, 3], &copies, t1 + 1_000);
+        for i in 0..3 {
+            assert!(hands[i].aborted().is_none(), "seat {i}: the stage lacks seat 3's copy");
+            assert!(bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1 + 20_000, 0).unwrap()).is_empty(), "inside the air");
+        }
+        let t2 = t1 + 500 + 30_000;
+        let mut silent: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+        for i in 0..3 {
+            silent[i] = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t2, 0).unwrap());
+            assert_eq!(silent[i].len(), 1, "seat {i} votes about seat 3, whose copy never came");
+        }
+        let mut bigger = cross(&mut hands, &keys, &[0, 1, 2], &silent, t2 + 500);
+        for i in 0..3 {
+            bigger[i].retain(|b| chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::TimeoutCert));
+            assert_eq!(bigger[i].len(), 1, "seat {i} seals seats 3 and 4 together");
+        }
+        let _ = cross(&mut hands, &keys, &[0, 1, 2], &bigger, t2 + 1_000);
+        for i in 0..3 {
+            assert!(hands[i].aborted().is_some(), "seat {i}: the larger certificate ended the hand");
+            assert!(!hands[i].took_part(4) && hands[i].took_part(3), "seat {i}: seat 4 out, seat 3 kept");
+        }
+    }
+
+    /// `D-065`: a vote is also a question. A vote about the quiet seat asks
+    /// for that seat's frame of the stage; a vote about a silent voter asks
+    /// for its votes; a vote about this client's own seat names it -- and
+    /// anything that is not a vote of this hand asks nothing.
+    #[test]
+    fn a_vote_reads_as_a_question() {
+        let (mut hands, keys) = present_and_quiet(5, 4);
+        let t1 = NOW + 30_000;
+        let v0 = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], t1, 0).unwrap());
+        let ask = hands[1].vote_asks(&v0[0]).expect("a vote asks");
+        assert_eq!((ask.voter, ask.seat, ask.sequence, ask.silent), (0, 4, 0, false));
+        assert!(hands[1].frames_at(0, Some(4)).is_empty(), "nobody holds the quiet seat's frame");
+        assert_eq!(hands[1].frames_at(0, Some(2)).len(), 1, "seat 2's opening, as seat 1 accepted it");
+        assert_eq!(hands[1].frames_at(0, None).len(), 3, "every opening seat 1 accepted: seats 0, 2 and 3");
+        assert!(hands[1].vote_asks(&[1, 2, 3]).is_none(), "noise asks nothing");
+        let _ = hands[1].on_event(&v0[0], &keys[1], t1 + 100);
+        assert_eq!(hands[1].votes_from(0), v0, "seat 0's vote, for a peer that lacks it");
     }
 
     /// `D-051`: seats every voter's client cut off for flooding the table's

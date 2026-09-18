@@ -292,6 +292,11 @@ param(
     [ValidateRange(0, 3600)][int]$MuteFor = 0,
     [ValidateRange(0, 32)][int]$MuteNode = 1,
     [switch]$MuteOnTurn,
+    # `-NoVoteNodes <list>` (S1-AQ): those nodes play every turn and never say a
+    # TIMEOUT_VOTE or a TIMEOUT_CERT -- the voter whose missing vote held every
+    # certificate about anybody else. Node numbers, comma-separated. Needs a
+    # binary built with `--features fault-harness`; the node's log says so.
+    [string]$NoVoteNodes = '',
     [ValidateRange(0, 3600)][int]$DropAt = 0,
     # `-DropOnTurn`: the dropper stops at its first own turn at or after `-DropAt`
     # rather than at the second itself, so the table plays past the death by a
@@ -339,6 +344,8 @@ param(
 $droppers = @("$DropNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 # Not `$stayNodes`: a local of that name IS the parameter.
 $stayList = @("$StayNodes" -split '[,\s]+' | Where-Object { $_ -ne '' })
+# Not `$noVoteNodes`, for the same reason.
+$noVoteList = @("$NoVoteNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 # Not `$hostSeats`: PowerShell variable names are case-insensitive and that
 # would BE the parameter.
 $founderSeats = if ($HostSeats -gt 0) { $HostSeats } else { $Seats }
@@ -513,9 +520,16 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
     $staysForNode = ($stayList -contains 'all') -or ($stayList -contains "$i")
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, [bool]$staysForNode -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays)
+    $noVoteForNode = ($noVoteList -contains $i)
+    # **A cast in argument mode is a string.** `-ArgumentList ..., [bool]$x` handed
+    # the job the text "[bool]False", which is true: from S1-FY on every node got
+    # P2P_POKER_STAYS, every mute was on-turn, every stranger flooded and every
+    # return sat out (found by -NoVote reaching all five nodes, S1-AQ,
+    # 2026-09-18). In parentheses it is an expression and a bool.
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode) -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote)
         if ($stays) { $env:P2P_POKER_STAYS = '1' }
+        if ($noVote) { $env:P2P_POKER_NO_VOTE = '1' }
         if ($holdMuck) { $env:P2P_POKER_HOLD_MUCK = "$holdMuck" }
         $env:P2P_POKER_FLOOD_RATE = "$floodRate"
         if ($floodAt -gt 0) {
@@ -635,6 +649,9 @@ if ($AfkAt -gt 0) {
 if ($stayList.Count -gt 0) {
     Write-Host "==> $(if ($stayList -contains 'all') { 'every node' } else { 'n' + ($stayList -join ', n') }) never leave(s) a table by itself, as a window's client (S1-FY; needs --features fault-harness)"
 }
+if ($noVoteList.Count -gt 0) {
+    Write-Host "==> n$($noVoteList -join ', n') play(s) every turn and never vote(s): no TIMEOUT_VOTE, no TIMEOUT_CERT (S1-AQ; needs --features fault-harness)"
+}
 if ($OfflineAt -gt 0) {
     Write-Host "==> n$OfflineNode's INTERNET goes away at $OfflineAt s for $OfflineFor s, at the socket; the process lives on$(if ($OfflineEvery -gt 0) { " -- and again every $OfflineEvery s" })"
     Write-Host "    (needs a binary built with --features fault-harness; expect the library's 58 s timeout at every member)"
@@ -678,7 +695,7 @@ if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
             continue
         }
         if ($ReturnAfk) { Write-Host "==> n$dn's return does not play: its own clock acts for it (S1-FS)" }
-        $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $delay, $spent, $dn, [bool]$ReturnAfk -ScriptBlock {
+        $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $delay, $spent, $dn, ([bool]$ReturnAfk) -ScriptBlock {
             param($exe, $work, $table, $seconds, $delay, $spent, $dn, $returnAfk)
             if ($returnAfk) { $env:P2P_POKER_AFK_AT = '0' }
             Start-Sleep -Seconds $delay

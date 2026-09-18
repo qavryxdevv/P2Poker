@@ -1228,3 +1228,139 @@ fn a_peers_bare_abort_is_refused_while_this_receiver_is_still_in_time() {
         "and it must not have ended it anyway"
     );
 }
+
+/// Deliver until nothing is left, every seat hearing every other. `muted`:
+/// seats whose every word is lost; `no_votes`: seats whose votes and
+/// certificate copies are lost -- a client that plays and never votes.
+fn pump(
+    hands: &mut [Hand],
+    keys: &[SigningKey],
+    mut queue: Vec<(usize, Vec<u8>)>,
+    at: u64,
+    muted: &[usize],
+    no_votes: &[usize],
+) {
+    use p2p_poker::protocol::messages::EventType;
+    for _ in 0..800 {
+        if queue.is_empty() {
+            return;
+        }
+        for (from, bytes) in std::mem::take(&mut queue) {
+            for to in 0..hands.len() {
+                if to == from {
+                    continue;
+                }
+                match hands[to].on_event(&bytes, &keys[to], at) {
+                    Ok(out) => {
+                        for Send::Broadcast(b) in out {
+                            if muted.contains(&to) {
+                                continue;
+                            }
+                            let vote_or_copy = matches!(
+                                p2p_poker::net::chained::peek(&b, 1 << 17),
+                                Ok((EventType::TimeoutVote | EventType::TimeoutCert, _, _))
+                            );
+                            if no_votes.contains(&to) && vote_or_copy {
+                                continue;
+                            }
+                            queue.push((to, b));
+                        }
+                    }
+                    Err(Failed::NotYet) => {
+                        let _ = hands[to].hold(bytes.clone());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    panic!("the delivery loop never went quiet");
+}
+
+/// `D-065`, the owner's ruling on `S1-AQ`, at a **betting** stage -- where the
+/// hole was widest. Five seats play to a turn; the seat to act goes silent, and
+/// one of the four others plays on and never votes. Before `D-065` the
+/// certificate that acts for the silent seat needed that voter's vote, and the
+/// stage stood until the hand's own budget ran out -- half an hour and more at
+/// a Sit & Go. Now the three voters vote about the seat to act at its deadline,
+/// about the voter that said nothing one budget later, and one certificate --
+/// the seat to act and the silent voter -- acts for the seat: the hand goes on,
+/// the seat to act leaves the next hand's roster, and the silent voter keeps
+/// its seat, having lost its veto and nothing else.
+#[test]
+fn a_betting_stage_is_not_held_by_a_voter_that_never_votes() {
+    const N: u8 = 5;
+    let keys: Vec<SigningKey> = (0..N).map(|s| key(10 + s)).collect();
+    let mut hands = Vec::new();
+    let mut queue: Vec<(usize, Vec<u8>)> = Vec::new();
+    for s in 0..N {
+        let mut o = opening3_with_bank(s, 0);
+        o.required = (0..N).collect();
+        o.seats = (0..N)
+            .map(|x| (x, key(10 + x).verifying_key().to_bytes(), 10_000))
+            .collect();
+        o.max_players = N;
+        o.grace = vec![GRACE_HANDS; usize::from(N)];
+        o.present_run = vec![0; usize::from(N)];
+        o.returns = vec![0; usize::from(N)];
+        let (h, out) = Hand::open(o, &keys[usize::from(s)], NOW, 30_000).expect("the hand opens");
+        hands.push(h);
+        for Send::Broadcast(b) in out {
+            queue.push((usize::from(s), b));
+        }
+    }
+    pump(&mut hands, &keys, queue, NOW, &[], &[]);
+
+    let owed = hands[0].waiting_for();
+    assert_eq!(owed.len(), 1, "one seat on the clock at a betting stage, not {owed:?}");
+    let actor = usize::from(owed[0]);
+    let rogue = (0..usize::from(N)).find(|s| *s != actor).expect("a seat");
+    let voters: Vec<usize> = (0..usize::from(N)).filter(|s| *s != actor && *s != rogue).collect();
+    assert_eq!(voters.len(), 3);
+
+    // The seat to act is silent from here; the rogue never votes.
+    let muted = [actor];
+    let no_votes = [rogue];
+    let t_vote = NOW + 20_000 + 5_000 + 1;
+    let mut votes = Vec::new();
+    for &v in &voters {
+        let out = hands[v].vote_on_timeouts(&keys[v], t_vote, 0).expect("voting is not an error");
+        assert_eq!(out.len(), 1, "seat {v} votes about seat {actor}");
+        for Send::Broadcast(b) in out {
+            votes.push((v, b));
+        }
+    }
+    pump(&mut hands, &keys, votes, t_vote, &muted, &no_votes);
+    for &v in &voters {
+        assert_eq!(
+            hands[v].waiting_for(),
+            vec![actor as u8],
+            "seat {v}: without the rogue's vote nothing is certified yet"
+        );
+    }
+
+    // One budget after their own votes the voters name the rogue.
+    let t_silent = t_vote + 20_000 + 5_000;
+    let mut silent = Vec::new();
+    for &v in &voters {
+        let out = hands[v].vote_on_timeouts(&keys[v], t_silent, 0).expect("voting is not an error");
+        assert_eq!(out.len(), 1, "seat {v} votes about seat {rogue} as a silent voter");
+        for Send::Broadcast(b) in out {
+            silent.push((v, b));
+        }
+    }
+    pump(&mut hands, &keys, silent, t_silent, &muted, &no_votes);
+
+    let at = hands[voters[0]].slot().sequence;
+    for &s in voters.iter().chain(std::iter::once(&rogue)) {
+        assert_ne!(
+            hands[s].waiting_for(),
+            vec![actor as u8],
+            "seat {s}: the table acted for seat {actor} and the hand went on"
+        );
+        assert_eq!(hands[s].slot().sequence, at, "seat {s} is where the voters are");
+        assert!(hands[s].aborted().is_none(), "seat {s}: a betting certificate ends nothing");
+        assert!(!hands[s].took_part(actor as u8), "seat {s}: the seat to act leaves the next roster");
+        assert!(hands[s].took_part(rogue as u8), "seat {s}: the silent voter keeps its seat");
+    }
+}

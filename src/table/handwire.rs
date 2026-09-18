@@ -777,6 +777,15 @@ pub struct TimeoutVote {
 /// certificate names with it is out of the table for good at that boundary.
 pub const CAUSE_FLOOD: u16 = 1;
 
+/// `D-065`: a timeout vote's cause -- the seat named is a voter of the round
+/// the voter is party to that said nothing about it within the round's air:
+/// no vote about every seat the round names, or no copy of the certificate the
+/// voter sealed. A certificate is still about the seats its stage waits on;
+/// a seat named with this cause rides along, and what the table takes from it
+/// is its veto for the rest of the hand and nothing else -- no strike, no
+/// roster effect, no word kept for its client.
+pub const CAUSE_SILENT_VOTER: u16 = 2;
+
 impl TimeoutVote {
     /// The digest a certificate identifies this subject by.
     ///
@@ -810,7 +819,7 @@ impl TimeoutVote {
     /// is refused rather than read as no cause: it is a second encoding of
     /// the same subject.
     pub fn cause_is_known(&self) -> bool {
-        matches!(self.cause, None | Some(CAUSE_FLOOD))
+        matches!(self.cause, None | Some(CAUSE_FLOOD) | Some(CAUSE_SILENT_VOTER))
     }
 }
 
@@ -853,6 +862,18 @@ impl CertSubject {
             .iter()
             .position(|s| *s == seat)
             .and_then(|i| self.causes.get(i).copied().flatten())
+    }
+
+    /// `D-065`: whether `seat` is named as a voter silent about the round
+    /// rather than as a seat the stage waits on.
+    pub fn names_silent(&self, seat: SeatIdx) -> bool {
+        self.cause_of(seat) == Some(CAUSE_SILENT_VOTER)
+    }
+
+    /// `D-065`: the seats named that the stage waits on -- every seat named
+    /// but the silent voters. In seat order.
+    pub fn quiet_seats(&self) -> Vec<SeatIdx> {
+        self.subject_seats.iter().copied().filter(|s| !self.names_silent(*s)).collect()
     }
 
     /// The digest a certificate identifies its subject by: every field but
@@ -1094,7 +1115,9 @@ mod tests {
         assert_eq!(back, flagged, "the cause survives the wire");
         assert!(flagged.cause_is_known() && vote.cause_is_known());
         assert!(!TimeoutVote { cause: Some(0), ..vote }.cause_is_known(), "no second spelling of no cause");
-        assert!(!TimeoutVote { cause: Some(2), ..vote }.cause_is_known());
+        // `D-065`: 2 is the silent voter; the catalogue ends there.
+        assert!(TimeoutVote { cause: Some(CAUSE_SILENT_VOTER), ..vote }.cause_is_known());
+        assert!(!TimeoutVote { cause: Some(3), ..vote }.cause_is_known());
 
         // A joint subject names each seat's cause; one without any hashes as before.
         let mut joint = CertSubject::of(&vote);

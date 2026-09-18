@@ -3458,7 +3458,7 @@ in this paragraph, which records its withdrawal.
 | `n(3) parent_event_hash` | `bytes[32]` | `stage_hash(subject_sequence - 1)` |
 | `n(4) deadline_ms` | `u32` | the `next_deadline_ms` carried by the parent stage's events |
 | `n(5) kind` | `u16` | `1` = action deadline, `2` = cryptographic-step deadline |
-| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
+| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. `2` (**D-065**): the seat is not one the stage waits on but a voter of the round at that stage that has said nothing about it within the round's air -- no vote about every seat the voter voted about there, or no copy of the certificate the voter sealed. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
 
 *Envelope:* `sequence = subject_sequence`,
 `previous_event_hash = parent_event_hash`, `chain_scope = 1` and
@@ -3488,6 +3488,30 @@ voter can never legitimately hold both kinds against one subject at one stage.
 `n(6) cause` (D-051) is fixed by the voter with its first vote about that seat at
 that stage: a client votes once about one seat at one stage, and a seat it cut off
 after voting is voted about with the cause at its next stage.
+
+**`cause = 2` and when it is said (D-065).** A voter votes about another voter of
+the round at a stage with `cause = 2` one stage deadline after its own last vote
+there about a seat the stage waits on, and after the copy of the certificate it
+sealed there if it sealed one -- and at once where its own reading has that voter
+out of the table's group or silent there for `QUIET_LIMIT_S`. It does so only
+while the certificate naming the seats it voted about and that voter together
+would clear §8.3's floor, and never about a seat the stage waits on: that seat is
+voted about with the ordinary vote. The fields `n(0)`..`n(5)` are the stage's own,
+exactly as for the seats the stage waits on, so the one certificate carries both.
+
+**A vote is also a question (D-065).** A `TIMEOUT_VOTE` about seat `s` at stage
+`x` says its voter has accepted nothing from `s` there, which a receiver holding
+that event can answer by sending it again under its author's signature -- an
+honest peer's events need no other authority, and a voter whose vote split from
+the table's because it lacked an event is answered with the event rather than
+certified. One receiver answers: the lowest dealt-in seat that is neither `s`, nor
+out of the table's group, nor heard voting the same; the next takes the question
+up when that one holds nothing. A vote about the receiver itself is answered with
+the receiver's own events of that stage, and one with `cause = 2` about it with
+its own votes and copies there and every event of that stage it holds -- what it
+did not vote about may be what it has. Once per hand, stage, seat and cause at
+each receiver. Answering is never a precondition of anything: a receiver that
+answers nothing breaks no rule, and the vote is judged as before.
 The one field that varies freely is the advisory `emitted_at_unix_ms`, which is
 why §5.2's re-emission rule is normative: a peer that must send its vote again
 sends the stored bytes and never re-signs.
@@ -3549,8 +3573,10 @@ every resignation is a `TABLE_LEAVE` for this table that verifies under the key
 of a seat of `S`, one per seat (`D-063`); `|V(S)| >= 1`, and with `Q` the seats of
 `S` carrying no resignation, either `Q` is empty or `|V(S)| >= 2` and
 `|V(S)| > |Q|` — a seat that said it left counts for nothing against the floor,
-its own word being its consent; a `kind = 1` certificate names one seat;
-every vote about one seat names one `cause`, and a defined one (D-051);
+its own word being its consent; every certificate names at least one seat
+without `cause = 2` -- a seat its stage waits on -- and a `kind = 1` certificate
+names exactly one, the seat to act, with any voters named `cause = 2` beside it
+(D-065); every vote about one seat names one `cause`, and a defined one (D-051);
 `subject_digest` recomputes; the emitter is itself a member of `V(S)`.
 
 **The certificate stage is collective.** The required emitter set is `V(subject)`;
@@ -4476,7 +4502,7 @@ resolved without a vote, a timer or a tie-break.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) cause` | `u16` | `1` failure to publish a required cryptographic contribution; `2` invalid shuffle proof; `3` invalid reveal proof; `4` unresolvable state divergence; `6` **anti-cheat void (D-014)** — a party emitted a provably illegal message and the hand it attacked is voided. **Value `5` (equivocation proven) is deleted and its code point is not reused**, which is why D-014's value is `6` and not `5` — see §5.2's ordering rule and the note below. Every surviving value is a function of chained content that the ordering buffer can place, which is what makes two honest peers derive one body |
-| `n(1) attributed` | `Vec<bytes[32]>` | ≤ `MAX_SEATS` app public keys, ascending by encoded bytes; may be empty. It carries the certified subject on `cause = 1`'s certified-subject path, the shuffler for `cause = 2`, the revealer for `cause = 3`, and is **empty** on `cause = 1`'s uncertified path — the gate's single `attributed = []`, `cert_hash = None` row, which spans both the hand-deadline expiry and §6.3 case (b) — and for `cause = 4`. **Evidence only — nothing in this document reads it to move a chip or to remove a player (D-010)** |
+| `n(1) attributed` | `Vec<bytes[32]>` | ≤ `MAX_SEATS` app public keys, ascending by encoded bytes; may be empty. It carries the certified subject on `cause = 1`'s certified-subject path -- the seats the certificate names without `cause = 2` (D-065) -- the shuffler for `cause = 2`, the revealer for `cause = 3`, and is **empty** on `cause = 1`'s uncertified path — the gate's single `attributed = []`, `cert_hash = None` row, which spans both the hand-deadline expiry and §6.3 case (b) — and for `cause = 4`. **Evidence only — nothing in this document reads it to move a chip or to remove a player (D-010)** |
 | `n(2) cert_hash` | `Option<bytes[32]>` | `event_hash` of the `TIMEOUT_CERT`. Required for `cause = 1` **when a certificate with an effect exists**, which is the certified-subject path and only that; `None` on every `attributed = []` path, where unanimity was by construction never reached and no certificate can exist |
 | `n(3) evidence` | `Vec<bytes>` | ≤ 2 `SignedEvent`s, each ≤ `MAX_EMBEDDED_EVENT` = 32 768 B; required for `cause` 2 and 3, which are the two causes a single chained event proves on its own |
 | `n(4) deltas` | `Vec<i64>` | **all zeroes, always (D-010).** An abort moves no chips, so there is no per-seat delta to carry; the field is a vector of `0` of length `\|occupied seats\|`. It is kept rather than removed so that `HAND_ABORT` and `HAND_COMPLETE` stay directly comparable to a verifier, and so that "the deltas sum to zero" stays one receiver check across both terminal messages rather than two |
@@ -7439,6 +7465,23 @@ D-007 at every table size. Wherever an earlier draft of this document said "at
 > `|V(S)| > |Q|`. A seat that said it left is at no fork -- it is at no table --
 > and the seats left need no majority to remove it; a certificate naming it puts
 > it out of the table for good.
+>
+> **`D-065` -- a vote that does not come stops being a veto (2026-09-18, the
+> project owner's ruling).** Unanimity is kept and made reachable. A voter of
+> the round at a stage that has said nothing about it within the round's air
+> is voted about in turn with `cause = 2` (§4.8), and one certificate names the
+> seats the stage waits on and those voters together, unanimously among the
+> rest, under the floor above with the silent voters counted among the named.
+> **What the table takes from a seat named with `cause = 2` is its veto for the
+> rest of the hand and nothing else:** it leaves `V` of every later certificate
+> of the hand as a seat an earlier certificate names; it is not struck, stays in
+> `R(k+1)`, is not attributed by an abort resting on the certificate, and no
+> word is kept for its client. At a betting stage the certificate still acts for
+> the one seat to act. A seat merely slow therefore loses nothing it needs, a
+> seat really gone is named by the next hand's opening as any quiet seat is, and
+> a client that plays every turn and never votes can no longer hold a
+> certificate about anybody -- which, before D-065, cost a table every hand
+> after one of its seats died, and a betting stage its whole `hand_deadline_ms`.
 >
 > **Being voted against is not exclusion.** A `TIMEOUT_VOTE` is one peer's
 > unilateral assertion, this section concedes below that a lying voter is

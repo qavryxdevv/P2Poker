@@ -873,6 +873,12 @@ struct TableRun {
     hand_said_again_ms: u64,
     /// `D-033`: the stage the running hand is at, and since when, for the re-say above.
     stage_waiting: (u64, u64),
+    /// `D-065`: the voters heard asking about each (hand, stage, seat, silent)
+    /// -- the seats known to lack what the question is about, so the seat that
+    /// answers is the lowest one not among them.
+    vote_asks_heard: std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
+    /// `D-065`: the questions this client has answered, once each.
+    vote_asks_answered: std::collections::BTreeSet<(u64, u64, u8, bool)>,
     /// `S1-CX`: the other seat's next hand, seen while this one is still
     /// inside a hand nothing was dealt in -- the hand id and the parent it
     /// carries -- for the stall tick to give this hand up on, if the parent
@@ -1225,6 +1231,8 @@ impl TableRun {
             material_recorded: None,
             hand_said_again_ms: 0,
             stage_waiting: (u64::MAX, 0),
+            vote_asks_heard: std::collections::BTreeMap::new(),
+            vote_asks_answered: std::collections::BTreeSet::new(),
             give_up_for: None,
             hand_one_held_since: None,
             hand_one_progress: None,
@@ -1540,6 +1548,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let delay_since = tokio::time::Instant::now();
+    // fault-harness, `-NoVote`: said once, so the run's log proves the knob
+    // reached this client.
+    if withholds_votes() {
+        let _ = events
+            .send(NodeEvent::Warning(
+                "fault-harness: this client says no TIMEOUT_VOTE and no TIMEOUT_CERT and hands on nobody's (-NoVote, S1-AQ)"
+                    .to_string(),
+            ))
+            .await;
+    }
     let _ = PROCESS_STARTED.get_or_init(std::time::Instant::now);
     // **The number nobody has: how many private addresses the real Amino DHT
     // hands this client.** `S1-AC`'s filter counts what it refuses, so the
@@ -2092,6 +2110,55 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(gossipsub::MessageAcceptance::Accept)
             } else {
+                            // `D-065`: a vote is also a question, answered before the
+                            // hand judges it -- a vote about a stage this client has
+                            // left is dropped there, and it is the one that most needs
+                            // an answer.
+                            if let Some(ask) = $h.vote_asks($bytes) {
+                                let gone: Vec<u8> = $t
+                                    .table
+                                    .as_ref()
+                                    .map(|f| seats_unheard(f, &$t.tox_sink))
+                                    .unwrap_or_default();
+                                let answer = answer_a_vote(
+                                    $h,
+                                    ask,
+                                    &$t.said,
+                                    &gone,
+                                    &mut $t.vote_asks_heard,
+                                    &mut $t.vote_asks_answered,
+                                );
+                                if !answer.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() {
+                                    let mut said_again = 0usize;
+                                    for b in &answer {
+                                        // fault-harness, `-NoVote`: nobody's votes either.
+                                        if withholds_votes()
+                                            && matches!(
+                                                crate::net::chained::peek(b, TABLE_FRAME_PEEK),
+                                                Ok((
+                                                    crate::protocol::messages::EventType::TimeoutVote
+                                                        | crate::protocol::messages::EventType::TimeoutCert,
+                                                    _,
+                                                    _
+                                                ))
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                        $t.tox_sink.try_broadcast(b);
+                                        said_again += 1;
+                                    }
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "seat {}'s vote about seat {}{} at stage {} asks for what it lacks: said {said_again} frame(s) again (D-065)",
+                                            ask.voter,
+                                            ask.seat,
+                                            if ask.silent { " as a silent voter" } else { "" },
+                                            ask.sequence
+                                        )))
+                                        .await;
+                                }
+                            }
                             match $h.on_event($bytes, &app_key, now) {
                             Ok(sends) => {
                                 // Anything held for a stage this client had
@@ -3175,6 +3242,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.forming_note = None;
             $t.ever_dealt = false;
             $t.hand = None;
+            $t.vote_asks_heard.clear();
+            $t.vote_asks_answered.clear();
             $t.late_cert_said = None;
             $t.previous = None;
             $t.next_inits.clear();
@@ -11922,6 +11991,80 @@ fn i_say_the_hand_again(h: &crate::table::hand::Hand, gone: &[u8]) -> bool {
     h.dealt_in().iter().copied().filter(|s| !waiting.contains(s) && !gone.contains(s)).min() == Some(h.my_seat())
 }
 
+/// `D-065`: what this client says in answer to a vote read as a question
+/// ([`crate::table::hand::Hand::vote_asks`]). A vote naming this client: its
+/// own frames of that stage -- and, named silent about the round, its own votes
+/// and copies there and every frame of that stage it holds, since what it did
+/// not vote about may be what it has. A vote naming another seat: that seat's
+/// frame of the stage, or its votes, when this client is the lowest seat dealt
+/// in that is neither the one named, nor gone from the group, nor heard asking
+/// the same -- one answer and not ten (`S1-HD`'s rule) -- and the next seat
+/// takes the question up if this one holds nothing. Once per hand, stage, seat
+/// and kind; the questions of hands before the last are forgotten.
+fn answer_a_vote(
+    h: &crate::table::hand::Hand,
+    ask: crate::table::hand::VoteAsk,
+    said: &[Vec<u8>],
+    gone: &[u8],
+    heard: &mut std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
+    answered: &mut std::collections::BTreeSet<(u64, u64, u8, bool)>,
+) -> Vec<Vec<u8>> {
+    use crate::protocol::messages::EventType as E;
+    let hid = h.hand_id();
+    heard.retain(|k, _| k.0.saturating_add(1) >= hid);
+    answered.retain(|k| k.0.saturating_add(1) >= hid);
+    let key = (hid, ask.sequence, ask.seat, ask.silent);
+    heard.entry(key).or_default().insert(ask.voter);
+    if answered.contains(&key) {
+        return Vec::new();
+    }
+    let me = h.my_seat();
+    let own_at = |votes: bool| -> Vec<Vec<u8>> {
+        said.iter()
+            .filter(|b| {
+                crate::net::chained::peek(b, TABLE_FRAME_PEEK).is_ok_and(|(kind, x, seq)| {
+                    x == hid && seq == ask.sequence && matches!(kind, E::TimeoutVote | E::TimeoutCert) == votes
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    let out: Vec<Vec<u8>> = if ask.seat == me {
+        if ask.silent {
+            let mut v = own_at(true);
+            v.extend(h.frames_at(ask.sequence, None));
+            v.extend(own_at(false));
+            v
+        } else {
+            own_at(false)
+        }
+    } else {
+        let lacking = heard.get(&key).cloned().unwrap_or_default();
+        let answerer = h
+            .dealt_in()
+            .iter()
+            .copied()
+            .filter(|s| *s != ask.seat && !gone.contains(s) && !lacking.contains(s))
+            .min();
+        if answerer != Some(me) {
+            return Vec::new();
+        }
+        if ask.silent {
+            if ask.sequence == h.slot().sequence {
+                h.votes_from(ask.seat)
+            } else {
+                Vec::new()
+            }
+        } else {
+            h.frames_at(ask.sequence, Some(ask.seat))
+        }
+    };
+    if !out.is_empty() {
+        answered.insert(key);
+    }
+    out
+}
+
 /// `S1-GL`: whether the table's group, as `(seen, want)`, holds every other seat
 /// but `gone` -- seats whose player left by its own word. Never for a group that
 /// wants nobody or saw nobody.
@@ -13150,6 +13293,18 @@ fn stop_at_hand_due(hand_id: u64) -> bool {
     *at == Some(hand_id)
 }
 
+/// fault-harness: `P2P_POKER_NO_VOTE` -- this client says no `TIMEOUT_VOTE`
+/// and no `TIMEOUT_CERT`, and hands on nobody's: the voter that plays every
+/// turn and never votes, whose missing vote `S1-AQ` is about. Read once;
+/// `false` in every build without the feature.
+fn withholds_votes() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static NO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO.get_or_init(|| std::env::var("P2P_POKER_NO_VOTE").is_ok())
+}
+
 /// fault-harness: whether `P2P_POKER_STOP_ON_TURN_AFTER` names a second this
 /// loop has reached. Read once; `false` in every build without the feature.
 fn stop_on_turn_due(since: tokio::time::Instant) -> bool {
@@ -14071,6 +14226,16 @@ fn publish_hand(
         // second on the clock. A no-op in every other mode and in every build
         // without the harness.
         if let Ok((kind, _, _)) = crate::net::chained::peek(&out, TABLE_FRAME_PEEK) {
+            // fault-harness, `-NoVote`: not said and not kept for a re-send.
+            if withholds_votes()
+                && matches!(
+                    kind,
+                    crate::protocol::messages::EventType::TimeoutVote
+                        | crate::protocol::messages::EventType::TimeoutCert
+                )
+            {
+                continue;
+            }
             arm_the_mute(kind);
         }
         let down = nothing_leaves();
