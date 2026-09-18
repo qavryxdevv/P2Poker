@@ -5749,6 +5749,25 @@ the staller as surely as one voided, and a voter that never votes was the accomp
        certificate at 4/4 in under a second of the clocks, *the table acted for seat 2: Fold* at 99.1 s, 38
        hands, one genesis, and no silent vote anywhere -- D-065 speaks only where a vote does not come.
 
+**Amended the same day (the owner: *continue with what remains*) -- the question comes early.** Asked at the
+stage's deadline, the question came when the table was itself about to vote the asker out: a seat that cannot hear
+one member lost a whole budget at every event of that member's, and the others, needing its next event, voted about
+it on the same clock -- and `D-059` cuts their patience after the first wait. So a voter asks five seconds into the
+stage (`QUESTION_AFTER_MS`) when it holds an event of a later stage of the hand signed by a seat other than the
+subject and itself (`Hand::later_frame_from_another`): that seat moved past the stage, which no seat does without
+the subject's event, so it will never vote about the subject there and the early vote can complete no certificate.
+Measured with two new harness knobs: `-DeafToNode/-DeafToSeat/-DeafToAt/-DeafToFor` (one client hears nothing the
+named seat's member delivers itself; copies other members send still arrive) and `-NoAnswerNodes`
+(`P2P_POKER_NO_ANSWER`: a client answers no vote). Five seats, n1 deaf to seat 3 from 90 s for 90 s. *Without the
+answer* (`run132920-5`, every node): n1 voted about seat 3 twice and nobody re-sent the frame; n1 stalled in hand
+#8, the four others certified seat 1 out of that hand at 149.5 s and out of the next at 171.5 s and took it off the
+table (172.4 s); its hearing back, n1 found the table at hand #10, took it up as a bystander from four copies
+(`D-038`) and was certified back in at 195.6 s, five seats again at 198.7 s -- seat 1 finished 31 hands of the
+table's 33. *With it* (`run131008-5`): n1 asked eleven times, six seconds apart whenever it lacked seat 3's event,
+and each time seat 0 -- the lowest seat neither named nor asking -- sent the frame again (seat 3 re-sent its own
+too, which the knob kept from n1); no certificate was made, every seat finished all 33 hands, one genesis. Times
+on n0's clock.
+
 
 ## D-066 — half the table silent: the half with the lowest seat goes on, and any two after five minutes
 
@@ -5803,3 +5822,20 @@ of the same day that no phase may stand.
        until 442.9 s, five minutes after the silence was read, when *the table has certified seats [0, 1]'s timeout,
        unanimously among [2, 3]* (446.5 s) and heads-up play went on: 45 hands opened on both, one genesis.
      - **a regression**, no knob (`run120313-4`): 46 hands, one genesis, not one vote.
+
+**Amended the same day -- the line, and the seat that was gone.** Two things the bed and a closer reading taught.
+(1) *Whose line is sound.* The count of five minutes runs only while this client hears some other seat of the
+table **and** its library is on the network: two players at one end of a table who lose their line together still
+hear each other over their own LAN, and would otherwise count the far end gone and split the table. (2) *A seat that
+was gone takes its certificate.* The refusal of point 4 held for a seat whose own line was up all the while; a seat
+whose line was down within `LONG_GONE_S` (the node's `line_down_at`) takes a certificate half the table carries
+about it -- it may really have been gone -- and comes back by D-028's return. Each hand is told as it opens, before
+the copies it holds replay (`line_down_within`): a hand taken up after an outage may carry the very certificate
+that named the seat while it was away, and the first build read the line only at the next stall tick -- a review
+of the change caught it before a run did. The window's note, the table's word
+about a seat out for good (`D-047`) and the engine now read one floor. Measured, `run131711-4` (times on n0's
+clock): four seats, n2 and n3 lost their internet together at 120 s for 150 s; the half left -- seat 0 in it --
+acted for seat 2 at its turn at 158.4 s, naming seat 3 a silent voter, certified seat 3 in the next hand (202.5 s)
+and played heads-up from 203.5 s; n2 and n3, their lines back, found the table far on, took up its running hand
+#26 as bystanders from the others' copies (`D-038`), asked to sit in, and were certified back in by the two at
+286.6 s -- the table was four again from hand #27 at 290.2 s, 48 hands, one genesis on all four.

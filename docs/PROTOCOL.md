@@ -3502,7 +3502,9 @@ exactly as for the seats the stage waits on, so the one certificate carries both
 **`cause = 3` and when it is said (D-066).** A voter votes about a seat the stage
 waits on with `cause = 3` at once -- without waiting out the stage's deadline -- when
 its own reading has that seat out of the table's group, or silent there, for
-`LONG_GONE_S` = 300 s or more, counted only while the voter's own line is sound. A
+`LONG_GONE_S` = 300 s or more, counted only while the voter's own line is sound --
+it hears some other seat of the table, and its library is on the network, since two
+seats that lost their line together still hear each other over their own LAN. A
 voter that voted about the seat at that stage without the cause votes again with it:
 another subject in another slot (§5.2), and the one exception to *once about one seat
 at one stage* -- a turn whose stage stands until `hand_deadline_ms` has no next stage
@@ -3521,6 +3523,15 @@ its own votes and copies there and every event of that stage it holds -- what it
 did not vote about may be what it has. Once per hand, stage, seat and cause at
 each receiver. Answering is never a precondition of anything: a receiver that
 answers nothing breaks no rule, and the vote is judged as before.
+
+**The question may come early.** A voter may cast its vote about seat `s` at stage
+`x` before `x`'s deadline -- `QUESTION_AFTER_MS`, five seconds, into the stage --
+when it holds an event of a later stage of this hand signed by a seat other than
+`s` and itself. That seat moved past `x`, which no seat does without `s`'s event of
+`x` (a collective stage needs every event, a single-writer one builds on the last),
+so it will never vote about `s` at `x` and the early vote can complete no
+certificate: it is a question and nothing else, and the answer comes seconds after
+the loss rather than a deadline after it.
 The one field that varies freely is the advisory `emitted_at_unix_ms`, which is
 why §5.2's re-emission rule is normative: a peer that must send its vote again
 sends the stored bytes and never re-signs.
@@ -3586,7 +3597,9 @@ its own word being its consent — or, `D-066`, `|V(S)| >= 2` and either
 `|V(S)| = |Q|` with the lowest seat of `V(S) ∪ Q` in `V(S)`, or every seat of `Q`
 not named `cause = 2` named `cause = 3`; a receiver that is itself a seat of `Q`
 named without `cause = 2` does not take a certificate that clears the floor only by
-`D-066` — it is here, which such a certificate may not overrule; every certificate names at least one seat
+`D-066` while its own line was sound for the last `LONG_GONE_S` — it was here, which
+such a certificate may not overrule — and takes it when its line was down within
+that time, since then it may really have been gone; every certificate names at least one seat
 without `cause = 2` -- a seat its stage waits on -- and a `kind = 1` certificate
 names exactly one, the seat to act, with any voters named `cause = 2` beside it
 (D-065); every vote about one seat names one `cause`, and a defined one (D-051);
@@ -7504,12 +7517,16 @@ D-007 at every table size. Wherever an earlier draft of this document said "at
 > `V(S) ∪ Q` -- one half of a table can hold it, never both, so two halves never
 > certify each other -- and **any number** is enough when every seat of `Q` is named
 > `cause = 3`, out of the table's group for `LONG_GONE_S` = 300 s by every voter's
-> own reading. Neither exception is ever taken by a seat of `Q` itself: a seat that
-> is here refutes the only claim such a certificate rests on, so a half or a
-> minority that lied about the rest forks away alone, and a seat really gone never
-> hears it. **The price, accepted by the owner:** a real partition of the network
-> that lasts past `LONG_GONE_S` splits the table in two, each half going on without
-> the other.
+> own reading, counted only while that voter hears some other seat and its library
+> is on the network. Neither exception is taken by a seat of `Q` whose own line was
+> sound all the while: a seat that was here refutes the only claim such a
+> certificate rests on, so a half or a minority that lied about the rest forks away
+> alone. A seat of `Q` whose line was down within `LONG_GONE_S` takes it -- it may
+> really have been gone -- and comes back by D-028's return, which is how a far end
+> of the table that lost its line together rejoins. **The price, accepted by the
+> owner:** a real partition of the network that lasts past `LONG_GONE_S` while both
+> sides keep their lines splits the table in two, each half going on without the
+> other.
 >
 > **Being voted against is not exclusion.** A `TIMEOUT_VOTE` is one peer's
 > unilateral assertion, this section concedes below that a lying voter is

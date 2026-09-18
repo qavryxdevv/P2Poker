@@ -884,6 +884,9 @@ struct TableRun {
     unheard_since: std::collections::BTreeMap<u8, tokio::time::Instant>,
     /// `D-066`: the seats said to be long gone, so each is said once.
     long_gone_said: std::collections::BTreeSet<u8>,
+    /// `D-066`: when this client's own line was last down while a hand ran --
+    /// no other seat heard, or its library off the network.
+    line_down_at: Option<tokio::time::Instant>,
     /// `D-065`: the driver's refused seat claims already acted on -- a claim
     /// refused leaves a member untaught here, so it is learnt again.
     claims_refused_seen: u64,
@@ -1243,6 +1246,7 @@ impl TableRun {
             vote_asks_answered: std::collections::BTreeSet::new(),
             unheard_since: std::collections::BTreeMap::new(),
             long_gone_said: std::collections::BTreeSet::new(),
+            line_down_at: None,
             claims_refused_seen: 0,
             give_up_for: None,
             hand_one_held_since: None,
@@ -1566,6 +1570,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             .send(NodeEvent::Warning(
                 "fault-harness: this client says no TIMEOUT_VOTE and no TIMEOUT_CERT and hands on nobody's (-NoVote, S1-AQ)"
                     .to_string(),
+            ))
+            .await;
+    }
+    if !answers_votes() {
+        let _ = events
+            .send(NodeEvent::Warning(
+                "fault-harness: this client answers no vote with the frame it lacks (-NoAnswerNodes, D-065 off)".to_string(),
             ))
             .await;
     }
@@ -2125,7 +2136,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // hand judges it -- a vote about a stage this client has
                             // left is dropped there, and it is the one that most needs
                             // an answer.
-                            if let Some(ask) = $h.vote_asks($bytes) {
+                            if let Some(ask) = $h.vote_asks($bytes).filter(|_| answers_votes()) {
                                 let gone: Vec<u8> = $t
                                     .table
                                     .as_ref()
@@ -3257,6 +3268,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.vote_asks_answered.clear();
             $t.unheard_since.clear();
             $t.long_gone_said.clear();
+            $t.line_down_at = None;
             $t.claims_refused_seen = 0;
             $t.late_cert_said = None;
             $t.previous = None;
@@ -4229,10 +4241,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 w.hand_id,
                                                 &|k| roster.seat_of(k),
                                             )?;
+                                            // D-036's floor, with `D-066`'s two ways past its
+                                            // majority: exactly half holding the lowest seat, or
+                                            // every seat named long gone.
+                                            let tie_break = voters.len() == subjects.len()
+                                                && voters.iter().chain(subjects.iter()).min().is_some_and(|m| voters.contains(m));
+                                            let long_gone = subjects.iter().all(|s| {
+                                                crate::table::hand::certificate_cause(&w.cert, &w.table_id, w.hand_id, *s)
+                                                    == Some(crate::table::handwire::CAUSE_LONG_GONE)
+                                            });
                                             if !subjects.contains(&w.seat)
                                                 || voters.contains(&w.seat)
                                                 || voters.len() < 2
-                                                || voters.len() <= subjects.len()
+                                                || (voters.len() <= subjects.len() && !tie_break && !long_gone)
                                             {
                                                 return None;
                                             }
@@ -7260,6 +7281,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             Some((which, item)) = next_from_tables(&mut tables) => {
                 let t = &mut tables[which];
                 mark_table(&events, &mut marked, t).await;
+                // fault-harness, `-DeafToSeat` (D-065's bed): nothing the member
+                // seated there delivers itself is heard for a window.
+                if let (Some(gk), Some(h)) = (item.claimed, t.hand.as_ref()) {
+                    if deaf_to_member(gk, &item.bytes, h) {
+                        let n = DEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n == 1 || n % 25 == 0 {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "fault-harness: deaf to one seat's member (-DeafToSeat): {n} of its frame(s) not heard"
+                                )))
+                                .await;
+                        }
+                        continue;
+                    }
+                }
                 // `D-051`: bytes that are no signed event, or whose signature does
                 // not verify under the key inside them, are noise no client of this
                 // build sends -- counted against the member that carried them, and
@@ -9573,6 +9609,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 };
                                                 match opened {
                                                     Ok((mut h, opening_sends)) => {
+                                                        // `D-066`: told before its copies, which may
+                                                        // carry a certificate naming this seat.
+                                                        h.note_line_down_recently(line_down_within(t.line_down_at));
                                                         if member && !signed_before {
                                                             publish_hand(opening_sends, &mut swarm, &mut t.said, &t.tox_sink);
                                                         }
@@ -9872,7 +9911,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .as_ref()
                         .map(|f| f.roster().seats().len().saturating_sub(1))
                         .unwrap_or(0);
-                    let suspect = others > 0 && gone_from_group.len() >= others;
+                    // ... and while its library is on the network: two seats that lost
+                    // their line together still hear each other over their own LAN,
+                    // and must not count the rest of the table gone (D-066). The
+                    // library's word lags a cut by up to a minute and a half, which
+                    // five minutes absorb.
+                    let off_network =
+                        t.ever_on_line && t.tox_sink.is_on_tox() && t.tox_sink.tox_connection() == 0;
+                    let suspect = (others > 0 && gone_from_group.len() >= others) || off_network;
+                    // `D-066`: and when this client's own line was last down, while a
+                    // hand runs -- a seat named by a certificate half the table carries
+                    // takes it only if its line was down within `LONG_GONE_S`.
+                    if suspect && t.hand.is_some() {
+                        t.line_down_at = Some(tokio::time::Instant::now());
+                    }
+                    let line_down_recently = line_down_within(t.line_down_at);
                     let long_gone = note_unheard(&mut t.unheard_since, &gone_from_group, suspect);
                     let newly: Vec<u8> = long_gone.iter().copied().filter(|s| !t.long_gone_said.contains(s)).collect();
                     t.long_gone_said.retain(|s| long_gone.contains(s));
@@ -9888,6 +9941,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let Some(h) = t.hand.as_mut() else { continue };
                     h.note_gone_from_group(&gone_from_group);
                     h.note_long_gone(&long_gone);
+                    h.note_line_down_recently(line_down_recently);
 
                     // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
                     // and the carrier's blind repair ladder puts its attempts in
@@ -11135,6 +11189,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         begin_hand_with(
                             opening,
                             voice,
+                            line_down_within(t.line_down_at),
                             &mut t.next_inits,
                             &mut t.next_early,
                             &mut t.next_early_lost,
@@ -12957,6 +13012,8 @@ async fn begin_hand(
     begin_hand_with(
         opening,
         crate::table::hand::Voice::Speak,
+        // Hand one: no certificate before it to take.
+        false,
         &mut none,
         &mut none_either,
         // This path opens hand one, where nothing can have arrived early.
@@ -13367,6 +13424,70 @@ fn stop_at_hand_due(hand_id: u64) -> bool {
     *at == Some(hand_id)
 }
 
+/// `D-066`: whether this client's own line was down at any moment of the last
+/// `LONG_GONE_S`, from when the node last read it down (`line_down_at`). Read at
+/// every stall tick, and given to each hand as it opens, before its held copies
+/// replay: a hand taken up after an outage may hold the certificate that named
+/// this seat while it was away.
+fn line_down_within(at: Option<tokio::time::Instant>) -> bool {
+    at.is_some_and(|at| at.elapsed().as_secs() < crate::protocol::constants::LONG_GONE_S)
+}
+
+/// fault-harness: `P2P_POKER_NO_ANSWER` -- this client answers no vote with the
+/// frame it asks for (`D-065` off), for a contrast run. `true` -- it answers --
+/// in every build without the feature.
+fn answers_votes() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return true;
+    }
+    static NO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*NO.get_or_init(|| std::env::var("P2P_POKER_NO_ANSWER").is_ok())
+}
+
+/// fault-harness: frames dropped by [`deaf_to_member`], for the log.
+static DEAF_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// fault-harness: `P2P_POKER_DEAF_TO_SEAT=<seat>`, `P2P_POKER_DEAF_TO_AT=<s>` and
+/// `P2P_POKER_DEAF_TO_FOR=<s>` -- for that window, counted from this process's
+/// start, this client hears nothing the member seated at `<seat>` delivers
+/// itself, while it hears whatever the other members say again. The member is
+/// learnt from the first frame that seat signs, before the window. One
+/// direction and one member: the partial delivery `D-065`'s question is for.
+/// `false` in every build without the feature.
+fn deaf_to_member(member: [u8; 32], bytes: &[u8], h: &crate::table::hand::Hand) -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static CONF: std::sync::OnceLock<Option<(u8, u64, u64)>> = std::sync::OnceLock::new();
+    static LEARNT: std::sync::OnceLock<std::sync::Mutex<Option<[u8; 32]>>> = std::sync::OnceLock::new();
+    let conf = CONF.get_or_init(|| {
+        let seat = std::env::var("P2P_POKER_DEAF_TO_SEAT").ok()?.trim().parse::<u8>().ok()?;
+        let at = std::env::var("P2P_POKER_DEAF_TO_AT").ok()?.trim().parse::<u64>().ok()?;
+        let dur = std::env::var("P2P_POKER_DEAF_TO_FOR").ok()?.trim().parse::<u64>().ok()?;
+        Some((seat, at, dur))
+    });
+    let Some((seat, at, dur)) = *conf else {
+        return false;
+    };
+    let age = PROCESS_STARTED.get().map(|s| s.elapsed().as_secs()).unwrap_or(0);
+    let mut learnt = LEARNT.get_or_init(|| std::sync::Mutex::new(None)).lock().expect("the deaf member");
+    if learnt.is_none() {
+        // Learnt from the seat's own opening of a hand, which its author says
+        // itself: a frame of the formation can come said again by the founder
+        // (the first bed run learnt the founder's member this way).
+        if age < at
+            && crate::net::chained::peek(bytes, TABLE_FRAME_PEEK)
+                .is_ok_and(|(kind, _, _)| kind == crate::protocol::messages::EventType::HandInit)
+            && crate::net::chained::sender_of(bytes, crate::table::fragment::MAX_MESSAGE).is_some()
+            && crate::net::chained::sender_of(bytes, crate::table::fragment::MAX_MESSAGE) == h.key_of(seat)
+        {
+            *learnt = Some(member);
+        }
+        return false;
+    }
+    age >= at && age < at.saturating_add(dur) && *learnt == Some(member)
+}
+
 /// fault-harness: `P2P_POKER_NO_VOTE` -- this client says no `TIMEOUT_VOTE`
 /// and no `TIMEOUT_CERT`, and hands on nobody's: the voter that plays every
 /// turn and never votes, whose missing vote `S1-AQ` is about. Read once;
@@ -13579,6 +13700,8 @@ async fn reopen_hand(
     let (genesis, required) = (opening.genesis, opening.required.clone());
     match Hand::open_with(opening, app_key, now, deadline, voice) {
         Ok((mut h, sends)) => {
+            // `D-066`: the old hand's word, before the held events replay.
+            h.note_line_down_recently(old.line_down_recently());
             purge_hand_from_said(said, h.hand_id());
             let carried = early.len();
             for b in early {
@@ -13636,6 +13759,7 @@ async fn reopen_hand(
 async fn begin_hand_with(
     opening: crate::table::hand::Opening,
     voice: crate::table::hand::Voice,
+    line_down: bool,
     next_inits: &mut Vec<(u8, Vec<u8>)>,
     next_early: &mut Vec<(u8, Vec<u8>)>,
     lost: &mut (u32, u32),
@@ -13657,6 +13781,9 @@ async fn begin_hand_with(
     let deadline = opening.crypto_step_timeout_ms;
     match Hand::open_with(opening, app_key, now, deadline, voice) {
         Ok((mut h, sends)) => {
+            // `D-066`: before the early copies replay -- a certificate among
+            // them may name this seat.
+            h.note_line_down_recently(line_down);
             if voice == Voice::Quiet {
                 let _ = events
                     .send(NodeEvent::Warning(format!(

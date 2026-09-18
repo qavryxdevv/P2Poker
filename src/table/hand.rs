@@ -1735,6 +1735,13 @@ pub struct Hand {
     /// `CAUSE_LONG_GONE`, which lets two voters certify them short of a
     /// majority.
     long_gone: BTreeSet<SeatIdx>,
+    /// `D-066`: whether this client's own line was down -- it heard no other
+    /// seat, or its library was off the network -- at any moment of the last
+    /// `LONG_GONE_S`, as the node reads it ([`Hand::note_line_down_recently`]).
+    /// A seat named by a certificate only half the table carries takes it then:
+    /// it may really have been gone. With its line up all along it was here,
+    /// and it does not.
+    line_down_recently: bool,
     /// `D-051`: the seats this client has voted about at the stage now open,
     /// whatever the cause -- one vote about one seat at one stage, so a
     /// cause is fixed with the first.
@@ -2279,6 +2286,7 @@ impl Hand {
                 resigned: BTreeSet::new(),
                 gone_from_group: BTreeSet::new(),
                 long_gone: BTreeSet::new(),
+                line_down_recently: false,
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
                 settled_pots: Vec::new(),
@@ -6952,7 +6960,13 @@ impl Hand {
             // receiver checks, and a certificate needs every voter: the table
             // votes a seat out when the most patient voter's clock says so.
             let after = self.vote_after_ms(seat, owed);
-            if age < after {
+            // `D-065`'s early question: a seat whose event of this stage another
+            // seat has visibly moved past is asked about five seconds in, not at
+            // the deadline -- that seat holds the event, so the vote can complete
+            // no certificate and only brings the answer.
+            let asking = age >= crate::protocol::constants::QUESTION_AFTER_MS
+                && self.later_frame_from_another(seat);
+            if age < after && !asking {
                 continue;
             }
             // **A seat the carrier is mid-delivery with is late, not silent.**
@@ -7194,6 +7208,44 @@ impl Hand {
             out.append(&mut self.certify_if_unanimous(key, now_ms)?);
         }
         Ok(out)
+    }
+
+    /// `D-065`'s early question: whether this hand holds, from a seat other than
+    /// `seat` and this client, an event of a stage past the one now open -- which
+    /// proves `seat`'s event of this stage exists and reached that seat, since no
+    /// stage is left without it (a collective stage needs every event, a
+    /// single-writer one builds on the last). Only stage events count: votes,
+    /// certificates, aborts and the boundary's return pair are no stage moved
+    /// past. `hold` opened every frame kept here.
+    fn later_frame_from_another(&self, seat: SeatIdx) -> bool {
+        let Some(theirs) = self.key_of(seat) else {
+            return false;
+        };
+        let mine = self.key_of(self.open.my_seat);
+        self.early.iter().any(|b| {
+            chained::peek(b, PEEK_CAP).is_ok_and(|(kind, hand, sequence)| {
+                hand == self.open.hand_id
+                    && sequence > self.slot.sequence
+                    && matches!(
+                        kind,
+                        EventType::HandInit
+                            | EventType::DeckInit
+                            | EventType::ShuffleStep
+                            | EventType::ShuffleProof
+                            | EventType::DeckCommit
+                            | EventType::DealPrivate
+                            | EventType::BoardReveal
+                            | EventType::ActionCheck
+                            | EventType::ActionCall
+                            | EventType::ActionBet
+                            | EventType::ActionRaise
+                            | EventType::ActionFold
+                            | EventType::ShowdownReveal
+                            | EventType::ShowdownMuck
+                            | EventType::HandComplete
+                    )
+            }) && chained::sender_of(b, FRAME_CAP).is_some_and(|k| k != theirs && Some(k) != mine)
+        })
     }
 
     /// `D-065`: the subject this client votes about a voter silent about the
@@ -8160,19 +8212,25 @@ impl Hand {
             return Ok(Vec::new());
         }
         // `D-066`: a certificate that only half the table or fewer carry is
-        // never taken by a seat it names as waited-on. That seat is here --
-        // this client is -- which is the one fact such a certificate may not
-        // overrule: a half or a minority that lied about the rest forks away
-        // alone, and a seat really gone never hears it. The voters themselves
-        // take it, having each said the seat was silent; a majority's
-        // certificate is taken by its subject as before (D-036 point 4).
+        // never taken by a seat it names as waited-on while that seat's own
+        // line was up all along: it was here, which is the one fact such a
+        // certificate may not overrule, and a half or a minority that lied
+        // about the rest forks away alone. A seat whose own line was down
+        // within `LONG_GONE_S` takes it -- it may really have been gone, and it
+        // comes back by D-028's return -- which is what heals a table whose
+        // players at one end lost their line together. The voters take their
+        // own certificate; a majority's is taken by its subject as before
+        // (D-036 point 4).
         let waited: Vec<SeatIdx> = c
             .subject
             .quiet_seats()
             .into_iter()
             .filter(|s| !resigned.contains(s))
             .collect();
-        if !Self::admissible(voter_seats.len(), waited.len()) && waited.contains(&self.open.my_seat) {
+        if !Self::admissible(voter_seats.len(), waited.len())
+            && waited.contains(&self.open.my_seat)
+            && !self.line_down_recently
+        {
             if self.shortfall_said.insert(c.subject.digest()) {
                 self.cert_note.push(format!(
                     "cert: from seat {seat} about {}, carried by {} voter(s) -- half the table or fewer -- names this client, which is here: not taken (D-066)",
@@ -10540,6 +10598,18 @@ impl Hand {
     /// each time, so a seat back in the group is waited for again.
     pub fn note_long_gone(&mut self, seats: &[SeatIdx]) {
         self.long_gone = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
+    }
+
+    /// `D-066`: whether this client's own line was down at any moment of the
+    /// last `LONG_GONE_S`, as the node reads it now.
+    pub fn note_line_down_recently(&mut self, down: bool) {
+        self.line_down_recently = down;
+    }
+
+    /// `D-066`: what [`Hand::note_line_down_recently`] last said -- carried into
+    /// the hand that re-opens this one.
+    pub fn line_down_recently(&self) -> bool {
+        self.line_down_recently
     }
 
     pub fn note_flooders(&mut self, seats: &[SeatIdx]) {
@@ -16858,6 +16928,74 @@ mod tests {
             let _ = zero.on_event(c, &key(10), t2 + 1_500);
         }
         assert!(zero.aborted().is_none() && zero.took_part(0), "a seat named that is here keeps its table");
+
+        // Seat 1's own line was down within the five minutes: it takes the
+        // certificate -- it may really have been gone -- and is out, to come
+        // back by D-028's return.
+        let (mut one, _) = Hand::open(opening_n(5, 1), &key(11), NOW, 30_000).unwrap();
+        one.note_line_down_recently(true);
+        for c in copies.iter().flatten() {
+            let _ = one.on_event(c, &key(11), t2 + 1_500);
+        }
+        assert!(one.aborted().is_some(), "a seat named whose line was down takes it");
+        assert!(!one.took_part(1), "and is out of the next hand, as the table has it");
+    }
+
+    /// `D-065`'s early question: seat 0 never received seat 4's opening, while
+    /// the other four opened the hand and moved on -- and seat 0 holds seat 1's
+    /// next stage, which could not exist without seat 4's opening. Five seconds
+    /// in, seat 0 asks by its vote instead of waiting out the stage's thirty;
+    /// seat 1 answers with seat 4's opening, and seat 0's hand moves on. Without
+    /// a later frame held, the stage's own deadline stands.
+    #[test]
+    fn a_vote_asks_early_once_another_seat_has_moved_past_the_frame() {
+        let keys: Vec<SigningKey> = (0..5u8).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..5u8 {
+            let (h, from) = Hand::open(opening_n(5, seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        // Seats 1 to 4 hear everybody and move on; seat 0 never hears seat 4.
+        let mut later: Vec<Vec<u8>> = Vec::new();
+        for i in 1..5 {
+            for j in 0..5 {
+                if i != j {
+                    later.extend(bytes_of_sends(deliver(&mut hands[i], &inits[j], &keys[i])));
+                }
+            }
+        }
+        for j in 1..4 {
+            let _ = deliver(&mut hands[0], &inits[j], &keys[0]);
+        }
+        assert_eq!(hands[0].waiting_for(), vec![4]);
+        assert!(!later.is_empty(), "the four moved to the next stage");
+        let t = NOW + 6_000;
+        assert!(
+            hands[0].vote_on_timeouts(&keys[0], t, 0).unwrap().is_empty(),
+            "six seconds in with nothing later held: the stage's own deadline"
+        );
+        // Seat 1's next stage reaches seat 0 and is held.
+        for b in later.iter().filter(|b| chained::sender_of(b, FRAME_CAP) == Some(keys[1].verifying_key().to_bytes())) {
+            if let Err(Failed::NotYet) = hands[0].on_event(b, &keys[0], t) {
+                let _ = hands[0].hold(b.clone());
+            }
+        }
+        assert!(
+            bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], NOW + 4_000, 0).unwrap()).is_empty(),
+            "not before five seconds"
+        );
+        let asked = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], t, 0).unwrap());
+        assert_eq!(asked.len(), 1, "seat 0 asks about seat 4 six seconds in");
+        let ask = hands[1].vote_asks(&asked[0]).expect("a vote asks");
+        assert_eq!((ask.voter, ask.seat, ask.silent), (0, 4, false));
+        let answer = hands[1].frames_at(ask.sequence, Some(ask.seat));
+        assert_eq!(answer.len(), 1, "seat 1 holds seat 4's opening");
+        let _ = hands[0].on_event(&answer[0], &keys[0], t + 100);
+        let _ = hands[0].replay_early(&keys[0], t + 100);
+        assert_ne!(hands[0].waiting_for(), vec![4], "seat 0 has the opening and its hand moves on");
+        assert!(hands[0].slot().sequence >= 1, "past stage 0");
     }
 
     /// `D-065`: one voter's word that another is silent seals nothing while

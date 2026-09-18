@@ -628,6 +628,14 @@ pub const PATIENCE_CUT_MS: u64 = 10_000;
 /// the table's thirty-second step [`WAIT_FROM_MS`] stops them after two.
 pub const MAX_PATIENCE_CUTS: u8 = 3;
 
+/// `D-065`'s early question: how long a stage waits on a seat's event before
+/// this client asks for it by its vote, when it already holds a later stage's
+/// event from another seat -- proof that the event exists and reached that seat,
+/// so the vote can complete no certificate and is a question and nothing else.
+/// Five seconds: well past the carrier's own repair of a gap (a round trip of
+/// 36 to 326 ms, `S1-BK`), and a sixth of the stage's thirty.
+pub const QUESTION_AFTER_MS: u64 = 5_000;
+
 /// `D-066`, the owner's choice (2026-09-18): how long a seat must have been out
 /// of the table's group, or silent there, by a voter's own reading before that
 /// voter names it with `CAUSE_LONG_GONE` -- a vote that lets two voters certify

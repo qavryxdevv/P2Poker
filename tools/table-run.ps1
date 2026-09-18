@@ -297,6 +297,22 @@ param(
     # certificate about anybody else. Node numbers, comma-separated. Needs a
     # binary built with `--features fault-harness`; the node's log says so.
     [string]$NoVoteNodes = '',
+    # `-NoAnswerNodes <list>` (D-065 off, for a contrast run): those nodes answer no
+    # vote with the frame it asks for. Node numbers, comma-separated, or `all`.
+    [string]$NoAnswerNodes = '',
+    # `-DeafToNode <n> -DeafToSeat <seat> -DeafToAt <s> -DeafToFor <s>` (D-065's
+    # bed): node n hears nothing the member at table seat <seat> delivers itself
+    # for that window -- counted from the process's start -- and everything the
+    # other members say again. The member is learnt from the first frame that seat
+    # signs before the window. Needs `--features fault-harness`; the log counts
+    # the frames not heard.
+    [ValidateRange(0, 32)][int]$DeafToNode = 1,
+    [ValidateRange(0, 9)][int]$DeafToSeat = 3,
+    [ValidateRange(0, 3600)][int]$DeafToAt = 0,
+    [ValidateRange(0, 3600)][int]$DeafToFor = 0,
+    # `-OfflineNodes <list>`: `-OfflineAt`'s outage for several nodes at once (the
+    # far end of a table losing its line together, D-066) instead of `-OfflineNode`.
+    [string]$OfflineNodes = '',
     [ValidateRange(0, 3600)][int]$DropAt = 0,
     # `-DropOnTurn`: the dropper stops at its first own turn at or after `-DropAt`
     # rather than at the second itself, so the table plays past the death by a
@@ -346,6 +362,9 @@ $droppers = @("$DropNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEac
 $stayList = @("$StayNodes" -split '[,\s]+' | Where-Object { $_ -ne '' })
 # Not `$noVoteNodes`, for the same reason.
 $noVoteList = @("$NoVoteNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+# Not `$noAnswerNodes` nor `$offlineNodes`: the same trap twice.
+$noAnswerList = @("$NoAnswerNodes" -split '[,\s]+' | Where-Object { $_ -ne '' })
+$offList = @("$OfflineNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 # Not `$hostSeats`: PowerShell variable names are case-insensitive and that
 # would BE the parameter.
 $founderSeats = if ($HostSeats -gt 0) { $HostSeats } else { $Seats }
@@ -501,7 +520,9 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
 
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
-    $offAt = if ($OfflineAt -gt 0 -and $i -eq $OfflineNode) { $OfflineAt } else { 0 }
+    $offAt = if ($OfflineAt -gt 0 -and (($offList.Count -eq 0 -and $i -eq $OfflineNode) -or ($offList -contains $i))) { $OfflineAt } else { 0 }
+    $noAnswerForNode = ($noAnswerList -contains 'all') -or ($noAnswerList -contains "$i")
+    $deafToForNode = if ($DeafToFor -gt 0 -and $i -eq $DeafToNode) { "$DeafToSeat,$DeafToAt,$DeafToFor" } else { '' }
     $afkForNode = if ($AfkAt -gt 0 -and $i -eq $AfkNode) { $AfkAt } else { 0 }
     $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
     # `D-051`. Not `$floodNodes`: a local of that name IS the parameter.
@@ -526,10 +547,17 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # P2P_POKER_STAYS, every mute was on-turn, every stranger flooded and every
     # return sat out (found by -NoVote reaching all five nodes, S1-AQ,
     # 2026-09-18). In parentheses it is an expression and a bool.
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode) -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode), ([bool]$noAnswerForNode), $deafToForNode -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote, $noAnswer, $deafTo)
         if ($stays) { $env:P2P_POKER_STAYS = '1' }
         if ($noVote) { $env:P2P_POKER_NO_VOTE = '1' }
+        if ($noAnswer) { $env:P2P_POKER_NO_ANSWER = '1' }
+        if ($deafTo) {
+            $deafParts = "$deafTo" -split ','
+            $env:P2P_POKER_DEAF_TO_SEAT = $deafParts[0]
+            $env:P2P_POKER_DEAF_TO_AT = $deafParts[1]
+            $env:P2P_POKER_DEAF_TO_FOR = $deafParts[2]
+        }
         if ($holdMuck) { $env:P2P_POKER_HOLD_MUCK = "$holdMuck" }
         $env:P2P_POKER_FLOOD_RATE = "$floodRate"
         if ($floodAt -gt 0) {
@@ -652,7 +680,16 @@ if ($stayList.Count -gt 0) {
 if ($noVoteList.Count -gt 0) {
     Write-Host "==> n$($noVoteList -join ', n') play(s) every turn and never vote(s): no TIMEOUT_VOTE, no TIMEOUT_CERT (S1-AQ; needs --features fault-harness)"
 }
-if ($OfflineAt -gt 0) {
+if ($noAnswerList.Count -gt 0) {
+    Write-Host "==> $(if ($noAnswerList -contains 'all') { 'every node' } else { 'n' + ($noAnswerList -join ', n') }) answer(s) no vote with the frame it lacks (D-065 off, a contrast run; needs --features fault-harness)"
+}
+if ($DeafToFor -gt 0) {
+    Write-Host "==> n$DeafToNode hears nothing seat $DeafToSeat's member delivers itself from $DeafToAt s for $DeafToFor s, and what the others say again (D-065's bed; needs --features fault-harness)"
+}
+if ($offList.Count -gt 0 -and $OfflineAt -gt 0) {
+    Write-Host "==> n$($offList -join ', n') lose their INTERNET together at $OfflineAt s for $OfflineFor s, at the socket (D-066)"
+}
+if ($OfflineAt -gt 0 -and $offList.Count -eq 0) {
     Write-Host "==> n$OfflineNode's INTERNET goes away at $OfflineAt s for $OfflineFor s, at the socket; the process lives on$(if ($OfflineEvery -gt 0) { " -- and again every $OfflineEvery s" })"
     Write-Host "    (needs a binary built with --features fault-harness; expect the library's 58 s timeout at every member)"
 }
