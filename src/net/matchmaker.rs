@@ -40,11 +40,16 @@
 //!    with the seats (`D-063` point 4: 0.06 a second at three seats, 1.3 at
 //!    ten), so the bigger formats expand more slowly and stop lower.
 //! 3. **Capacity adaptation.** A table this client founded for the search
-//!    advertises `min_players_to_start = 2` and starts at [`capacity_now`]:
-//!    every `CAPACITY_STEP` it has stood unfilled the founder needs one seat
-//!    fewer, down to two. The advert never changes -- a founder that re-signed
-//!    its parameters would make its own table unjoinable (`§7.2` rule 7) --
-//!    only the founder's own rule for when it says it is ready does.
+//!    advertises `min_players_to_start = 2` and starts at its capacity:
+//!    every step it has stood unfilled the founder needs one seat fewer, down
+//!    to two. The advert never changes -- a founder that re-signed its
+//!    parameters would make its own table unjoinable (`§7.2` rule 7) -- only
+//!    the founder's own rule for when it says it is ready does. `S1-IC`: the
+//!    clock is **integrated** -- each tick adds the time since the last at the
+//!    step the queue names now ([`capacity_step`]) -- and **stands while this
+//!    client's own line is down**: a deaf founder reads *nobody waits*, and
+//!    nothing can start meanwhile anyway, so the hold is the outage and no
+//!    longer.
 //! 4. **Arming, and why a joiner does not ratify everything it holds.** The
 //!    founder ratifies last (`S1-HE`), so a table cannot start without every
 //!    seat's ratification -- and a seat's ratification is therefore its
@@ -52,12 +57,25 @@
 //!    wanted ratifies at most one of them at a time: the one closest to
 //!    starting, which it keeps for `COMMIT_TTL` before it may prefer another.
 //!    Two tables cannot start under it in the same second, so it never has to
-//!    walk out of a game that has begun.
-//! 5. **Seats flow to the lower key.** Two searchers who both found a table
-//!    would each join the other's, and two half tables would start together.
-//!    So a client that founded its own table joins another search table only
-//!    when that founder's key is lower than its own: every seat flows one way
-//!    and the lowest key's table fills first. And a client founds only after
+//!    walk out of a game that has begun. `S1-IB` (the owner, 2026-09-18: *the
+//!    search seats as many players together as it can*): a search sits at
+//!    **one** search table of more than two seats for each game it wants --
+//!    a player held at two forming tables is counted at both and fills
+//!    neither -- moves its seat only to a table where strictly more players
+//!    sit, and among big tables consents only to the one it prefers: the most
+//!    players, then the founder that can be reached, then the lower founder's
+//!    key. No hold here outlasts `OVERDUE_GRACE`: a table that should have
+//!    started by this client's own reading keeps its seat and its consent,
+//!    and the search sits down and consents elsewhere as well.
+//! 5. **Seats flow to where more players sit** (`S1-ID`), **and between
+//!    equals to the lower key.** Two searchers who both found a table would
+//!    each join the other's, and two half tables would start together. So a
+//!    client that founded its own table joins another search table only where
+//!    more players sit than at its own, or as many and that founder's key is
+//!    lower: every seat flows one way and the fullest table fills first. It
+//!    was the key alone, whatever the players: a founder back from an outage
+//!    kept a table of one beside a table of two whose founder's key was
+//!    higher, and took one of the two into a heads-up game. And a client founds only after
 //!    `found_after`, which grows with the number of searchers of its format
 //!    whose key is lower -- the lowest founds first, the rest see its table
 //!    inside a lobby round and join it instead. `S1-HT`: a founder reached
@@ -256,6 +274,16 @@ pub const AVOID_MAX: Duration = Duration::from_secs(600);
 /// three times, its two members unable to hear each other in its group, and
 /// the search stood at it for eleven minutes.
 pub const GIVE_BACKS_MAX: u32 = 3;
+/// `S1-IB`: how long a search table that should have started -- by this
+/// client's own reading of its founder's clock -- stays the one big table the
+/// search sits at. Past it the table keeps its seat and its consent, and the
+/// search may sit down and consent elsewhere as well: a founder that never
+/// starts holds nobody (the owner's standing word: no phase may freeze).
+pub const OVERDUE_GRACE: Duration = Duration::from_secs(120);
+/// `S1-IB`: a search that moved its seat to a fuller table does not move again
+/// within this long: adverts are up to a lobby round old, and two seats that
+/// each read the other's table as the fuller one would otherwise swap for ever.
+pub const MOVE_COOLDOWN: Duration = Duration::from_secs(60);
 /// A search that found nothing in this long ends, and says so: a client
 /// forgotten with a search on would otherwise hold seats at other people's
 /// tables for the night.
@@ -773,7 +801,10 @@ pub fn capacity_step(waiting: Option<u32>, missing: u8) -> Duration {
 }
 
 /// The seats a search table's founder needs to start after standing `age`
-/// unfilled: one fewer every `step`, never under two.
+/// unfilled at one unchanging `step`: one fewer every step, never under two.
+/// The arithmetic of one step, and what the tests measure the founder's clock
+/// against; the clock itself is integrated over a step that changes with the
+/// queue, and stands while the founder is deaf (`S1-IC`, `Reservation::advance`).
 pub fn capacity_now(seats: u8, age: Duration, step: Duration) -> u8 {
     let steps = (age.as_secs() / step.as_secs().max(1)).min(u64::from(u8::MAX)) as u8;
     seats.saturating_sub(steps).max(2)
@@ -869,9 +900,6 @@ struct Reservation {
     seats: u8,
     /// A table founded for a search, whose founder starts at capacity.
     search_table: bool,
-    /// When the table began, as far as this client knows: the founding, or
-    /// the first sight of the advert.
-    began: Instant,
     set: bool,
     /// Since when its ratification is allowed.
     armed: Option<Instant>,
@@ -889,6 +917,21 @@ struct Reservation {
     yielding: bool,
     /// `S1-HV`: what the table waits for, from the node.
     note: Option<String>,
+    /// `S1-IC`: the founder's clock, **integrated** -- the steps it has come
+    /// down so far, as of `progress_at`, and the steps a second it takes now
+    /// (`rate`). Each tick adds the time since the last at the step the queue
+    /// names *now*; the clock stands while this client's own line is down. It
+    /// used to be `age / step-of-this-moment`, floored by every reading: a
+    /// founder whose line dropped read an empty queue, took the fast step for
+    /// the whole of its outage, and one reading of a smaller queue brought a
+    /// table of three down to two for good (the owner's evening, 2026-09-18).
+    progress: f64,
+    progress_at: Instant,
+    rate: f64,
+    /// `S1-IB`: since when this table could have started, by this client's
+    /// reading of its founder's clock -- for `OVERDUE_GRACE`.
+    ready_since: Option<Instant>,
+    overdue_said: bool,
 }
 
 impl Reservation {
@@ -900,12 +943,47 @@ impl Reservation {
         capacity_step(waiting.map(|w| w.saturating_sub(here)), self.seats.saturating_sub(self.players))
     }
 
-    fn capacity(&self, now: Instant, waiting: Option<u32>) -> u8 {
+    /// `S1-IC`: take the founder's clock forward to `now` at the step the
+    /// queue names now. With this client's own line down the clock stands:
+    /// a deaf founder reads *nobody waits*, and nothing can start meanwhile
+    /// anyway -- the hold is as long as the outage and no longer.
+    fn advance(&mut self, now: Instant, waiting: Option<u32>, line_down: bool) {
+        let dt = now.saturating_duration_since(self.progress_at).as_secs_f64();
+        let rate = if !self.search_table || line_down {
+            0.0
+        } else {
+            1.0 / self.step(waiting).as_secs_f64().max(1.0)
+        };
+        self.progress += rate * dt;
+        self.progress_at = now;
+        self.rate = rate;
+    }
+
+    /// The steps the founder's clock has taken by `now`.
+    fn steps_at(&self, now: Instant) -> f64 {
+        self.progress + self.rate * now.saturating_duration_since(self.progress_at).as_secs_f64()
+    }
+
+    fn capacity(&self, now: Instant, _waiting: Option<u32>) -> u8 {
         if self.search_table {
-            capacity_now(self.seats, now.saturating_duration_since(self.began), self.step(waiting)).min(self.cap_floor)
+            let steps = self.steps_at(now).floor().clamp(0.0, 255.0) as u8;
+            self.seats.saturating_sub(steps).max(2).min(self.cap_floor)
         } else {
             self.seats
         }
+    }
+
+    /// `S1-IB`: a search table of more than two seats that is not a game yet
+    /// -- one whose founder times the set, and where a seat is a player kept
+    /// from every other forming table.
+    fn big(&self) -> bool {
+        self.search_table && self.seats > 2 && !self.set
+    }
+
+    /// `S1-IB`: the table should have started long ago by this client's
+    /// reading, and no longer holds the search to itself.
+    fn overdue(&self, now: Instant) -> bool {
+        !self.mine && self.ready_since.is_some_and(|at| now.saturating_duration_since(at) >= OVERDUE_GRACE)
     }
 
     /// Whether the table could start now, as far as this client can tell: a
@@ -939,15 +1017,16 @@ impl Reservation {
     }
 
     fn eta(&self, now: Instant, per_seat_s: u64, waiting: Option<u32>) -> Option<u64> {
-        eta_s(
-            self.players,
-            self.seats,
-            self.search_table,
-            now.saturating_duration_since(self.began),
-            self.step(waiting),
-            per_seat_s,
-            self.relayed,
-        )
+        // `S1-IE`: a seat alone at a search table, with a queue that was heard
+        // and is empty, has nobody to wait for -- no estimate, where the window
+        // used to say *~405 s* for ten minutes: nine seats at the default pace.
+        if self.search_table && self.players < 2 && waiting == Some(0) {
+            return None;
+        }
+        // `S1-IC`: the founder's clock as an age at the present step.
+        let step = self.step(waiting);
+        let age = Duration::from_secs_f64((self.steps_at(now) * step.as_secs_f64()).max(0.0));
+        eta_s(self.players, self.seats, self.search_table, age, step, per_seat_s, self.relayed)
     }
 
     fn view(&self, now: Instant, waiting: Option<u32>) -> ReservationView {
@@ -1005,6 +1084,15 @@ struct Search {
     /// The searchers of a compatible format the queue holds, as last read;
     /// `None` while the queue is not heard yet (`S1-HK`).
     waiting: Option<u32>,
+    /// `S1-ID`: this client was reached through a relay only at some moment
+    /// of this search. Its own reading flaps -- AutoNAT says *reachable* and
+    /// *behind NAT* within a second, a reservation is gone for a while after
+    /// an outage -- while every other client goes on seeing it behind a relay;
+    /// the flow between founders needs both ends to read it alike, so for the
+    /// search's length once is enough.
+    was_relayed: bool,
+    /// `S1-IB`: when this search last moved its seat to a fuller table.
+    last_move_at: Option<Instant>,
 }
 
 /// The matchmaker: at most one search at a time, and what it has learned
@@ -1117,6 +1205,8 @@ impl Matchmaker {
             arrivals: Arrivals::default(),
             started: Vec::new(),
             waiting: None,
+            was_relayed: false,
+            last_move_at: None,
         });
         steps.push(Step::Log(format!(
             "search: started ({}, {} game(s) at once{})",
@@ -1426,11 +1516,59 @@ impl Matchmaker {
         s.waiting = queue_known.then(|| queue.count(Some(s.req.format), me));
         let waiting = s.waiting;
 
+        // `S1-IC`: every founder's clock forward to now, at the step the queue
+        // names now, standing while this client's own line is down. `S1-IB`:
+        // and since when a table another client founded could have started.
+        s.was_relayed |= net.relayed;
+        let me_relayed = net.relayed || s.was_relayed;
+        // Deaf is the table carrier's line down, **or no poker client connected
+        // at all**: the queue then reads empty whoever is looking, and nobody
+        // could sit down meanwhile -- a far founder whose relayed connections
+        // had all lapsed came down from six seats to two in two minutes beside
+        // two searchers it could not hear (`search213621-3`).
+        let deaf = net.line_down || net.poker_peers == 0;
+        for r in s.reservations.iter_mut() {
+            r.advance(now, waiting, deaf);
+            if !r.mine && r.big() && r.seated.is_some() && r.players >= r.capacity(now, waiting) {
+                r.ready_since.get_or_insert(now);
+            } else {
+                r.ready_since = None;
+            }
+            if r.overdue(now) && !r.overdue_said {
+                r.overdue_said = true;
+                steps.push(Step::Log(format!(
+                    "search: {} could have started {} s ago by this client's reading and has not; \
+                     its seat is kept, and the search looks at other tables as well",
+                    r.key.map(|k| short(&k)).unwrap_or_default(),
+                    OVERDUE_GRACE.as_secs()
+                )));
+            }
+        }
+
         // 3. Reserve at the tables closest to starting, up to the expansion's limit.
         let looking_at = dqe_limit(s.req.format, elapsed);
-        let founded_here = s.founded_at.is_some();
         let room = usize::from(looking_at).saturating_sub(s.reservations.len());
-        if room > 0 {
+        // `S1-ID`: the players at the table this client founded, if it holds one.
+        let own_players = s.reservations.iter().find(|r| r.mine && !r.set).map(|r| r.players);
+        // `S1-IB`: the big search tables of other founders this search sits at
+        // -- one for each game wanted, so that a player is counted at one
+        // forming table and the fullest one fills. A table overdue by
+        // `OVERDUE_GRACE` no longer counts.
+        let held_big: Vec<([u8; 32], u8, bool)> = s
+            .reservations
+            .iter()
+            .filter(|r| !r.mine && r.big() && !r.overdue(now))
+            .filter_map(|r| r.key.map(|k| (k, r.players, r.founder_relayed)))
+            .collect();
+        let mut big_room = want.saturating_sub(held_big.len());
+        let least_full = held_big.iter().min_by_key(|(k, p, _)| (*p, *k)).copied();
+        let mut may_move = s.last_move_at.is_none_or(|at| now.saturating_duration_since(at) >= MOVE_COOLDOWN);
+        // No seat is asked for while this client's own line is down: it could
+        // not be heard at the table, which would count it among its players
+        // all the same -- a founder asked for a seat elsewhere in the middle of
+        // its own outage, sat there unheard for two minutes and lost the seat
+        // with a strike (`search213621-3`). The asking resumes with the line.
+        if !net.line_down && (room > 0 || (may_move && least_full.is_some())) {
             let mut eligible: Vec<(u64, u8, [u8; 32], &Candidate)> = candidates
                 .iter()
                 .filter(|c| c.tournament && !c.password && c.joinable && c.fresh)
@@ -1438,12 +1576,19 @@ impl Matchmaker {
                 .filter(|c| s.req.format.accepts(c.seats))
                 .filter(|c| !s.reservations.iter().any(|r| r.key == Some(c.key)))
                 .filter(|c| !self.avoided.get(&c.key).is_some_and(|(until, _)| *until > now))
-                // Rule 5: seats flow to the lower key -- and to the founder that
-                // is not reached through a relay only (`S1-HT`).
-                .filter(|c| {
-                    !(founded_here
-                        && is_search_table(&c.name, c.min_players)
-                        && !flows_to(net.relayed, c.relayed, &c.founder, me))
+                // Rule 5, as `S1-ID` left it: a client that founded sits down at
+                // another search table only where **more players** sit than at
+                // its own -- whoever's key is lower -- and between equals at the
+                // one `flows_to` names; never, from a founder that can be
+                // reached, at a table whose founder is behind a relay only
+                // (`S1-HT`: that group is the one two members behind one router
+                // cannot hear each other in).
+                .filter(|c| match own_players {
+                    Some(own) if is_search_table(&c.name, c.min_players) => {
+                        !(c.relayed && !me_relayed)
+                            && (c.players > own || (c.players == own && flows_to(me_relayed, c.relayed, &c.founder, me)))
+                    }
+                    _ => true,
                 })
                 .filter_map(|c| {
                     let age = Duration::from_millis(now_ms.saturating_sub(c.first_seen_ms));
@@ -1461,7 +1606,51 @@ impl Matchmaker {
                 })
                 .collect();
             eligible.sort_by_key(|(eta, missing, key, _)| (*eta, *missing, *key));
-            for (_, _, _, c) in eligible.into_iter().take(room) {
+            let mut taken = 0usize;
+            for (_, _, _, c) in eligible {
+                let search_table = is_search_table(&c.name, c.min_players);
+                // `S1-IB`: a big search table is sat at one for each game wanted.
+                // With that seat held, another is taken only as a **move** -- to
+                // a table where strictly more players sit than at the one left,
+                // so the two never trade places -- once in `MOVE_COOLDOWN`, and
+                // never from a reachable founder's table to a relayed one's.
+                let mut leaving: Option<[u8; 32]> = None;
+                if search_table && c.seats > 2 {
+                    if big_room > 0 && taken < room {
+                        big_room -= 1;
+                    } else {
+                        match least_full {
+                            Some((k, players, founder_relayed))
+                                if may_move && c.players > players && !(c.relayed && !founder_relayed) =>
+                            {
+                                leaving = Some(k);
+                                may_move = false;
+                            }
+                            _ => continue,
+                        }
+                    }
+                } else if taken >= room {
+                    continue;
+                }
+                if let Some(k) = leaving {
+                    s.reservations.retain(|r| r.key != Some(k));
+                    s.last_move_at = Some(now);
+                    steps.push(Step::Log(format!(
+                        "search: moving from {} to {}, where more players sit ({}/{})",
+                        short(&k),
+                        short(&c.key),
+                        c.players,
+                        c.seats
+                    )));
+                    steps.push(Step::Leave { key: k, why: "search: a fuller table is forming elsewhere".to_string() });
+                } else {
+                    taken += 1;
+                }
+                // The founder's clock as first read: the advert's age at the
+                // step the queue names now, integrated from here on (`S1-IC`).
+                let age = Duration::from_millis(now_ms.saturating_sub(c.first_seen_ms));
+                let here = u32::from(c.players.saturating_sub(1));
+                let step = capacity_step(waiting.map(|w| w.saturating_sub(here)), c.seats.saturating_sub(c.players));
                 s.reservations.push(Reservation {
                     key: Some(c.key),
                     name: c.name.clone(),
@@ -1471,8 +1660,7 @@ impl Matchmaker {
                     mine: false,
                     players: c.players,
                     seats: c.seats,
-                    search_table: is_search_table(&c.name, c.min_players),
-                    began: now.checked_sub(Duration::from_millis(now_ms.saturating_sub(c.first_seen_ms))).unwrap_or(now),
+                    search_table,
                     set: false,
                     armed: None,
                     last_players: (c.players, now),
@@ -1482,6 +1670,11 @@ impl Matchmaker {
                     founder_relayed: c.relayed,
                     yielding: false,
                     note: None,
+                    progress: if search_table { age.as_secs_f64() / step.as_secs_f64().max(1.0) } else { 0.0 },
+                    progress_at: now,
+                    rate: 0.0,
+                    ready_since: None,
+                    overdue_said: false,
                 });
                 steps.push(Step::Log(format!(
                     "search: asking for a seat at {} ({}/{}{})",
@@ -1530,16 +1723,22 @@ impl Matchmaker {
                 players: 1,
                 seats,
                 search_table: true,
-                began: now,
                 set: false,
                 armed: None,
                 last_players: (1, now),
                 relayed: false,
                 cap_floor: floor,
                 founder: *me,
-                founder_relayed: net.relayed,
+                founder_relayed: me_relayed,
                 yielding: false,
                 note: None,
+                // `S1-HX` on the integrated clock: a carried capacity is the
+                // steps already taken.
+                progress: f64::from(seats.saturating_sub(floor)),
+                progress_at: now,
+                rate: 0.0,
+                ready_since: None,
+                overdue_said: false,
             });
             s.founded_at = Some(now);
             steps.push(Step::Log(format!(
@@ -1557,26 +1756,55 @@ impl Matchmaker {
             r.cap_floor = r.cap_floor.min(read);
         }
         // Tables whose founder times the set -- this client's own, and search
-        // tables of more than two seats -- are armed whenever they are ready
-        // and a game is wanted: the founder ratifies last, so a seat's early
+        // tables of more than two seats -- are armed when they are ready and a
+        // game is wanted: the founder ratifies last, so a seat's early
         // ratification starts nothing (`S1-HM`).
-        // `S1-HU`: a founder holds its own table while it sits at a bigger
-        // search table it would yield to (`flows_to`): its own table setting
-        // heads-up while three sat at the other was the owner's evening.
+        // `S1-IB`: among the **big** ones, only the `want` this search prefers
+        // -- the most players first, then the founder that can be reached, then
+        // the lower founder's key: an order every client reads the same off the
+        // same tables -- so a seat held at two forming tables consents to one,
+        // and the founder whose clock happens to be older cannot take a player
+        // out of the fuller table. An overdue table keeps its consent besides
+        // (`OVERDUE_GRACE`): whichever of the two starts first then has the
+        // player, as it was before, and nothing waits on a founder that never
+        // starts.
+        let mut ranked: Vec<usize> = (0..s.reservations.len())
+            .filter(|i| {
+                let r = &s.reservations[*i];
+                r.big() && (r.mine || r.seated.is_some()) && !r.overdue(now)
+            })
+            .collect();
+        ranked.sort_by_key(|i| {
+            let r = &s.reservations[*i];
+            (std::cmp::Reverse(r.players), if r.mine { me_relayed } else { r.founder_relayed }, r.founder)
+        });
+        let preferred: Vec<usize> = ranked.into_iter().take(want).collect();
+        // `S1-HU`: a founder holds its own table while it sits at a search
+        // table that goes first: its own table setting heads-up while three sat
+        // at the other was the owner's evening. A big table of its own is held
+        // when it is not among the preferred; a heads-up one while this client
+        // sits where more players are, or as many at a table `flows_to` names.
         let yields: Vec<bool> = s
             .reservations
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
                 r.mine
                     && !r.set
-                    && s.reservations.iter().any(|o| {
-                        !o.mine
-                            && o.search_table
-                            && !o.set
-                            && o.seated.is_some()
-                            && o.players > r.players
-                            && flows_to(net.relayed, o.founder_relayed, &o.founder, me)
-                    })
+                    && if r.big() {
+                        !preferred.contains(&i)
+                    } else {
+                        s.reservations.iter().any(|o| {
+                            !o.mine
+                                && o.search_table
+                                && !o.set
+                                && o.seated.is_some()
+                                && !o.overdue(now)
+                                && (o.players > r.players
+                                    || (o.players == r.players
+                                        && flows_to(me_relayed, o.founder_relayed, &o.founder, me)))
+                        })
+                    }
             })
             .collect();
         for (i, r) in s.reservations.iter_mut().enumerate() {
@@ -1599,6 +1827,7 @@ impl Matchmaker {
                 .iter()
                 .enumerate()
                 .filter(|(i, r)| r.ready(now, waiting) && !r.ratification_is_the_set() && !yields[*i])
+                .filter(|(i, r)| !r.big() || preferred.contains(i) || r.overdue(now))
                 .map(|(i, _)| i)
                 .collect()
         } else {
@@ -1665,7 +1894,11 @@ impl Matchmaker {
             s.last_report = Some(now);
             let phase = if net.line_down || net.poker_peers == 0 {
                 "waiting for the network"
-            } else if s.reservations.iter().any(|r| r.armed.is_some()) {
+            // About to start is a table with the players its founder needs now
+            // -- not any table this client has consented at: a joiner consents
+            // from two seats (`S1-HM`), and the window said *about to start*
+            // for four minutes beside *2 of about 9 needed*.
+            } else if s.reservations.iter().any(|r| r.armed.is_some() && r.players >= r.capacity(now, waiting)) {
                 "a table is about to start"
             } else if s.reservations.iter().any(|r| r.seated.is_some()) {
                 "seats reserved; waiting for players"
@@ -1862,12 +2095,12 @@ mod tests {
         let net = NetReading::default();
         assert!(!net.queue_known(false, Duration::from_secs(30)), "no peer, nothing heard, half a minute: unknown");
         assert!(net.queue_known(true, Duration::ZERO), "one presence heard: known");
-        assert!(NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() }.queue_known(false, Duration::ZERO));
+        assert!(NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() }.queue_known(false, Duration::ZERO));
         assert!(net.queue_known(false, QUEUE_WAIT_MAX), "a minute alone: found anyway");
         // `S1-HN`: the lobby the same way.
         assert!(!net.lobby_known(Duration::from_secs(30)), "no answer, no warm line, half a minute: unknown");
         assert!(NetReading { lobby_answered: true, ..Default::default() }.lobby_known(Duration::ZERO));
-        assert!(NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() }.lobby_known(Duration::ZERO));
+        assert!(NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() }.lobby_known(Duration::ZERO));
         assert!(net.lobby_known(QUEUE_WAIT_MAX), "a minute alone: found anyway");
         // `S1-HP`: the minute's cap is for a client alone; a peer that came on
         // the line this second has not answered yet.
@@ -1960,7 +2193,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let net = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let net = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::HeadsUp, 1), now, NOW_MS);
         let early = mm.tick(now + Duration::from_secs(5), NOW_MS, &[], &[], &net, &Queue::new(), &me);
         assert!(founds(&early).is_empty(), "not before found_after");
@@ -2027,7 +2260,7 @@ mod tests {
 
     #[test]
     fn the_founding_order_is_by_key_and_seats_flow_to_the_lower_one() {
-        let net = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let net = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         assert!(net.found_after(0) < net.found_after(1));
         assert_eq!(net.found_after(9), net.found_after(4), "capped");
         // A client that founded joins another search table only below its key.
@@ -2090,7 +2323,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let alone = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let alone = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
         let t = now + alone.found_after(0);
         assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], &alone, &Queue::new(), &me)), vec![AUTO_SEATS]);
@@ -2121,7 +2354,7 @@ mod tests {
     fn seats_flow_to_the_reachable_founder_and_a_relayed_one_founds_later() {
         let now = Instant::now();
         let me = key(0x50);
-        let warm = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let relayed = NetReading { relayed: true, ..warm };
         assert_eq!(relayed.found_after(0), warm.found_after(0) + Duration::from_secs(30));
         // This client relayed, founded; a reachable founder of a HIGHER key
@@ -2155,7 +2388,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0x50);
-        let warm = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
         let t = now + warm.found_after(0);
         assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], &warm, &Queue::new(), &me)), vec![AUTO_SEATS]);
@@ -2185,7 +2418,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let warm = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
         let cands = vec![search_candidate(1, 10, 2, 0x01, 0)];
         let _ = mm.tick(now, NOW_MS, &cands, &[], &warm, &Queue::new(), &me);
@@ -2216,7 +2449,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let warm = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
         let cands = vec![search_candidate(1, 10, 2, 0x01, 5)];
         let _ = mm.tick(now, NOW_MS, &cands, &[], &warm, &Queue::new(), &me);
@@ -2308,7 +2541,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let alone = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let alone = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
         let t = now + alone.found_after(0);
         assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], &alone, &Queue::new(), &me)), vec![AUTO_SEATS]);
@@ -2367,7 +2600,7 @@ mod tests {
         // On offer: a heads-up table with one seat, and a ten-seat search
         // table with eight; the bigger one is asked for first.
         let mut big = Matchmaker::new();
-        let known = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let known = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = big.start(req(Format::Any, 1), now, NOW_MS);
         let cands = vec![candidate(0x05, 2, 1, 0x05), search_candidate(0x06, 10, 8, 0x06, 0)];
         let steps = big.tick(now, NOW_MS, &cands, &[], &known, &Queue::new(), &me);
@@ -2580,6 +2813,301 @@ mod tests {
         assert_eq!(r.eta_s, Some(0), "at capacity");
         assert!(r.reservations[0].armed);
         assert_eq!(r.phase, "a table is about to start");
+    }
+
+    fn mine_at(slot_no: u8, players: u8) -> SlotReading {
+        SlotReading { founder: true, name: search_table_name(AUTO_SEATS), ..slot(slot_no, key(0x99), players, AUTO_SEATS) }
+    }
+
+    fn search_slot(slot_no: u8, table: u8, players: u8) -> SlotReading {
+        SlotReading { name: search_table_name(10), ..slot(slot_no, key(table), players, 10) }
+    }
+
+    /// `S1-IC`: a founder's clock stands while its own line is down. A founder
+    /// whose internet dropped read an empty queue, took the fast step for the
+    /// whole outage and came back three seats lower to an empty table.
+    #[test]
+    fn a_founders_clock_stands_while_its_own_line_is_down() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0xaa);
+        let up = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let down = NetReading { line_down: true, ..up };
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let t = now + up.found_after(0);
+        assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], &up, &Queue::new(), &me)), vec![AUTO_SEATS]);
+        let mine = mine_at(1, 3);
+        let at = |s: u64| t + Duration::from_secs(s);
+        // A minute on the line with nobody waiting: two seats down.
+        let _ = mm.tick(at(61), NOW_MS, &[], &[mine.clone()], &up, &Queue::new(), &me);
+        assert_eq!(mm.founder_gate(&key(0x99), at(61)).expect("mine").floor, 8);
+        // Two minutes with the line down: it stands at eight, where the wall
+        // clock at the fast step read four.
+        for s in (70..=180).step_by(10) {
+            let _ = mm.tick(at(s), NOW_MS, &[], &[mine.clone()], &down, &Queue::new(), &me);
+        }
+        assert_eq!(mm.founder_gate(&key(0x99), at(180)).expect("mine").floor, 8, "the outage took nothing");
+        assert_eq!(capacity_now(AUTO_SEATS, Duration::from_secs(180), STEP_FAST), 4, "what it used to read");
+        // The line back: it goes on from eight.
+        let _ = mm.tick(at(181), NOW_MS, &[], &[mine.clone()], &up, &Queue::new(), &me);
+        let _ = mm.tick(at(242), NOW_MS, &[], &[mine.clone()], &up, &Queue::new(), &me);
+        assert_eq!(mm.founder_gate(&key(0x99), at(242)).expect("mine").floor, 6);
+        // The carrier up and **no poker client connected**: as deaf -- the
+        // queue reads empty whoever is looking (`search213621-3`).
+        let nobody = NetReading { poker_peers: 0, ..up };
+        for s in (250..=360).step_by(10) {
+            let _ = mm.tick(at(s), NOW_MS, &[], &[mine.clone()], &nobody, &Queue::new(), &me);
+        }
+        assert_eq!(mm.founder_gate(&key(0x99), at(360)).expect("mine").floor, 6, "nor did the silence");
+        // Heard again, it still comes down to two: no hold outlasts its cause.
+        let _ = mm.tick(at(361), NOW_MS, &[], &[mine.clone()], &up, &Queue::new(), &me);
+        let _ = mm.tick(at(1_000), NOW_MS, &[], &[mine], &up, &Queue::new(), &me);
+        assert_eq!(mm.founder_gate(&key(0x99), at(1_000)).expect("mine").floor, 2);
+    }
+
+    /// No seat is asked for while this client's own line is down: it could not
+    /// be heard at the table, which would count it among its players all the
+    /// same. The asking resumes with the line (`search213621-3`).
+    #[test]
+    fn no_seat_is_asked_for_while_this_clients_own_line_is_down() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0xaa);
+        let up = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let down = NetReading { line_down: true, ..up };
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let cands = vec![search_candidate(1, 10, 3, 0x01, 0)];
+        let steps = mm.tick(now, NOW_MS, &cands, &[], &down, &Queue::new(), &me);
+        assert!(joins(&steps).is_empty(), "deaf: no seat asked for");
+        assert!(founds(&steps).is_empty(), "and nothing founded");
+        let steps = mm.tick(now + Duration::from_secs(1), NOW_MS, &cands, &[], &up, &Queue::new(), &me);
+        assert_eq!(joins(&steps), vec![key(1)], "the line back: the asking resumes");
+    }
+
+    /// `S1-IC`: the clock is integrated. One reading of an empty queue -- a
+    /// presence late by a lobby round -- moves it by that one second at the
+    /// fast step; it used to be `age / step-of-this-moment`, kept as a floor,
+    /// which took a table of three to two for good in one tick.
+    #[test]
+    fn one_reading_of_an_empty_queue_does_not_bring_a_table_down_for_good() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0xaa);
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let t = now + warm.found_after(0);
+        assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], &warm, &Queue::new(), &me)), vec![AUTO_SEATS]);
+        let mine = mine_at(1, 2);
+        let mut q = Queue::new();
+        for n in 1..=8u8 {
+            q.note(Heard { who: key(n), format: Some(Format::Any), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
+        }
+        let at = |s: u64| t + Duration::from_secs(s);
+        let _ = mm.tick(at(1), NOW_MS, &[], &[mine.clone()], &warm, &q, &me);
+        // Five minutes with eight waiting: the slow end of the step, one seat.
+        let _ = mm.tick(at(300), NOW_MS, &[], &[mine.clone()], &warm, &q, &me);
+        assert_eq!(mm.founder_gate(&key(0x99), at(300)).expect("mine").floor, 9);
+        // One tick reads the queue empty.
+        let _ = mm.tick(at(301), NOW_MS, &[], &[mine.clone()], &warm, &Queue::new(), &me);
+        assert_eq!(mm.founder_gate(&key(0x99), at(301)).expect("mine").floor, 9, "one second at the fast step");
+        assert_eq!(capacity_now(AUTO_SEATS, Duration::from_secs(301), STEP_FAST), 2, "what it used to read, for good");
+        let _ = mm.tick(at(302), NOW_MS, &[], &[mine], &warm, &q, &me);
+        assert_eq!(mm.founder_gate(&key(0x99), at(302)).expect("mine").floor, 9);
+    }
+
+    /// `S1-IB`: a search sits at **one** big search table for each game it
+    /// wants, so a player is counted at one forming table; it moves only to a
+    /// table where strictly more players sit, and not twice in a minute.
+    #[test]
+    fn a_search_sits_at_one_big_table_and_moves_only_to_a_fuller_one() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0xaa);
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let at = |s: u64| now + Duration::from_secs(s);
+        let a = search_candidate(1, 10, 3, 0x01, 0);
+        let b = search_candidate(2, 10, 2, 0x02, 0);
+        let steps = mm.tick(now, NOW_MS, &[a.clone(), b.clone()], &[], &warm, &Queue::new(), &me);
+        assert_eq!(joins(&steps), vec![key(1)], "one seat, at the table closest to starting");
+        let seated = search_slot(1, 1, 4);
+        let steps = mm.tick(at(1), NOW_MS, &[a.clone(), b.clone()], &[seated.clone()], &warm, &Queue::new(), &me);
+        assert!(joins(&steps).is_empty(), "the other table is not sat at as well");
+        // As many players elsewhere: no move. More: the seat moves.
+        let c = search_candidate(3, 10, 4, 0x03, 0);
+        let steps = mm.tick(at(2), NOW_MS, &[a.clone(), c], &[seated.clone()], &warm, &Queue::new(), &me);
+        assert!(joins(&steps).is_empty() && leaves(&steps).is_empty(), "equal is no reason to move");
+        let d = search_candidate(4, 10, 5, 0x04, 0);
+        let steps = mm.tick(at(3), NOW_MS, &[a.clone(), d.clone()], &[seated], &warm, &Queue::new(), &me);
+        assert_eq!((leaves(&steps), joins(&steps)), (vec![key(1)], vec![key(4)]), "to the fuller table");
+        // A fuller one still, a moment later: not twice within the cooldown.
+        let here = search_slot(2, 4, 6);
+        let e = search_candidate(5, 10, 8, 0x05, 0);
+        let steps = mm.tick(at(10), NOW_MS, &[a.clone(), d.clone(), e.clone()], &[here.clone()], &warm, &Queue::new(), &me);
+        assert!(joins(&steps).is_empty(), "adverts are a lobby round old: no second move at once");
+        let later = at(4) + MOVE_COOLDOWN;
+        let steps = mm.tick(later, NOW_MS, &[a, d, e], &[here], &warm, &Queue::new(), &me);
+        assert_eq!((leaves(&steps), joins(&steps)), (vec![key(4)], vec![key(5)]));
+    }
+
+    /// `S1-IB`, the owner's standing word that no phase may freeze: a table
+    /// that could have started `OVERDUE_GRACE` ago by this client's reading
+    /// keeps its seat and its consent and no longer holds the search to
+    /// itself -- a founder that never starts holds nobody.
+    #[test]
+    fn a_table_that_should_have_started_no_longer_holds_the_search_to_itself() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0xaa);
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let at = |s: u64| now + Duration::from_secs(s);
+        let stuck = search_candidate(1, 10, 2, 0x01, 0);
+        let other = search_candidate(2, 10, 2, 0x02, 0);
+        let _ = mm.tick(now, NOW_MS, &[stuck.clone()], &[], &warm, &Queue::new(), &me);
+        let seated = search_slot(1, 1, 3);
+        // Seven fast steps bring a table of three to its start: 210 s.
+        let mut said = false;
+        let mut second_seat_at = None;
+        for s in (1..=400).step_by(5) {
+            let steps = mm.tick(at(s), NOW_MS, &[stuck.clone(), other.clone()], &[seated.clone()], &warm, &Queue::new(), &me);
+            said |= steps.iter().any(|x| matches!(x, Step::Log(l) if l.contains("could have started")));
+            if joins(&steps).contains(&key(2)) {
+                second_seat_at = Some(s);
+                break;
+            }
+        }
+        let second = second_seat_at.expect("the search sat down elsewhere in the end");
+        assert!(said, "and said why");
+        assert!(second >= 210 + OVERDUE_GRACE.as_secs(), "not before the grace was out: {second}");
+        assert!(second <= 215 + OVERDUE_GRACE.as_secs() + 10, "and right after it: {second}");
+        // Both seats held now, both consented to: whichever starts first.
+        let there = search_slot(2, 2, 3);
+        let _ = mm.tick(at(second + 1), NOW_MS, &[stuck, other], &[seated, there], &warm, &Queue::new(), &me);
+        assert!(mm.may_ratify(&key(1)) && mm.may_ratify(&key(2)));
+    }
+
+    /// `S1-ID`: a client that founded goes where **more players** sit,
+    /// whoever's key is lower; between equals `flows_to` decides as before;
+    /// and a founder that can be reached never goes to a relayed one's table
+    /// (`S1-HT`).
+    #[test]
+    fn a_founder_goes_to_the_fuller_table_whatever_the_keys() {
+        let now = Instant::now();
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let founded = |me: [u8; 32], net: &NetReading| {
+            let mut mm = Matchmaker::new();
+            let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+            let t = now + net.found_after(0);
+            assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], net, &Queue::new(), &me)), vec![AUTO_SEATS]);
+            let _ = mm.tick(t + Duration::from_secs(1), NOW_MS, &[], &[mine_at(1, 1)], net, &Queue::new(), &me);
+            (mm, t + Duration::from_secs(2))
+        };
+        // The lowest key of all, alone at its table; two sit at a higher key's.
+        let me = key(0x10);
+        let (mut mm, t) = founded(me, &warm);
+        let fuller = vec![search_candidate(0x90, 10, 2, 0x90, 5)];
+        let steps = mm.tick(t, NOW_MS, &fuller, &[mine_at(1, 1)], &warm, &Queue::new(), &me);
+        assert_eq!(joins(&steps), vec![key(0x90)], "the fuller table, though its founder's key is higher");
+        // One at each: the lower key's table is where both meet.
+        let (mut mm, t) = founded(me, &warm);
+        let equal_higher = vec![search_candidate(0x90, 10, 1, 0x90, 5)];
+        assert!(joins(&mm.tick(t, NOW_MS, &equal_higher, &[mine_at(1, 1)], &warm, &Queue::new(), &me)).is_empty());
+        let (mut mm, t) = founded(key(0xa0), &warm);
+        let equal_lower = vec![search_candidate(0x90, 10, 1, 0x90, 5)];
+        let steps = mm.tick(t, NOW_MS, &equal_lower, &[mine_at(1, 1)], &warm, &Queue::new(), &key(0xa0));
+        assert_eq!(joins(&steps), vec![key(0x90)]);
+        // Fewer there than here: never, whatever the keys.
+        let (mut mm, t) = founded(key(0xa0), &warm);
+        let emptier = vec![search_candidate(0x20, 10, 1, 0x20, 5)];
+        assert!(joins(&mm.tick(t, NOW_MS, &emptier, &[mine_at(1, 2)], &warm, &Queue::new(), &key(0xa0))).is_empty());
+        // A relayed founder's table, fuller: not from a founder that can be reached.
+        let (mut mm, t) = founded(me, &warm);
+        let relayed_fuller = vec![Candidate { relayed: true, ..search_candidate(0x90, 10, 3, 0x90, 5) }];
+        assert!(joins(&mm.tick(t, NOW_MS, &relayed_fuller, &[mine_at(1, 1)], &warm, &Queue::new(), &me)).is_empty());
+    }
+
+    /// `S1-ID`: a client reads itself behind a relay for the search's length
+    /// once it has been: its own reading flaps while the others go on seeing
+    /// it relayed, and the flow between founders needs both ends alike.
+    #[test]
+    fn a_client_that_was_relayed_reads_itself_so_for_the_whole_search() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0x10);
+        let relayed = NetReading { relayed: true, poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let flapped = NetReading { relayed: false, ..relayed };
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let t = now + relayed.found_after(0);
+        assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], &relayed, &Queue::new(), &me)), vec![AUTO_SEATS]);
+        let _ = mm.tick(t + Duration::from_secs(1), NOW_MS, &[], &[mine_at(1, 1)], &relayed, &Queue::new(), &me);
+        // Its reading says *reachable* now; a reachable founder of a HIGHER
+        // key has as many players: the seats still flow there.
+        let cands = vec![search_candidate(0x90, 10, 1, 0x90, 5)];
+        let steps = mm.tick(t + Duration::from_secs(2), NOW_MS, &cands, &[mine_at(1, 1)], &flapped, &Queue::new(), &me);
+        assert_eq!(joins(&steps), vec![key(0x90)]);
+    }
+
+    /// The owner's evening of 2026-09-18, from both sides. Three *any*
+    /// searchers; the far founder's line dropped and came back. **The test
+    /// client**, seated with the main one at the main client's table, does not
+    /// sit down at the returned founder's table as well; **the far founder**,
+    /// alone at its table, goes to the table of two. Three players, one table.
+    #[test]
+    fn a_founder_back_from_an_outage_joins_the_table_its_seats_went_to() {
+        let now = Instant::now();
+        let warm = NetReading { poker_peers: 1, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let main_table = search_candidate(0x2b, 10, 2, 0x2b, 30);
+        let far_table = Candidate { relayed: true, ..search_candidate(0xe5, 10, 1, 0xe5, 200) };
+        // The test client.
+        let mut b = Matchmaker::new();
+        let me_b = key(0xbb);
+        let _ = b.start(req(Format::Any, 1), now, NOW_MS);
+        let _ = b.tick(now, NOW_MS, &[main_table.clone()], &[], &warm, &Queue::new(), &me_b);
+        let seated = search_slot(3, 0x2b, 2);
+        let steps = b.tick(now + Duration::from_secs(30), NOW_MS, &[main_table.clone(), far_table], &[seated], &warm, &Queue::new(), &me_b);
+        assert!(joins(&steps).is_empty(), "one forming table holds this player, not two");
+        // The far founder: relayed when it founded, its reading unsure since.
+        let mut c = Matchmaker::new();
+        let me_c = key(0xe5);
+        let relayed = NetReading { relayed: true, ..warm };
+        let _ = c.start(req(Format::Any, 1), now, NOW_MS);
+        let t = now + relayed.found_after(0);
+        assert_eq!(founds(&c.tick(t, NOW_MS, &[], &[], &relayed, &Queue::new(), &me_c)), vec![AUTO_SEATS]);
+        let own = SlotReading { founder: true, name: search_table_name(AUTO_SEATS), ..slot(2, key(0xe5), 1, AUTO_SEATS) };
+        let _ = c.tick(t + Duration::from_secs(1), NOW_MS, &[], &[own.clone()], &relayed, &Queue::new(), &me_c);
+        let steps = c.tick(t + Duration::from_secs(2), NOW_MS, &[main_table], &[own.clone()], &warm, &Queue::new(), &me_c);
+        assert_eq!(joins(&steps), vec![key(0x2b)], "to the table of two");
+        // Seated there, three now: its own table is held, the other consented to.
+        let there = search_slot(4, 0x2b, 3);
+        let late = t + Duration::from_secs(600);
+        let _ = c.tick(late, NOW_MS, &[], &[own, there], &warm, &Queue::new(), &me_c);
+        assert!(!c.founder_gate(&key(0xe5), late).expect("its own").armed, "its own table of one starts nothing");
+        assert!(c.may_ratify(&key(0x2b)));
+    }
+
+    /// `S1-IE`: a seat alone at a search table, with a queue heard and empty,
+    /// has nobody to wait for: no estimate. The window said *~405 s* for ten
+    /// minutes -- nine seats at the default pace.
+    #[test]
+    fn a_seat_alone_with_an_empty_queue_has_no_estimate() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0xaa);
+        let warm = NetReading { poker_peers: 2, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let t = now + warm.found_after(0);
+        assert_eq!(founds(&mm.tick(t, NOW_MS, &[], &[], &warm, &Queue::new(), &me)), vec![AUTO_SEATS]);
+        let steps = mm.tick(t + Duration::from_secs(5), NOW_MS, &[], &[mine_at(1, 1)], &warm, &Queue::new(), &me);
+        let r = steps.iter().find_map(|s| match s { Step::Report(r) => Some(r.clone()), _ => None }).expect("a report");
+        assert!(r.queue_known && r.queue == 0);
+        assert_eq!(r.eta_s, None, "nobody is coming that this client knows of");
+        // Somebody in the queue: an estimate again.
+        let mut q = Queue::new();
+        q.note(Heard { who: key(1), format: Some(Format::Any), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
+        let steps = mm.tick(t + Duration::from_secs(7), NOW_MS, &[], &[mine_at(1, 1)], &warm, &q, &me);
+        let r = steps.iter().find_map(|s| match s { Step::Report(r) => Some(r.clone()), _ => None }).expect("a report");
+        assert!(r.eta_s.is_some());
     }
 
     #[test]

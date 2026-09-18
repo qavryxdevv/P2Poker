@@ -54,6 +54,15 @@ param(
     [ValidateRange(0, 9)][int]$Crashes = 0,
     [ValidateRange(0, 9)][int]$Cancels = 0,
     [ValidateRange(60, 3000)][int]$ChurnUntil = 200,
+    # An explicit plan in place of the draw (S1-IB..ID: the owner's evening of a founder's
+    # outage needs the far founder first and ITS line cut, for longer than a joiner's
+    # patience): -Arrivals, the second each node starts, one per node; -CutNodes, the
+    # nodes whose line is cut, at -CutAt seconds of the run, for -CutFor seconds. Left out,
+    # everything is drawn from -Seed as before and a seed's plan is what it was.
+    [string]$Arrivals = '',
+    [string]$CutNodes = '',
+    [ValidateRange(0, 3000)][int]$CutAt = 0,
+    [ValidateRange(0, 600)][int]$CutFor = 0,
     # Every seat's stack at a table founded here: 300 against blinds of 50/100
     # ends a tournament in a few hands.
     [ValidateRange(0, 100000)][int]$StartStack = 300,
@@ -114,6 +123,11 @@ function Tables-Of([int]$n) { if ($tableList.Count -eq 1) { [int]$tableList[0] }
 foreach ($f in $formatList) { if ($f -notin @('hu', '6', '10', 'auto')) { throw "-Formats '$f': hu, 6, 10 or auto" } }
 $farList = @("$FarNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 foreach ($f in $farList) { if ($nodeList -notcontains $f) { throw "-FarNodes ${f}: not a node of $Nodes" } }
+$arrivalList = @("$Arrivals" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+if ($arrivalList.Count -gt 0 -and $arrivalList.Count -ne $Nodes) { throw "-Arrivals: one second for each of the $Nodes nodes" }
+$cutList = @("$CutNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+foreach ($c in $cutList) { if ($nodeList -notcontains $c) { throw "-CutNodes ${c}: not a node of $Nodes" } }
+if ($cutList.Count -gt 0 -and ($CutAt -le 0 -or $CutFor -le 0)) { throw '-CutNodes needs -CutAt and -CutFor' }
 $shuffled = @($nodeList | Sort-Object { $rng.Next() })
 $far = if ($farList.Count -gt 0) { $farList } else { @($shuffled | Select-Object -First $There) }
 $There = $far.Count
@@ -131,8 +145,14 @@ function Add-Life($node, $life, $start, $stop, $end, $offAt, $offFor, $cancelAt,
         OfflineAt = $offAt; OfflineFor = $offFor; CancelAt = $cancelAt; AgainAt = $againAt; Resume = $resume
     })
 }
+foreach ($c in $cutList) { $roles["$c"] = 'cut' }
 foreach ($n in $nodeList) {
     $a = Draw 3 ([Math]::Max(3, $ArriveOver))
+    if ($arrivalList.Count -gt 0) { $a = $arrivalList[$n] }
+    if ($cutList -contains $n) {
+        Add-Life $n 0 $a $Seconds 'close' ([Math]::Max(1, $CutAt - $a)) $CutFor 0 0 $false
+        continue
+    }
     switch ($roles["$n"]) {
         'cut' {
             $t = Draw ($a + 20) ([Math]::Max($a + 20, $ChurnUntil - 60))

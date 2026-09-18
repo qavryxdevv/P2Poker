@@ -6605,7 +6605,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )
                         };
                         // `D-064`: a Sit & Go the search founds starts at two -- its
-                        // founder's own rule says when (`matchmaker::capacity_now`), and
+                        // founder's own rule says when (`Matchmaker::founder_gate`), and
                         // the advert says so from the first, so every joiner agrees
                         // (`§7.2` rule 7). `TableAd::sng` seals a table that starts full,
                         // which is what a player's own Sit & Go is.

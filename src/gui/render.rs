@@ -778,7 +778,7 @@ pub fn search_modal(ctx: &egui::Context, s: &super::lobby::SearchView) -> Option
 
 /// What the search's window says, above its one button.
 fn search_body(ui: &mut egui::Ui, s: &super::lobby::SearchView) {
-    use super::lobby::{clock, closest_table, eta_words, held_words, queue_words, reservation_words};
+    use super::lobby::{clock, closest_table, eta_words, held_words, needed_now, queue_words, reservation_words};
     ui.horizontal(|ui| {
         ui.add(egui::Spinner::new().size(26.0).color(theme::GOLD_ACTION));
         ui.add_space(6.0);
@@ -808,10 +808,12 @@ fn search_body(ui: &mut egui::Ui, s: &super::lobby::SearchView) {
     let r = s.report.as_ref();
     // The seats of the table closest to starting, drawn as they fill: what
     // the player is waiting for, shown as the thing itself rather than as a
-    // bar.
+    // bar. `S1-IE`: the rings are the players its founder needs **now**, so
+    // they go one by one as the founder comes down -- ten rings from the first
+    // second to the last said nothing of that.
     ui.horizontal(|ui| match closest_table(r) {
         Some(x) => {
-            dots(ui, egui::Id::new(("search-dots", s.id)), x.players, x.seats, theme::GOLD_ACTION, 16.0);
+            dots(ui, egui::Id::new(("search-dots", s.id)), x.players, needed_now(x), theme::GOLD_ACTION, 16.0);
             ui.add_space(6.0);
             ui.add(
                 egui::Label::new(
@@ -856,7 +858,7 @@ fn search_body(ui: &mut egui::Ui, s: &super::lobby::SearchView) {
         for (i, x) in r.reservations.iter().enumerate() {
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(8.0);
-                dots(ui, egui::Id::new(("held-dots", s.id, i)), x.players, x.seats, theme::GOLD_EDGE, 10.0);
+                dots(ui, egui::Id::new(("held-dots", s.id, i)), x.players, needed_now(x), theme::GOLD_EDGE, 10.0);
                 ui.label(RichText::new(&x.name).color(theme::TEXT).size(14.0).strong());
                 ui.label(RichText::new(reservation_words(x)).color(theme::TEXT_DIM).size(14.0));
             });
@@ -1665,12 +1667,18 @@ fn badge(ui: &mut egui::Ui, text: &str, colour: Color32) -> egui::Response {
 /// The seats of a table, drawn: a gold disc per player, a ring per empty
 /// seat. A seat taken since the last frame fills over a third of a second
 /// (`D-067`: a table filling is a thing to watch, and it is the truth).
-fn seat_dots(ui: &mut egui::Ui, row: &TableRow) {
+fn seat_dots(ui: &mut egui::Ui, row: &TableRow, needed: Option<u8>) {
     let colour = if row.state.joinable() { theme::GOLD_ACTION } else { theme::TEXT_DIM };
-    dots(ui, egui::Id::new(("seats", row.key)), row.seated, row.seats, colour, 10.0)
-        .on_hover_text(format!("{} of {} seats taken", row.seated, row.seats));
+    // `S1-IE`: at a search table this client holds a seat at, the rings are
+    // the players its founder needs now -- from the search's own report -- and
+    // the table's size is in the words beside them.
+    let total = needed.unwrap_or(row.seats).max(row.seated);
+    dots(ui, egui::Id::new(("seats", row.key)), row.seated, total, colour, 10.0).on_hover_text(match needed {
+        Some(n) => format!("{} of the {n} players needed to start now; a table of {}", row.seated, row.seats),
+        None => format!("{} of {} seats taken", row.seated, row.seats),
+    });
     ui.label(
-        RichText::new(format!("{}/{}", row.seated, row.seats))
+        RichText::new(format!("{}/{}", row.seated, total))
             .color(theme::TEXT_DIM)
             .size(13.0),
     );
@@ -1994,16 +2002,22 @@ fn table_rows(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi, rows: &[
                                     badge(ui, word, if row.sit_and_go { theme::GOLD_ACTION } else { theme::OK })
                                         .on_hover_text(tip);
                                     ui.label(RichText::new(shape_words(row.seats)).color(theme::TEXT_DIM).size(14.0));
-                                    seat_dots(ui, row);
+                                    let needed = super::lobby::row_needed(view, &row.key);
+                                    seat_dots(ui, row, needed);
                                     let tone = match row.state {
-                                        TableState::Open if row.seated < row.needed => Tone::Warn,
+                                        TableState::Open if needed.is_some_and(|n| row.seated >= n) => Tone::Ok,
+                                        TableState::Open if needed.is_some() || row.seated < row.needed => Tone::Warn,
                                         TableState::Open => Tone::Ok,
                                         TableState::Full => Tone::Dim,
                                         TableState::ParametersChanged => Tone::Danger,
                                     };
-                                    let status = ui.label(
-                                        RichText::new(status_words(row)).color(tone_colour(tone)).size(14.0),
-                                    );
+                                    let words = match needed {
+                                        Some(n) if row.state.joinable() => {
+                                            super::lobby::status_words_needed(row.seated, n)
+                                        }
+                                        _ => status_words(row),
+                                    };
+                                    let status = ui.label(RichText::new(words).color(tone_colour(tone)).size(14.0));
                                     if let Some(why) = row.state.why_not() {
                                         status.on_hover_text(why);
                                     }
@@ -2297,7 +2311,7 @@ fn table_info(ui: &mut egui::Ui, r: &TableRow, view: &LobbyView, state: &mut Lob
     field(ui, if r.sit_and_go { "Stack" } else { "Buy-in" }, &r.stack, theme::STACK);
     ui.horizontal(|ui| {
         ui.label(RichText::new("Seats").color(theme::TEXT_DIM).size(14.0));
-        seat_dots(ui, r);
+        seat_dots(ui, r, super::lobby::row_needed(view, &r.key));
     });
     field(ui, "Clock", &r.timing, theme::TEXT);
     field(ui, "Host", &r.host, theme::TEXT_DIM);

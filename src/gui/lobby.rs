@@ -798,19 +798,65 @@ pub fn closest_table(
         .max_by_key(|x| (u32::from(x.players) * 1_000 / u32::from(x.capacity), x.players))
 }
 
-/// One held table's line: the seats and when it starts.
+/// `S1-IE`: the seats a held table's drawing shows -- what its founder needs
+/// **now** to start, never fewer than sit there and never more than the table
+/// has -- so the rings go as the founder comes down. The window drew the
+/// table's ten seats from the first second to the last while the node said
+/// the falling number every second (the owner, 2026-09-18).
+pub fn needed_now(x: &crate::net::matchmaker::ReservationView) -> u8 {
+    x.capacity.max(x.players).min(x.seats.max(x.players)).max(2)
+}
+
+/// One held table's line: how many of the players needed now are there, the
+/// table's size, whose it is. At another client's table the number needed is
+/// this client's reading of that founder's clock, and is said as *about*.
 pub fn reservation_words(x: &crate::net::matchmaker::ReservationView) -> String {
-    let mut s = format!("{} of {} seated", x.players, x.seats);
-    if x.capacity > 0 && x.capacity < x.seats {
-        s.push_str(&format!(" \u{00b7} starts at {}", x.capacity));
-    }
+    let needed = needed_now(x);
+    let mut s = if needed < x.seats {
+        format!(
+            "{} of {}{} needed to start \u{00b7} table of {}",
+            x.players,
+            if x.mine { "" } else { "about " },
+            needed,
+            x.seats
+        )
+    } else {
+        format!("{} of {} seated", x.players, x.seats)
+    };
     if x.mine {
         s.push_str(" \u{00b7} yours");
     }
-    if x.armed {
-        s.push_str(" \u{00b7} ready");
+    // *Starting* is a table with the players it needs now and this client's
+    // consent; consent alone is not said -- a joiner gives it from two seats,
+    // and *ready* beside *2 of about 9 needed* read as a promise.
+    if x.armed && x.players >= needed {
+        s.push_str(" \u{00b7} starting");
     }
     s
+}
+
+/// `S1-IE`: what a search table this client holds a seat at needs now, for
+/// its row in the list -- from the search's own report. `None` for any other
+/// table: an advert does not carry its founder's clock, and the row then says
+/// the table's seats and nothing about when it starts.
+pub fn row_needed(view: &LobbyView, key: &[u8; 32]) -> Option<u8> {
+    view.search
+        .as_ref()?
+        .report
+        .as_ref()?
+        .reservations
+        .iter()
+        .find(|x| x.key.as_ref() == Some(key) && x.capacity < x.seats)
+        .map(needed_now)
+}
+
+/// The row's sentence for a held search table: the distance to its start in
+/// players, by what its founder needs now.
+pub fn status_words_needed(seated: u8, needed: u8) -> String {
+    match needed.saturating_sub(seated) {
+        0 => "about to start".to_string(),
+        n => format!("waiting for {n} more"),
+    }
 }
 
 /// One line of lobby chat.
@@ -1236,8 +1282,34 @@ mod tests {
         assert!(closest_table(Some(&r)).is_none(), "no seat held, no closest table");
         r.reservations = vec![table("Far", 1, 6, 6, false, false), table("Near", 3, 4, 6, true, true)];
         assert_eq!(closest_table(Some(&r)).map(|x| x.name.as_str()), Some("Near"));
-        assert_eq!(reservation_words(&r.reservations[1]), "3 of 6 seated \u{00b7} starts at 4 \u{00b7} yours \u{00b7} ready");
+        // `S1-IE`: the number said and drawn is what the founder needs now.
+        assert_eq!(
+            reservation_words(&r.reservations[1]),
+            "3 of 4 needed to start \u{00b7} table of 6 \u{00b7} yours"
+        );
+        assert_eq!(needed_now(&r.reservations[1]), 4);
         assert_eq!(reservation_words(&r.reservations[0]), "1 of 6 seated");
+        assert_eq!(needed_now(&r.reservations[0]), 6);
+        let theirs = table("Theirs", 2, 5, 10, false, true);
+        assert_eq!(
+            reservation_words(&theirs),
+            "2 of about 5 needed to start \u{00b7} table of 10",
+            "another founder's clock is this client's reading of it; consent alone is not said"
+        );
+        let over = table("Over", 4, 2, 10, true, true);
+        assert_eq!(needed_now(&over), 4, "never fewer rings than players");
+        assert!(reservation_words(&over).ends_with("yours \u{00b7} starting"), "{}", reservation_words(&over));
+        assert_eq!(status_words_needed(2, 5), "waiting for 3 more");
+        assert_eq!(status_words_needed(3, 3), "about to start");
+        // The row of a held table reads the search's report; any other row nothing.
+        let mut view = LobbyView::default();
+        view.search = Some(SearchView { id: 1, format: "Automatic", games: 1, elapsed_s: 9, report: Some(r.clone()), typical_s: None });
+        assert_eq!(row_needed(&view, &[0u8; 32]), None);
+        let mut held = r.clone();
+        held.reservations[1].key = Some([7u8; 32]);
+        view.search = Some(SearchView { id: 1, format: "Automatic", games: 1, elapsed_s: 9, report: Some(held), typical_s: None });
+        assert_eq!(row_needed(&view, &[7u8; 32]), Some(4));
+        assert_eq!(row_needed(&view, &[8u8; 32]), None, "an advert does not carry its founder's clock");
         assert!(FOUND_TOAST_MS >= 3_000 && FOUND_TOAST_MS <= 6_000, "long enough to read, short enough to not wait for");
     }
 
