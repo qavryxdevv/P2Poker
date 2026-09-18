@@ -195,6 +195,32 @@ pub struct LobbyUi {
     pub dialog: Option<Dialog>,
     /// What the player has chosen, as the dialogs read it.
     pub settings: Settings,
+    /// The settings dialog's page, kept while the client runs.
+    pub settings_tab: SettingsTab,
+}
+
+/// The settings dialog's pages, one at a time: all of them on one page no longer
+/// fitted the window, and the dialog was cut off (the owner, 2026-09-18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    General,
+    Sound,
+    Table,
+    Network,
+}
+
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 4] = [SettingsTab::General, SettingsTab::Sound, SettingsTab::Table, SettingsTab::Network];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::General => "General",
+            SettingsTab::Sound => "Sound",
+            SettingsTab::Table => "Table",
+            SettingsTab::Network => "Network",
+        }
+    }
 }
 
 impl LobbyUi {
@@ -211,6 +237,7 @@ impl LobbyUi {
             // `D-002`: the first run says what relaying is before anything else.
             dialog: settings.relay.is_none().then(|| Dialog::RelayNotice(settings.clone())),
             settings,
+            settings_tab: SettingsTab::default(),
         }
     }
 }
@@ -781,6 +808,12 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
         Dialog::RelayNotice(_) => "Relaying for other players",
     };
 
+    // Every dialog scrolls inside the window rather than running past its edge:
+    // at a large text size a Sit & Go's *Create a table* is taller than a small
+    // window, as the settings were at any size (2026-09-18). The body scrolls,
+    // not the window -- a window that scrolls keeps a default height of its own
+    // and hid the settings' buttons -- and the settings scroll their own page.
+    let own_scroll = matches!(open, Dialog::Settings(_));
     egui::Window::new(RichText::new(title).size(19.0).strong())
         .collapsible(false)
         .resizable(false)
@@ -794,7 +827,8 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
         )
         .show(ui.ctx(), |ui| {
             ui.set_min_width(340.0);
-            match &mut open {
+            let body_height = (ui.ctx().content_rect().height() - 110.0).max(160.0);
+            let mut body = |ui: &mut egui::Ui| match &mut open {
                 Dialog::Create(f) => {
                     field_row(ui, "Name", |ui| {
                         ui.add(egui::TextEdit::singleline(&mut f.name).char_limit(32));
@@ -976,91 +1010,122 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                     });
                 }
                 Dialog::Settings(f) => {
-                    field_row(ui, "Name", |ui| {
-                        // Bounded by characters here and by bytes where it is
-                        // saved. This one is only to stop a player typing a
-                        // paragraph; §4.3's real limit is 32 **bytes** and
-                        // `Settings::repair` is what enforces it.
-                        ui.add(
-                            egui::TextEdit::singleline(&mut f.nickname)
-                                .char_limit(super::super::storage::settings::NAME_MAX),
-                        );
+                    // The owner, 2026-09-18: one page no longer fitted the
+                    // window and the dialog was cut off. Four pages, one at a
+                    // time, each in a scrolling area of one height -- so the
+                    // dialog keeps its size between pages, and at any text size
+                    // the buttons stay on the screen.
+                    ui.set_max_width(460.0);
+                    ui.horizontal(|ui| {
+                        for tab in SettingsTab::ALL {
+                            if ui
+                                .selectable_value(&mut state.settings_tab, tab, RichText::new(tab.label()).size(15.0))
+                                .changed()
+                            {
+                                // The page's scroll bar is sized from the frame
+                                // before; without a second frame a page taller
+                                // than its area showed no bar until the mouse
+                                // moved.
+                                ui.ctx().request_repaint();
+                            }
+                        }
                     });
-                    ui.label(
-                        RichText::new(
-                            "Shown to other players. It is never how you are identified — \
-                             two people may pick the same one.",
-                        )
-                        .color(theme::TEXT_DIM)
-                        .size(14.0),
-                    );
-                    ui.add_space(10.0);
-
-                    field_row(ui, "Text size", |ui| {
-                        ui.add(
-                            egui::Slider::new(
-                                &mut f.text_percent,
-                                super::super::storage::settings::SCALE_MIN
-                                    ..=super::super::storage::settings::SCALE_MAX,
-                            )
-                            .suffix(" %"),
-                        );
-                    });
-                    ui.label(
-                        RichText::new("Applies to both windows, at once.")
-                            .color(theme::TEXT_DIM)
-                            .size(14.0),
-                    );
-
-                    // PokerTH's sound settings (`SoundSettings.qml`): the
-                    // master switch, the volume, the four categories.
-                    ui.add_space(10.0);
-                    let mut sound = f.sound();
-                    ui.label(RichText::new("Sound").color(theme::TEXT).strong());
-                    ui.checkbox(&mut sound.on, "Enable sound effects");
-                    ui.add_enabled_ui(sound.on, |ui| {
-                        field_row(ui, "Volume", |ui| {
-                            ui.add(egui::Slider::new(&mut sound.volume, 1..=10));
+                    ui.separator();
+                    let page_height = (ui.ctx().content_rect().height() - 240.0).clamp(140.0, 300.0);
+                    scroller(egui::ScrollArea::vertical())
+                        .id_salt("settings-page")
+                        .max_height(page_height)
+                        .min_scrolled_height(page_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match state.settings_tab {
+                            SettingsTab::General => {
+                                field_row(ui, "Name", |ui| {
+                                    // Bounded by characters here and by bytes where it is
+                                    // saved. This one is only to stop a player typing a
+                                    // paragraph; §4.3's real limit is 32 **bytes** and
+                                    // `Settings::repair` is what enforces it.
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut f.nickname)
+                                            .char_limit(super::super::storage::settings::NAME_MAX),
+                                    );
+                                });
+                                ui.label(
+                                    RichText::new(
+                                        "Shown to other players. It is never how you are identified — \
+                                         two people may pick the same one.",
+                                    )
+                                    .color(theme::TEXT_DIM)
+                                    .size(14.0),
+                                );
+                                ui.add_space(10.0);
+                                field_row(ui, "Text size", |ui| {
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut f.text_percent,
+                                            super::super::storage::settings::SCALE_MIN
+                                                ..=super::super::storage::settings::SCALE_MAX,
+                                        )
+                                        .suffix(" %"),
+                                    );
+                                });
+                                ui.label(
+                                    RichText::new("Applies to both windows, at once.")
+                                        .color(theme::TEXT_DIM)
+                                        .size(14.0),
+                                );
+                            }
+                            SettingsTab::Sound => {
+                                // PokerTH's sound settings (`SoundSettings.qml`): the
+                                // master switch, the volume, the four categories.
+                                let mut sound = f.sound();
+                                ui.checkbox(&mut sound.on, "Enable sound effects");
+                                ui.add_enabled_ui(sound.on, |ui| {
+                                    field_row(ui, "Volume", |ui| {
+                                        ui.add(egui::Slider::new(&mut sound.volume, 1..=10));
+                                    });
+                                    ui.checkbox(&mut sound.game_actions, "Game actions (check, call, raise ...)");
+                                    ui.checkbox(&mut sound.lobby_chat, "Lobby chat notifications");
+                                    ui.checkbox(&mut sound.network_game, "Network game notifications");
+                                    ui.checkbox(&mut sound.blind_raise, "Blind raise notification");
+                                });
+                                if sound != f.sound() {
+                                    f.sound = Some(sound);
+                                }
+                            }
+                            SettingsTab::Table => {
+                                // The owner, 2026-09-13: the odds beside the table's
+                                // action bar, shown or hidden here, shown by default.
+                                let mut show_odds = f.show_odds();
+                                if ui.checkbox(&mut show_odds, "Show the odds beside the action bar").changed() {
+                                    f.show_odds = Some(show_odds);
+                                }
+                                let mut show_chat = f.show_chat();
+                                if ui.checkbox(&mut show_chat, "Show the chat beside the action bar").changed() {
+                                    f.show_chat = Some(show_chat);
+                                }
+                                let mut auto_muck = f.auto_muck();
+                                if ui
+                                    .checkbox(&mut auto_muck, "Auto muck: a hand that may muck is mucked at once")
+                                    .on_hover_text("Off: at a showdown your losing hand waits three seconds for Show cards")
+                                    .changed()
+                                {
+                                    f.auto_muck = Some(auto_muck);
+                                }
+                            }
+                            SettingsTab::Network => {
+                                // `D-002`, the owner's ruling (2026-09-18): on by
+                                // default, turned off here.
+                                let mut relay = f.relay();
+                                if ui
+                                    .checkbox(&mut relay, "Relay connections for other players of this game")
+                                    .changed()
+                                {
+                                    f.relay = Some(relay);
+                                }
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(relay_terms()).color(theme::TEXT_DIM).size(14.0));
+                            }
                         });
-                        ui.checkbox(&mut sound.game_actions, "Game actions (check, call, raise ...)");
-                        ui.checkbox(&mut sound.lobby_chat, "Lobby chat notifications");
-                        ui.checkbox(&mut sound.network_game, "Network game notifications");
-                        ui.checkbox(&mut sound.blind_raise, "Blind raise notification");
-                    });
-                    if sound != f.sound() {
-                        f.sound = Some(sound);
-                    }
-
-                    // The owner, 2026-09-13: the odds beside the table's action
-                    // bar, shown or hidden here, shown by default.
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Table").color(theme::TEXT).strong());
-                    let mut show_odds = f.show_odds();
-                    if ui.checkbox(&mut show_odds, "Show the odds beside the action bar").changed() {
-                        f.show_odds = Some(show_odds);
-                    }
-                    let mut show_chat = f.show_chat();
-                    if ui.checkbox(&mut show_chat, "Show the chat beside the action bar").changed() {
-                        f.show_chat = Some(show_chat);
-                    }
-                    let mut auto_muck = f.auto_muck();
-                    if ui
-                        .checkbox(&mut auto_muck, "Auto muck: a hand that may muck is mucked at once")
-                        .on_hover_text("Off: at a showdown your losing hand waits three seconds for Show cards")
-                        .changed()
-                    {
-                        f.auto_muck = Some(auto_muck);
-                    }
-
-                    // `D-002`, the owner's ruling (2026-09-18): on by default,
-                    // turned off here.
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Network").color(theme::TEXT).strong());
-                    let mut relay = f.relay();
-                    if ui.checkbox(&mut relay, "Relay connections for other players of this game").changed() {
-                        f.relay = Some(relay);
-                    }
-                    ui.label(RichText::new(relay_terms()).color(theme::TEXT_DIM).size(14.0));
 
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -1168,6 +1233,15 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                         }
                     });
                 }
+            };
+            if own_scroll {
+                body(ui);
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("dialog-body")
+                    .max_height(body_height)
+                    .auto_shrink([false, true])
+                    .show(ui, body);
             }
         });
 
@@ -1203,45 +1277,51 @@ fn field_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 fn header(ui: &mut egui::Ui, view: &LobbyView) -> bool {
     let mut opened = false;
-    ui.horizontal(|ui| {
-        // A felt-green stripe: the one place the table's colour appears in the
-        // lobby, and what makes the window read as a poker client rather than
-        // as a file manager.
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(5.0, 30.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 2.5, theme::SELECTED);
-        ui.add_space(6.0);
-
+    // **Right to left, the Settings button first** (2026-09-18): laid out left
+    // to right, the title and the counters took the width first, and at a large
+    // text size in a small window the button went off the right edge -- the one
+    // place the text size can be turned back down. Now the button and the name
+    // are placed first, and the title and the counters get what is left, cut at
+    // its edge rather than drawn over the button.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.button("Settings").clicked() {
+            opened = true;
+        }
         ui.label(
-            RichText::new("Decentralised poker")
+            RichText::new(&view.me)
                 .color(theme::TEXT)
-                .size(24.0)
+                .size(16.0)
                 .strong(),
         );
-        ui.add_space(16.0);
-        let open = view.tables.iter().filter(|r| r.state.joinable()).count();
-        for (n, what, colour) in [
-            (view.tables.len(), "tables", theme::TEXT_DIM),
-            (open, "open", theme::OK),
-            (view.status.peers, "peers", theme::ACCENT),
-            // Beside it, not instead of it: "462 peers" is true about the
-            // network and says nothing about who is here to play.
-            (view.status.lobby_peers, "in lobby", theme::OK),
-            // `D-064`: who is looking for a game right now.
-            (usize::try_from(view.searching).unwrap_or(usize::MAX), "searching", theme::WARN),
-        ] {
-            pill(ui, &format!("{n} {what}"), colour);
-        }
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+            // A felt-green stripe: the one place the table's colour appears in the
+            // lobby, and what makes the window read as a poker client rather than
+            // as a file manager.
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(5.0, 30.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2.5, theme::SELECTED);
+            ui.add_space(6.0);
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Settings").clicked() {
-                opened = true;
-            }
             ui.label(
-                RichText::new(&view.me)
+                RichText::new("Decentralised poker")
                     .color(theme::TEXT)
-                    .size(16.0)
+                    .size(24.0)
                     .strong(),
             );
+            ui.add_space(16.0);
+            let open = view.tables.iter().filter(|r| r.state.joinable()).count();
+            for (n, what, colour) in [
+                (view.tables.len(), "tables", theme::TEXT_DIM),
+                (open, "open", theme::OK),
+                (view.status.peers, "peers", theme::ACCENT),
+                // Beside it, not instead of it: "462 peers" is true about the
+                // network and says nothing about who is here to play.
+                (view.status.lobby_peers, "in lobby", theme::OK),
+                // `D-064`: who is looking for a game right now.
+                (usize::try_from(view.searching).unwrap_or(usize::MAX), "searching", theme::WARN),
+            ] {
+                pill(ui, &format!("{n} {what}"), colour);
+            }
         });
     });
     opened
