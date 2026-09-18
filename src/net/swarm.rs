@@ -109,30 +109,92 @@ pub const RELAY_MAX_CIRCUIT_BYTES: u64 =
 /// How many circuits one peer may hold on this client at once.
 pub const RELAY_MAX_CIRCUITS_PER_PEER: usize = 4;
 
-/// `D-002` point 2, `S1-FK`: the peers this client's relay serves -- poker
-/// clients, as `identify` named them, kept by the node loop beside its own
-/// `poker_peers`. Shared, because `relay::Config` is fixed when the swarm is
-/// built and the set is not.
-pub type RelayAdmits = std::sync::Arc<std::sync::RwLock<std::collections::HashSet<PeerId>>>;
+/// How many circuits this client carries at once, for everybody together -- the
+/// number the first-run notice and the settings tell the player (`D-002`).
+pub const RELAY_MAX_CIRCUITS: usize = 64;
+
+/// `D-002`, `S1-FK`: whom this client's relay serves, and whether it serves at
+/// all. Shared with the node loop, because `relay::Config` is fixed when the
+/// swarm is built and neither of these is.
+#[derive(Debug)]
+pub struct RelayAdmission {
+    /// Point 2: the peers `identify` named poker clients, kept by the node loop
+    /// beside its own `poker_peers`.
+    known: std::sync::RwLock<std::collections::HashSet<PeerId>>,
+    /// Point 1 as the owner ruled it (2026-09-18): the player's switch in the
+    /// settings, **on by default**. Off, the relay takes no reservation and opens
+    /// no circuit; what is already open runs out on its own.
+    on: std::sync::atomic::AtomicBool,
+}
+
+impl Default for RelayAdmission {
+    fn default() -> Self {
+        RelayAdmission { known: Default::default(), on: std::sync::atomic::AtomicBool::new(true) }
+    }
+}
+
+impl RelayAdmission {
+    /// A poker client this relay may reserve for.
+    pub fn admit(&self, peer: PeerId) {
+        if let Ok(mut known) = self.known.write() {
+            known.insert(peer);
+        }
+    }
+
+    /// A peer gone from this client.
+    pub fn forget(&self, peer: &PeerId) {
+        if let Ok(mut known) = self.known.write() {
+            known.remove(peer);
+        }
+    }
+
+    /// The player's switch; `false` stops new reservations and circuits at once.
+    pub fn set_on(&self, on: bool) {
+        self.on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.on.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reserves_for(&self, peer: &PeerId) -> bool {
+        self.is_on() && self.known.read().is_ok_and(|known| known.contains(peer))
+    }
+}
+
+/// `D-002`, `S1-FK`: the admission the node loop and the relay share.
+pub type RelayAdmits = std::sync::Arc<RelayAdmission>;
 
 /// `D-002` point 2, `S1-FK`: a **reservation** only for a peer `identify` named a
-/// poker client. Without it a client with a confirmed external address was a
-/// relay for the whole libp2p world, IPFS traffic included, on its player's
-/// line. Our own clients ask for a reservation only once the relay's `identify`
-/// reached them (`run`, the reservation request), and the relay's reading of
-/// theirs is on its way at the same moment, so they are known when they ask.
+/// poker client, and only while the player's switch is on. Without it a client
+/// with a confirmed external address was a relay for the whole libp2p world,
+/// IPFS traffic included, on its player's line. Our own clients ask for a
+/// reservation only once the relay's `identify` reached them (`run`, the
+/// reservation request), and the relay's reading of theirs is on its way at the
+/// same moment, so they are known when they ask.
 ///
-/// **Circuits are not gated on their source**, where `NETWORK_STACK.md` §9.6
-/// asked for both: a circuit can end only at a peer holding a reservation here,
-/// which the gate above makes one of ours -- nobody else's traffic can cross
-/// this client -- and a newcomer's first dial through a relay it has never met
-/// opens the circuit half a round trip before the relay has its `identify`, so a
-/// source gate would refuse exactly the new player trying to reach a table.
+/// **Circuits are gated on the switch alone**, where `NETWORK_STACK.md` §9.6
+/// asked for the source too: a circuit can end only at a peer holding a
+/// reservation here, which the gate above makes one of ours -- nobody else's
+/// traffic can cross this client -- and a newcomer's first dial through a relay
+/// it has never met opens the circuit half a round trip before the relay has its
+/// `identify`, so a source gate would refuse exactly the new player trying to
+/// reach a table.
 struct PokerPeersOnly(RelayAdmits);
 
 impl relay::RateLimiter for PokerPeersOnly {
     fn try_next(&mut self, peer: PeerId, _addr: &libp2p::Multiaddr, _now: web_time::Instant) -> bool {
-        self.0.read().is_ok_and(|known| known.contains(&peer))
+        self.0.reserves_for(&peer)
+    }
+}
+
+/// `D-002` point 1: no circuit through this client while the player has the
+/// relay switched off.
+struct WhileOn(RelayAdmits);
+
+impl relay::RateLimiter for WhileOn {
+    fn try_next(&mut self, _peer: PeerId, _addr: &libp2p::Multiaddr, _now: web_time::Instant) -> bool {
+        self.0.is_on()
     }
 }
 
@@ -532,8 +594,9 @@ pub struct NodeConfig {
     /// discovery over the DHT works, since mDNS would answer first and the
     /// proof would be of nothing.
     pub local_discovery: bool,
-    /// `D-002` point 2 (`S1-FK`): who may hold a reservation on this client's
-    /// relay. The node loop fills it; an empty set refuses everybody.
+    /// `D-002` (`S1-FK`): who may hold a reservation on this client's relay,
+    /// and whether it relays at all. The node loop fills it and sets the switch
+    /// from the player's settings; an empty set refuses everybody.
     pub relay_admits: RelayAdmits,
 }
 
@@ -855,7 +918,8 @@ pub fn gossipsub_config() -> Result<gossipsub::Config, Box<dyn std::error::Error
 /// way through that it cannot provide.
 ///
 /// A volunteer's reservations go only to the peers in `admits` ([`PokerPeersOnly`],
-/// `S1-FK`), on top of the crate's own per-peer and per-address limiters.
+/// `S1-FK`), and its circuits only while the player's switch is on ([`WhileOn`]),
+/// on top of the crate's own per-peer and per-address limiters.
 pub fn relay_config(role: RelayRole, admits: &RelayAdmits) -> relay::Config {
     match role {
         RelayRole::Volunteer => {
@@ -863,13 +927,14 @@ pub fn relay_config(role: RelayRole, admits: &RelayAdmits) -> relay::Config {
                 max_reservations: 128,
                 max_reservations_per_peer: 4,
                 reservation_duration: RELAY_RESERVATION,
-                max_circuits: 64,
+                max_circuits: RELAY_MAX_CIRCUITS,
                 max_circuits_per_peer: RELAY_MAX_CIRCUITS_PER_PEER,
                 max_circuit_duration: RELAY_RESERVATION,
                 max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
                 ..Default::default()
             };
             c.reservation_rate_limiters.push(Box::new(PokerPeersOnly(admits.clone())));
+            c.circuit_src_rate_limiters.push(Box::new(WhileOn(admits.clone())));
             c
         }
         RelayRole::Declined => relay::Config {
@@ -1094,19 +1159,30 @@ mod tests {
         let addr: libp2p::Multiaddr = "/ip4/1.1.1.1/tcp/4001".parse().expect("a literal");
         let stranger = PeerId::random();
         let ours = PeerId::random();
-        admits.write().expect("the admission set").insert(ours);
-        let mut asks = |peer: PeerId| {
-            let now = web_time::Instant::now();
+        admits.admit(ours);
+        let now = web_time::Instant::now();
+        let reserves = |c: &mut relay::Config, peer: PeerId| {
             c.reservation_rate_limiters.iter_mut().all(|l| l.try_next(peer, &addr, now))
         };
-        assert!(!asks(stranger), "a stranger holds no reservation here");
-        assert!(asks(ours), "a poker peer does");
-        let circuits = relay_config(RelayRole::Volunteer, &admits).circuit_src_rate_limiters.len();
+        assert!(!reserves(&mut c, stranger), "a stranger holds no reservation here");
+        assert!(reserves(&mut c, ours), "a poker peer does");
+        let circuit = |c: &mut relay::Config, peer: PeerId| {
+            c.circuit_src_rate_limiters.iter_mut().all(|l| l.try_next(peer, &addr, now))
+        };
+        assert!(circuit(&mut c, stranger), "a circuit's source is not asked who it is");
         assert_eq!(
-            circuits,
-            relay::Config::default().circuit_src_rate_limiters.len(),
-            "circuit sources keep the crate's own limiters and no more"
+            c.circuit_src_rate_limiters.len(),
+            relay::Config::default().circuit_src_rate_limiters.len() + 1,
+            "circuit sources keep the crate's own limiters, and the switch"
         );
+        // The player's switch, off: nothing new, for anybody (D-002 point 1).
+        admits.set_on(false);
+        assert!(!reserves(&mut c, ours), "no reservation, even for one of ours");
+        assert!(!circuit(&mut c, ours), "and no circuit");
+        admits.set_on(true);
+        assert!(reserves(&mut c, ours), "on again, at once");
+        admits.forget(&ours);
+        assert!(!reserves(&mut c, ours), "a peer gone from this client is forgotten");
     }
 
     /// The relay this client offers must pass the test this client applies.

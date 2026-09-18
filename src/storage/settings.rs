@@ -83,6 +83,12 @@ pub struct Settings {
     /// past searches took. `None` in a file written before the search existed.
     #[n(6)]
     pub search: Option<SearchSettings>,
+    /// `D-002` as the owner ruled it (2026-09-18): whether this client relays
+    /// connections for other players of this game -- on by default, turned off
+    /// here. `None` until the player has seen the first-run notice about it,
+    /// and read as on.
+    #[n(7)]
+    pub relay: Option<bool>,
 }
 
 /// `D-064`: the most past searches remembered.
@@ -226,7 +232,14 @@ impl Settings {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         }
+    }
+
+    /// `D-002`: whether this client relays for other players of this game: yes
+    /// unless the player said no.
+    pub fn relay(&self) -> bool {
+        self.relay.unwrap_or(true)
     }
 
     /// `D-064`: the search's settings in force: the player's, or the defaults.
@@ -357,6 +370,7 @@ mod tests {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         };
         save(&dir, &s, &k).unwrap();
         assert_eq!(load(&dir, &k), s);
@@ -413,9 +427,15 @@ mod tests {
         assert!(s.show_odds());
         assert!(s.show_chat());
         assert!(s.auto_muck(), "and a hand that may muck is mucked at once");
+        assert_eq!(s.relay, None, "the first-run notice about relaying not yet seen");
+        assert!(s.relay(), "and the client relays for other players, as by default");
         let hidden = Settings { show_odds: Some(false), ..s };
         save(&dir, &hidden, &k).unwrap();
         assert!(!load(&dir, &k).show_odds());
+        // `D-002`: the player's word on relaying round-trips.
+        let off = Settings { relay: Some(false), ..load(&dir, &k) };
+        save(&dir, &off, &k).unwrap();
+        assert!(!load(&dir, &k).relay());
     }
 
     /// A first run has no file and is not an error.
@@ -458,6 +478,7 @@ mod tests {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         };
         s.repair(&k);
         assert!(s.nickname.len() <= NAME_MAX);
@@ -470,6 +491,7 @@ mod tests {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         };
         s.repair(&k);
         assert!(!s.nickname.chars().any(|c| c.is_control()));
@@ -484,6 +506,7 @@ mod tests {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         };
         s.repair(&k);
         assert_eq!(s.nickname, Settings::defaults(&k).nickname);
@@ -504,6 +527,7 @@ mod tests {
                 show_chat: None,
                 auto_muck: None,
                 search: None,
+                relay: None,
             };
             s.repair(&k);
             assert!(s.nickname.len() <= NAME_MAX, "{n}");
@@ -528,6 +552,7 @@ mod tests {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         };
         // Written past `save`'s own repair, the way a person editing the file
         // would.
@@ -543,6 +568,7 @@ mod tests {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         };
         std::fs::write(settings_path(&dir), minicbor::to_vec(&tiny).unwrap()).unwrap();
         assert_eq!(load(&dir, &k).text_percent, SCALE_MIN);
@@ -559,6 +585,7 @@ mod tests {
             show_chat: None,
             auto_muck: None,
             search: None,
+            relay: None,
         };
         assert_eq!(s.zoom(), 1.0);
     }
@@ -579,6 +606,7 @@ mod tests {
                 show_chat: None,
                 auto_muck: None,
                 search: None,
+                relay: None,
             },
             &k,
         )
@@ -593,6 +621,7 @@ mod tests {
                 show_chat: None,
                 auto_muck: None,
                 search: None,
+                relay: None,
             },
             &k,
         )

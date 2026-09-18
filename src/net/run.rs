@@ -1328,9 +1328,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     } = cfg;
     // Advisory events are offered, not waited for. See `Events`.
     let events = Events::new(events);
-    // `D-002` point 2 (`S1-FK`): who may hold a reservation on this client's
-    // relay -- the poker peers `identify` named, kept beside `poker_peers`.
+    // `D-002` (`S1-FK`): who may hold a reservation on this client's relay --
+    // the poker peers `identify` named, kept beside `poker_peers` -- and the
+    // player's switch, read from the settings the window keeps: on unless the
+    // player turned it off (the owner, 2026-09-18). The window says it again on
+    // every save, and the node keeps the last word.
     let relay_admits = swarm::RelayAdmits::default();
+    relay_admits.set_on(crate::storage::settings::load(&profile_dir, &app_key).relay());
     let mut swarm = swarm::build(NodeConfig {
         relay_admits: relay_admits.clone(),
         identity,
@@ -4099,9 +4103,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // actually went anywhere, and seventeen
                         // direct-connection events for eight arrivals.
                         if num_established == 0 && poker_peers.remove(&peer_id) {
-                            if let Ok(mut known) = relay_admits.write() {
-                                known.remove(&peer_id);
-                            }
+                            relay_admits.forget(&peer_id);
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: true })
                                 .await;
@@ -5458,9 +5460,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             && poker_peers.insert(peer_id)
                         {
                             // `S1-FK`: and one this client's relay may reserve for.
-                            if let Ok(mut known) = relay_admits.write() {
-                                known.insert(peer_id);
-                            }
+                            relay_admits.admit(peer_id);
                             poker_line_since.get_or_insert_with(std::time::Instant::now);
                             // Never subject to the cap. The whole point of a
                             // cap is to keep strangers from crowding out the
@@ -7277,6 +7277,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
                     NodeCommand::SetAutoMuck(on) => {
                         auto_muck = on;
+                    }
+
+                    // `D-002`: the player's relay switch -- off, nothing new is
+                    // relayed, for anybody; what is open runs out on its own.
+                    NodeCommand::SetRelay(on) => {
+                        if relay_admits.is_on() != on {
+                            relay_admits.set_on(on);
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "relaying for other players of this game: {} (the player's setting, D-002)",
+                                    if on { "on" } else { "off" }
+                                )))
+                                .await;
+                        }
                     }
 
                     NodeCommand::ShowCards => {

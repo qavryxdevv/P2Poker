@@ -677,6 +677,7 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
             .send(NodeCommand::SetNickname(settings.nickname.clone()))
             .await;
         let _ = commands.send(NodeCommand::SetAutoMuck(settings.auto_muck())).await;
+        let _ = commands.send(NodeCommand::SetRelay(settings.relay())).await;
         if let Some(command) = hosted {
             let _ = commands.send(command).await;
         }
@@ -1181,6 +1182,7 @@ fn windowed(player: Player, run: Run) -> Started {
     let opening = commands.clone();
     let opening_name = settings.nickname.clone();
     let opening_auto_muck = settings.auto_muck();
+    let opening_relay = settings.relay();
     // The window keeps a copy: it saves the settings, and the defaults a
     // settings file falls back to are derived from this key.
     let node_key = app_key.clone();
@@ -1190,6 +1192,7 @@ fn windowed(player: Player, run: Run) -> Started {
     rt.spawn(async move {
         let _ = opening.send(NodeCommand::SetNickname(opening_name)).await;
         let _ = opening.send(NodeCommand::SetAutoMuck(opening_auto_muck)).await;
+        let _ = opening.send(NodeCommand::SetRelay(opening_relay)).await;
         if let Some(command) = hosted {
             let _ = opening.send(command).await;
         }
@@ -2099,6 +2102,8 @@ impl Client {
         }
         // `D-050`: said on every save; the node keeps the last word.
         self.tell(NodeCommand::SetAutoMuck(settings.auto_muck()));
+        // `D-002`: and the relay switch, the same way.
+        self.tell(NodeCommand::SetRelay(settings.relay()));
         // Saved to disk, and said either way. A setting that silently did not
         // persist is one the player changes again next time and blames the
         // client for.

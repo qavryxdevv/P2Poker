@@ -2724,9 +2724,10 @@ Relay v2 **server** with raised limits, so a relayed connection can carry a whol
 session rather than only a hole-punch coordination. This is the only way to get an
 unlimited relay without the project operating infrastructure.
 
-**Off by default.** Enabled only by an explicit, visible setting, with a first-run
-disclosure in plain language: strangers' poker traffic will cross the user's
-connection, at the user's bandwidth cost. The disclosure must state the ceilings
+**On by default, since the owner's ruling of 2026-09-18 (D-002, amended); off by an
+explicit, visible setting**, with a first-run disclosure in plain language: other
+players' traffic will cross the user's connection, at the user's bandwidth cost. This
+paragraph said *off by default* until then. The disclosure must state the ceilings
 **in concrete terms**, because the raised limits below are large and a user who
 agrees to "help relay" is agreeing to these numbers: *up to 128 circuits open at
 the same time, each allowed to carry up to 1 GiB — counted in both directions
@@ -2735,28 +2736,28 @@ reservation through you.*
 Slot and bandwidth ceilings are user-visible and user-settable, and the network
 status panel shows how many peers are currently being relayed.
 
-> **The client is only partly this section (`S1-FK`, checked 2026-09-15, half
-> built 2026-09-18).** *Built:* admission. `swarm::relay_config` pushes a
-> `PokerPeersOnly` into `reservation_rate_limiters`, holding the set of peers
-> `identify` named poker clients (`swarm::RelayAdmits`, kept by the node loop
-> beside its `poker_peers`), so a reservation goes to one of ours and to nobody
-> else — and a circuit can end only at a peer holding a reservation, so nobody
-> else's traffic crosses the user's line. `circuit_src_rate_limiters` keeps the
-> crate's own limiters and no admission of its own, against the next paragraph's
-> *both*: a newcomer's first dial through a relay it has never met opens its
-> circuit half a round trip before the relay has its `identify`, and a source
-> gate would refuse exactly the new player trying to reach a table. *Built:* the
-> count — the node counts the peers holding a reservation and the circuits
-> open, the lobby's network strip says *relaying for N players, M connections*,
-> and every refused stranger is logged. *Not built, the owner's:* the default
-> and the setting. Every client is still built with `RelayRole::Volunteer`, with
-> no setting, no first-run disclosure and no user-settable ceilings — a client
-> behind a NAT that reaches its game only through another client's relay is
-> why turning it off by default is not a change to make without a ruling. The
-> build's numbers are 128 reservations (4 per peer), 64 circuits (4 per peer,
-> `RELAY_MAX_CIRCUITS_PER_PEER`), an hour per circuit (`RELAY_RESERVATION`) and
-> `RELAY_MAX_CIRCUIT_BYTES`, not the block below. What follows is what D-002
-> requires.
+> **The client is this section, with the owner's default (`S1-FK`, checked
+> 2026-09-15, built 2026-09-18).** Admission: `swarm::relay_config` pushes a
+> `PokerPeersOnly` into `reservation_rate_limiters`, holding the peers `identify`
+> named poker clients (`swarm::RelayAdmission`, kept by the node loop beside its
+> `poker_peers`), so a reservation goes to one of ours and to nobody else -- and a
+> circuit can end only at a peer holding a reservation, so nobody else's traffic
+> crosses the user's line. Circuit sources are asked nothing but the switch
+> (`WhileOn`), against the next paragraph's *both*: a newcomer's first dial through
+> a relay it has never met opens its circuit half a round trip before the relay has
+> its `identify`, and a source gate would refuse exactly the new player trying to
+> reach a table. The switch: `Settings::relay`, on by default, read by the node at
+> start and taken live from the window's every save; off refuses every new
+> reservation and circuit at once, and what is open runs out on its own. The
+> disclosure: the lobby's first run opens *Relaying for other players* once, and the
+> settings carry the switch under *Network*, both with the ceilings in numbers. The
+> count: *relaying for N players, M connections* on the lobby's network strip, and
+> every refused stranger logged. Not built: user-settable ceilings -- the owner asked
+> for the switch. The build's numbers are 128 reservations (4 per peer), 64 circuits
+> (`RELAY_MAX_CIRCUITS`, 4 per peer), an hour per circuit (`RELAY_RESERVATION`) and
+> `RELAY_MAX_CIRCUIT_BYTES` (about 2.1 MiB), not the block below, and no rate: a
+> relayed connection runs at the line's speed until its byte cap. What follows is
+> what D-002 required before its amendment.
 
 **The trap: Circuit Relay v2 is not protocol-selective.** `HOP_PROTOCOL_NAME` and
 `STOP_PROTOCOL_NAME` are compile-time constants

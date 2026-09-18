@@ -118,7 +118,7 @@ async fn run() -> Outcome {
     let reserver_id = *reserver.local_peer_id();
     // The relay reserves only for poker clients (`S1-FK`); `identify` would name
     // the reserver one, and this test names it itself.
-    admits.write().expect("the admission set").insert(reserver_id);
+    admits.admit(reserver_id);
 
     relay_node
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse::<Multiaddr>().unwrap())
@@ -249,7 +249,7 @@ async fn no_external_address() -> bool {
     let relay_id = *relay_node.local_peer_id();
     // Admitted (`S1-FK`), so what this proves is the missing address and not
     // the admission.
-    admits.write().expect("the admission set").insert(*reserver.local_peer_id());
+    admits.admit(*reserver.local_peer_id());
 
     relay_node
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse::<Multiaddr>().unwrap())

@@ -174,6 +174,10 @@ pub enum Dialog {
     Settings(Settings),
     /// `D-064`: the automatic search's format and games at once.
     Search(SearchForm),
+    /// `D-002`, the owner's ruling (2026-09-18): the first-run word on this
+    /// client relaying for other players -- on by default, and turned off here or
+    /// in the settings. Shown until the player has answered it once.
+    RelayNotice(Settings),
 }
 
 /// The parts of the pane the user types into.
@@ -204,7 +208,8 @@ impl LobbyUi {
             search: String::new(),
             draft: String::new(),
             filter: Filter::default(),
-            dialog: None,
+            // `D-002`: the first run says what relaying is before anything else.
+            dialog: settings.relay.is_none().then(|| Dialog::RelayNotice(settings.clone())),
             settings,
         }
     }
@@ -749,6 +754,20 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
 
 /// The create and sit-down dialogs, which are the only two places this client
 /// asks a player for anything.
+/// `D-002`: what relaying costs the player, in the terms `NETWORK_STACK.md` §9.6
+/// asks for -- the ceilings as numbers -- said by the first-run notice and under
+/// the switch in the settings.
+fn relay_terms() -> String {
+    format!(
+        "It uses your connection: at most {} connections at a time, each up to {:.1} MiB and one hour. \
+         The hands themselves travel another way; what passes through is the lobby and sitting down \
+         at a table. Off, nothing new passes through; what is open finishes. You can change this in \
+         Settings at any time.",
+        crate::net::swarm::RELAY_MAX_CIRCUITS,
+        crate::net::swarm::RELAY_MAX_CIRCUIT_BYTES as f64 / (1024.0 * 1024.0)
+    )
+}
+
 fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
     let mut action = None;
     let mut close = false;
@@ -759,6 +778,7 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
         Dialog::Sit(_) => "Sit down",
         Dialog::Settings(_) => "Settings",
         Dialog::Search(_) => "Find a game",
+        Dialog::RelayNotice(_) => "Relaying for other players",
     };
 
     egui::Window::new(RichText::new(title).size(19.0).strong())
@@ -1032,6 +1052,16 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                         f.auto_muck = Some(auto_muck);
                     }
 
+                    // `D-002`, the owner's ruling (2026-09-18): on by default,
+                    // turned off here.
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Network").color(theme::TEXT).strong());
+                    let mut relay = f.relay();
+                    if ui.checkbox(&mut relay, "Relay connections for other players of this game").changed() {
+                        f.relay = Some(relay);
+                    }
+                    ui.label(RichText::new(relay_terms()).color(theme::TEXT_DIM).size(14.0));
+
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui
@@ -1050,6 +1080,45 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::RelayNotice(f) => {
+                    ui.set_max_width(460.0);
+                    ui.label(
+                        RichText::new(
+                            "Two players who are both behind a router that lets nothing in cannot reach \
+                             each other. A client the internet can reach passes their connection through, \
+                             and this one does that for players of this game — never for any other \
+                             program's traffic, and only while your line can be reached from the internet.",
+                        )
+                        .color(theme::TEXT)
+                        .size(15.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(relay_terms()).color(theme::TEXT_DIM).size(14.0));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Keep it on")
+                                        .color(Color32::from_rgb(4, 16, 26))
+                                        .strong(),
+                                )
+                                .fill(theme::ACCENT)
+                                .min_size(egui::vec2(120.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            f.relay = Some(true);
+                            action = Some(LobbyAction::Save(f.clone()));
+                            close = true;
+                        }
+                        if ui.button("Turn it off").clicked() {
+                            f.relay = Some(false);
+                            action = Some(LobbyAction::Save(f.clone()));
                             close = true;
                         }
                     });

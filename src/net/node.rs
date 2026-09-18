@@ -66,6 +66,9 @@ pub enum NodeCommand {
     /// `D-050`: the player's *Auto muck*: a hand that may muck is mucked at
     /// once (`true`) or waits for *Show cards*.
     SetAutoMuck(bool),
+    /// `D-002`: the player's switch for relaying connections for other players
+    /// of this game -- on by default (the owner, 2026-09-18).
+    SetRelay(bool),
     /// Say something in the lobby.
     ///
     /// The text is whatever was typed. It is trimmed and capped where it is
