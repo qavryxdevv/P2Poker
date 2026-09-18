@@ -72,6 +72,22 @@ pub const STACK: Color32 = rgb(0x7FD4FF);
 /// Money.
 pub const MONEY: Color32 = rgb(0xFFCB57);
 
+/// The table's gold, in the lobby for the one action a player wants first and
+/// for a win -- `D-048`'s `COLOR_ACCENT`, PokerTH's `Theme.colorAccent`, so the
+/// lobby's one loud colour is the room's (`D-067`). Used sparingly: the
+/// button, a win, a selected table's edge. Gold on everything is gold on
+/// nothing.
+pub const GOLD_ACTION: Color32 = rgb(0xE3C800);
+/// The gold's rim, PokerTH's `PlayerBoxAccent`: outlines, the avatar's edge,
+/// the header's keyline.
+pub const GOLD_EDGE: Color32 = rgb(0xC8A84A);
+/// The ink on a gold button: near-black with the gold's warmth, never the
+/// lobby's cool near-white, which on gold reads as a printing error.
+pub const INK_ON_GOLD: Color32 = rgb(0x1A1400);
+/// The felt's warm cream for words on the felt band, the table's
+/// `PANEL_TEXT_2`.
+pub const ON_FELT_DIM: Color32 = rgb(0xE6D6A8);
+
 pub const OK: Color32 = rgb(0x35C48C);
 pub const WARN: Color32 = rgb(0xF2A63B);
 pub const DANGER: Color32 = rgb(0xEF5B5B);
@@ -212,6 +228,8 @@ mod tests {
             ("ok", OK),
             ("warn", WARN),
             ("danger", DANGER),
+            ("gold", GOLD_ACTION),
+            ("gold edge", GOLD_EDGE),
         ];
 
         for (sname, surface) in surfaces {
@@ -360,5 +378,19 @@ mod tests {
     fn the_lobby_is_not_the_table() {
         assert!(separation(WINDOW, FELT_EDGE) >= 40);
         assert!(separation(PANEL, FELT_CENTRE) >= 40);
+    }
+
+    /// `D-067`: the lobby's gold **is** the table's, measured and not
+    /// approximated, so the two windows share one accent; the ink on it is
+    /// legible; and the words on the felt band read on the felt.
+    #[test]
+    fn the_lobbys_gold_is_the_tables_and_reads_on_what_it_sits_on() {
+        assert_eq!(GOLD_ACTION, crate::gui::table::style::COLOR_ACCENT);
+        assert_eq!(GOLD_EDGE, crate::gui::table::style::BOX_ACCENT);
+        assert!(separation(GOLD_ACTION, INK_ON_GOLD) >= 200, "the ink on a gold button");
+        for (name, ink) in [("text", TEXT), ("cream", ON_FELT_DIM), ("gold", GOLD_ACTION), ("ok", OK), ("warn", WARN)] {
+            assert!(separation(FELT_EDGE, ink) >= 150, "{name} on the felt band");
+            assert!(separation(FELT_MID, ink) >= 150, "{name} on the felt band");
+        }
     }
 }

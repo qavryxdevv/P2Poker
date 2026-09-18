@@ -6,16 +6,26 @@
 //! worst true thing about the connection is — is answered by a tested function
 //! next door, and this file puts the answer on the screen.
 //!
-//! # The layout is the Python client's, and so is the way it is built
+//! # The layout is a card room's (`D-067`, 2026-09-18)
 //!
-//! Header, three columns, network strip: tables on the left, chat and the player
-//! list in the middle, table information and the client log on the right.
+//! Header on a band of the table's own felt, then columns, then one strip. The
+//! left column is where a game is found: the one large gold button, the format
+//! beside it, *Create table* under it, and the tables as rows that show their
+//! seats rather than count them. The middle column is the people -- chat and
+//! who is here -- and the right column is the player's own card and the table
+//! they are looking at. Everything technical about the connection is behind
+//! *Network details* on the bottom strip, with the client log; a player reads
+//! *Online* and nothing else unless they ask.
 //!
 //! The columns are **panels** (`SidePanel::show_inside`,
 //! `CentralPanel::show_inside`) rather than hand-computed fractions of the
 //! available width, and that is what makes them follow the window when it is
 //! resized. The first version divided `available_width()` by hand and drifted
-//! out of the window the moment anything changed size.
+//! out of the window the moment anything changed size. **How many columns**
+//! follows the width in points ([`columns_for`]): three on a wide window, two
+//! on a narrower one, and one -- the tables, with the people a button away --
+//! when the text is at 200 % in a small window, where three columns had left
+//! the middle one no room and drawn the buttons over the list.
 //!
 //! # Text sizes are set, not inherited
 //!
@@ -37,14 +47,19 @@
 
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, TextStyle};
 
-use super::lobby::{empty_explanation, visible, Filter, LobbyView, TableState, PASSWORD_WARNING};
+use super::lobby::{
+    empty_state, format_badge, format_chip, headline_counts, result_praise, result_words, session_words, shape_words,
+    sorted, status_words, visible, Filter, LobbyView, Sort, TableRow, TableState, Tone, FAIR_PLAY, HOW_IT_WORKS,
+    PASSWORD_WARNING,
+};
+use super::table::style;
+use super::theme;
 use crate::net::lobby::TableKind;
 use crate::net::matchmaker::{Format, SearchRequest};
 use crate::protocol::constants::{
     RATED_BLIND_EVERY_N_HANDS, RATED_SEATS, RATED_SMALL_BLIND, RATED_START_STACK,
 };
 use crate::storage::settings::Settings;
-use super::theme;
 
 /// What the user did this frame.
 ///
@@ -197,6 +212,19 @@ pub struct LobbyUi {
     pub settings: Settings,
     /// The settings dialog's page, kept while the client runs.
     pub settings_tab: SettingsTab,
+    /// `D-067`: how the list is ordered.
+    pub sort: Sort,
+    /// `D-067`: the format the big button searches for, opened on what the
+    /// player chose last time.
+    pub hero_format: Format,
+    /// `D-067`: the network details and the client log, shown on the strip
+    /// when asked for.
+    pub diagnostics_open: bool,
+    /// `D-067`: the note on what *provably fair* means, opened from the header.
+    pub fair_open: bool,
+    /// `D-067`: on a one-column window, the people and the player's card in
+    /// place of the tables.
+    pub side_open: bool,
 }
 
 /// The settings dialog's pages, one at a time: all of them on one page no longer
@@ -236,9 +264,42 @@ impl LobbyUi {
             filter: Filter::default(),
             // `D-002`: the first run says what relaying is before anything else.
             dialog: settings.relay.is_none().then(|| Dialog::RelayNotice(settings.clone())),
+            sort: Sort::default(),
+            hero_format: Format::parse(settings.search().format).unwrap_or(Format::Any),
+            diagnostics_open: false,
+            fair_open: false,
+            side_open: false,
             settings,
             settings_tab: SettingsTab::default(),
         }
+    }
+}
+
+/// How many columns the lobby draws at a width in points.
+///
+/// Three need about a thousand points: the tables want 430 and the people and
+/// the card 215 each, with air between. Two need the tables and one side.
+/// Under 660 the tables alone fit, and the side is a button away. At 200 % text
+/// a 1 180-pixel window is 590 points wide, which is where three columns used
+/// to draw over each other.
+pub const fn columns_for(across: f32) -> u8 {
+    if across >= 980.0 {
+        3
+    } else if across >= 660.0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The colour a tone is said in.
+const fn tone_colour(tone: Tone) -> Color32 {
+    match tone {
+        Tone::Dim => theme::TEXT_DIM,
+        Tone::Ok => theme::OK,
+        Tone::Accent => theme::ACCENT,
+        Tone::Warn => theme::WARN,
+        Tone::Danger => theme::DANGER,
     }
 }
 
@@ -377,22 +438,27 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
             asked = Some(what);
         }
     }
-    // The chat box is in the middle column and the columns are drawn inside
-    // closures, so what it produced is carried out here rather than assigned
-    // through a borrow the closure does not have.
+    // The chat box is in a column drawn inside a closure, so what it produced
+    // is carried out here rather than assigned through a borrow the closure
+    // does not have.
     let mut said: Option<String> = None;
+    // `D-067`: how many columns this width takes.
+    let columns = columns_for(ui.available_width());
 
     egui::Panel::top("header")
         .frame(
+            // The table's felt, with its gold keyline: the one band of the
+            // room's own colour, so the window reads as a poker client before a
+            // word of it is read.
             egui::Frame::new()
-                .fill(theme::PANEL)
-                .stroke(Stroke::new(1.0, theme::LINE))
+                .fill(theme::FELT_EDGE)
+                .stroke(Stroke::new(1.0, theme::GOLD_EDGE))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin {
                     left: 16,
                     right: 16,
-                    top: 11,
-                    bottom: 11,
+                    top: 10,
+                    bottom: 10,
                 })
                 .outer_margin(egui::Margin {
                     left: 5,
@@ -402,49 +468,83 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
                 }),
         )
         .show(ui, |ui| {
-            if header(ui, view) {
+            let pressed = header(ui, view, state, columns);
+            if pressed.settings {
                 state.dialog = Some(Dialog::Settings(state.settings.clone()));
             }
+            if pressed.fair {
+                state.fair_open = !state.fair_open;
+            }
+            if pressed.side {
+                state.side_open = !state.side_open;
+            }
         });
+    if state.fair_open {
+        fair_window(ui.ctx(), state);
+    }
 
     egui::Panel::bottom("network")
         .frame(frame())
-        .show(ui, |ui| network_strip(ui, view));
+        .show(ui, |ui| network_strip(ui, view, state));
 
     // Proportions rather than pixel counts: 560 and 280 are answers to one
     // window size only, and on a wide one they left the middle column too narrow
-    // to fit the words "Players in the lobby" on a single line.
-    //
-    // The tables column gets over half, because it carries eight columns of its
-    // own and the first proportion that fixed the middle column cut "Timing" and
-    // "State" off the right of it.
+    // to fit the words "Players in the lobby" on a single line. The tables get
+    // over half: the way into a game is there.
     let across = ui.available_width();
-    egui::Panel::left("tables")
-        .resizable(true)
-        .default_size((across * 0.55).clamp(430.0, 1_000.0))
-        .min_size(360.0)
-        .frame(frame())
-        .show(ui, |ui| {
-            action = tables_column(ui, view, state);
-        });
-
-    egui::Panel::right("info")
-        .resizable(true)
-        .default_size((across * 0.22).clamp(215.0, 430.0))
-        .min_size(200.0)
-        .frame(frame())
-        .show(ui, |ui| info_column(ui, view));
-
-    egui::CentralPanel::default()
-        .frame(frame())
-        .show(ui, |ui| {
-            // The middle column can produce an action now, so its result is
-            // taken rather than dropped. `CentralPanel::show` hands back what
-            // the closure returns.
-            if let LobbyAction::Say(text) = people_column(ui, view, state) {
-                said = Some(text);
-            }
-        });
+    match columns {
+        3 => {
+            egui::Panel::left("tables")
+                .resizable(true)
+                .default_size((across * 0.52).clamp(430.0, 1_000.0))
+                .min_size(380.0)
+                .frame(frame())
+                .show(ui, |ui| {
+                    action = tables_column(ui, view, state);
+                });
+            egui::Panel::right("info")
+                .resizable(true)
+                .default_size((across * 0.24).clamp(230.0, 430.0))
+                .min_size(210.0)
+                .frame(frame())
+                .show(ui, |ui| info_column(ui, view, state));
+            egui::CentralPanel::default().frame(frame()).show(ui, |ui| {
+                // The middle column can produce an action, so its result is
+                // taken rather than dropped.
+                if let LobbyAction::Say(text) = people_column(ui, view, state) {
+                    said = Some(text);
+                }
+            });
+        }
+        2 => {
+            egui::Panel::right("side")
+                .resizable(true)
+                .default_size((across * 0.36).clamp(240.0, 380.0))
+                .min_size(220.0)
+                .frame(frame())
+                .show(ui, |ui| match side_column(ui, view, state) {
+                    LobbyAction::Say(text) => said = Some(text),
+                    LobbyAction::None => {}
+                    other => action = other,
+                });
+            egui::CentralPanel::default().frame(frame()).show(ui, |ui| {
+                action = tables_column(ui, view, state);
+            });
+        }
+        _ => {
+            egui::CentralPanel::default().frame(frame()).show(ui, |ui| {
+                if state.side_open {
+                    match side_column(ui, view, state) {
+                        LobbyAction::Say(text) => said = Some(text),
+                        LobbyAction::None => {}
+                        other => action = other,
+                    }
+                } else {
+                    action = tables_column(ui, view, state);
+                }
+            });
+        }
+    }
 
     // A line typed into the chat box beats nothing else that happened this
     // frame: the other actions come from buttons, and a button and the Enter
@@ -1275,198 +1375,372 @@ fn field_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(6.0);
 }
 
-fn header(ui: &mut egui::Ui, view: &LobbyView) -> bool {
-    let mut opened = false;
+/// What the header's buttons asked for this frame.
+struct HeaderPress {
+    settings: bool,
+    fair: bool,
+    side: bool,
+}
+
+fn header(ui: &mut egui::Ui, view: &LobbyView, state: &LobbyUi, columns: u8) -> HeaderPress {
+    let mut press = HeaderPress { settings: false, fair: false, side: false };
+    // The felt: the table's own gradient over the panel's fill, painted first
+    // so everything sits on it. `D-048` sampled these off the reference.
+    let band = ui.max_rect().expand2(egui::vec2(16.0, 10.0));
+    style::gradient_rect(ui.painter(), band, 10.0, &[(0.0, theme::FELT_MID), (1.0, theme::FELT_EDGE)]);
     // **Right to left, the Settings button first** (2026-09-18): laid out left
     // to right, the title and the counters took the width first, and at a large
     // text size in a small window the button went off the right edge -- the one
-    // place the text size can be turned back down. Now the button and the name
+    // place the text size can be turned back down. Now the button and the player
     // are placed first, and the title and the counters get what is left, cut at
     // its edge rather than drawn over the button.
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if ui.button("Settings").clicked() {
-            opened = true;
+            press.settings = true;
         }
-        ui.label(
-            RichText::new(&view.me)
-                .color(theme::TEXT)
-                .size(16.0)
-                .strong(),
-        );
+        // The player: the table's round avatar and the name beside it.
+        ui.label(RichText::new(&view.me).color(theme::TEXT).size(16.0).strong());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+        style::avatar(ui.painter(), rect, &view.me, true);
+        if columns == 1 {
+            // One column: the people and the card are a button away.
+            let label = if state.side_open { "Tables" } else { "People" };
+            if ui.button(label).clicked() {
+                press.side = true;
+            }
+        }
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-            // A felt-green stripe: the one place the table's colour appears in the
-            // lobby, and what makes the window read as a poker client rather than
-            // as a file manager.
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(5.0, 30.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 2.5, theme::SELECTED);
-            ui.add_space(6.0);
-
-            ui.label(
-                RichText::new("Decentralised poker")
-                    .color(theme::TEXT)
-                    .size(24.0)
-                    .strong(),
+            // The mark: a spade in a gold ring.
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.circle_filled(rect.center(), 19.0, Color32::from_black_alpha(150));
+            p.circle_stroke(rect.center(), 18.0, Stroke::new(1.5, theme::GOLD_EDGE));
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{2660}",
+                FontId::proportional(22.0),
+                theme::GOLD_ACTION,
             );
-            ui.add_space(16.0);
+            ui.add_space(4.0);
+            // No room for the name beside the buttons -- 200 % in the smallest
+            // window -- and the mark stands for it alone; *De…* stood for
+            // nothing.
+            if ui.available_width() < 200.0 {
+                return;
+            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // Cut, never wrapped: at 200 % in a small window the title had
+                // gone to two lines and the band with it.
+                ui.add(
+                    egui::Label::new(RichText::new("Decentralised poker").color(theme::TEXT).size(23.0).strong())
+                        .truncate(),
+                );
+                // The claim the room is built on, in the first line a player
+                // reads; the four sentences behind it are one click away. Not
+                // on a one-column window, where the band has room for the name
+                // alone.
+                if columns > 1 {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("No house. No server. Every card proven.")
+                                .color(theme::ON_FELT_DIM)
+                                .size(13.0),
+                        )
+                        .truncate(),
+                    );
+                }
+            });
+            ui.add_space(12.0);
+            if pill(ui, "provably fair", theme::GOLD_ACTION, true)
+                .on_hover_text("What that means, in four sentences.")
+                .clicked()
+            {
+                press.fair = true;
+            }
+            // `D-067`: what is happening, in a person's words, and never a
+            // zero. The DHT's peers are not players and are in the details.
             let open = view.tables.iter().filter(|r| r.state.joinable()).count();
-            for (n, what, colour) in [
-                (view.tables.len(), "tables", theme::TEXT_DIM),
-                (open, "open", theme::OK),
-                (view.status.peers, "peers", theme::ACCENT),
-                // Beside it, not instead of it: "462 peers" is true about the
-                // network and says nothing about who is here to play.
-                (view.status.lobby_peers, "in lobby", theme::OK),
-                // `D-064`: who is looking for a game right now.
-                (usize::try_from(view.searching).unwrap_or(usize::MAX), "searching", theme::WARN),
-            ] {
-                pill(ui, &format!("{n} {what}"), colour);
+            for (words, tone) in headline_counts(
+                view.tables.len(),
+                open,
+                view.status.lobby_peers,
+                usize::try_from(view.searching).unwrap_or(usize::MAX),
+            ) {
+                pill(ui, &words, tone_colour(tone), false);
             }
         });
     });
-    opened
+    press
 }
 
-/// A counter, in a rounded chip.
+/// A counter, in a rounded chip on the felt.
 ///
 /// Three numbers inside one sentence are three numbers nobody reads; three
 /// chips are three things, and the eye finds the one it wants.
-fn pill(ui: &mut egui::Ui, text: &str, colour: Color32) {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_string(), egui::FontId::proportional(15.0), colour);
-    let (rect, _) = ui.allocate_exact_size(
+fn pill(ui: &mut egui::Ui, text: &str, colour: Color32, clickable: bool) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), egui::FontId::proportional(14.0), Color32::PLACEHOLDER);
+    let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(galley.size().x + 22.0, 27.0),
-        egui::Sense::hover(),
+        if clickable { egui::Sense::click() } else { egui::Sense::hover() },
     );
-    ui.painter().rect_filled(rect, 13.0, theme::PANEL_LIGHT);
-    ui.painter()
-        .galley(rect.center() - galley.size() * 0.5, galley, colour);
+    let fill = if clickable && resp.hovered() {
+        Color32::from_black_alpha(60)
+    } else {
+        Color32::from_black_alpha(120)
+    };
+    ui.painter().rect_filled(rect, 13.0, fill);
+    if clickable {
+        ui.painter().rect_stroke(rect, 13.0, Stroke::new(1.0, theme::GOLD_EDGE), egui::StrokeKind::Inside);
+    }
+    ui.painter().galley(rect.center() - galley.size() * 0.5, galley, colour);
+    resp
+}
+
+/// `D-067`: what *provably fair* means, opened from the header's chip.
+fn fair_window(ctx: &egui::Context, state: &mut LobbyUi) {
+    egui::Window::new(RichText::new("Provably fair \u{2014} no house").size(19.0).strong())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 96.0))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::GOLD_EDGE))
+                .corner_radius(12.0)
+                .inner_margin(18.0),
+        )
+        .show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new(FAIR_PLAY).color(theme::TEXT).size(15.0));
+            ui.add_space(8.0);
+            if ui.button("Got it").clicked() {
+                state.fair_open = false;
+            }
+        });
+}
+
+/// The one large gold button: the table's gold, lit from the top, the ink
+/// dark on it. Everything else on the screen is quieter than this on purpose.
+fn gold_button(ui: &mut egui::Ui, label: &str, size: egui::Vec2) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let p = ui.painter();
+    let lift = if resp.hovered() { 0.12 } else { 0.0 };
+    let top = style::mix(theme::GOLD_ACTION, Color32::WHITE, 0.08 + lift);
+    let bottom = style::mix(theme::GOLD_EDGE, Color32::BLACK, 0.04);
+    style::shadow(p, rect, 10.0, 3.0, 8.0, Color32::from_black_alpha(100));
+    style::gradient_rect(p, rect, 10.0, &[(0.0, top), (1.0, bottom)]);
+    p.rect_stroke(
+        rect,
+        10.0,
+        Stroke::new(1.0, style::mix(theme::GOLD_ACTION, Color32::WHITE, 0.35)),
+        egui::StrokeKind::Inside,
+    );
+    style::text(
+        p,
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        18.0,
+        style::Weight::Bold,
+        theme::INK_ON_GOLD,
+    );
+    resp
+}
+
+/// A choice in a row of them: the chosen one in the felt's green with a gold
+/// edge, the rest quiet.
+fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(14.0), Color32::PLACEHOLDER);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 22.0, 28.0), egui::Sense::click());
+    let (fill, ink, edge) = if selected {
+        (theme::SELECTED, theme::GOLD_ACTION, theme::GOLD_EDGE)
+    } else if resp.hovered() {
+        (theme::PANEL_LIGHT, theme::TEXT, theme::LINE)
+    } else {
+        (theme::PANEL, theme::TEXT_DIM, theme::LINE)
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 14.0, fill);
+    p.rect_stroke(rect, 14.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+    p.galley(rect.center() - galley.size() * 0.5, galley, ink);
+    resp
+}
+
+/// A small tinted word on a row: the game.
+fn badge(ui: &mut egui::Ui, text: &str, colour: Color32) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(13.0), colour);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 14.0, 22.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 11.0, colour.gamma_multiply(0.16));
+    p.rect_stroke(rect, 11.0, Stroke::new(1.0, colour.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+    p.galley(rect.center() - galley.size() * 0.5, galley, colour);
+    resp
+}
+
+/// The seats of a table, drawn: a gold disc per player, a ring per empty
+/// seat. A seat taken since the last frame fills over a third of a second
+/// (`D-067`: a table filling is a thing to watch, and it is the truth).
+fn seat_dots(ui: &mut egui::Ui, row: &TableRow) {
+    let seats = row.seats.clamp(1, 10);
+    let d = 10.0;
+    let gap = 3.0;
+    let width = f32::from(seats) * (d + gap) - gap;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 16.0), egui::Sense::hover());
+    let shown = ui
+        .ctx()
+        .animate_value_with_time(egui::Id::new(("seats", row.key)), f32::from(row.seated), 0.35);
+    let colour = if row.state.joinable() { theme::GOLD_ACTION } else { theme::TEXT_DIM };
+    let p = ui.painter();
+    for i in 0..seats {
+        let c = egui::pos2(rect.left() + d / 2.0 + f32::from(i) * (d + gap), rect.center().y);
+        let fill = (shown - f32::from(i)).clamp(0.0, 1.0);
+        if fill > 0.0 {
+            p.circle_filled(c, d / 2.0 * (0.6 + 0.4 * fill), colour.gamma_multiply(0.5 + 0.5 * fill));
+        }
+        // An empty seat's ring in a half-strength dim, which shows on the
+        // list's field and on a selected row's green alike; the line colour
+        // vanished on the green.
+        p.circle_stroke(
+            c,
+            d / 2.0 - 0.5,
+            Stroke::new(1.0, if fill > 0.0 { colour } else { theme::TEXT_DIM.gamma_multiply(0.55) }),
+        );
+    }
+    resp.on_hover_text(format!("{} of {} seats taken", row.seated, row.seats));
+    ui.label(
+        RichText::new(format!("{}/{}", row.seated, row.seats))
+            .color(theme::TEXT_DIM)
+            .size(13.0),
+    );
+}
+
+/// The empty list: an invitation in the middle of the space, with the suits
+/// as a quiet mark of what room this is.
+fn empty(ui: &mut egui::Ui, e: super::lobby::EmptyState) {
+    ui.add_space(28.0);
+    let width = ui.available_width().min(460.0);
+    let left = ui.max_rect().center().x - width / 2.0;
+    let rect = egui::Rect::from_min_size(egui::pos2(left, ui.cursor().top()), egui::vec2(width, 10.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+        |ui| {
+            ui.label(
+                RichText::new("\u{2660}   \u{2665}   \u{2666}   \u{2663}")
+                    .color(theme::TEXT_DIM.gamma_multiply(0.45))
+                    .size(26.0),
+            );
+            ui.add_space(6.0);
+            if e.connecting {
+                ui.add(egui::Spinner::new().size(22.0).color(theme::GOLD_EDGE));
+                super::table::paint_again(ui.ctx(), std::time::Duration::from_millis(250));
+                ui.add_space(4.0);
+            }
+            ui.label(RichText::new(e.title).color(theme::TEXT).size(19.0).strong());
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(e.body).color(theme::TEXT_DIM)).wrap());
+        },
+    );
+}
+
+/// `D-067`: the way in, first. The format, the one large button, *Create
+/// table* beside it, and an honest line on what to expect.
+fn hero(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
+    let mut action = LobbyAction::None;
+    egui::Frame::new()
+        .fill(theme::FIELD)
+        .stroke(Stroke::new(1.0, theme::LINE))
+        .corner_radius(10.0)
+        .inner_margin(14.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Play now").color(theme::TEXT).size(17.0).strong());
+                ui.add_space(6.0);
+                for f in Format::ALL {
+                    if chip(ui, format_chip(f), state.hero_format == f).clicked() {
+                        state.hero_format = f;
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                // One click: the search starts with the format chosen here and
+                // what the player asked for last time about games at once.
+                if gold_button(ui, "FIND A GAME", egui::vec2(230.0, 48.0))
+                    .on_hover_text(
+                        "The client reserves seats at the tables closest to starting and founds \
+                         one when nothing is on offer. You are seated the moment a game starts.",
+                    )
+                    .clicked()
+                {
+                    let s = state.settings.search();
+                    action = LobbyAction::StartSearch(SearchRequest {
+                        id: 0,
+                        format: state.hero_format,
+                        tables: s.tables,
+                        again: s.again,
+                    });
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Create table").color(theme::GOLD_EDGE).strong())
+                            .stroke(Stroke::new(1.0, theme::GOLD_EDGE))
+                            .fill(theme::PANEL)
+                            .min_size(egui::vec2(150.0, 48.0)),
+                    )
+                    .on_hover_text("Found a table of your own, for friends or for anybody.")
+                    .clicked()
+                {
+                    state.dialog = Some(Dialog::Create(NewTable::default()));
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("More options\u{2026}").color(theme::TEXT_DIM).size(14.0))
+                            .frame(false),
+                    )
+                    .on_hover_text("Games at once, and searching again when a game ends.")
+                    .clicked()
+                {
+                    state.dialog = Some(Dialog::Search(SearchForm::from_settings(&state.settings.search())));
+                }
+            });
+            ui.add_space(4.0);
+            let note = super::lobby::hero_note(
+                state.settings.search().typical_s(state.hero_format.code()),
+                state.hero_format,
+                view.searching,
+            );
+            ui.add(egui::Label::new(RichText::new(note).color(theme::TEXT_DIM).size(14.0)).wrap());
+        });
+    action
 }
 
 fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
     let mut action = LobbyAction::None;
 
-    // Which room this is a list *of*. An empty list means two different things —
-    // "quiet here" and "nowhere at all" — and a player cannot pick a reaction
-    // without knowing which, so it is stated whether the list is empty or not.
-    ui.label(
-        RichText::new("Lobby: public")
-            .color(theme::TEXT_DIM)
-            .size(17.0)
-            .strong(),
-    );
-    ui.add_space(4.0);
-
-    ui.horizontal(|ui| {
-        let width = ui.available_width();
-        ui.add(
-            egui::TextEdit::singleline(&mut state.search)
-                .hint_text("search tables or hosts…")
-                .desired_width(width * 0.60),
-        );
-        egui::ComboBox::from_id_salt("filter")
-            .selected_text(state.filter.label())
-            .width(width * 0.30)
-            .show_ui(ui, |ui| {
-                for f in Filter::ALL {
-                    ui.selectable_value(&mut state.filter, f, f.label());
-                }
-            });
-    });
-    ui.add_space(6.0);
-
-    let rows = visible(&view.tables, &state.search, state.filter);
-
-    // The buttons are placed from the bottom first, so the list takes what is
-    // left. Laid out the other way round, a long list pushes them off the
-    // window — which is where they went in the first version.
-    egui::Panel::bottom("table-buttons")
-        .frame(egui::Frame::new().inner_margin(egui::Margin {
-            left: 0,
-            right: 0,
-            top: 8,
-            bottom: 0,
-        }))
-        .show(ui, |ui| {
-            // Two rows, not one.
-            //
-            // The first version put the two main buttons on the left of a line
-            // and the two secondary ones on the right of the same line, and
-            // when the column was narrowed they were drawn on top of each
-            // other: two opposed layouts in one row have no idea the other
-            // exists. Two rows always fit, and they say which pair matters.
-            ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("Create table")
-                                .color(Color32::from_rgb(4, 16, 26))
-                                .strong(),
-                        )
-                        .fill(theme::ACCENT)
-                        .min_size(egui::vec2(140.0, 34.0)),
-                    )
-                    .clicked()
-                {
-                    state.dialog = Some(Dialog::Create(NewTable::default()));
-                }
-                // `D-064`: the one button that finds a game by itself.
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("Find a game")
-                                .color(Color32::from_rgb(4, 16, 26))
-                                .strong(),
-                        )
-                        .fill(theme::OK)
-                        .min_size(egui::vec2(140.0, 34.0)),
-                    )
-                    .on_hover_text("Search for a Sit & Go automatically: the client reserves seats at the tables closest to starting and founds one when nothing is on offer.")
-                    .clicked()
-                {
-                    state.dialog = Some(Dialog::Search(SearchForm::from_settings(&state.settings.search())));
-                }
-
-                let can_join = view.can_join();
-                let join = ui.add_enabled(
-                    can_join,
-                    egui::Button::new(RichText::new("Join table").strong())
-                        .min_size(egui::vec2(140.0, 34.0)),
-                );
-                if join.clicked() {
-                    if let Some(row) = view.selected_row() {
-                        // `S1-FG`: not a table this client is at: the lobby says so
-                        // instead of opening the dialog.
-                        if view.here.contains(&row.key) {
-                            action = LobbyAction::AlreadyAt(row.key);
-                        } else {
-                            state.dialog = Some(Dialog::Sit(SitDown {
-                                key: row.key,
-                                buyin: row.default_buyin,
-                                password: String::new(),
-                                wants_password: row.password_required,
-                            }));
-                        }
-                    }
-                }
-                if view.selected_row().is_some_and(|r| view.here.contains(&r.key)) {
-                    ui.label(RichText::new("You are at this table").color(theme::WARN));
-                }
-                if !can_join {
-                    // A grey button with no explanation is indistinguishable
-                    // from a broken client, so the reason is one hover away.
-                    let why = view
-                        .selected_row()
-                        .and_then(|r| r.state.why_not())
-                        .unwrap_or("Select a table first.");
-                    join.on_hover_text(why);
-                }
-            });
-            ui.add_space(6.0);
-            // `D-043`: every table this client sits at, the active one lit, the
-            // one whose turn it is marked; a click turns the table window to it.
-            if view.my_tables.len() > 1 {
+    // `D-043`: every table this client sits at, the active one lit, the
+    // one whose turn it is marked; a click turns the table window to it.
+    if view.my_tables.len() > 1 {
+        egui::Panel::bottom("my-tables")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 0,
+                right: 0,
+                top: 6,
+                bottom: 0,
+            }))
+            .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Your tables").color(theme::TEXT_DIM));
                     for s in &view.my_tables {
@@ -1482,85 +1756,313 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                         }
                     }
                 });
-                ui.add_space(4.0);
-            }
-            // `S1-DR`: no buttons for the table here. The table window opens
-            // with the seat, and closing it is leaving -- the window asks.
-        });
+            });
+    }
+    // `S1-DR`: no buttons for the table here. The table window opens
+    // with the seat, and closing it is leaving -- the window asks.
 
-    egui::CentralPanel::default()
-        .frame(egui::Frame::NONE)
-        .show(ui, |ui| {
-            scroller(egui::ScrollArea::both())
+    // The way in first, in a panel of its own, so the list takes what is left
+    // and nothing is ever drawn over it -- which is where the buttons went at
+    // 200 % text in a small window when they were placed from the bottom.
+    // Too short for the way in and the list both -- 200 % text in a small
+    // window -- and the column scrolls as one instead, the way in at its top.
+    let compact = ui.available_height() < 420.0;
+    if compact {
+        scroller(egui::ScrollArea::vertical())
+            .id_salt("tables-all")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let LobbyAction::StartSearch(req) = hero(ui, view, state) {
+                    action = LobbyAction::StartSearch(req);
+                }
+                ui.add_space(8.0);
+                if let Some(what) = table_list(ui, view, state) {
+                    action = what;
+                }
+            });
+    } else {
+        egui::Panel::top("hero")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 8,
+            }))
+            .show(ui, |ui| {
+                if let LobbyAction::StartSearch(req) = hero(ui, view, state) {
+                    action = LobbyAction::StartSearch(req);
+                }
+            });
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            list_head(ui, state);
+            scroller(egui::ScrollArea::vertical())
                 .id_salt("tables")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    egui::Grid::new("table-list")
-                        .num_columns(8)
-                        .striped(true)
-                        .spacing([10.0, 6.0])
-                        .min_col_width(32.0)
-                        .show(ui, |ui| {
-                            for h in [
-                                "Table", "Players", "Type", "Stack", "Blinds", "Timing", "Host",
-                                "State",
-                            ] {
-                                let r = ui.label(
-                                    RichText::new(h.to_uppercase())
-                                        .color(theme::TEXT_DIM)
-                                        .size(13.0)
-                                        .strong(),
-                                );
-                                ui.painter().hline(
-                                    r.rect.left()..=r.rect.right(),
-                                    r.rect.bottom() + 4.0,
-                                    Stroke::new(1.0, theme::LINE),
-                                );
-                            }
-                            ui.end_row();
-
-                            for row in &rows {
-                                let selected = view.selected == Some(row.key);
-                                let mut name = RichText::new(&row.name).color(theme::TEXT);
-                                if selected {
-                                    name = name.strong();
-                                }
-                                if ui.selectable_label(selected, name).clicked() {
-                                    action = LobbyAction::Select(row.key);
-                                }
-
-                                ui.label(RichText::new(&row.occupancy).color(theme::TEXT));
-                                ui.label(RichText::new(&row.game).color(theme::TEXT_DIM));
-                                ui.label(RichText::new(&row.stack).color(theme::STACK));
-                                ui.label(RichText::new(&row.blinds).color(theme::MONEY));
-                                ui.label(RichText::new(&row.timing).color(theme::TEXT_DIM));
-                                ui.label(
-                                    RichText::new(&row.host).color(theme::TEXT_DIM).monospace(),
-                                );
-
-                                let state_label = ui.label(
-                                    RichText::new(row.state.label())
-                                        .color(state_colour(&row.state)),
-                                );
-                                if let Some(why) = row.state.why_not() {
-                                    state_label.on_hover_text(why);
-                                }
-                                ui.end_row();
-                            }
-                        });
-
-                    // The explanation for an empty list, and only for an empty
-                    // one: which silence this is, and the action that ends it.
-                    if let Some(why) =
-                        empty_explanation(view.tables.len(), rows.len(), view.status.peers)
-                    {
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(why).color(theme::TEXT_DIM).italics());
+                    if let Some(what) = table_rows_and_empty(ui, view, state) {
+                        action = what;
                     }
                 });
         });
+    }
 
     action
+}
+
+/// The list's head: its name and the search on one line, the filter and the
+/// order on the next, each half the width -- two lines that always fit, where
+/// one wrapped line was cut at the column's edge in a small window.
+fn list_head(ui: &mut egui::Ui, state: &mut LobbyUi) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Tables").color(theme::TEXT).size(17.0).strong());
+        ui.add(
+            egui::TextEdit::singleline(&mut state.search)
+                .hint_text("search tables or hosts\u{2026}")
+                .desired_width(ui.available_width()),
+        );
+    });
+    ui.horizontal(|ui| {
+        let half = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(90.0);
+        egui::ComboBox::from_id_salt("filter")
+            .selected_text(state.filter.label())
+            .width(half)
+            .show_ui(ui, |ui| {
+                for f in Filter::ALL {
+                    ui.selectable_value(&mut state.filter, f, f.label());
+                }
+            });
+        egui::ComboBox::from_id_salt("sort")
+            .selected_text(state.sort.label())
+            .width(half)
+            .show_ui(ui, |ui| {
+                for s in Sort::ALL {
+                    ui.selectable_value(&mut state.sort, s, s.label());
+                }
+            });
+    });
+    ui.add_space(6.0);
+}
+
+/// The head and the list together, for the column that scrolls as one.
+fn table_list(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Option<LobbyAction> {
+    list_head(ui, state);
+    table_rows_and_empty(ui, view, state)
+}
+
+/// The rows that survive the search, the filter and the order -- and, for an
+/// empty list, which silence this is and the action that ends it.
+fn table_rows_and_empty(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Option<LobbyAction> {
+    let rows = sorted(visible(&view.tables, &state.search, state.filter), state.sort);
+    let action = table_rows(ui, view, state, &rows);
+    if let Some(e) = empty_state(view.tables.len(), rows.len(), view.status.peers) {
+        empty(ui, e);
+    }
+    action
+}
+
+/// The sit-down dialog for a row, opened from its button or a double click.
+fn sit_dialog(row: &TableRow) -> Dialog {
+    Dialog::Sit(SitDown {
+        key: row.key,
+        buyin: row.default_buyin,
+        password: String::new(),
+        wants_password: row.password_required,
+    })
+}
+
+/// The tables, one card each: the name and the game on the first line with
+/// the seats drawn and what the table is doing; the numbers on the second.
+/// The whole card selects, a double click sits down, and the selected card
+/// carries its own *Join* -- the button is beside the table it joins.
+fn table_rows(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi, rows: &[&TableRow]) -> Option<LobbyAction> {
+    let mut action = None;
+    for row in rows {
+        let selected = view.selected == Some(row.key);
+        let here = view.here.contains(&row.key);
+        let inner = ui.scope_builder(
+            egui::UiBuilder::new()
+                .id_salt(("table-row", row.key))
+                .sense(egui::Sense::click()),
+            |ui| {
+                let resp = ui.response();
+                let fill = if selected {
+                    theme::SELECTED
+                } else if resp.hovered() {
+                    theme::PANEL_LIGHT
+                } else {
+                    theme::FIELD
+                };
+                let edge = if selected { Stroke::new(1.0, theme::GOLD_EDGE) } else { Stroke::NONE };
+                egui::Frame::new()
+                    .fill(fill)
+                    .stroke(edge)
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let join_w = if selected && row.state.joinable() && !here { 92.0 } else { 0.0 };
+                            let width = (ui.available_width() - join_w).max(120.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(width, 28.0),
+                                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                                |ui| {
+                                    ui.set_max_width(width);
+                                    ui.label(RichText::new(&row.name).color(theme::TEXT).size(16.5).strong());
+                                    let (word, tip) = format_badge(row);
+                                    badge(ui, word, if row.sit_and_go { theme::GOLD_ACTION } else { theme::OK })
+                                        .on_hover_text(tip);
+                                    ui.label(RichText::new(shape_words(row.seats)).color(theme::TEXT_DIM).size(14.0));
+                                    seat_dots(ui, row);
+                                    let tone = match row.state {
+                                        TableState::Open if row.seated < row.needed => Tone::Warn,
+                                        TableState::Open => Tone::Ok,
+                                        TableState::Full => Tone::Dim,
+                                        TableState::ParametersChanged => Tone::Danger,
+                                    };
+                                    let status = ui.label(
+                                        RichText::new(status_words(row)).color(tone_colour(tone)).size(14.0),
+                                    );
+                                    if let Some(why) = row.state.why_not() {
+                                        status.on_hover_text(why);
+                                    }
+                                    if row.password_required {
+                                        // A word and not a lock glyph: the fonts here have
+                                        // no lock, and a word teaches what a glyph assumes.
+                                        ui.label(RichText::new("password").color(theme::WARN).size(14.0))
+                                            .on_hover_text("This table asks for a password.");
+                                    }
+                                    if here {
+                                        ui.label(RichText::new("you are here").color(theme::WARN).size(14.0));
+                                    }
+                                },
+                            );
+                            if join_w > 0.0 {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("Join").color(theme::INK_ON_GOLD).strong(),
+                                            )
+                                            .fill(theme::OK)
+                                            .min_size(egui::vec2(72.0, 30.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        state.dialog = Some(sit_dialog(row));
+                                    }
+                                });
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(RichText::new("blinds").color(theme::TEXT_DIM).size(13.0));
+                            ui.label(RichText::new(&row.blinds).color(theme::MONEY).size(14.0))
+                                .on_hover_text("The small and the big blind: the two forced bets that start every hand.");
+                            ui.label(RichText::new("\u{00b7}").color(theme::TEXT_DIM));
+                            ui.label(
+                                RichText::new(if row.sit_and_go { "stack" } else { "buy-in" })
+                                    .color(theme::TEXT_DIM)
+                                    .size(13.0),
+                            );
+                            ui.label(RichText::new(&row.stack).color(theme::STACK).size(14.0));
+                            ui.label(RichText::new("\u{00b7}").color(theme::TEXT_DIM));
+                            ui.label(
+                                RichText::new(format!("{} s to act", row.action_s))
+                                    .color(theme::TEXT_DIM)
+                                    .size(13.0),
+                            )
+                            .on_hover_text(format!("The clock a player gets to act: {}.", row.timing));
+                            ui.label(RichText::new("\u{00b7}").color(theme::TEXT_DIM));
+                            ui.label(
+                                RichText::new(format!("host {}", row.host))
+                                    .color(theme::TEXT_DIM)
+                                    .size(13.0)
+                                    .monospace(),
+                            );
+                        });
+                    });
+            },
+        );
+        let resp = inner.response;
+        if resp.clicked() {
+            action = Some(LobbyAction::Select(row.key));
+        }
+        if resp.double_clicked() {
+            // `S1-FG`: not a table this client is at: the lobby says so
+            // instead of opening the dialog.
+            if here {
+                action = Some(LobbyAction::AlreadyAt(row.key));
+            } else if row.state.joinable() {
+                state.dialog = Some(sit_dialog(row));
+            }
+        }
+        ui.add_space(4.0);
+    }
+    action
+}
+
+/// The chat's history, scrolling, stuck to the newest line.
+fn chat_history(ui: &mut egui::Ui, view: &LobbyView) {
+    scroller(egui::ScrollArea::vertical())
+        .id_salt("chat")
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for line in &view.chat {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("{}:", line.who)).color(theme::ACCENT).strong());
+                    // Untrusted display data, rendered as data.
+                    ui.label(RichText::new(&line.said).color(theme::TEXT));
+                });
+            }
+            if view.chat.is_empty() {
+                ui.label(RichText::new("Quiet for now. Say hello.").color(theme::TEXT_DIM).italics());
+            }
+        });
+}
+
+/// The chat's box. Enter sends and keeps the cursor where it was, because a
+/// chat box that loses focus after every line is a chat box that is used once.
+fn chat_box(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<String> {
+    let box_id = ui.id().with("chat-draft");
+    let field = ui.add(
+        egui::TextEdit::singleline(&mut state.draft)
+            .id(box_id)
+            .hint_text("say something\u{2026}")
+            .desired_width(f32::INFINITY),
+    );
+    let sent = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if sent && !state.draft.trim().is_empty() {
+        ui.memory_mut(|m| m.request_focus(box_id));
+        return Some(std::mem::take(&mut state.draft));
+    }
+    None
+}
+
+/// Who is in the lobby: the table's avatar and the name, as they said it.
+/// No state beside a name -- the lobby knows who is here and not what they
+/// are doing, and it says only what it knows.
+fn players_list(ui: &mut egui::Ui, view: &LobbyView) {
+    for name in &view.seated {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+            style::avatar(ui.painter(), rect, name, true);
+            ui.label(RichText::new(name).color(theme::TEXT));
+        });
+    }
+    if view.seated.is_empty() {
+        ui.label(RichText::new("Nobody else yet.").color(theme::TEXT_DIM).italics());
+    }
+}
+
+fn players_heading(view: &LobbyView) -> String {
+    if view.seated.is_empty() {
+        "Players in the lobby".to_string()
+    } else {
+        format!("Players in the lobby \u{00b7} {}", view.seated.len())
+    }
 }
 
 fn people_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
@@ -1573,123 +2075,222 @@ fn people_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
             // gives the history all of it and pushes the box off the pane.
             let line_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
             let history = (ui.available_height() - line_height).max(0.0);
-            ui.allocate_ui(egui::vec2(ui.available_width(), history), |ui| {
-            scroller(egui::ScrollArea::vertical())
-                .id_salt("chat")
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &view.chat {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(format!("{}:", line.who))
-                                    .color(theme::ACCENT)
-                                    .strong(),
-                            );
-                            // Untrusted display data, rendered as data.
-                            ui.label(RichText::new(&line.said).color(theme::TEXT));
-                        });
-                    }
-                    if view.chat.is_empty() {
-                        ui.label(RichText::new("quiet").color(theme::TEXT_DIM).italics());
-                    }
-                });
-            });
-
-            // Enter sends and keeps the cursor where it was, because a chat box
-            // that loses focus after every line is a chat box that is used once.
-            let box_id = ui.id().with("chat-draft");
-            let field = ui.add(
-                egui::TextEdit::singleline(&mut state.draft)
-                    .id(box_id)
-                    .hint_text("say something…")
-                    .desired_width(f32::INFINITY),
-            );
-            let sent = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if sent && !state.draft.trim().is_empty() {
-                action = LobbyAction::Say(std::mem::take(&mut state.draft));
-                ui.memory_mut(|m| m.request_focus(box_id));
+            ui.allocate_ui(egui::vec2(ui.available_width(), history), |ui| chat_history(ui, view));
+            if let Some(text) = chat_box(ui, state) {
+                action = LobbyAction::Say(text);
             }
         });
     });
 
-    group(ui, "Players in the lobby", |ui| {
+    group(ui, &players_heading(view), |ui| {
         scroller(egui::ScrollArea::vertical())
             .id_salt("players")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for name in &view.seated {
-                    ui.label(RichText::new(name).color(theme::TEXT));
-                }
-                if view.seated.is_empty() {
-                    ui.label(RichText::new("nobody yet").color(theme::TEXT_DIM).italics());
-                }
-            });
+            .show(ui, |ui| players_list(ui, view));
     });
 
     action
 }
 
-fn info_column(ui: &mut egui::Ui, view: &LobbyView) {
-    let top = ui.available_height() * 0.46;
-    ui.allocate_ui(egui::vec2(ui.available_width(), top), |ui| {
-        group(ui, "Table information", |ui| {
-            scroller(egui::ScrollArea::vertical())
-                .id_salt("info")
-                .auto_shrink([false, false])
-                .show(ui, |ui| match view.selected_row() {
-                    Some(r) => {
-                        field(ui, "Name", &r.name, theme::TEXT);
-                        field(
-                            ui,
-                            "Identity",
-                            &super::lobby::short_key(&r.key),
-                            theme::TEXT_DIM,
-                        );
-                        field(ui, "Game", &r.game, theme::TEXT);
-                        field(ui, "Blinds", &r.blinds, theme::MONEY);
-                        field(ui, "Stack", &r.stack, theme::STACK);
-                        field(ui, "Clock", &r.timing, theme::TEXT);
-                        field(ui, "Seats", &r.occupancy, theme::TEXT);
-                        field(ui, "State", r.state.label(), state_colour(&r.state));
-                        if let Some(why) = r.state.why_not() {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(why).color(theme::WARN).size(14.0));
-                        }
-                        if r.password_required {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(PASSWORD_WARNING).color(theme::WARN).size(14.0),
-                            );
-                        }
-                    }
-                    None => {
-                        ui.label(
-                            RichText::new("select a table")
-                                .color(theme::TEXT_DIM)
-                                .italics(),
-                        );
-                    }
-                });
-        });
-    });
-
-    group(ui, "Client log", |ui| {
-        scroller(egui::ScrollArea::vertical())
-            .id_salt("log")
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &view.log {
+/// `D-067`: the player's own card -- the avatar, the name, how long they have
+/// been here, and their record from this profile. Nothing on it is a ranking
+/// of anybody else; nothing on it asks for anything back.
+fn you_card(ui: &mut egui::Ui, view: &LobbyView) {
+    egui::Frame::new()
+        .fill(theme::FIELD)
+        .stroke(Stroke::new(1.0, theme::LINE))
+        .corner_radius(10.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::hover());
+                style::avatar(ui.painter(), rect, &view.me, true);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new(&view.me).color(theme::TEXT).size(18.0).strong());
                     ui.label(
-                        RichText::new(line)
+                        RichText::new(format!("here for {}", session_words(view.session_s)))
                             .color(theme::TEXT_DIM)
-                            .monospace()
-                            .size(13.5),
+                            .size(13.0),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            match view.record.as_ref() {
+                Some(r) if r.games > 0 => {
+                    ui.horizontal_wrapped(|ui| {
+                        stat(ui, "Sit & Gos", &r.games.to_string(), theme::TEXT);
+                        stat(ui, "Wins", &r.wins.to_string(), theme::GOLD_ACTION);
+                        if let Some(b) = r.best_place {
+                            stat(ui, "Best", &super::table::ordinal(usize::from(b)), theme::STACK);
+                        }
+                    });
+                    if let Some(last) = r.last.as_ref() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Last game").color(theme::TEXT_DIM).size(13.0));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(result_words(last))
+                                    .color(if last.won() { theme::GOLD_ACTION } else { theme::TEXT })
+                                    .size(15.0),
+                            )
+                            .wrap(),
+                        );
+                        if let Some(p) = result_praise(last) {
+                            ui.label(RichText::new(p).color(theme::OK).size(14.0));
+                        }
+                    }
+                }
+                _ => {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("No games on record yet. Your first Sit & Go is one click away.")
+                                .color(theme::TEXT_DIM)
+                                .size(14.0),
+                        )
+                        .wrap(),
                     );
                 }
+            }
+        });
+}
+
+/// One number on the card, with its word under it.
+fn stat(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.label(RichText::new(value).color(colour).size(20.0).strong());
+        ui.label(RichText::new(label).color(theme::TEXT_DIM).size(12.0));
+    });
+    ui.add_space(10.0);
+}
+
+/// The three steps, for the space a table's details take once one is chosen.
+fn how_it_works(ui: &mut egui::Ui) {
+    ui.label(RichText::new("How it works").color(theme::TEXT).size(15.0).strong());
+    ui.add_space(4.0);
+    for (i, (head, rest)) in HOW_IT_WORKS.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.circle_filled(rect.center(), 12.0, theme::SELECTED);
+            p.circle_stroke(rect.center(), 11.5, Stroke::new(1.0, theme::GOLD_EDGE));
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                FontId::proportional(13.0),
+                theme::GOLD_ACTION,
+            );
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add(egui::Label::new(RichText::new(*head).color(theme::TEXT).size(14.5).strong()).wrap());
+                ui.add(egui::Label::new(RichText::new(*rest).color(theme::TEXT_DIM).size(13.5)).wrap());
+            });
+        });
+        ui.add_space(6.0);
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Select a table to see its details here.")
+            .color(theme::TEXT_DIM)
+            .size(13.0)
+            .italics(),
+    );
+}
+
+/// The chosen table's details, and its own way in.
+fn table_info(ui: &mut egui::Ui, r: &TableRow, view: &LobbyView, state: &mut LobbyUi) {
+    let here = view.here.contains(&r.key);
+    ui.add(egui::Label::new(RichText::new(&r.name).color(theme::TEXT).size(18.0).strong()).wrap());
+    ui.horizontal_wrapped(|ui| {
+        let (word, tip) = format_badge(r);
+        badge(ui, word, if r.sit_and_go { theme::GOLD_ACTION } else { theme::OK }).on_hover_text(tip);
+        ui.label(RichText::new(shape_words(r.seats)).color(theme::TEXT_DIM).size(14.0));
+        if r.password_required {
+            ui.label(RichText::new("password").color(theme::WARN).size(14.0));
+        }
+    });
+    ui.add_space(6.0);
+    field(ui, "Blinds", &r.blinds, theme::MONEY);
+    field(ui, if r.sit_and_go { "Stack" } else { "Buy-in" }, &r.stack, theme::STACK);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Seats").color(theme::TEXT_DIM).size(14.0));
+        seat_dots(ui, r);
+    });
+    field(ui, "Clock", &r.timing, theme::TEXT);
+    field(ui, "Host", &r.host, theme::TEXT_DIM);
+    field(ui, "Identity", &super::lobby::short_key(&r.key), theme::TEXT_DIM);
+    let tone = match r.state {
+        TableState::Open if r.seated < r.needed => Tone::Warn,
+        TableState::Open => Tone::Ok,
+        TableState::Full => Tone::Dim,
+        TableState::ParametersChanged => Tone::Danger,
+    };
+    field(ui, "State", &status_words(r), tone_colour(tone));
+    if let Some(why) = r.state.why_not() {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(why).color(theme::WARN).size(14.0)).wrap());
+    }
+    if r.password_required {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(PASSWORD_WARNING).color(theme::WARN).size(14.0)).wrap());
+    }
+    ui.add_space(8.0);
+    if here {
+        ui.label(RichText::new("You are at this table.").color(theme::WARN));
+    } else if r.state.joinable() {
+        if ui
+            .add(
+                egui::Button::new(RichText::new("Join this table").color(theme::INK_ON_GOLD).strong())
+                    .fill(theme::OK)
+                    .min_size(egui::vec2(150.0, 34.0)),
+            )
+            .clicked()
+        {
+            state.dialog = Some(sit_dialog(r));
+        }
+    }
+}
+
+fn info_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) {
+    you_card(ui, view);
+    ui.add_space(10.0);
+    group(ui, "Table", |ui| {
+        scroller(egui::ScrollArea::vertical())
+            .id_salt("info")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match view.selected_row() {
+                Some(r) => table_info(ui, r, view, state),
+                None => how_it_works(ui),
             });
     });
+}
+
+/// The people and the card in one scrolling column, for a window too narrow
+/// for three.
+fn side_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
+    let mut action = LobbyAction::None;
+    scroller(egui::ScrollArea::vertical())
+        .id_salt("side")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            you_card(ui, view);
+            ui.add_space(10.0);
+            group(ui, "Table", |ui| match view.selected_row() {
+                Some(r) => table_info(ui, r, view, state),
+                None => how_it_works(ui),
+            });
+            group(ui, "Lobby chat", |ui| {
+                ui.allocate_ui(egui::vec2(ui.available_width(), 180.0), |ui| chat_history(ui, view));
+                if let Some(text) = chat_box(ui, state) {
+                    action = LobbyAction::Say(text);
+                }
+            });
+            group(ui, &players_heading(view), |ui| players_list(ui, view));
+        });
+    action
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
@@ -1699,31 +2300,49 @@ fn field(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
     });
 }
 
-/// The bottom strip: what the connection is actually doing.
-fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
+/// The bottom strip: one light and one word a player reads -- and, when they
+/// ask, everything the connection is doing, with the client log (`D-067`).
+fn network_strip(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) {
+    let s = &view.status;
     ui.horizontal(|ui| {
-        let s = &view.status;
-        ui.label(RichText::new(s.summary()).color(status_colour(view)).strong());
-        ui.add_space(16.0);
+        let (word, tone) = s.headline();
+        let colour = tone_colour(tone);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 5.0, colour);
+        if tone == Tone::Ok {
+            ui.painter().circle_stroke(rect.center(), 6.5, Stroke::new(1.0, colour.gamma_multiply(0.4)));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = if state.diagnostics_open { "Hide details" } else { "Network details" };
+            if ui
+                .add(egui::Button::new(RichText::new(label).color(theme::TEXT_DIM).size(14.0)).frame(false))
+                .clicked()
+            {
+                state.diagnostics_open = !state.diagnostics_open;
+                ui.ctx().request_repaint();
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(word).color(colour).strong()).truncate());
+            });
+        });
+    });
 
+    if !state.diagnostics_open {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(s.summary()).color(status_colour(view)).size(14.0));
         ui.label(
-            RichText::new(if s.dht_announced {
-                "DHT: announced"
-            } else {
-                "DHT: not yet"
-            })
-            .color(if s.dht_announced {
-                theme::OK
-            } else {
-                theme::TEXT_DIM
-            })
-            .size(14.0),
+            RichText::new(if s.dht_announced { "DHT: announced" } else { "DHT: not yet" })
+                .color(if s.dht_announced { theme::OK } else { theme::TEXT_DIM })
+                .size(14.0),
         );
-
         ui.label(
             // A relay is a relay. Whether its budget carries a hand is a
             // question about a table, and it is asked in `net::relay` when
-            // somebody sits down — not on a strip that reads "too small for a
+            // somebody sits down -- not on a strip that reads "too small for a
             // hand" at a player who is not in one, permanently, because every
             // public relay reports the library's defaults.
             RichText::new(match &s.relay {
@@ -1736,15 +2355,9 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
             })
             .size(14.0),
         );
-
         if let Some(how) = s.port_mapped {
-            ui.label(
-                RichText::new(format!("{how}: port open"))
-                    .color(theme::OK)
-                    .size(14.0),
-            );
+            ui.label(RichText::new(format!("{how}: port open")).color(theme::OK).size(14.0));
         }
-
         // `D-002` point 3 (`S1-FK`): what this client's own line carries for
         // other players, shown whenever it carries anything.
         let (reserved, circuits) = s.relaying;
@@ -1759,10 +2372,9 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
                 .size(14.0),
             );
         }
-
         if s.failed_dials > 0 {
             // Counted rather than listed: most dials fail on an open DHT, and a
-            // log of them buries what matters — but with no count at all, "most
+            // log of them buries what matters -- but with no count at all, "most
             // dials fail" and "this client is broken" look identical.
             ui.label(
                 RichText::new(format!("{} dials failed", s.failed_dials))
@@ -1771,6 +2383,19 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
             );
         }
     });
+    ui.add_space(4.0);
+    ui.label(RichText::new("Client log").color(theme::TEXT_DIM).size(13.0).strong());
+    let height = (ui.ctx().content_rect().height() * 0.28).clamp(70.0, 220.0);
+    scroller(egui::ScrollArea::vertical())
+        .id_salt("log")
+        .max_height(height)
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for line in &view.log {
+                ui.label(RichText::new(line).color(theme::TEXT_DIM).monospace().size(13.5));
+            }
+        });
 }
 
 /// The colour of the status line, which follows the worst true thing.
@@ -1875,11 +2500,28 @@ mod tests {
             theme::OK,
             theme::WARN,
             theme::DANGER,
+            theme::GOLD_ACTION,
+            theme::GOLD_EDGE,
         ] {
             assert!(
                 theme::separation(theme::PANEL, c) >= 150,
                 "a colour drawn on a panel is not legible on it"
             );
+        }
+    }
+
+    /// `D-067`: the columns follow the width in points. Three on a wide
+    /// window; one at 200 % text in a 1 180-pixel window (590 points), where
+    /// three had drawn over each other; and every tone has a palette colour.
+    #[test]
+    fn the_columns_follow_the_width() {
+        assert_eq!(columns_for(1_180.0), 3, "the default window at 100 %");
+        assert_eq!(columns_for(900.0), 2, "the smallest window at 100 %");
+        assert_eq!(columns_for(787.0), 2, "the default window at 150 %");
+        assert_eq!(columns_for(590.0), 1, "the default window at 200 %");
+        assert_eq!(columns_for(450.0), 1, "the smallest window at 200 %");
+        for tone in [Tone::Dim, Tone::Ok, Tone::Accent, Tone::Warn, Tone::Danger] {
+            assert!(theme::separation(theme::PANEL, tone_colour(tone)) >= 150);
         }
     }
 

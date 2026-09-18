@@ -1326,6 +1326,8 @@ fn windowed(player: Player, run: Run) -> Started {
                 table_ui: Default::default(),
                 windows_shown: Default::default(),
                 sound: p2p_poker::sound::Player::new(),
+                // `D-067`: the record behind the lobby's card about the player.
+                results: p2p_poker::storage::results::load(&profile_dir),
                 profile_dir,
                 app_key,
                 commands,
@@ -1799,6 +1801,9 @@ struct Client {
     windows_shown: std::collections::BTreeSet<u8>,
     /// PokerTH's sounds, played as the app owes them.
     sound: p2p_poker::sound::Player,
+    /// `D-067`: this player's own record of finished tournaments, from the
+    /// profile, for the lobby's card; written to as the node decides a place.
+    results: p2p_poker::storage::results::Results,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
     commands: tokio::sync::mpsc::Sender<NodeCommand>,
     bounded: Option<u64>,
@@ -2176,6 +2181,16 @@ impl eframe::App for Client {
             }
             self.ui.settings = settings;
         }
+        // `D-067`: a place the node decided, kept in the profile's record.
+        let finished = self.state.take_results();
+        if !finished.is_empty() {
+            for entry in finished {
+                self.results.record(entry);
+            }
+            if let Err(e) = p2p_poker::storage::results::save(&self.profile_dir, &self.results) {
+                self.state.log.push_back(format!("the results did not save: {e}"));
+            }
+        }
         // `S1-CX`: an unreachable heads-up opponent is said once it is worth saying.
         self.state.tick_opponent();
         // PokerTH's turn warning, and every sound owed since the last frame.
@@ -2227,7 +2242,11 @@ impl eframe::App for Client {
 
         {
             {
-                let view = self.state.view();
+                let mut view = self.state.view();
+                // `D-067`: the card about the player -- how long this client
+                // has been open, and the record from the profile.
+                view.session_s = self.started.elapsed().as_secs();
+                view.record = Some(self.results.summary());
                 match render::lobby(ui, &view, &mut self.ui) {
                     render::LobbyAction::Select(key) => self.state.selected = Some(key),
                     render::LobbyAction::None => {}

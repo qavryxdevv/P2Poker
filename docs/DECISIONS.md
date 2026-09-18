@@ -5869,3 +5869,48 @@ acted for seat 2 at its turn at 158.4 s, naming seat 3 a silent voter, certified
 and played heads-up from 203.5 s; n2 and n3, their lines back, found the table far on, took up its running hand
 #26 as bystanders from the others' copies (`D-038`), asked to sit in, and were certified back in by the two at
 286.6 s -- the table was four again from hand #27 at 290.2 s, 48 hands, one genesis on all four.
+
+## D-067 — the lobby is a card room, not a network console
+
+**Decided 2026-09-18 by the project owner**, who asked for a lobby that the poker community would take to on
+sight -- attractive, plain to a newcomer within five seconds, a table found by a regular within two -- in the
+table window's own style (`D-048`), with everything technical kept but moved out of the first view.
+
+1. **The case.** The lobby's first line read *0 tables, 0 open, 132 peers, 0 in lobby, 0 searching*; the largest
+   text below it was a client log of DHT walks; the strip said *27 dials failed*; and the one thing a player wanted
+   -- a game -- was a green button among three at the bottom of a list of eight columns. Four zeroes read as an
+   empty restaurant, a DHT count reads as players when it is not, and a log of peer ids is a thing an operator
+   reads. At 200 % text the three columns drew over each other and the buttons over the list.
+2. **What it says now.** A band of the table's felt with its gold keyline, the mark, the name and the claim the
+   room is built on -- *No house. No server. Every card proven.* -- with the four sentences behind it one click
+   away, its fourth being what the cryptography does not stop (`gui::lobby::FAIR_PLAY`). Under it the one large
+   gold button, *FIND A GAME*, which starts the search on the click with the format chosen beside it; *Create
+   table* beside it, quieter; an honest line on what to expect. The tables are cards: the name, the game as a
+   badge whose hover says what the game is, the seats **drawn** -- a gold disc per player, a ring per empty seat,
+   filling over a third of a second as a seat is taken -- and what the table is doing in a sentence a player acts
+   on (*waiting for 2 more*, *1 seat left*, *full*, *rules changed*). The selected card carries its own *Join*; a
+   double click sits down. An empty list is an invitation with the suits over it. The player has a card of their
+   own: the table's avatar, the name, how long they have been here, and their record. The connection is one light
+   and one word -- *Online*, *Online through a relay*, *Connecting…*, and red only for the one real fault, an
+   unreachable client with no relay -- with *Network details* beside it, which opens what the strip used to say and
+   the client log under it.
+3. **The rules the words follow**, each a function with a test in `gui::lobby`: nothing is ever invented -- not a
+   player, not a number, not a wait (`headline_counts` says only what is there and never a zero; `hero_note` names
+   no number before one was measured; the DHT's peers are in the details and are not players); a result is stated
+   and a win congratulated, and nothing asks for the chips back (`result_words`, `result_praise`); the session's
+   length is said and never nagged about (`session_words`); no fabricated scarcity, no streak, no daily reward. The
+   lobby's gold **is** the table's, measured: `theme::GOLD_ACTION` is `style::COLOR_ACCENT` and `GOLD_EDGE` is
+   `BOX_ACCENT`, asserted, and used for the one action, a win and a selected table's edge only.
+4. **The record.** `storage::results` (`results.cbor` in the profile, at most 500 entries) keeps the place this
+   player finished each Sit & Go in, written by the window from the node's `Finished` word at the boundary and
+   from nothing else (`S1-FL`); a cash game has no place and leaves no entry. Local and private, as the notes are.
+5. **The width decides the columns** (`render::columns_for`): three from 980 points, two from 660, one below --
+   the tables, with the people and the card behind a *People* button. A 1 180-pixel window at 200 % is 590 points.
+   A column too short for the way in and the list both (under 420 points) scrolls as one. Photographed at 100 % and
+   200 % text in 1 180×760 and 900×600 windows, with a headless founder on the LAN for a row to draw: nothing runs
+   past an edge, every function reachable.
+6. **Unchanged, and checked by hand on the build**: the search (`D-064`, its modal and *More options…*), creating
+   and sitting down (the dialogs), the lobby chat and who is here, the unfinished game, the relay notice
+   (`D-002`), the four-tab settings, `D-043`'s *Your tables*, and every rule the pane carried before -- a table
+   whose rules changed is not joinable and says why; a password's warning is said. The window still takes the
+   node's word for every game fact.

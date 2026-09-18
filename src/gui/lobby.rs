@@ -2,7 +2,15 @@
 //!
 //! `SPEC_CS.md` §22 asks for PokerTH's shape — a table list with columns for the
 //! game, the blinds, the occupancy and the state, a player list, chat, a join
-//! button and a create button.
+//! button and a create button. All of it is still here. `D-067` (2026-09-18)
+//! changed how it is *said*: the lobby is a card room and not a network console
+//! — the one action a player wants first is the largest thing on the screen,
+//! a table's seats are drawn rather than counted, an empty list is an
+//! invitation and never a zero, and everything technical about the connection
+//! is one click away rather than on the screen. The words are here, as
+//! functions with tests, because a word on a screen is a claim and every claim
+//! this pane makes must be true: nothing is ever invented — not a player, not
+//! a number, not a wait.
 //!
 //! # Why the logic is here and the drawing is a thin layer over it
 //!
@@ -23,6 +31,7 @@
 //! advert has no cards in it.
 
 use crate::net::lobby::{Held, LobbyStore, Mode};
+use crate::net::matchmaker::Format;
 use crate::table::formation::Roster;
 
 /// One row of the table list.
@@ -57,6 +66,12 @@ pub struct TableRow {
     pub host: String,
     pub state: TableState,
     pub password_required: bool,
+    /// How many seats the table has, as a number: the seats are drawn.
+    pub seats: u8,
+    /// A Sit & Go, as against a cash game.
+    pub sit_and_go: bool,
+    /// The clock a player gets to act, in seconds.
+    pub action_s: u32,
 }
 
 /// What the state column says, and what the join button does about it.
@@ -161,7 +176,247 @@ pub fn row(key: [u8; 32], held: &Held) -> TableRow {
         host: short_key(&ad.founder_app_key),
         state,
         password_required: ad.password_required,
+        seats: ad.max_players,
+        sit_and_go: Mode::parse(ad.mode).is_some_and(|m| m.is_tournament()),
+        action_s: ad.action_timeout_ms / 1_000,
     }
+}
+
+/// A table's shape in a player's words: *heads-up*, *6-max*, *full ring*.
+pub fn shape_words(seats: u8) -> String {
+    match seats {
+        2 => "heads-up".to_string(),
+        10 => "full ring".to_string(),
+        n => format!("{n}-max"),
+    }
+}
+
+/// The badge a row wears: the game, and what the game means for somebody who
+/// has not played it -- the hover text, so the lobby teaches a newcomer without
+/// lecturing a regular.
+pub fn format_badge(row: &TableRow) -> (&'static str, &'static str) {
+    if row.sit_and_go {
+        (
+            "Sit & Go",
+            "Sit & Go: everybody starts with the same stack, the game begins when the \
+             seats are in, and it ends when one player holds every chip.",
+        )
+    } else {
+        (
+            "Cash",
+            "Cash game: sit down with a buy-in of your choice, play as long as you \
+             like, and leave between hands with what you have.",
+        )
+    }
+}
+
+/// What the table is doing, in a sentence a player acts on.
+///
+/// *Waiting for 2 more* is the goal-gradient effect put to honest use: a table
+/// two seats short is a table somebody can start by sitting down, and the
+/// sentence says how far it is rather than only that it is open. A full table
+/// and one whose rules changed say so; the reason for the latter stays on the
+/// hover and in the information pane, as before.
+pub fn status_words(row: &TableRow) -> String {
+    match row.state {
+        TableState::ParametersChanged => "rules changed".to_string(),
+        TableState::Full => "full".to_string(),
+        TableState::Open => {
+            let short = row.needed.saturating_sub(row.seated);
+            if short > 0 {
+                format!("waiting for {short} more")
+            } else {
+                let left = row.seats.saturating_sub(row.seated);
+                if left == 1 {
+                    "1 seat left".to_string()
+                } else {
+                    format!("{left} seats left")
+                }
+            }
+        }
+    }
+}
+
+/// How the list is ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sort {
+    /// The tables about to start first: open before full, the fullest first,
+    /// then by name. What a player looking for a game now wants at the top.
+    #[default]
+    ClosestToStart,
+    Name,
+    /// The biggest blinds first.
+    Blinds,
+}
+
+impl Sort {
+    pub const ALL: [Sort; 3] = [Sort::ClosestToStart, Sort::Name, Sort::Blinds];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Sort::ClosestToStart => "closest to starting",
+            Sort::Name => "by name",
+            Sort::Blinds => "by blinds",
+        }
+    }
+}
+
+/// The rows in the order asked for. Every order ends on the name and then the
+/// key, so two tables alike in every counted way keep one order between
+/// frames: `rows` already promises the list does not reshuffle under the
+/// cursor, and a sort that broke ties by arrival would break that promise.
+pub fn sorted<'a>(mut rows: Vec<&'a TableRow>, sort: Sort) -> Vec<&'a TableRow> {
+    let rank = |r: &TableRow| match r.state {
+        TableState::Open => 0u8,
+        TableState::Full => 1,
+        TableState::ParametersChanged => 2,
+    };
+    let fill = |r: &TableRow| {
+        if r.seats == 0 {
+            0u32
+        } else {
+            u32::from(r.seated) * 1_000 / u32::from(r.seats)
+        }
+    };
+    let blinds = |r: &TableRow| {
+        r.blinds
+            .split('/')
+            .next_back()
+            .and_then(|b| b.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    match sort {
+        Sort::ClosestToStart => rows.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then(fill(b).cmp(&fill(a)))
+                .then(b.seated.cmp(&a.seated))
+                .then(a.name.cmp(&b.name))
+                .then(a.key.cmp(&b.key))
+        }),
+        Sort::Name => rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.key.cmp(&b.key))),
+        Sort::Blinds => rows.sort_by(|a, b| {
+            blinds(b)
+                .cmp(&blinds(a))
+                .then(a.name.cmp(&b.name))
+                .then(a.key.cmp(&b.key))
+        }),
+    }
+    rows
+}
+
+/// The colour a word is said in, decided here so the drawing does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Dim,
+    Ok,
+    Accent,
+    Warn,
+    Danger,
+}
+
+/// The header's counts, in a person's words and **only when they are not
+/// zero**.
+///
+/// *0 tables, 0 open, 0 in lobby, 0 searching* was the first thing the old
+/// header said, and four zeroes read as an empty restaurant. What is happening
+/// is said; what is not happening is not announced. Nothing is rounded up and
+/// nobody is counted twice: the DHT's several hundred peers are not players
+/// and are not here (they are in the network details).
+pub fn headline_counts(tables: usize, open: usize, online: usize, searching: usize) -> Vec<(String, Tone)> {
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
+    let mut out = Vec::new();
+    if tables > 0 {
+        out.push((format!("{tables} {}", plural(tables, "table", "tables")), Tone::Dim));
+    }
+    if open > 0 {
+        out.push((format!("{open} open"), Tone::Ok));
+    }
+    if online > 0 {
+        out.push((format!("{online} {} online", plural(online, "player", "players")), Tone::Accent));
+    }
+    if searching > 0 {
+        out.push((format!("{searching} searching"), Tone::Warn));
+    }
+    out
+}
+
+/// A session's length, said the way a person says it.
+pub fn session_words(secs: u64) -> String {
+    let mins = secs / 60;
+    if mins < 60 {
+        format!("{mins} min")
+    } else {
+        format!("{} h {:02} min", mins / 60, mins % 60)
+    }
+}
+
+/// The lobby's word on one finished game, for the card about the player.
+///
+/// A win is congratulated; a place is stated. **Neither asks for anything
+/// back**: *win it back* is the sentence a casino writes, and this lobby does
+/// not write it.
+pub fn result_words(e: &crate::storage::results::Entry) -> String {
+    let place = crate::gui::table::ordinal(usize::from(e.place));
+    if e.won() {
+        format!("You won at {}", e.table)
+    } else if e.tied {
+        format!("Tied for {place} of {} at {}", e.seats, e.table)
+    } else {
+        format!("{} of {} at {}", capitalised(&place), e.seats, e.table)
+    }
+}
+
+fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// A word for a good result, and none for the rest: a win is congratulated,
+/// a top place at a table of six or more is praised, and a place is a place.
+pub fn result_praise(e: &crate::storage::results::Entry) -> Option<&'static str> {
+    if e.won() {
+        Some("Congratulations!")
+    } else if e.place <= 3 && e.seats >= 6 {
+        Some("Well played.")
+    } else {
+        None
+    }
+}
+
+/// The format's name on a chip: short, because four of them share one row
+/// with the word beside them.
+pub const fn format_chip(f: Format) -> &'static str {
+    match f {
+        Format::HeadsUp => "Heads-up",
+        Format::SixMax => "6-max",
+        Format::FullRing => "Full ring",
+        Format::Any => "Any format",
+    }
+}
+
+/// The line under the big button: what a search takes, when that is known
+/// from this profile's own searches, and who else is looking right now, when
+/// anybody is. Never a number the client has not measured: before the first
+/// search it says what the wait depends on.
+pub fn hero_note(typical_s: Option<u32>, format: Format, searching: u32) -> String {
+    let mut note = match typical_s {
+        Some(t) => format!(
+            "Searches for {} usually take about {} here.",
+            format_chip(format).to_lowercase(),
+            clock(u64::from(t))
+        ),
+        None => "How long it takes depends on who else is looking; the search shows an estimate as it learns.".to_string(),
+    };
+    match searching {
+        0 => {}
+        1 => note.push_str(" 1 player is searching right now."),
+        n => note.push_str(&format!(" {n} players are searching right now.")),
+    }
+    note
 }
 
 /// Every table the client holds, in a stable order.
@@ -234,25 +489,64 @@ pub fn visible<'a>(rows: &'a [TableRow], search: &str, filter: Filter) -> Vec<&'
         .collect()
 }
 
-/// What to say when the list is empty, which is two different things.
+/// What an empty list says: a title and a line under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyState {
+    pub title: &'static str,
+    pub body: &'static str,
+    /// Still connecting: the drawing shows it is working rather than waiting.
+    pub connecting: bool,
+}
+
+/// What to say when the list is empty, which is three different things.
 ///
-/// *"This lobby is quiet"* and *"your filter hides everything"* look identical
-/// on screen and need opposite reactions, so the message says which. The Python
-/// client makes the same distinction and for the same reason.
-pub fn empty_explanation(total: usize, shown: usize, peers: usize) -> Option<&'static str> {
+/// *"This lobby is quiet"*, *"your filter hides everything"* and *"not on the
+/// network yet"* look identical on screen and need three reactions, so the
+/// message says which. And each one is an **invitation, not an apology**: the
+/// old text explained the network (*nobody is advertising a table*) where a
+/// player wants to know what to do next -- start the search, and they are
+/// seated the moment somebody else does.
+pub fn empty_state(total: usize, shown: usize, peers: usize) -> Option<EmptyState> {
     if shown > 0 {
         return None;
     }
     Some(if total > 0 {
-        "Every table is hidden by the search or the filter. Clear them to see the rest."
+        EmptyState {
+            title: "Every table is hidden",
+            body: "Clear the search or the filter to see the rest.",
+            connecting: false,
+        }
     } else if peers == 0 {
-        "No peers yet. This client is still looking for others; nothing can be \
-         advertised to it until it finds some."
+        EmptyState {
+            title: "Connecting\u{2026}",
+            body: "Looking for other players on the network. Tables appear here as soon as they are found.",
+            connecting: true,
+        }
     } else {
-        "Connected, and nobody is advertising a table. Create one and it will \
-         appear in the other clients' lobbies."
+        EmptyState {
+            title: "Nobody is playing right now",
+            body: "Start a search and you are seated the moment an opponent arrives \u{2014} \
+                   or create a table and invite your friends.",
+            connecting: false,
+        }
     })
 }
+
+/// The three steps, for a card a newcomer reads once.
+pub const HOW_IT_WORKS: [(&str, &str); 3] = [
+    ("Find a game", "or create a table for your friends."),
+    ("The table starts", "when its seats are in."),
+    ("Every card is verified", "on your own machine, shuffled by all the players together."),
+];
+
+/// What *provably fair* means here, in four sentences, the fourth being what it
+/// does not mean. The claim is `CRYPTOGRAPHY.md`'s: Barnett–Smart mental poker
+/// with Bayer–Groth shuffle proofs and no server -- and its honesty clause.
+pub const FAIR_PLAY: &str =
+    "Every player shuffles the deck in turn and proves the shuffle was honest. A card is opened only \
+     when every player releases their part of it, so nobody \u{2014} not even the table's founder \u{2014} \
+     can see or stack a card. There is no server, no house and no rake. What no cryptography stops is \
+     two players talking to each other outside the game; that is the same at every table.";
 
 /// What a password-protected table's dialog must say.
 ///
@@ -340,6 +634,23 @@ impl NetworkStatus {
             (_, _, n) => format!("Connected to {n} peer{}", if n == 1 { "" } else { "s" }),
         }
     }
+
+    /// The one light and its word, for the strip a player reads: *Online*,
+    /// and nothing technical about how. Red only for the one thing that is a
+    /// real fault of the connection -- unreachable and relayless -- which is
+    /// [`summary`](Self::summary)'s first arm, in the same order. The rest of
+    /// what the connection is doing is one click away, in the details.
+    pub fn headline(&self) -> (&'static str, Tone) {
+        match (self.public, self.relay.is_some(), self.peers) {
+            (Some(false), false, _) => (
+                "No way in from the internet \u{2014} tables may not be joinable",
+                Tone::Danger,
+            ),
+            (_, _, 0) => ("Connecting\u{2026}", Tone::Dim),
+            (_, true, _) => ("Online through a relay", Tone::Ok),
+            _ => ("Online", Tone::Ok),
+        }
+    }
 }
 
 /// `S1-CS`: what the connecting window says.
@@ -394,6 +705,12 @@ pub struct LobbyView {
     pub search: Option<SearchView>,
     /// `D-064`: other clients searching for a game, as the queue topic says.
     pub searching: u32,
+    /// `D-067`: how long this client has been open, for the card about the
+    /// player -- said, never nagged about.
+    pub session_s: u64,
+    /// `D-067`: this player's own record, from the profile; `None` while the
+    /// window has not read it.
+    pub record: Option<crate::storage::results::Summary>,
 }
 
 /// `D-064`: the search under way, as the modal window shows it.
@@ -442,6 +759,8 @@ impl LobbyView {
             already_at: None,
             search: None,
             searching: 0,
+            session_s: 0,
+            record: None,
         }
     }
 
@@ -615,13 +934,186 @@ mod tests {
         assert_eq!(waiting[0].key, [1u8; 32]);
     }
 
-    /// An empty list means two opposite things and the message says which.
+    /// An empty list means three different things and the message says which
+    /// -- and each is an invitation, never an apology or a zero.
     #[test]
     fn an_empty_list_says_which_silence_it_is() {
-        assert!(empty_explanation(3, 0, 5).unwrap().contains("hidden by the search"));
-        assert!(empty_explanation(0, 0, 0).unwrap().contains("No peers yet"));
-        assert!(empty_explanation(0, 0, 4).unwrap().contains("nobody is advertising"));
-        assert!(empty_explanation(3, 3, 5).is_none(), "a list explains itself");
+        let hidden = empty_state(3, 0, 5).unwrap();
+        assert!(hidden.title.contains("hidden"));
+        assert!(hidden.body.contains("Clear the search"));
+        let alone = empty_state(0, 0, 0).unwrap();
+        assert!(alone.connecting, "not on the network yet: the drawing shows it working");
+        assert!(alone.title.starts_with("Connecting"));
+        let quiet = empty_state(0, 0, 4).unwrap();
+        assert!(quiet.title.contains("Nobody is playing"));
+        assert!(quiet.body.contains("Start a search"), "the next thing to do, not the network's state");
+        assert!(!quiet.connecting);
+        for s in [hidden, alone, quiet] {
+            assert!(!s.title.contains('0') && !s.body.contains('0'), "no zero is announced: {s:?}");
+            assert!(!s.body.to_lowercase().contains("advertis"), "no protocol word: {s:?}");
+        }
+        assert!(empty_state(3, 3, 5).is_none(), "a list explains itself");
+    }
+
+    /// `D-067`: a table's state is a sentence a player acts on, and the
+    /// distance to a start is said in seats.
+    #[test]
+    fn the_status_says_how_far_a_table_is_from_starting() {
+        let mut r = row([1u8; 32], &held(1, false));
+        r.needed = 3;
+        r.seated = 1;
+        assert_eq!(status_words(&r), "waiting for 2 more");
+        r.seated = 3;
+        assert_eq!(status_words(&r), "3 seats left", "past the minimum, the seats free are what is said");
+        r.seated = 5;
+        assert_eq!(status_words(&r), "1 seat left");
+        assert_eq!(status_words(&row([2u8; 32], &held(6, false))), "full");
+        assert_eq!(status_words(&row([3u8; 32], &held(2, true))), "rules changed");
+    }
+
+    /// `D-067`: the shape and the badge are a player's words, and the badge
+    /// carries what the game means for somebody who has not played it.
+    #[test]
+    fn the_shape_and_the_badge_are_a_players_words() {
+        assert_eq!(shape_words(2), "heads-up");
+        assert_eq!(shape_words(6), "6-max");
+        assert_eq!(shape_words(10), "full ring");
+        assert_eq!(shape_words(4), "4-max");
+        let cash = row([1u8; 32], &held(2, false));
+        assert!(!cash.sit_and_go);
+        assert_eq!(format_badge(&cash).0, "Cash");
+        assert!(format_badge(&cash).1.contains("buy-in"));
+        let mut h = held(2, false);
+        h.ad.mode = Mode::TournamentSngPlayMoney.code();
+        let sng = row([2u8; 32], &h);
+        assert!(sng.sit_and_go);
+        assert_eq!(format_badge(&sng).0, "Sit & Go");
+        assert!(format_badge(&sng).1.contains("same stack"));
+        assert_eq!(sng.seats, 6);
+        assert_eq!(sng.action_s, 20);
+    }
+
+    /// `D-067`: closest to starting means open before full, the fullest first,
+    /// and every order ends on the name so nothing reshuffles between frames.
+    #[test]
+    fn the_default_order_puts_the_table_about_to_start_first() {
+        let mut nearly = row([1u8; 32], &held(5, false));
+        nearly.name = "Zeta".into();
+        let mut empty = row([2u8; 32], &held(1, false));
+        empty.name = "Alpha".into();
+        let full = row([3u8; 32], &held(6, false));
+        let broken = row([4u8; 32], &held(5, true));
+        let rows = vec![&broken, &empty, &full, &nearly];
+
+        let closest: Vec<&str> = sorted(rows.clone(), Sort::ClosestToStart).iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(closest, vec!["Zeta", "Alpha", "Riverside", "Riverside"]);
+        let by_state: Vec<TableState> = sorted(rows.clone(), Sort::ClosestToStart).iter().map(|r| r.state.clone()).collect();
+        assert_eq!(by_state[2], TableState::Full);
+        assert_eq!(by_state[3], TableState::ParametersChanged, "a refused table is last");
+
+        let by_name: Vec<&str> = sorted(rows.clone(), Sort::Name).iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(by_name, vec!["Alpha", "Riverside", "Riverside", "Zeta"]);
+
+        let mut big = row([5u8; 32], &held(1, false));
+        big.blinds = "50 / 100".into();
+        big.name = "Big".into();
+        let by_blinds: Vec<&str> = sorted(vec![&empty, &big], Sort::Blinds).iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(by_blinds, vec!["Big", "Alpha"], "the biggest blinds first");
+    }
+
+    /// `D-067`: the header says what is happening and never announces a zero;
+    /// the DHT's peers are not among what it says.
+    #[test]
+    fn the_header_counts_only_what_is_there() {
+        assert!(headline_counts(0, 0, 0, 0).is_empty(), "an empty room announces nothing");
+        let some = headline_counts(1, 1, 12, 3);
+        let words: Vec<&str> = some.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(words, vec!["1 table", "1 open", "12 players online", "3 searching"]);
+        let one = headline_counts(2, 0, 1, 0);
+        let words: Vec<&str> = one.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(words, vec!["2 tables", "1 player online"]);
+        assert!(some.iter().all(|(w, _)| !w.starts_with('0')));
+    }
+
+    /// `D-067`: the strip's one light. Red for the one real fault, in the same
+    /// order as the summary; *Online* otherwise, with nothing technical in it.
+    #[test]
+    fn the_headline_is_one_friendly_light() {
+        let stuck = NetworkStatus { peers: 4, public: Some(false), relay: None, ..Default::default() };
+        assert_eq!(stuck.headline().1, Tone::Danger);
+        assert!(stuck.summary().contains("no relay"), "the two agree on the worst true thing");
+        let alone = NetworkStatus::default();
+        assert_eq!(alone.headline(), ("Connecting\u{2026}", Tone::Dim));
+        let relayed = NetworkStatus {
+            peers: 4,
+            public: Some(false),
+            relay: Some(RelayStatus { peer: "12D3KooW".into(), adequate: true }),
+            ..Default::default()
+        };
+        assert_eq!(relayed.headline(), ("Online through a relay", Tone::Ok));
+        let fine = NetworkStatus { peers: 40, public: Some(true), ..Default::default() };
+        assert_eq!(fine.headline(), ("Online", Tone::Ok));
+        for s in [&stuck, &alone, &relayed, &fine] {
+            let w = s.headline().0.to_lowercase();
+            assert!(!w.contains("peer") && !w.contains("dht") && !w.contains("dial"), "{w}");
+        }
+    }
+
+    /// `D-067`: the card's words. A session is said, not nagged about; a win is
+    /// congratulated, a place is stated, and nothing asks for the chips back.
+    #[test]
+    fn the_cards_words_are_a_persons_and_ask_for_nothing_back() {
+        assert_eq!(session_words(59), "0 min");
+        assert_eq!(session_words(25 * 60), "25 min");
+        assert_eq!(session_words(65 * 60 + 30), "1 h 05 min");
+        let won = crate::storage::results::Entry { when_unix_ms: 0, table: "Riverside".into(), seats: 6, place: 1, tied: false };
+        assert_eq!(result_words(&won), "You won at Riverside");
+        let third = crate::storage::results::Entry { place: 3, ..won.clone() };
+        assert_eq!(result_words(&third), "3rd of 6 at Riverside");
+        let tied = crate::storage::results::Entry { place: 4, tied: true, ..won.clone() };
+        assert_eq!(result_words(&tied), "Tied for 4th of 6 at Riverside");
+        for e in [&won, &third, &tied] {
+            let w = result_words(e).to_lowercase();
+            assert!(!w.contains("back") && !w.contains("again") && !w.contains("lost"), "{w}");
+        }
+    }
+
+    /// `D-067`: the chips are short and distinct, the praise is for a good
+    /// result only, and the note under the button invents no number.
+    #[test]
+    fn the_chips_the_praise_and_the_note_say_only_what_is_true() {
+        let chips: Vec<&str> = Format::ALL.iter().map(|f| format_chip(*f)).collect();
+        let mut distinct = chips.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4);
+        assert!(chips.iter().all(|c| c.len() <= 10));
+
+        let won = crate::storage::results::Entry { when_unix_ms: 0, table: "R".into(), seats: 6, place: 1, tied: false };
+        assert_eq!(result_praise(&won), Some("Congratulations!"));
+        assert_eq!(result_praise(&crate::storage::results::Entry { place: 3, ..won.clone() }), Some("Well played."));
+        assert_eq!(result_praise(&crate::storage::results::Entry { place: 2, seats: 2, ..won.clone() }), None, "second of two is last");
+        assert_eq!(result_praise(&crate::storage::results::Entry { place: 5, ..won.clone() }), None);
+
+        let unknown = hero_note(None, Format::Any, 0);
+        assert!(unknown.contains("depends on who else is looking"));
+        assert!(!unknown.chars().any(|c| c.is_ascii_digit()), "no number before one was measured: {unknown}");
+        let known = hero_note(Some(75), Format::SixMax, 1);
+        assert!(known.contains("6-max usually take about 01:15"));
+        assert!(known.ends_with("1 player is searching right now."));
+        assert!(hero_note(Some(75), Format::HeadsUp, 3).ends_with("3 players are searching right now."));
+    }
+
+    /// `D-067`: the words about fairness claim what the cryptography gives and
+    /// say what it does not; the three steps say what to do first.
+    #[test]
+    fn the_fair_play_note_is_honest_about_its_limit() {
+        assert!(FAIR_PLAY.contains("proves the shuffle"));
+        assert!(FAIR_PLAY.contains("no server, no house and no rake"));
+        assert!(FAIR_PLAY.contains("What no cryptography stops"), "the honesty clause is on the screen too");
+        assert!(!FAIR_PLAY.to_lowercase().contains("impossible"), "nothing claims cheating is impossible");
+        assert_eq!(HOW_IT_WORKS.len(), 3);
+        assert!(HOW_IT_WORKS[0].0.contains("Find a game"));
     }
 
     #[test]
@@ -635,6 +1127,7 @@ mod tests {
         assert_eq!(r.timing, "20 s + 5 s");
         assert_eq!(r.host, "07070707");
         assert_eq!(r.state, TableState::Open);
+        assert_eq!((r.seats, r.sit_and_go, r.action_s), (6, false, 20), "and the numbers the drawing draws");
     }
 
     /// A tournament pays every entrant the same stack, so the column shows one

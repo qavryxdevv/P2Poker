@@ -555,6 +555,9 @@ pub struct AppState {
     /// `D-064`: searches that ended in a game -- the format's code and the
     /// seconds each took -- not yet written to the profile.
     pub search_history: Vec<(u8, u32)>,
+    /// `D-067`: the places this player finished in since the window last
+    /// wrote them to the profile's record (`storage::results`).
+    pub results_owed: Vec<crate::storage::results::Entry>,
     /// `D-064`: what past searches took, from the profile, for the window's
     /// word before a search has measured anything.
     pub search_settings: crate::storage::settings::SearchSettings,
@@ -2378,6 +2381,20 @@ impl AppState {
             // seconds to look at the hand that ended the tournament.
             let delay = if over { crate::gui::table::FINISH_WINDOW_DELAY_MS } else { crate::gui::table::BUST_WINDOW_DELAY_MS };
             self.finished = Some((crate::gui::table::Finish { place, tied, players_left, show_in_ms: delay }, at));
+            // `D-067`: the lobby's card about the player keeps the place, from
+            // this same word of the node's and no other.
+            if let Some(s) = self.seated.as_ref() {
+                let when_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                self.results_owed.push(crate::storage::results::Entry {
+                    when_unix_ms,
+                    table: s.name.clone(),
+                    seats: s.seats,
+                    place: u8::try_from(place).unwrap_or(u8::MAX),
+                    tied,
+                });
+            }
             if place == 1 && over {
                 self.note("you won the tournament".to_string());
             } else {
@@ -3364,6 +3381,12 @@ impl AppState {
             return None;
         }
         Some(std::mem::take(&mut self.search_history))
+    }
+
+    /// `D-067`: the places finished in since the window last asked, for the
+    /// profile's record.
+    pub fn take_results(&mut self) -> Vec<crate::storage::results::Entry> {
+        std::mem::take(&mut self.results_owed)
     }
 
     /// `S1-HL`: whether slot `slot`'s table window is drawn now.
