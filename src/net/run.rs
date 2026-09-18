@@ -5598,9 +5598,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                         if let QueryResult::GetProviders(Ok(
-                            GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
-                        )) = result
+                            GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers },
+                        )) = &result
                         {
+                            let was_lobby = lobby_lookups.get(&id).copied();
+                            // `S1-E`: what one walk of the lobby key costs and what it
+                            // says about the DHT it walked -- how many nodes it asked,
+                            // and the size its closest nodes put the DHT at, which is
+                            // the price of placing a node among them. The first three
+                            // walks of a process, as numbers nobody had.
+                            if was_lobby.is_some() && LOBBY_WALKS_SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                                let estimate = dht_size_from_closest(&lobby_namespace(), closest_peers);
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "public lobby walk: {} DHT node(s) asked, {} answered; its {} closest put the DHT at ~{} nodes (S1-E)",
+                                        stats.num_requests(),
+                                        stats.num_successes(),
+                                        closest_peers.len(),
+                                        estimate.map_or_else(|| "?".to_string(), |n| n.to_string())
+                                    )))
+                                    .await;
+                            }
                             // Said out loud. An answer of nobody and a question
                             // never asked look the same in a log that only
                             // reports findings, and the first is a working lobby
@@ -13558,6 +13576,33 @@ fn stop_at_hand_due(hand_id: u64) -> bool {
     *at == Some(hand_id)
 }
 
+/// `S1-E`: how many lobby walks this process has described.
+static LOBBY_WALKS_SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `S1-E`: the size of the DHT the closest nodes to `key` imply. In a keyspace
+/// that `n` nodes fill uniformly, the `k`-th closest lies at about `k / n` of
+/// the space; so each of them says `n ~ k / d_k`, and the median of what they
+/// say is the estimate. `None` for fewer than four of them.
+fn dht_size_from_closest(key: &libp2p::kad::RecordKey, closest: &[libp2p::PeerId]) -> Option<u64> {
+    let target = libp2p::kad::KBucketKey::new(key.clone());
+    let mut fractions: Vec<f64> = closest
+        .iter()
+        .map(|p| {
+            let d = libp2p::kad::KBucketKey::from(*p).distance(&target);
+            // The top 64 bits of the 256-bit distance, as a fraction of the space.
+            (d.0 >> 192usize).low_u64() as f64 / 18_446_744_073_709_551_616.0
+        })
+        .filter(|f| *f > 0.0)
+        .collect();
+    if fractions.len() < 4 {
+        return None;
+    }
+    fractions.sort_by(|a, b| a.total_cmp(b));
+    let mut says: Vec<f64> = fractions.iter().enumerate().map(|(i, d)| (i + 1) as f64 / d).collect();
+    says.sort_by(|a, b| a.total_cmp(b));
+    Some(says[says.len() / 2].round() as u64)
+}
+
 /// `S1-HZ`: whether the founder's lobby answer naming the table, `ago_ms` old on
 /// this client's clock, still says the founder is alive while the table's group
 /// has not heard it for `quiet_s` seconds (`None`: the group holds no reading
@@ -17976,6 +18021,20 @@ mod a_joiner_before_the_first_hand {
         assert!(joiner_leaves_because(false, false, None, false, true, false, true).is_some_and(|w| w.contains("silent")));
         assert!(joiner_leaves_because(false, false, None, false, false, false, true).is_some_and(|w| w.contains("answered nothing for 90 s")));
         assert_eq!(joiner_leaves_because(false, false, None, false, false, false, false), None);
+    }
+
+    /// `S1-E`: the twenty closest of five thousand random nodes put the DHT at
+    /// about five thousand -- within a factor of two, which is what twenty
+    /// samples of a uniform keyspace can say -- and four are the fewest it reads.
+    #[test]
+    fn the_closest_nodes_to_a_key_say_how_big_the_dht_is() {
+        let key = lobby_namespace();
+        let target = libp2p::kad::KBucketKey::new(key.clone());
+        let mut all: Vec<libp2p::PeerId> = (0..5_000).map(|_| libp2p::PeerId::random()).collect();
+        all.sort_by_key(|p| libp2p::kad::KBucketKey::from(*p).distance(&target));
+        let n = dht_size_from_closest(&key, &all[..20]).expect("twenty nodes");
+        assert!((2_500..=10_000).contains(&n), "an estimate of {n} for 5 000 nodes");
+        assert_eq!(dht_size_from_closest(&key, &all[..3]), None);
     }
 
     /// `S1-HZ`: a founder's lobby answer keeps it alive through its silence in the

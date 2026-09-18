@@ -1102,8 +1102,10 @@ So a hostile provider record costs a dial and nothing else. Its cost in
 > that discharged it did. What follows was derived from `libp2p-kad 0.48.0` and
 > re-read on 2026-09-15 against `0.49.0`, the version `Cargo.lock` pins now — no
 > default or behaviour below moved, only line numbers — and from what
-> `src/net/run.rs` and `src/net/swarm.rs` actually do with it. Three figures are
-> marked `[UNMEASURED]` and are the honest remainder of `S1-E`.
+> `src/net/run.rs` and `src/net/swarm.rs` actually do with it. Three figures were
+> marked `[UNMEASURED]` as the remainder of `S1-E`; all three are measured since
+> 2026-09-18 -- the record's lifetime by `S1-AI`'s census of our own test
+> identities, the walk and the grind by the client's own account of its lobby walks.
 
 **Start with the fact that frames all the others: the lobby is not our network.**
 The rendezvous lives on the **public IPFS DHT**. `swarm.rs` builds a second
@@ -1193,7 +1195,10 @@ price §3.3 says is worth paying — but the user is the one paying it.
   minutes, more often than Mainline's 10-minute re-announce did. Until
   2026-09-15 this bullet said *publishes exactly once*, which was what ran for a
   client behind a NAT whatever happened to its walk (`S1-FI`). Those 20 nodes
-  churn, and once confirmed nothing notices. `[UNMEASURED]`
+  churn, and once confirmed nothing notices. What that costs was measured over
+  our own test identities (`S1-AI`, 2026-09-06): a record still answered for 88 %
+  of the identities last seen within 24 h, 47 % of those last seen 24-48 h before,
+  and 0 % of the 151 older -- the oldest survivor 47.99 h.
 
 * **Reading the lobby discloses more than writing it, and far more often.** Every
   `get_providers` runs over an authenticated libp2p connection, so each node on
@@ -1201,9 +1206,10 @@ price §3.3 says is worth paying — but the user is the one paying it.
   and the **exact key asked for**. The client asks every **60 seconds**
   (`run::run`'s discovery timer) — about **1440 times a day**, against the ~150 the Mainline
   section counted — plus a second query for the relay namespace whenever there is
-  no reservation. **How many distinct nodes one walk contacts is `[UNMEASURED]`;**
-  the Mainline figure of 105-176 has no counterpart here and must not be assumed
-  to carry over in either direction.
+  no reservation. **One walk asks 85 to 240 distinct nodes, about 125 as a rule,
+  and 24 to 132 of them answer** -- nine walks of three clients on one machine,
+  2026-09-18 (`run164847-3`, the client's own *public lobby walk* line), against
+  the 105-176 the Mainline section counted.
 
 * **The audience is worse than "a rotating set of strangers": it is a fixed one,
   and anyone may join it.** The key is a compiled-in constant, so the ~20 nodes
@@ -1211,8 +1217,13 @@ price §3.3 says is worth paying — but the user is the one paying it.
   who can read §3.2**. Placement is `sha2-256(PeerId)` (`kbucket/key.rs:115-120`),
   so an observer grinds an Ed25519 keypair until its digest lands near the key,
   runs one always-on node, and from then on **receives every `ADD_PROVIDER` and
-  every republish, passively, without ever announcing itself.** The grind cost is
-  set by the size of the public DHT and is `[UNMEASURED]` here. This is the
+  every republish, passively, without ever announcing itself.** The grind costs
+  nothing worth the name. The 20 closest nodes each walk found put the DHT it
+  sees at about 1 200 to 2 000 nodes (the median of `k / d_k`, `run164847-3`; a
+  floor, since a node that does not answer is not among them): a digest lands
+  among the 20 closest about once in `N / 20`, some hundred keypairs, and takes
+  all 20 places after about `N`, a few thousand -- milliseconds of key generation
+  either way, and a DHT ten times larger changes only the milliseconds. This is the
   Kademlia analogue of the crawl §3.5 used to report as observed, and it is
   cheaper, quieter and more complete.
 
@@ -1239,8 +1250,10 @@ price §3.3 says is worth paying — but the user is the one paying it.
   Mainline's LRU pushed the oldest out; this pushes the **newest** away. Under a
   flood the player who cannot be seen is the one who just arrived. Expired entries
   are pruned only lazily, on a query that touches the key
-  (`behaviour.rs:1245-1249`). **What the go-libp2p nodes that actually store our
-  record do instead is `[UNMEASURED]`**, and it is the same gap as the TTL.
+  (`behaviour.rs:1245-1249`). **The go-libp2p nodes that actually store our record
+  keep far more than 20:** one node's answer about the lobby key carried 162
+  providers (`S1-AI`, `split210900-2`), so no newcomer is turned away there, and
+  their records lapse at 48 h like ours (`S1-AI`'s census, §10.1).
 
 * **What is unchanged, and should not be softened.** It is still one fixed public
   key that no one can un-publish. It is still a hint and not a credential. It
@@ -1294,14 +1307,15 @@ more days, so rotation blunts a historical crawl far less than it looks. Still
 > `run::reachable`, `run::dht_effort`, and the announce and lookup arms of
 > `run::run` — by name, because this file's line numbers into `run.rs` had all
 > gone stale as it grew.
-> **`[UNMEASURED]`, and these are what keeps `S1-E` open:** (i) the TTL the
-> **go-libp2p** nodes that actually store our record apply — the 48 h above is
-> rust-libp2p's default and is almost certainly not the operative number;
-> (ii) how many distinct DHT nodes one `get_providers` walk contacts, which is the
-> figure the Mainline section had and this one does not; (iii) the
-> keypair-grinding cost of placing a node among the 20 closest to the lobby key,
-> which sets the price of complete passive enumeration. **Do not quote a number
-> for any of the three until it has been measured.**
+> **Measured 2026-09-18, and `S1-E` closes on them:** (i) the lifetime the
+> **go-libp2p** nodes that store our record give it is 48 h -- a hard edge in
+> `S1-AI`'s census of our own identities (§10.1); (ii) one `get_providers` walk
+> asks 85 to 240 distinct nodes, about 125, and 24 to 132 answer; (iii) the 20
+> closest nodes put the DHT the walk sees at 1 200 to 2 000 nodes, so a keypair
+> lands among them after some hundred tries and holds all 20 places after a few
+> thousand: complete passive enumeration costs milliseconds of key generation.
+> (ii) and (iii) are the client's own *public lobby walk* line, said for the
+> first three walks of every process.
 
 ---
 
@@ -3096,12 +3110,14 @@ remotely — it is the reason the discovery loop dials at most
 contains, and it is a disclosure, which §3.5 states.
 
 **The 45-minute figure and `OQ-1` are both obsolete, and their replacement is
-not measured.** 48 h and 12 h are `libp2p-kad`'s **own** defaults, the same in `0.48.0` and `0.49.0`. The
+measured.** 48 h and 12 h are `libp2p-kad`'s **own** defaults, the same in `0.48.0` and `0.49.0`. The
 nodes that actually store our record on the Amino DHT are overwhelmingly
-go-libp2p, whose `ProvideValidity` governs the real lifetime, and that constant
-was not read here. So the operative TTL is **[UNMEASURED]**, and the honest
-statement is that it is bounded above by 48 h by our own crate's expiry stamp
-and otherwise unknown. `OQ-1` is re-aimed at that question rather than closed.
+go-libp2p, whose `ProvideValidity` governs the real lifetime -- and the lifetime
+they give it is **48 h**, measured rather than read: of our own test identities
+last seen more than 48 h before a lobby read, 151, not one was still a provider;
+of those last seen 24-48 h before, 47 %; the oldest record still returned was
+47.99 h old (`S1-AI`, 2026-09-06). A hard edge exactly where the constant would
+put it, with 151 chances to be wrong.
 
 ### 10.2 libp2p connection layer
 

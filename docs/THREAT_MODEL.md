@@ -2178,7 +2178,10 @@ only authentication is that a record must name the peer that sent it.
   nothing anyone else can see (`NETWORK_STACK.md` §3.5, §10.1).
 * **The storing nodes are a fixed audience, and anyone may join it.** They are the
   nodes closest to a published key, the same for everybody, and a node can be
-  placed among them by grinding a keypair, at a cost nobody has measured.
+  placed among them by grinding a keypair -- some hundred keypairs for one of the
+  20 places and a few thousand for all of them, milliseconds of key generation, as
+  measured on 2026-09-18 against a DHT the walk sees at 1 200 to 2 000 nodes
+  (`NETWORK_STACK.md` §3.5, `S1-E`).
 * **Reading discloses more than writing, and far more often.** Every lobby read
   runs over authenticated connections, so each node on the walk learns the
   reader's `PeerId`, IP address, software name and the key asked for — once per
