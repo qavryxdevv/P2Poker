@@ -1364,3 +1364,88 @@ fn a_betting_stage_is_not_held_by_a_voter_that_never_votes() {
         assert!(hands[s].took_part(rogue as u8), "seat {s}: the silent voter keeps its seat");
     }
 }
+
+/// Four seats of the 3-seat fixture's timings, every hand heard by every seat.
+fn open_four() -> (Vec<Hand>, Vec<SigningKey>, Vec<(usize, Vec<u8>)>) {
+    const N: u8 = 4;
+    let keys: Vec<SigningKey> = (0..N).map(|s| key(10 + s)).collect();
+    let mut hands = Vec::new();
+    let mut queue: Vec<(usize, Vec<u8>)> = Vec::new();
+    for s in 0..N {
+        let mut o = opening3_with_bank(s, 0);
+        o.required = (0..N).collect();
+        o.seats = (0..N)
+            .map(|x| (x, key(10 + x).verifying_key().to_bytes(), 10_000))
+            .collect();
+        o.max_players = N;
+        o.grace = vec![GRACE_HANDS; usize::from(N)];
+        o.present_run = vec![0; usize::from(N)];
+        o.returns = vec![0; usize::from(N)];
+        let (h, out) = Hand::open(o, &keys[usize::from(s)], NOW, 30_000).expect("the hand opens");
+        hands.push(h);
+        for Send::Broadcast(b) in out {
+            queue.push((usize::from(s), b));
+        }
+    }
+    (hands, keys, queue)
+}
+
+/// `D-066` at a **betting** stage: four seats play to a turn; the seat to act
+/// and one other go silent together, and the lowest seat is one of the two --
+/// so the two left are exactly half without the lowest seat, the tie-break
+/// does not let them go on, and the turn stands (it would stand to the hand's
+/// own budget). Once both have been out of the table's group for five minutes,
+/// the two vote again with `CAUSE_LONG_GONE`, name the other silent seat as a
+/// silent voter, and one certificate acts for the seat to act: the hand goes
+/// on without either.
+#[test]
+fn half_the_table_gone_at_a_turn_goes_on_after_five_minutes() {
+    let (mut hands, keys, queue) = open_four();
+    pump(&mut hands, &keys, queue, NOW, &[], &[]);
+    let owed = hands[0].waiting_for();
+    assert_eq!(owed.len(), 1, "one seat on the clock at a betting stage, not {owed:?}");
+    let actor = usize::from(owed[0]);
+    let gone = if actor == 0 { 1 } else { 0 };
+    let voters: Vec<usize> = (0..4usize).filter(|s| *s != actor && *s != gone).collect();
+    let muted = [actor, gone];
+    for &v in &voters {
+        hands[v].note_gone_from_group(&[actor as u8, gone as u8]);
+    }
+
+    let t_vote = NOW + 20_000 + 5_000 + 1;
+    let mut votes = Vec::new();
+    for &v in &voters {
+        let out = hands[v].vote_on_timeouts(&keys[v], t_vote, 0).expect("voting is not an error");
+        assert_eq!(out.len(), 1, "seat {v} votes about seat {actor}; naming seat {gone} too would break the floor");
+        for Send::Broadcast(b) in out {
+            votes.push((v, b));
+        }
+    }
+    pump(&mut hands, &keys, votes, t_vote, &muted, &[]);
+    for &v in &voters {
+        assert_eq!(hands[v].waiting_for(), vec![actor as u8], "seat {v}: the turn stands");
+    }
+
+    // Five minutes out of the group.
+    for &v in &voters {
+        hands[v].note_long_gone(&[actor as u8, gone as u8]);
+    }
+    let t_long = t_vote + 300_000;
+    let mut again = Vec::new();
+    for &v in &voters {
+        let out = hands[v].vote_on_timeouts(&keys[v], t_long, 0).expect("voting is not an error");
+        assert_eq!(out.len(), 2, "seat {v}: again about seat {actor} with the cause, and seat {gone} as a silent voter");
+        for Send::Broadcast(b) in out {
+            again.push((v, b));
+        }
+    }
+    pump(&mut hands, &keys, again, t_long, &muted, &[]);
+    for &v in &voters {
+        assert_ne!(hands[v].waiting_for(), vec![actor as u8], "seat {v}: the table acted for seat {actor}");
+        assert!(hands[v].aborted().is_none(), "seat {v}: a betting certificate ends nothing");
+        assert!(!hands[v].took_part(actor as u8), "seat {v}: the seat to act leaves the next roster");
+        assert!(hands[v].took_part(gone as u8), "seat {v}: the silent voter is named by the next hand, not this one");
+    }
+    assert_eq!(hands[voters[0]].slot().sequence, hands[voters[1]].slot().sequence, "the two are at one place");
+}
+

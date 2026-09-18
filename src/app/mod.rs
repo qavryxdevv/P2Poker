@@ -2511,7 +2511,18 @@ impl AppState {
         }
         let on = others.len() - off.len();
         let voters = 1 + on;
-        (!(voters >= 2 && voters > named)).then_some((named, on))
+        // `D-066`: exactly half is enough for the half holding the lowest seat
+        // of the voters and the named -- the certificate still ends the wait.
+        let voter_seats: Vec<u8> = std::iter::once(me)
+            .chain(others.iter().copied().filter(|n| !off.contains(n)))
+            .collect();
+        let lowest = voter_seats
+            .iter()
+            .chain(off.iter().filter(|n| !self.certified.contains(n)))
+            .min()
+            .copied();
+        let tie_break = voters >= 2 && voters == named && lowest.is_some_and(|m| voter_seats.contains(&m));
+        (!(voters >= 2 && voters > named) && !tie_break).then_some((named, on))
     }
 
     /// `D-058`: the seats this table waits on, goes on without, or takes back,
@@ -3094,8 +3105,9 @@ impl AppState {
             } else if self.opponent_gone.as_ref().is_some_and(|g| g.alone) {
                 match self.floor_at_table() {
                     Some((named, on)) if on > 0 => self.note(format!(
-                        "{named} seat(s) have been unreachable for {secs} s, and the {} on the line cannot certify them out (D-036: two voters at least, and more voters than seats named): wait for them, or leave the table",
-                        on + 1
+                        "{named} seat(s) have been unreachable for {secs} s, and the {} on the line cannot certify them out yet (D-036: more voters than seats named); once they have been gone {} min they can (D-066): wait for them, or leave the table",
+                        on + 1,
+                        crate::protocol::constants::LONG_GONE_S / 60
                     )),
                     _ => self.note(format!(
                         "nobody at the table has been reachable for {secs} s; alone, nobody can certify anybody (D-036): wait for them, or leave the table"
@@ -5088,12 +5100,44 @@ mod tests {
         assert!(s.certified.is_empty(), "the next hand starts clean");
     }
 
-    /// `D-036`'s floor at the window (the owner, 2026-09-17): at four seats,
-    /// two off the line cannot be certified out by the two on it -- the
-    /// question, naming the two; one off is a certificate's matter and no
-    /// question; a seat certified out already is not named.
+    /// `D-036`'s floor at the window (the owner, 2026-09-17), with `D-066`'s
+    /// tie-break (2026-09-18): at four seats, two off the line -- the lowest
+    /// seat among them -- cannot be certified out by the two on it until they
+    /// have been gone five minutes: the question, naming the two; one off is a
+    /// certificate's matter and no question; a seat certified out already is
+    /// not named.
     #[test]
     fn half_the_table_off_the_line_is_the_question_too() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 3 });
+        s.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "a".into(), 1_000), (1, "b".into(), 1_000), (2, "c".into(), 1_000), (3, "me".into(), 1_000)],
+        });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2, 3], small_blind: 10, big_blind: 20 });
+        for seat in 0..=2 {
+            s.apply(NodeEvent::SeatLink { seat, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        }
+        assert_eq!(s.floor_at_table(), None, "everybody on the line");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(25), away: false });
+        s.tick_opponent();
+        assert_eq!(s.floor_at_table(), None, "one off: three voters name one");
+        assert!(s.opponent_gone.is_none());
+        s.apply(NodeEvent::SeatLink { seat: 0, rtt_ms: None, group: false, quiet_s: Some(22), away: false });
+        s.tick_opponent();
+        assert_eq!(s.floor_at_table(), Some((2, 1)), "two off, the lowest seat among them: two voters cannot name two yet");
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.alone), "the question");
+        s.apply(NodeEvent::SeatCertified { seat: 1, hand_id: 3 });
+        s.tick_opponent();
+        assert_eq!(s.floor_at_table(), None, "one certified out already: two voters name one");
+        assert!(s.opponent_gone.is_none(), "withdrawn");
+    }
+
+    /// `D-066`: at four seats, two off the line and the lowest seat on it --
+    /// exactly half, holding the lowest seat, certifies them out: no question.
+    #[test]
+    fn half_the_table_holding_the_lowest_seat_is_no_question() {
         let mut s = AppState::new();
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster {
@@ -5102,22 +5146,12 @@ mod tests {
         });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
         s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2, 3], small_blind: 10, big_blind: 20 });
-        for seat in 1..=3 {
-            s.apply(NodeEvent::SeatLink { seat, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
-        }
-        assert_eq!(s.floor_at_table(), None, "everybody on the line");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(22), away: false });
         s.apply(NodeEvent::SeatLink { seat: 3, rtt_ms: None, group: false, quiet_s: Some(25), away: false });
         s.tick_opponent();
-        assert_eq!(s.floor_at_table(), None, "one off: three voters name one");
-        assert!(s.opponent_gone.is_none());
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(22), away: false });
-        s.tick_opponent();
-        assert_eq!(s.floor_at_table(), Some((2, 1)), "two off: two voters cannot name two");
-        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.alone), "the question");
-        s.apply(NodeEvent::SeatCertified { seat: 3, hand_id: 3 });
-        s.tick_opponent();
-        assert_eq!(s.floor_at_table(), None, "one certified out already: two voters name one");
-        assert!(s.opponent_gone.is_none(), "withdrawn");
+        assert_eq!(s.floor_at_table(), None, "the half with seat 0 names the other half");
+        assert!(s.opponent_gone.is_none(), "no question");
     }
 
     /// `S1-EE`: a seat-left about the player's own seat marks nothing -- the felt

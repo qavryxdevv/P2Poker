@@ -63,7 +63,7 @@ use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
     DealPrivate, DeckCommit, DeckInit, Field, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
     Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep, TimeoutCert,
-    TimeoutVote, CertSubject, CAUSE_FLOOD, CAUSE_SILENT_VOTER};
+    TimeoutVote, CertSubject, CAUSE_FLOOD, CAUSE_LONG_GONE, CAUSE_SILENT_VOTER};
 use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 
@@ -1729,6 +1729,12 @@ pub struct Hand {
     /// floor fails with it named, no certificate is reachable in this hand and
     /// the local abort waits for none.
     gone_from_group: BTreeSet<SeatIdx>,
+    /// `D-066`: the seats the node reads as out of the table's group, or
+    /// silent there, for `LONG_GONE_S` or more -- set each tick
+    /// ([`Hand::note_long_gone`]). Voted about at once and with
+    /// `CAUSE_LONG_GONE`, which lets two voters certify them short of a
+    /// majority.
+    long_gone: BTreeSet<SeatIdx>,
     /// `D-051`: the seats this client has voted about at the stage now open,
     /// whatever the cause -- one vote about one seat at one stage, so a
     /// cause is fixed with the first.
@@ -2272,6 +2278,7 @@ impl Hand {
                 leave_words: BTreeMap::new(),
                 resigned: BTreeSet::new(),
                 gone_from_group: BTreeSet::new(),
+                long_gone: BTreeSet::new(),
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
                 settled_pots: Vec::new(),
@@ -6321,15 +6328,16 @@ impl Hand {
         if quiet.is_empty() {
             return false;
         }
+        let gone_voters: Vec<SeatIdx> = self
+            .voters_of(&quiet)
+            .into_iter()
+            .filter(|v| *v != self.open.my_seat && self.gone_from_group.contains(v))
+            .collect();
         let mut named = quiet.clone();
-        named.extend(
-            self.voters_of(&quiet)
-                .into_iter()
-                .filter(|v| *v != self.open.my_seat && self.gone_from_group.contains(v)),
-        );
+        named.extend(gone_voters.iter().copied());
         named.sort_unstable();
         named.dedup();
-        self.admissible_for(self.voters_of(&named).len(), &named)
+        self.admissible_for(&self.voters_of(&named), &named, &gone_voters)
     }
 
     /// Whether a certificate could still end the stage this hand is waiting on.
@@ -6342,7 +6350,7 @@ impl Hand {
             .into_iter()
             .filter(|s| *s != self.open.my_seat && self.mine.dealt_in.contains(s))
             .collect();
-        !quiet.is_empty() && self.admissible_for(self.voters_of(&quiet).len(), &quiet)
+        !quiet.is_empty() && self.admissible_for(&self.voters_of(&quiet), &quiet, &[])
     }
 
     /// D-036: how many votes a subject needs, for the tally's denominator --
@@ -6361,27 +6369,76 @@ impl Hand {
     /// D-036's floor, both halves: at least two voters, and more voters
     /// than seats named. Below two, "unanimity" is one interested party
     /// (D-008); at or below the named count, a group short of a majority of
-    /// the live seats could certify the rest out.
+    /// the live seats could certify the rest out -- which `D-066` allows in
+    /// two cases only, see [`Hand::floor_holds_for`].
     fn admissible(voters: usize, named: usize) -> bool {
         voters >= 2 && voters > named
     }
 
-    /// `D-063`: the floor with the resigned excepted. A seat named with its
-    /// player's own signed leave counts for nothing against it -- its word is
-    /// its consent, and no fork can hold a seat that said it left -- so the
-    /// floor is asked of the quiet alone, and a certificate naming only seats
-    /// that resigned needs one voter (the owner, 2026-09-17: a table whose
-    /// players leave must not stand for ever).
-    fn floor_holds(voters: usize, named: usize, resigned: usize) -> bool {
-        let quiet = named.saturating_sub(resigned.min(named));
-        voters >= 1 && (quiet == 0 || Self::admissible(voters, quiet))
+    /// `D-063` and `D-066`: the floor, asked of the sets themselves.
+    ///
+    /// `D-063`: a seat named with its player's own signed leave counts for
+    /// nothing against it -- its word is its consent, and no fork can hold a
+    /// seat that said it left -- so the floor is asked of the rest, and a
+    /// certificate naming only seats that resigned needs one voter (the owner,
+    /// 2026-09-17: a table whose players leave must not stand for ever).
+    ///
+    /// `D-066` (the owner, 2026-09-18: nor a table half of whose players went
+    /// silent): past two voters, **exactly half** is enough for the half that
+    /// holds the lowest seat of the voters and the named together -- one half
+    /// of a table can hold it, never both, so two halves never certify each
+    /// other -- and **any number** is enough when every seat named as waited-on
+    /// has been out of the table's group for `LONG_GONE_S` (`relaxed`: the
+    /// certificate's own `CAUSE_LONG_GONE`). Neither is ever taken by a seat it
+    /// names as waited-on (`on_timeout_cert`), so a lying half or minority
+    /// forks away alone.
+    fn floor_holds_for(voters: &[SeatIdx], named: &[SeatIdx], resigned: &[SeatIdx], relaxed: bool) -> bool {
+        let quiet: Vec<SeatIdx> = named.iter().copied().filter(|s| !resigned.contains(s)).collect();
+        let v = voters.len();
+        if v == 0 {
+            return false;
+        }
+        if quiet.is_empty() {
+            return true;
+        }
+        if Self::admissible(v, quiet.len()) {
+            return true;
+        }
+        if v < 2 {
+            return false;
+        }
+        if relaxed {
+            return true;
+        }
+        v == quiet.len() && voters.iter().chain(quiet.iter()).min().is_some_and(|m| voters.contains(m))
     }
 
-    /// `D-063`: the floor for a set this client would seal, with the words it
-    /// holds.
-    fn admissible_for(&self, voters: usize, named: &[SeatIdx]) -> bool {
-        let resigned = named.iter().filter(|s| self.leave_words.contains_key(s)).count();
-        Self::floor_holds(voters, named.len(), resigned)
+    /// `D-066`: whether a certificate's own causes relax its floor -- every
+    /// seat it names as waited-on (not a silent voter, not resigned) named
+    /// long gone, and at least one such seat.
+    fn relaxed_by_causes(subject: &CertSubject, resigned: &[SeatIdx]) -> bool {
+        let waited: Vec<SeatIdx> = subject
+            .subject_seats
+            .iter()
+            .copied()
+            .filter(|s| !subject.names_silent(*s) && !resigned.contains(s))
+            .collect();
+        !waited.is_empty() && waited.iter().all(|s| subject.cause_of(*s) == Some(CAUSE_LONG_GONE))
+    }
+
+    /// `D-063`/`D-066`: the floor for a set this client would seal, with the
+    /// words it holds and its own reading of who is long gone. `silent`: the
+    /// seats of `named` that are voters named silent (`D-065`), which are not
+    /// waited on and so neither relax the floor nor keep it.
+    fn admissible_for(&self, voters: &[SeatIdx], named: &[SeatIdx], silent: &[SeatIdx]) -> bool {
+        let resigned: Vec<SeatIdx> = named.iter().copied().filter(|s| self.leave_words.contains_key(s)).collect();
+        let waited: Vec<SeatIdx> = named
+            .iter()
+            .copied()
+            .filter(|s| !silent.contains(s) && !resigned.contains(s))
+            .collect();
+        let relaxed = !waited.is_empty() && waited.iter().all(|s| self.long_gone.contains(s));
+        Self::floor_holds_for(voters, named, &resigned, relaxed)
     }
 
     /// The floor, told to the player once per hand when it is what holds
@@ -6403,10 +6460,11 @@ impl Hand {
         if quiet.is_empty() {
             return;
         }
-        let voters = self.voters_of(&quiet).len();
+        let voter_seats = self.voters_of(&quiet);
+        let voters = voter_seats.len();
         // `D-063`: the seats that resigned are removed whatever the floor says;
         // the note is about the quiet, and only while the floor holds.
-        if self.admissible_for(voters, &quiet) {
+        if self.admissible_for(&voter_seats, &quiet, &[]) {
             return;
         }
         let quiet: Vec<SeatIdx> = quiet.into_iter().filter(|s| !self.leave_words.contains_key(s)).collect();
@@ -6416,9 +6474,10 @@ impl Hand {
         let waited_s = now_ms.saturating_sub(self.stage_at_ms) / 1_000;
         self.floor_said = true;
         self.cert_note.push(format!(
-            "seat(s) {} have not acted at this stage for {waited_s} s and no certificate can remove them: {voters} seat(s) are present to vote about the {} that stopped, and the rule needs two voters at least and more voters than seats named (D-036); the table waits for them -- wait, or leave the table",
+            "seat(s) {} have not acted at this stage for {waited_s} s and no certificate can remove them yet: {voters} seat(s) are present to vote about the {} that stopped, and the rule needs two voters at least and more voters than seats named (D-036) -- at exactly half the half holding the table's lowest seat, and after {} min out of the table's group any two (D-066); the table waits for them -- wait, or leave the table",
             Self::seats_words(&quiet),
-            quiet.len()
+            quiet.len(),
+            crate::protocol::constants::LONG_GONE_S / 60
         ));
     }
 
@@ -6478,7 +6537,12 @@ impl Hand {
         }
         let named: Vec<SeatIdx> = set.iter().copied().collect();
         let voters = self.voters_of(&named);
-        if !self.admissible_for(voters.len(), &named) {
+        let silent: Vec<SeatIdx> = named
+            .iter()
+            .copied()
+            .filter(|s| about[s].0.cause == Some(CAUSE_SILENT_VOTER))
+            .collect();
+        if !self.admissible_for(&voters, &named, &silent) {
             return None;
         }
         let first = &about[set.iter().next()?].0;
@@ -6640,8 +6704,15 @@ impl Hand {
             kind: if acting { 1 } else { 2 },
             // `D-051`: a seat this client cut off for flooding is voted about
             // with the cause, and only votes with the same cause count with
-            // this client's.
-            cause: self.flooders.contains(&seat).then_some(CAUSE_FLOOD),
+            // this client's. `D-066`: a seat long gone from the table's group,
+            // with that cause -- by the same rule, a claim only unanimity makes.
+            cause: if self.flooders.contains(&seat) {
+                Some(CAUSE_FLOOD)
+            } else if self.long_gone.contains(&seat) {
+                Some(CAUSE_LONG_GONE)
+            } else {
+                None
+            },
         })
     }
 
@@ -6913,7 +6984,13 @@ impl Hand {
             // `D-051`: once about one seat at one stage, whatever the cause --
             // a seat cut off after this client voted about it without one is
             // voted about with the cause at its next stage, never twice here.
-            if self.voted.contains(&digest) || self.voted_about.contains(&seat) {
+            // `D-066` is the one exception: a seat that has been gone long
+            // enough while its stage stood -- a turn that waits for the hand's
+            // own budget has no next stage -- is voted about again with
+            // `CAUSE_LONG_GONE`, another subject in another slot.
+            if self.voted.contains(&digest)
+                || (self.voted_about.contains(&seat) && subject.cause != Some(CAUSE_LONG_GONE))
+            {
                 continue;
             }
             // Below the floor a certificate has no effect whatever, so a vote
@@ -7080,8 +7157,10 @@ impl Hand {
             named.push(voter);
             named.sort_unstable();
             named.dedup();
-            let need = self.voters_of(&named).len();
-            if !self.admissible_for(need, &named) {
+            let silent: Vec<SeatIdx> = named.iter().copied().filter(|s| !waiting.contains(s)).collect();
+            let need_seats = self.voters_of(&named);
+            let need = need_seats.len();
+            if !self.admissible_for(&need_seats, &named, &silent) {
                 continue;
             }
             if !self.voters(voter).contains(&self.open.my_seat) {
@@ -7879,10 +7958,17 @@ impl Hand {
                 what: "every resignation named a seat the certificate names",
             });
         }
-        if !Self::floor_holds(voters.len(), subject.subject_seats.len(), resignations.len()) {
+        let resigned: Vec<SeatIdx> = resignations.iter().map(|(s, _)| *s).collect();
+        let voter_seats: Vec<SeatIdx> = voters.iter().copied().collect();
+        if !Self::floor_holds_for(
+            &voter_seats,
+            &subject.subject_seats,
+            &resigned,
+            Self::relaxed_by_causes(&subject, &resigned),
+        ) {
             return Err(Failed::Elsewhere {
                 seat: emitter,
-                what: "at least two voters, and more voters than seats named that did not resign",
+                what: "at least two voters, and more voters than seats named that did not resign -- or exactly half holding the lowest seat, or every seat waited on long gone (D-066)",
             });
         }
         if !voters.contains(&emitter) {
@@ -8059,10 +8145,41 @@ impl Hand {
         // heads-up cannot have this and falls back to the hand deadline.
         // D-036 adds the other half: the voters outnumber the seats named, so
         // no group short of a majority of the live seats completes a
-        // certificate about the rest.
+        // certificate about the rest -- `D-066` excepted: exactly half holding
+        // the lowest seat, or every seat waited on long gone.
+        let resigned: Vec<SeatIdx> = c.resignations.iter().map(|(s, _)| *s).collect();
+        let voter_seats: Vec<SeatIdx> = c.voters.iter().copied().collect();
         if self.mine.dealt_in.len() < 3
-            || !Self::floor_holds(c.voters.len(), c.subject.subject_seats.len(), c.resignations.len())
+            || !Self::floor_holds_for(
+                &voter_seats,
+                &c.subject.subject_seats,
+                &resigned,
+                Self::relaxed_by_causes(&c.subject, &resigned),
+            )
         {
+            return Ok(Vec::new());
+        }
+        // `D-066`: a certificate that only half the table or fewer carry is
+        // never taken by a seat it names as waited-on. That seat is here --
+        // this client is -- which is the one fact such a certificate may not
+        // overrule: a half or a minority that lied about the rest forks away
+        // alone, and a seat really gone never hears it. The voters themselves
+        // take it, having each said the seat was silent; a majority's
+        // certificate is taken by its subject as before (D-036 point 4).
+        let waited: Vec<SeatIdx> = c
+            .subject
+            .quiet_seats()
+            .into_iter()
+            .filter(|s| !resigned.contains(s))
+            .collect();
+        if !Self::admissible(voter_seats.len(), waited.len()) && waited.contains(&self.open.my_seat) {
+            if self.shortfall_said.insert(c.subject.digest()) {
+                self.cert_note.push(format!(
+                    "cert: from seat {seat} about {}, carried by {} voter(s) -- half the table or fewer -- names this client, which is here: not taken (D-066)",
+                    Self::seats_words(&c.subject.subject_seats),
+                    voter_seats.len()
+                ));
+            }
             return Ok(Vec::new());
         }
         let nominal: BTreeSet<SeatIdx> = self
@@ -9287,8 +9404,9 @@ impl Hand {
     /// decide is never cut.
     fn vote_after_ms(&self, seat: SeatIdx, owed: EventType) -> u64 {
         // `S1-GK`: a seat whose player said it left, and whose client left the
-        // table's group, has nothing more to say at any stage or turn.
-        if self.gone_by_word.contains(&seat) {
+        // table's group, has nothing more to say at any stage or turn --
+        // `D-066`: nor has one gone from the group for `LONG_GONE_S`.
+        if self.gone_by_word.contains(&seat) || self.long_gone.contains(&seat) {
             return 0;
         }
         let budget = u64::from(self.next_deadline_for(owed));
@@ -10415,6 +10533,13 @@ impl Hand {
     /// `QUIET_LIMIT_S`, as the node reads them now -- the whole set each time.
     pub fn note_gone_from_group(&mut self, seats: &[SeatIdx]) {
         self.gone_from_group = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
+    }
+
+    /// `D-066`: the seats out of the table's group, or silent there, for
+    /// `LONG_GONE_S` or more, as the node reads them now -- the whole set
+    /// each time, so a seat back in the group is waited for again.
+    pub fn note_long_gone(&mut self, seats: &[SeatIdx]) {
+        self.long_gone = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
     }
 
     pub fn note_flooders(&mut self, seats: &[SeatIdx]) {
@@ -16551,14 +16676,188 @@ mod tests {
             assert!(!hands[i].took_part(5) && hands[i].took_part(4), "seat {i}: the quiet seat out, the gone voter kept");
         }
 
-        // Three present of four, seat 3 quiet and voter 2 gone: named, it would
-        // be two voters for two seats -- the floor fails, and the deadline ends
-        // the hand as `S1-HA` did.
-        let (mut small, keys) = present_and_quiet(4, 3);
-        small[0].note_gone_from_group(&[2]);
+        // Seats 1, 2 and 3 of four present, seat 0 quiet and voter 3 gone:
+        // named, it would be two voters for two seats with the lowest seat among
+        // the named -- the floor fails even with `D-066`'s tie-break, and the
+        // deadline ends the hand as `S1-HA` did.
+        let (mut small, keys) = with_present(4, &[1, 2, 3]);
+        small[0].note_gone_from_group(&[3]);
         let out = bytes_of_sends(small[0].vote_on_timeouts(&keys[0], t1, 0).unwrap());
-        assert_eq!(out.len(), 1, "the quiet seat alone: naming seat 2 too would break the floor");
+        assert_eq!(out.len(), 1, "the quiet seat alone: naming seat 3 too would break the floor");
         assert!(small[0].may_abandon(t1 + 1_000), "no certificate can close: the deadline ends it");
+    }
+
+    /// `D-066`: an `n`-seat table where exactly the seats in `present` open the
+    /// hand and hear each other; the rest never say anything. The hands and
+    /// keys come in `present`'s order.
+    fn with_present(n: u8, present: &[u8]) -> (Vec<Hand>, Vec<SigningKey>) {
+        let keys: Vec<SigningKey> = present.iter().map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for (i, seat) in present.iter().enumerate() {
+            let (h, from) = Hand::open(opening_n(n, *seat), &keys[i], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        for i in 0..present.len() {
+            for j in 0..present.len() {
+                if i != j {
+                    let _ = deliver(&mut hands[i], &inits[j], &keys[i]);
+                }
+            }
+        }
+        let quiet: Vec<SeatIdx> = (0..n).filter(|s| !present.contains(s)).collect();
+        for h in &hands {
+            assert_eq!(h.waiting_for(), quiet, "stage 0 waits on the seats not present");
+        }
+        (hands, keys)
+    }
+
+    /// Every certificate copy among a batch of sends.
+    fn certs_of(sends: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        sends
+            .into_iter()
+            .filter(|b| chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::TimeoutCert))
+            .collect()
+    }
+
+    /// `D-066`, the owner's choice on half the table silent: seats 2 and 3 of
+    /// four are gone, and 0 and 1 -- exactly half, holding the lowest seat --
+    /// certify both out at the stage's deadline: the hand ends and the next
+    /// opens with the two, one genesis. Before, two voters could never name
+    /// two seats and every hand ended on its deadline with all four.
+    #[test]
+    fn half_the_table_holding_the_lowest_seat_certifies_the_other_half() {
+        let (mut hands, keys) = present_and_quiet(4, 2);
+        let t1 = NOW + 30_000;
+        let votes: Vec<Vec<Vec<u8>>> = (0..2)
+            .map(|i| bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()))
+            .collect();
+        for v in &votes {
+            assert_eq!(v.len(), 2, "each votes about both absent seats");
+        }
+        let copies: Vec<Vec<Vec<u8>>> = cross(&mut hands, &keys, &[0, 1], &votes, t1 + 500)
+            .into_iter()
+            .map(certs_of)
+            .collect();
+        for c in &copies {
+            assert_eq!(c.len(), 1, "each seals the pair");
+        }
+        let _ = cross(&mut hands, &keys, &[0, 1], &copies, t1 + 1_000);
+        for h in &hands {
+            assert!(h.aborted().is_some(), "the certificate ended the hand");
+            assert!(!h.took_part(2) && !h.took_part(3));
+        }
+        let (a, b) = (hands[0].next_hand().expect("next"), hands[1].next_hand().expect("next"));
+        assert_eq!(a.required, vec![0, 1]);
+        assert_eq!(a.genesis, b.genesis, "one GENESIS(k+1)");
+    }
+
+    /// `D-066`: the half without the lowest seat cannot certify the half with
+    /// it -- one half of a table holds that seat, never both -- so it casts no
+    /// vote, says why once, and the stage's deadline ends the hand.
+    #[test]
+    fn the_half_without_the_lowest_seat_waits() {
+        let (mut hands, keys) = with_present(4, &[2, 3]);
+        let t1 = NOW + 30_000;
+        for i in 0..2 {
+            assert!(
+                hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap().is_empty(),
+                "no vote towards a certificate that can never be sealed"
+            );
+        }
+        let note = hands[0].take_cert_note().expect("the player is told");
+        assert!(note.contains("no certificate can remove them yet") && note.contains("D-066"), "{note}");
+        assert!(hands[0].may_abandon(t1 + 1_000), "no certificate possible: the deadline ends the hand");
+    }
+
+    /// `D-066`: a certificate only half the table carries is never taken by a
+    /// seat it names as waited-on -- that seat is here, which is the one fact
+    /// it may not overrule. Seat 2 hears 0 and 1 but they do not hear it; they
+    /// certify 2 and 3 by the tie-break and end the hand, and seat 2 does not:
+    /// a half that lied forks away alone.
+    #[test]
+    fn a_certificate_half_the_table_carries_is_not_taken_by_a_seat_it_names() {
+        let keys: Vec<SigningKey> = (0..4u8).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..3u8 {
+            let (h, from) = Hand::open(opening_n(4, seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        // 0 and 1 hear each other; 2 hears them, and they never hear 2.
+        let _ = deliver(&mut hands[0], &inits[1], &keys[0]);
+        let _ = deliver(&mut hands[1], &inits[0], &keys[1]);
+        let _ = deliver(&mut hands[2], &inits[0], &keys[2]);
+        let _ = deliver(&mut hands[2], &inits[1], &keys[2]);
+        assert_eq!(hands[0].waiting_for(), vec![2, 3]);
+        let t1 = NOW + 30_000;
+        let votes: Vec<Vec<Vec<u8>>> = (0..2)
+            .map(|i| bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()))
+            .collect();
+        let copies: Vec<Vec<Vec<u8>>> = cross(&mut hands[..2], &keys[..2], &[0, 1], &votes, t1 + 500)
+            .into_iter()
+            .map(certs_of)
+            .collect();
+        let _ = cross(&mut hands[..2], &keys[..2], &[0, 1], &copies, t1 + 1_000);
+        assert!(hands[0].aborted().is_some() && hands[1].aborted().is_some(), "the half that certified goes on");
+        for c in copies.iter().flatten() {
+            let out = hands[2].on_event(c, &keys[2], t1 + 1_500);
+            assert!(out.map(|o| o.is_empty()).unwrap_or(false), "seat 2 takes nothing from it");
+        }
+        assert!(hands[2].aborted().is_none(), "seat 2 is here and does not take a certificate naming it");
+        assert!(hands[2].took_part(2), "and it keeps its seat at its own table");
+        let note = hands[2].take_cert_note().expect("said");
+        assert!(note.contains("names this client, which is here"), "{note}");
+    }
+
+    /// `D-066`: three of five gone for five minutes are certified out by the
+    /// two left -- `CAUSE_LONG_GONE` on every seat named, voted at once -- and
+    /// before the five minutes the two cast nothing. A named seat that is here
+    /// does not take it.
+    #[test]
+    fn seats_long_gone_are_certified_by_two_short_of_a_majority() {
+        let (mut hands, keys) = with_present(5, &[3, 4]);
+        let t1 = NOW + 30_000;
+        for i in 0..2 {
+            assert!(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap().is_empty(), "two cannot name three");
+        }
+        for h in hands.iter_mut() {
+            h.note_long_gone(&[0, 1, 2]);
+        }
+        let t2 = t1 + 1_000;
+        let votes: Vec<Vec<Vec<u8>>> = (0..2)
+            .map(|i| bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t2, 0).unwrap()))
+            .collect();
+        for v in &votes {
+            assert_eq!(v.len(), 3, "each votes about the three, at once, with the cause");
+        }
+        let copies: Vec<Vec<Vec<u8>>> = cross(&mut hands, &keys, &[0, 1], &votes, t2 + 500)
+            .into_iter()
+            .map(certs_of)
+            .collect();
+        for c in &copies {
+            assert_eq!(c.len(), 1, "each seals the three");
+        }
+        assert_eq!(
+            certificate_cause(&copies[0][0], &hands[0].open.table_id, hands[0].open.hand_id, 0),
+            Some(CAUSE_LONG_GONE),
+            "the bytes say why"
+        );
+        let _ = cross(&mut hands, &keys, &[0, 1], &copies, t2 + 1_000);
+        for h in &hands {
+            assert!(h.aborted().is_some(), "the certificate ended the hand");
+            assert!(!h.took_part(0) && !h.took_part(1) && !h.took_part(2));
+        }
+        assert_eq!(hands[0].next_hand().expect("next").required, vec![3, 4]);
+
+        // Seat 0 was here all along, unheard: it takes nothing.
+        let (mut zero, _) = Hand::open(opening_n(5, 0), &key(10), NOW, 30_000).unwrap();
+        for c in copies.iter().flatten() {
+            let _ = zero.on_event(c, &key(10), t2 + 1_500);
+        }
+        assert!(zero.aborted().is_none() && zero.took_part(0), "a seat named that is here keeps its table");
     }
 
     /// `D-065`: one voter's word that another is silent seals nothing while

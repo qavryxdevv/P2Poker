@@ -3458,7 +3458,7 @@ in this paragraph, which records its withdrawal.
 | `n(3) parent_event_hash` | `bytes[32]` | `stage_hash(subject_sequence - 1)` |
 | `n(4) deadline_ms` | `u32` | the `next_deadline_ms` carried by the parent stage's events |
 | `n(5) kind` | `u16` | `1` = action deadline, `2` = cryptographic-step deadline |
-| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. `2` (**D-065**): the seat is not one the stage waits on but a voter of the round at that stage that has said nothing about it within the round's air -- no vote about every seat the voter voted about there, or no copy of the certificate the voter sealed. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
+| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. `2` (**D-065**): the seat is not one the stage waits on but a voter of the round at that stage that has said nothing about it within the round's air -- no vote about every seat the voter voted about there, or no copy of the certificate the voter sealed. `3` (**D-066**): the seat, one the stage waits on, has been out of the table's group or silent there for `LONG_GONE_S` or more by the voter's own reading. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
 
 *Envelope:* `sequence = subject_sequence`,
 `previous_event_hash = parent_event_hash`, `chain_scope = 1` and
@@ -3498,6 +3498,15 @@ while the certificate naming the seats it voted about and that voter together
 would clear §8.3's floor, and never about a seat the stage waits on: that seat is
 voted about with the ordinary vote. The fields `n(0)`..`n(5)` are the stage's own,
 exactly as for the seats the stage waits on, so the one certificate carries both.
+
+**`cause = 3` and when it is said (D-066).** A voter votes about a seat the stage
+waits on with `cause = 3` at once -- without waiting out the stage's deadline -- when
+its own reading has that seat out of the table's group, or silent there, for
+`LONG_GONE_S` = 300 s or more, counted only while the voter's own line is sound. A
+voter that voted about the seat at that stage without the cause votes again with it:
+another subject in another slot (§5.2), and the one exception to *once about one seat
+at one stage* -- a turn whose stage stands until `hand_deadline_ms` has no next stage
+to carry the cause.
 
 **A vote is also a question (D-065).** A `TIMEOUT_VOTE` about seat `s` at stage
 `x` says its voter has accepted nothing from `s` there, which a receiver holding
@@ -3573,7 +3582,11 @@ every resignation is a `TABLE_LEAVE` for this table that verifies under the key
 of a seat of `S`, one per seat (`D-063`); `|V(S)| >= 1`, and with `Q` the seats of
 `S` carrying no resignation, either `Q` is empty or `|V(S)| >= 2` and
 `|V(S)| > |Q|` — a seat that said it left counts for nothing against the floor,
-its own word being its consent; every certificate names at least one seat
+its own word being its consent — or, `D-066`, `|V(S)| >= 2` and either
+`|V(S)| = |Q|` with the lowest seat of `V(S) ∪ Q` in `V(S)`, or every seat of `Q`
+not named `cause = 2` named `cause = 3`; a receiver that is itself a seat of `Q`
+named without `cause = 2` does not take a certificate that clears the floor only by
+`D-066` — it is here, which such a certificate may not overrule; every certificate names at least one seat
 without `cause = 2` -- a seat its stage waits on -- and a `kind = 1` certificate
 names exactly one, the seat to act, with any voters named `cause = 2` beside it
 (D-065); every vote about one seat names one `cause`, and a defined one (D-051);
@@ -7482,6 +7495,21 @@ D-007 at every table size. Wherever an earlier draft of this document said "at
 > a client that plays every turn and never votes can no longer hold a
 > certificate about anybody -- which, before D-065, cost a table every hand
 > after one of its seats died, and a betting stage its whole `hand_deadline_ms`.
+>
+> **`D-066` -- half the table silent (2026-09-18, the project owner's choice).**
+> The majority floor kept a table standing whenever the seats that stopped were
+> half of it or more: every hand ended on its deadline with the same seats, and a
+> turn stood until `hand_deadline_ms`. Two exceptions, each needing two voters at
+> least: **exactly half** is enough for the half that holds the lowest seat of
+> `V(S) ∪ Q` -- one half of a table can hold it, never both, so two halves never
+> certify each other -- and **any number** is enough when every seat of `Q` is named
+> `cause = 3`, out of the table's group for `LONG_GONE_S` = 300 s by every voter's
+> own reading. Neither exception is ever taken by a seat of `Q` itself: a seat that
+> is here refutes the only claim such a certificate rests on, so a half or a
+> minority that lied about the rest forks away alone, and a seat really gone never
+> hears it. **The price, accepted by the owner:** a real partition of the network
+> that lasts past `LONG_GONE_S` splits the table in two, each half going on without
+> the other.
 >
 > **Being voted against is not exclusion.** A `TIMEOUT_VOTE` is one peer's
 > unilateral assertion, this section concedes below that a lying voter is

@@ -879,6 +879,14 @@ struct TableRun {
     vote_asks_heard: std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
     /// `D-065`: the questions this client has answered, once each.
     vote_asks_answered: std::collections::BTreeSet<(u64, u64, u8, bool)>,
+    /// `D-066`: since when each seat has been gone from the table's group, as
+    /// this client reads it with its own line sound (`note_unheard`).
+    unheard_since: std::collections::BTreeMap<u8, tokio::time::Instant>,
+    /// `D-066`: the seats said to be long gone, so each is said once.
+    long_gone_said: std::collections::BTreeSet<u8>,
+    /// `D-065`: the driver's refused seat claims already acted on -- a claim
+    /// refused leaves a member untaught here, so it is learnt again.
+    claims_refused_seen: u64,
     /// `S1-CX`: the other seat's next hand, seen while this one is still
     /// inside a hand nothing was dealt in -- the hand id and the parent it
     /// carries -- for the stall tick to give this hand up on, if the parent
@@ -1233,6 +1241,9 @@ impl TableRun {
             stage_waiting: (u64::MAX, 0),
             vote_asks_heard: std::collections::BTreeMap::new(),
             vote_asks_answered: std::collections::BTreeSet::new(),
+            unheard_since: std::collections::BTreeMap::new(),
+            long_gone_said: std::collections::BTreeSet::new(),
+            claims_refused_seen: 0,
             give_up_for: None,
             hand_one_held_since: None,
             hand_one_progress: None,
@@ -3244,6 +3255,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.hand = None;
             $t.vote_asks_heard.clear();
             $t.vote_asks_answered.clear();
+            $t.unheard_since.clear();
+            $t.long_gone_said.clear();
+            $t.claims_refused_seen = 0;
             $t.late_cert_said = None;
             $t.previous = None;
             $t.next_inits.clear();
@@ -7259,6 +7273,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 }
+                // `D-065`: a seat claim the driver refused -- a frame another
+                // member said again (a vote's answer, `D-033`'s re-say) that came
+                // before that member's own -- left the member marked taught here
+                // and unknown there; learn every member again from its next frame.
+                let refused = t.tox_sink.claims_refused();
+                if refused != t.claims_refused_seen {
+                    t.claims_refused_seen = refused;
+                    t.taught.clear();
+                }
                 // **Learn who this group peer is, once, from a signature.**
                 // The driver reports a sender by its group key and cannot get
                 // further; the roster is keyed by application key. Pairing them
@@ -9838,8 +9861,33 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // `S1-HA`: and the seats gone from the table's group, for the
                     // round a gone voter cannot close.
                     let gone_from_group: Vec<u8> = t.table.as_ref().map(|f| seats_unheard(f, &t.tox_sink)).unwrap_or_default();
+                    // `D-066`: and the seats gone that long -- counted only while this
+                    // client hears some other seat of the table, since a client that
+                    // lost its own line reads every other seat gone. Not
+                    // `own_line_suspect`: its two-timeouts-in-a-minute reading is
+                    // exactly what two seats dying together produce, and it held the
+                    // count back a minute and a half on the bed (`run115311-4`).
+                    let others = t
+                        .table
+                        .as_ref()
+                        .map(|f| f.roster().seats().len().saturating_sub(1))
+                        .unwrap_or(0);
+                    let suspect = others > 0 && gone_from_group.len() >= others;
+                    let long_gone = note_unheard(&mut t.unheard_since, &gone_from_group, suspect);
+                    let newly: Vec<u8> = long_gone.iter().copied().filter(|s| !t.long_gone_said.contains(s)).collect();
+                    t.long_gone_said.retain(|s| long_gone.contains(s));
+                    for s in newly {
+                        t.long_gone_said.insert(s);
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "seat {s} has been out of the table's group for {} min: two seats may certify it out now, short of a majority (D-066)",
+                                crate::protocol::constants::LONG_GONE_S / 60
+                            )))
+                            .await;
+                    }
                     let Some(h) = t.hand.as_mut() else { continue };
                     h.note_gone_from_group(&gone_from_group);
+                    h.note_long_gone(&long_gone);
 
                     // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
                     // and the carrier's blind repair ladder puts its attempts in
@@ -11989,6 +12037,32 @@ fn own_line_suspect(t: &TableRun) -> bool {
 fn i_say_the_hand_again(h: &crate::table::hand::Hand, gone: &[u8]) -> bool {
     let waiting = h.waiting_for();
     h.dealt_in().iter().copied().filter(|s| !waiting.contains(s) && !gone.contains(s)).min() == Some(h.my_seat())
+}
+
+/// `D-066`: keep, per seat, since when it has been gone from the table's group
+/// -- out of it, or silent there for `QUIET_LIMIT_S` -- and return the seats gone
+/// for `LONG_GONE_S` or more. A seat back in the group is forgotten, and every
+/// seat is while this client's own line is the suspect -- it hears no other seat
+/// of the table at all.
+fn note_unheard(
+    since: &mut std::collections::BTreeMap<u8, tokio::time::Instant>,
+    gone: &[u8],
+    suspect: bool,
+) -> Vec<u8> {
+    if suspect {
+        since.clear();
+        return Vec::new();
+    }
+    since.retain(|s, _| gone.contains(s));
+    let now = tokio::time::Instant::now();
+    for s in gone {
+        since.entry(*s).or_insert(now);
+    }
+    since
+        .iter()
+        .filter(|(_, at)| at.elapsed().as_secs() >= crate::protocol::constants::LONG_GONE_S)
+        .map(|(s, _)| *s)
+        .collect()
 }
 
 /// `D-065`: what this client says in answer to a vote read as a question

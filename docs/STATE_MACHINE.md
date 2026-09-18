@@ -1866,6 +1866,10 @@ and named in `S` beside the seats the stage waits on, under the same floor. What
 the hand -- it leaves `V` of every later certificate -- and nothing else: no strike, no effect on `R(k+1)`, not
 attributed by the abort (`PROTOCOL.md` §4.8, §8.3).
 
+**D-066 (2026-09-18) lets half the table go on.** Past two voters, exactly half is enough for the half holding the
+lowest seat of `V(S) ∪ S`, and any number is when every seat of `S` the stage waits on has been out of the table's
+group for `LONG_GONE_S` (`cause = 3`); a seat of `S` itself never takes such a certificate (`PROTOCOL.md` §8.3).
+
 **`V(subject)` appears in no guard in this table, and that is D-015.** The required voter set of
 §8.4 was read by six rows and by nothing else; with those rows deleted there is no guard left
 that needs it, no guard that reads `certified_subjects`, and no guard that reads a certificate

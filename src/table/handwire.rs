@@ -786,6 +786,13 @@ pub const CAUSE_FLOOD: u16 = 1;
 /// roster effect, no word kept for its client.
 pub const CAUSE_SILENT_VOTER: u16 = 2;
 
+/// `D-066`: a timeout vote's cause -- the seat the stage waits on has been out
+/// of the table's group, or silent there, for `LONG_GONE_S` or more by the
+/// voter's own reading. A certificate whose every seat named as waited-on
+/// carries it needs two voters and no majority; the seat named leaves the
+/// roster as any quiet seat does.
+pub const CAUSE_LONG_GONE: u16 = 3;
+
 impl TimeoutVote {
     /// The digest a certificate identifies this subject by.
     ///
@@ -819,7 +826,7 @@ impl TimeoutVote {
     /// is refused rather than read as no cause: it is a second encoding of
     /// the same subject.
     pub fn cause_is_known(&self) -> bool {
-        matches!(self.cause, None | Some(CAUSE_FLOOD) | Some(CAUSE_SILENT_VOTER))
+        matches!(self.cause, None | Some(CAUSE_FLOOD) | Some(CAUSE_SILENT_VOTER) | Some(CAUSE_LONG_GONE))
     }
 }
 
@@ -1115,9 +1122,10 @@ mod tests {
         assert_eq!(back, flagged, "the cause survives the wire");
         assert!(flagged.cause_is_known() && vote.cause_is_known());
         assert!(!TimeoutVote { cause: Some(0), ..vote }.cause_is_known(), "no second spelling of no cause");
-        // `D-065`: 2 is the silent voter; the catalogue ends there.
+        // `D-065`: 2 is the silent voter; `D-066`: 3 the seat long gone; the catalogue ends there.
         assert!(TimeoutVote { cause: Some(CAUSE_SILENT_VOTER), ..vote }.cause_is_known());
-        assert!(!TimeoutVote { cause: Some(3), ..vote }.cause_is_known());
+        assert!(TimeoutVote { cause: Some(CAUSE_LONG_GONE), ..vote }.cause_is_known());
+        assert!(!TimeoutVote { cause: Some(4), ..vote }.cause_is_known());
 
         // A joint subject names each seat's cause; one without any hashes as before.
         let mut joint = CertSubject::of(&vote);

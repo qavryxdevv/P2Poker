@@ -628,6 +628,15 @@ pub const PATIENCE_CUT_MS: u64 = 10_000;
 /// the table's thirty-second step [`WAIT_FROM_MS`] stops them after two.
 pub const MAX_PATIENCE_CUTS: u8 = 3;
 
+/// `D-066`, the owner's choice (2026-09-18): how long a seat must have been out
+/// of the table's group, or silent there, by a voter's own reading before that
+/// voter names it with `CAUSE_LONG_GONE` -- a vote that lets two voters certify
+/// it short of a majority. Five minutes, the owner's figure: well past the far
+/// client's library outage of about a minute on 2026-09-17, and short of a
+/// table that looks abandoned. A real partition that lasts longer splits the
+/// table in two, which is the price the owner accepted for never standing.
+pub const LONG_GONE_S: u64 = 300;
+
 /// `D-034`: how long a seat at one of this client's own tables has to decide,
 /// once it is its turn -- the owner's rule, thirty seconds when the client is
 /// on the line, then the forced fold. The window's clock runs over exactly
