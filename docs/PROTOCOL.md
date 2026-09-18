@@ -374,7 +374,7 @@ per message code.
 | `TABLE_CHAT` | table mesh: the table's group, or its topic where there is no group (§7.8) |
 | `TABLE_LEAVE` | table mesh: the table's group; before the table is set, its topic too (§7.10) |
 | `TABLE_HEARING` | table mesh: the table's group and its topic, before the table is set (§7.11) |
-| `TABLE_CONTINUES` | table mesh: the topic of the table that goes on, before it is set (§7.12) |
+| `TABLE_CONTINUES` | table mesh: the group and the topic of the table that goes on, before it is set (§7.12) |
 | `SEARCH_PRESENCE` | search queue broadcast (§7.13) |
 | `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
@@ -4918,7 +4918,7 @@ means it does not and never can be.
 | `0x0107` | `TABLE_CHAT` | table mesh (the table's group; its topic where there is no group) | 0 | — | a seated application key (§7.8) |
 | `0x0108` | `TABLE_LEAVE` | table mesh (the table's group; before the set, its topic too) | 0 | — | a seated application key, of its own seat (§7.10) |
 | `0x0109` | `TABLE_HEARING` | table mesh (the table's group and its topic, before the set) | 0 | — | a seated application key, of its own seat (§7.11) |
-| `0x010A` | `TABLE_CONTINUES` | table mesh (the topic of the table that goes on, before the set) | 0 | — | a seated application key, the founder of the advert it carries (§7.12) |
+| `0x010A` | `TABLE_CONTINUES` | table mesh (the group and the topic of the table that goes on, before the set) | 0 | — | a seated application key, the founder of the advert it carries (§7.12) |
 | `0x010B` | `SEARCH_PRESENCE` | search queue broadcast (§7.13) | 0 | — | any peer, about itself |
 | `0x0201` | `JOIN_REQUEST` | join RPC | 0 | — | joiner |
 | `0x0202` | `JOIN_ACCEPT` | join RPC | 0 | — | table key |
@@ -6964,7 +6964,10 @@ nobody else holds that key; so the table is not handed over, it is **founded aga
 -- same name, same parameters -- by a seat of its roster, with a key of its own, and
 this word takes the other seats there.
 
-*Channel:* the topic of the table that goes on, before it is set.
+*Channel:* the group and the topic of the table that goes on, before it is set. The
+seat that founds stays in the old group for the minute it says the word there, and
+leaves it after: a seat with no poker peer on the lobby's line hears it in the group
+and nowhere else (`S1-IA`).
 *Signed by:* the application key of a seat in the receiver's roster for that table.
 *Sent:* by the seat that founded the new table, every 5 s for a minute after.
 *Envelope:* unchained (`chain_scope = 0`).

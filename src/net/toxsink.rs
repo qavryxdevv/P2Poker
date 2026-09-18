@@ -1023,6 +1023,28 @@ impl TableSink {
         }
     }
 
+    /// `S1-IA`: give the table up as [`TableSink::clear`] does, but hand its
+    /// group to the caller: this client stays a member until the returned sink
+    /// is dropped, and can say a last word there with
+    /// [`TableSink::try_broadcast`] -- the continuation a forming table goes on
+    /// at, to the seats that hear this client in the group and nowhere else.
+    /// Nothing reads the group's inbox meanwhile; the driver drops what does not
+    /// fit.
+    pub fn hand_over_group(&mut self) -> TableSink {
+        let held = TableSink {
+            #[cfg(feature = "tox")]
+            driver: self.driver.clone(),
+            #[cfg(feature = "tox")]
+            inner: self.inner.take(),
+            #[cfg(feature = "tox")]
+            mine: self.mine,
+            reach: self.reach,
+            wants_tox: false,
+        };
+        self.wants_tox = false;
+        held
+    }
+
     /// `S1-GO`: give the table up as [`TableSink::clear`] does, but stay in the
     /// table's group for `linger` first. A member that got this client's later
     /// messages and missed an earlier one asks this client for it, and a client

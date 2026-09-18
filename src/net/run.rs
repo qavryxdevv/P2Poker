@@ -1082,6 +1082,10 @@ struct Continuing {
     advert: Option<Vec<u8>>,
     until: tokio::time::Instant,
     said: Option<tokio::time::Instant>,
+    /// `S1-IA`: the old table's group, held until the word has been said there
+    /// for `CONTINUES_SAY_FOR` -- a seat with no poker peer on the lobby's line
+    /// hears this client in the group and nowhere else. Dropped with this.
+    group: super::toxsink::TableSink,
 }
 
 /// `S1-FY`: a join as the player asked for it.
@@ -3697,6 +3701,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.avoided.insert(old, tokio::time::Instant::now());
             state.lobby.remove(&old);
             let old_topic = $t.table_topic.take();
+            // `S1-IA`: the old group is kept for the word, and left with it.
+            let old_group = $t.tox_sink.hand_over_group();
             $t.tox_sink.clear();
             $t.tox_group_said = false;
             $t.table_announces = 0;
@@ -3711,6 +3717,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     advert: None,
                     until: tokio::time::Instant::now() + CONTINUES_SAY_FOR,
                     said: None,
+                    group: old_group,
                 });
             }
             let why = "the founder is gone: this client founds the table's continuation, and its seats go on there (D-061)".to_string();
@@ -7630,6 +7637,38 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
+                // `S1-IA`: D-061's word that this forming table goes on at a table a
+                // seat founded, over the group -- as the lobby's topic carries it.
+                if let Ok((crate::protocol::messages::EventType::TableContinues, _, _)) =
+                    crate::net::chained::peek(&item.bytes, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
+                {
+                    if let (Some(f), Some(gk)) = (t.table.as_ref().filter(|f| f.session().is_none() && !t.resuming), item.claimed) {
+                        let now = super::node::now_unix_ms();
+                        let seen = &t.roster_keys_seen;
+                        let me = f.my_seat();
+                        match super::tabletalk::receive_continues(&item.bytes, &f.table_id(), f.advert(), |k| f.roster().seat_of(k).or_else(|| seen.get(k).copied()), now) {
+                            Ok(c) => {
+                                if Some(c.seat) != me && !t.continues_heard.contains_key(&c.seat) {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "seat {} founded this table's continuation, said in the table's group (D-061, S1-IA)",
+                                            c.seat
+                                        )))
+                                        .await;
+                                    t.continues_heard.insert(c.seat, c);
+                                }
+                            }
+                            Err(why @ super::tabletalk::NotHeard::Forged) => {
+                                t.tox_sink.tell(super::toxsink::Seat::Noise {
+                                    member_key: gk,
+                                    points: super::tabletalk::noise_points(why),
+                                });
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    continue;
+                }
                 // `D-060`: a seat's word on whom it cannot hear, before the table is set.
                 if let Ok((crate::protocol::messages::EventType::TableHearing, _, _)) =
                     crate::net::chained::peek(&item.bytes, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
@@ -8534,6 +8573,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         });
                         if let Some((old, serial, advert, topic)) = word_due {
                             if let Ok(bytes) = super::tabletalk::continues_word(&app_key, &old, serial, &advert, now) {
+                                // `S1-IA`: in the old group too -- a seat with no poker
+                                // peer on the lobby's line hears this client there alone.
+                                if let Some(c) = t.continuing.as_ref() {
+                                    let _ = c.group.try_broadcast(&bytes);
+                                }
                                 let _ = swarm.behaviour_mut().gossipsub.publish(topic, bytes);
                             }
                             if let Some(c) = t.continuing.as_mut() {
