@@ -449,7 +449,8 @@ fn lobby_hours_to_read(unix_s: u64) -> Vec<u64> {
 ///
 /// **What is NOT established, because an earlier draft of this comment said it
 /// was:** that the reading costs hands. Each of those two runs had one hand that
-/// stalled on a silent seat and the run without `D-070` between them had none
+/// stalled on a seat that lacked one message (`S1-II`: the carrier's receive
+/// ring replayed a leftover, patch 0039) and the run without `D-070` had none
 /// (`split181415-9`), which read as harm growing with the dose -- until one of
 /// the three runs with the key read only while alone stalled the same way
 /// (`split185900-9`), and another of them walked seven seats' records inside

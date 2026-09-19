@@ -265,6 +265,9 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker (patch 0038): a sync that names a member removed for good'
        Why    = '0038: S1-FZ. A sync response naming a member the table''s word removed for good hit patch 0034''s refusal, which unpack_gc_sync_announce read as an impossible value, and LOGGER_FATAL aborted the whole client -- a founder died 4 s after giving a silent seat back (run153101-3). The member is skipped; the wire is untouched.' }
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'p2p-poker (patch 0039): a leftover in the receive ring is cleared, never replayed.'
+       Why    = '0039: S1-II. The receive ring''s drain took whatever sat in the awaited message''s slot for the awaited message, so an entry left behind a lap of the ring earlier -- a copy stored out of order and then overtaken by its own retransmission -- was replayed, acknowledged under its old id and counted as the awaited message, and the real one was dropped as a duplicate: a lossless stream lost one message to one receiver, and a hand stalled on a seat that lacked what every other seat had. The sender''s half is upstream''s own line, Wrap-around on message N with N from the first lap' }
 )
 
 Step 'checking the patches are in the vendored source'

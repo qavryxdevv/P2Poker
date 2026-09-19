@@ -1,0 +1,151 @@
+# 0039 - a leftover in the receive ring is cleared, never replayed; and the copy that
+#        becomes one goes with its message.
+#
+# S1-II (2026-09-19), found in three evening runs of the 8+1 rig (runs/split174430-9,
+# runs/split175954-9, runs/split185900-9): in each, one hand stalled for a minute or more
+# because ONE seat lacked a message every other seat had -- the rest of the table moved on
+# and waited for that seat, that seat waited for the sender, seven clocks ran out on it,
+# and the table's own repairs (D-033, D-059, D-065) ended the hand. The seat was not deaf:
+# its counters for every peer went on rising through the whole stall.
+#
+# The carrier keeps each connection's messages in rings of GCC_BUFFER_SIZE = 2048 slots,
+# slot = id % 2048. Two things, both upstream's:
+#
+#   1. gcc_check_recv_array, the periodic drain, looked at the SLOT of the awaited message
+#      and took whatever was in it for the awaited message. It never compared the id.
+#   2. A message that arrives out of order is stored; if its retransmission then arrives in
+#      order before the drain has run, the message is handed straight to its handler and
+#      the stored copy is never cleared -- the drain only ever looks at the awaited slot,
+#      and that has just moved past it.
+#
+# So a copy left behind by (2) sat in its slot for a lap of the ring, and 2048 messages
+# later (1) replayed it: handed it to the application a second time, acknowledged it under
+# its OLD id, and moved received_message_id past a message that had not arrived. The real
+# one was then a duplicate by its number -- dropped, and acknowledged, so the sender forgot
+# it as well. A lossless stream lost one message, to one receiver, with no error anywhere.
+#
+# This project's own repairs made (2) systematic, which is why upstream rarely meets it: a
+# receiver asks at once for what it misses (0009) and a sender answers with a run of
+# consecutive ids (0024), so after every reordering the retransmitted run arrives in one
+# poll batch and overtakes every copy stored ahead of it.
+#
+# The sender's half was in the logs all along, as upstream's own line: the ack under the
+# old id finds another message in that slot of the SEND ring, and gcc_handle_ack says
+# "Wrap-around on message N". Measured in those three runs: 2, 109 and 205 such lines with
+# N above zero; N always small (123..776, the first lap); none in the first 250 s of any
+# run, and none before some connection's counter had passed 2048; every one at a moment
+# when a receiver's counter passed N + 2048 (no other offset fits them all: +1024 fits
+# 0 to 12 %, +4096 0 to 4 %); in runs of consecutive ids, which is 0024's burst.
+#
+# The change, in toxcore/group_connection.c:
+#   * gcc_handle_received_message: when the awaited message arrives in order and a copy
+#     of the same id waits in the ring, the copy is cleared with it (and said, at DEBUG).
+#   * gcc_check_recv_array: an occupant of the awaited slot whose id is not the awaited id
+#     is a leftover by construction -- everything below has been consumed, and a sender
+#     cannot be 2048 ahead of what this side has handled, its own ring holding 2047
+#     unacknowledged messages and no more -- so it is cleared and said, never processed.
+#     That also closes the door to a member who SENDS awaited + 2048 on purpose.
+#
+# Measured after, the same rig the same evening (runs/split195458-9 and the runs that
+# followed): "Wrap-around" with N above zero 0 lines; the copy cleared with its message
+# 4 475 times in one seven-minute run, which is how many leftovers a run was making (only
+# those of the first few hundred ids come round inside seven minutes; at a table played
+# for an hour all of them do); the drain's own check never had to fire. Read a run with
+# tools/fold-ring-leftovers.py.
+#
+# Local; the wire is untouched. The DEBUG lines are compiled in under fault-harness only
+# (build.rs sets MIN_LOGGER_LEVEL there and nowhere else).
+#
+# Vendored tree patched in place. Re-apply on a toxcore bump with
+#   git apply patches/0039-*.patch
+# and check tools/build-tox.ps1's marker for 0039 in group_connection.c.
+diff --git a/vendor/c-toxcore/toxcore/group_connection.c b/vendor/c-toxcore/toxcore/group_connection.c
+index 8b63d17..b305b99 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.c
++++ b/vendor/c-toxcore/toxcore/group_connection.c
+@@ -620,6 +620,36 @@ int gcc_handle_received_message(const Logger *log, const Memory *mem, const Mono
+         return 1;
+     }
+ 
++    /* p2p-poker (patch 0039): a copy that waited in the ring goes with the message.
++     *
++     * This message is the awaited one and is handed straight to its handler; it
++     * never touches recv_array. But a COPY of it may be there: it arrived once
++     * before, out of order, and was stored -- and what arrives now is the
++     * sender's retransmission, which won the race with the periodic drain
++     * (gcc_check_recv_array runs once a do_gc pass; a poll delivers a whole
++     * batch before it). Nothing ever cleared that copy: the drain looks at the
++     * slot of received_message_id + 1 only, and that has just moved past it.
++     * The leftover then sat in its slot for a lap of the ring, and see
++     * gcc_check_recv_array for what it did when the ids came round.
++     *
++     * Made systematic by this project's own repairs, which is why upstream
++     * rarely meets it: a receiver asks at once for what it misses (0009) and a
++     * sender answers with a run of consecutive ids (0024), so after every
++     * reordering the retransmitted run arrives in one batch and overtakes every
++     * copy stored ahead of it. Measured, three runs of nine seats on
++     * 2026-09-19: 2, 109 and 205 leftovers a run, in runs of consecutive ids.
++     */
++    {
++        const uint16_t idx = gcc_get_array_index(message_id);
++        GC_Message_Array_Entry *const copy = &gconn->recv_array[idx];
++
++        if (!array_entry_is_empty(copy) && copy->message_id == message_id) {
++            LOGGER_DEBUG(log, "p2p-poker: message %llu arrived in order while a copy of it waited in the ring; the copy goes with it",
++                         (unsigned long long)message_id);
++            clear_array_entry(mem, copy);
++        }
++    }
++
+     gcc_set_recv_message_id(gconn, gconn->received_message_id + 1);
+ 
+     return 2;
+@@ -707,9 +737,46 @@ void gcc_check_recv_array(const GC_Session *c, GC_Chat *chat, GC_Connection *gco
+     const uint16_t idx = (gconn->received_message_id + 1) % GCC_BUFFER_SIZE;
+     GC_Message_Array_Entry *const array_entry = &gconn->recv_array[idx];
+ 
+-    if (!array_entry_is_empty(array_entry)) {
+-        process_recv_array_entry(c, chat, gconn, peer_number, array_entry, userdata);
++    if (array_entry_is_empty(array_entry)) {
++        return;
+     }
++
++    /* p2p-poker (patch 0039): a leftover in the receive ring is cleared, never replayed.
++     *
++     * This looked at the SLOT of the awaited message and took whatever was in
++     * it for the awaited message. A slot is `id % GCC_BUFFER_SIZE`, so an entry
++     * left behind 2048 messages ago has the same slot -- and was handed to the
++     * application a second time, acknowledged under its OLD id, and counted as
++     * the awaited message: received_message_id moved past a message that had
++     * not arrived. When the real one came it was a duplicate by its number,
++     * dropped and acknowledged, so the sender forgot it too. **A lossless
++     * stream lost one message, to one receiver, with no error on either side.**
++     *
++     * The sender's half of it is a line upstream already prints: the ack under
++     * the old id finds another message in that slot of the send ring, and
++     * gcc_handle_ack says "Wrap-around on message N" -- with N small, from the
++     * first lap, and only once that connection has carried N + 2048 messages.
++     * Measured on 2026-09-19, three runs of nine seats, 316 such lines: every
++     * one came after some receiver's counter had passed N + 2048 (no other
++     * offset fits them all), none in the first 250 s of any run, and in each
++     * run one hand stalled for a minute or more on a seat that lacked a message
++     * every other seat had (S1-II).
++     *
++     * A different id here is a leftover by construction. Everything below the
++     * awaited id has been consumed, and a sender cannot be 2048 ahead of what
++     * this side has handled -- its own ring holds 2047 unacknowledged messages
++     * and no more -- so no message still to come shares this slot with the
++     * awaited one.
++     */
++    if (array_entry->message_id != gconn->received_message_id + 1) {
++        LOGGER_DEBUG(chat->log, "p2p-poker: a leftover in the receive ring is cleared, not replayed: slot %u held message %llu while %llu is awaited",
++                     idx, (unsigned long long)array_entry->message_id,
++                     (unsigned long long)(gconn->received_message_id + 1));
++        clear_array_entry(chat->mem, array_entry);
++        return;
++    }
++
++    process_recv_array_entry(c, chat, gconn, peer_number, array_entry, userdata);
+ }
+ 
+ void gcc_resend_packets(const GC_Chat *chat, GC_Connection *gconn)

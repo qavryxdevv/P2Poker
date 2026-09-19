@@ -620,6 +620,36 @@ int gcc_handle_received_message(const Logger *log, const Memory *mem, const Mono
         return 1;
     }
 
+    /* p2p-poker (patch 0039): a copy that waited in the ring goes with the message.
+     *
+     * This message is the awaited one and is handed straight to its handler; it
+     * never touches recv_array. But a COPY of it may be there: it arrived once
+     * before, out of order, and was stored -- and what arrives now is the
+     * sender's retransmission, which won the race with the periodic drain
+     * (gcc_check_recv_array runs once a do_gc pass; a poll delivers a whole
+     * batch before it). Nothing ever cleared that copy: the drain looks at the
+     * slot of received_message_id + 1 only, and that has just moved past it.
+     * The leftover then sat in its slot for a lap of the ring, and see
+     * gcc_check_recv_array for what it did when the ids came round.
+     *
+     * Made systematic by this project's own repairs, which is why upstream
+     * rarely meets it: a receiver asks at once for what it misses (0009) and a
+     * sender answers with a run of consecutive ids (0024), so after every
+     * reordering the retransmitted run arrives in one batch and overtakes every
+     * copy stored ahead of it. Measured, three runs of nine seats on
+     * 2026-09-19: 2, 109 and 205 leftovers a run, in runs of consecutive ids.
+     */
+    {
+        const uint16_t idx = gcc_get_array_index(message_id);
+        GC_Message_Array_Entry *const copy = &gconn->recv_array[idx];
+
+        if (!array_entry_is_empty(copy) && copy->message_id == message_id) {
+            LOGGER_DEBUG(log, "p2p-poker: message %llu arrived in order while a copy of it waited in the ring; the copy goes with it",
+                         (unsigned long long)message_id);
+            clear_array_entry(mem, copy);
+        }
+    }
+
     gcc_set_recv_message_id(gconn, gconn->received_message_id + 1);
 
     return 2;
@@ -707,9 +737,46 @@ void gcc_check_recv_array(const GC_Session *c, GC_Chat *chat, GC_Connection *gco
     const uint16_t idx = (gconn->received_message_id + 1) % GCC_BUFFER_SIZE;
     GC_Message_Array_Entry *const array_entry = &gconn->recv_array[idx];
 
-    if (!array_entry_is_empty(array_entry)) {
-        process_recv_array_entry(c, chat, gconn, peer_number, array_entry, userdata);
+    if (array_entry_is_empty(array_entry)) {
+        return;
     }
+
+    /* p2p-poker (patch 0039): a leftover in the receive ring is cleared, never replayed.
+     *
+     * This looked at the SLOT of the awaited message and took whatever was in
+     * it for the awaited message. A slot is `id % GCC_BUFFER_SIZE`, so an entry
+     * left behind 2048 messages ago has the same slot -- and was handed to the
+     * application a second time, acknowledged under its OLD id, and counted as
+     * the awaited message: received_message_id moved past a message that had
+     * not arrived. When the real one came it was a duplicate by its number,
+     * dropped and acknowledged, so the sender forgot it too. **A lossless
+     * stream lost one message, to one receiver, with no error on either side.**
+     *
+     * The sender's half of it is a line upstream already prints: the ack under
+     * the old id finds another message in that slot of the send ring, and
+     * gcc_handle_ack says "Wrap-around on message N" -- with N small, from the
+     * first lap, and only once that connection has carried N + 2048 messages.
+     * Measured on 2026-09-19, three runs of nine seats, 316 such lines: every
+     * one came after some receiver's counter had passed N + 2048 (no other
+     * offset fits them all), none in the first 250 s of any run, and in each
+     * run one hand stalled for a minute or more on a seat that lacked a message
+     * every other seat had (S1-II).
+     *
+     * A different id here is a leftover by construction. Everything below the
+     * awaited id has been consumed, and a sender cannot be 2048 ahead of what
+     * this side has handled -- its own ring holds 2047 unacknowledged messages
+     * and no more -- so no message still to come shares this slot with the
+     * awaited one.
+     */
+    if (array_entry->message_id != gconn->received_message_id + 1) {
+        LOGGER_DEBUG(chat->log, "p2p-poker: a leftover in the receive ring is cleared, not replayed: slot %u held message %llu while %llu is awaited",
+                     idx, (unsigned long long)array_entry->message_id,
+                     (unsigned long long)(gconn->received_message_id + 1));
+        clear_array_entry(chat->mem, array_entry);
+        return;
+    }
+
+    process_recv_array_entry(c, chat, gconn, peer_number, array_entry, userdata);
 }
 
 void gcc_resend_packets(const GC_Chat *chat, GC_Connection *gconn)
