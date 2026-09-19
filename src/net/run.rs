@@ -383,6 +383,247 @@ fn shard_namespace(slice: &str) -> libp2p::kad::RecordKey {
     namespace(format!("p2p-poker/main-lobby/v1/{slice}").as_bytes())
 }
 
+/// `D-070`: the lobby's key for one hour of the clock -- where the clients that
+/// are here **now** find each other.
+///
+/// **A provider record outlives its client, and a lobby key collects the dead.**
+/// The DHT's nodes keep a record for two days and nothing can withdraw it
+/// (`S1-AI`), so the lobby's one key names everybody who was here since the day
+/// before yesterday: on 2026-09-19 it held 43 records and not one of them was a
+/// running client. A client that looks there for somebody to play with dials
+/// the dead until it happens on the living, and nothing in a record says which
+/// is which -- before a connection there is no advert and no way to tell a
+/// founder from a stranger.
+///
+/// **An hour's key cannot hold anybody older than the hour.** No honest client
+/// announces under it before it begins, so whoever is found there announced
+/// within it: the client is running, or was minutes ago. Every client announces
+/// under the key of the current hour as well as the lobby's own, and reads it
+/// while it has no poker client to talk to (`reads_the_hours_keys`); after the
+/// turn of the hour it announces under the next, at its own moment of the first
+/// `HOUR_TURN_SPREAD_S`, and for `PREVIOUS_HOUR_READ_S` whoever reads, reads the
+/// hour before too. That is the *reason to want a provider*
+/// `S1-AI` asked for, and it costs no field in any message: the wire is
+/// untouched, and a client that does not know these keys still meets everybody
+/// under the lobby's own, as before.
+///
+/// **What it tells an observer**, which `NETWORK_STACK.md` §3.5 says in full:
+/// that this `PeerId` was here within this hour, to anybody who asks within the
+/// two days the record lives -- asked afterwards, which the lobby's own key
+/// cannot answer. A clock an hour wrong announces where nobody looks, and that
+/// client is met under the lobby's own key as it always was.
+fn hour_namespace(hour: u64) -> libp2p::kad::RecordKey {
+    namespace(format!("p2p-poker/main-lobby/v1/hour/{hour}").as_bytes())
+}
+
+/// `D-070`: which hour of the clock a moment falls in.
+const fn lobby_hour(unix_s: u64) -> u64 {
+    unix_s / LOBBY_HOUR_S
+}
+
+/// `D-070`: the hours whose keys are read at a moment: the current one, and for
+/// the first `PREVIOUS_HOUR_READ_S` of it the one before, where every client
+/// that has not made its turn yet still is.
+fn lobby_hours_to_read(unix_s: u64) -> Vec<u64> {
+    let hour = lobby_hour(unix_s);
+    let mut hours = vec![hour];
+    if hour > 0 && unix_s % LOBBY_HOUR_S < PREVIOUS_HOUR_READ_S {
+        hours.push(hour - 1);
+    }
+    hours
+}
+
+/// `D-070`: whether the hour's keys are read this cycle -- **only while no poker
+/// client is connected**, which is the whole of what they are for.
+///
+/// **The first cut read them every cycle, and that bought nothing once anybody
+/// was met.** The hour's key answers one question -- *who is here now, for a
+/// client that knows nobody* -- and a client with one poker client connected has
+/// GossipSub and the lobby's own crawl for the rest, exactly as it had before.
+/// What the reading cost is counted: a walk is about 125 connections to
+/// strangers, one more of them every cycle and two in an hour's first ten
+/// minutes, and nine seats drew 5 070 and 10 779 answers about an hour's key in
+/// two seven-minute runs (`split174430-9`, `split175954-9`) against 1 203 to
+/// 1 378 once the key was read only by a seat that was alone. So the key is read
+/// while this client is alone and not after.
+///
+/// **What is NOT established, because an earlier draft of this comment said it
+/// was:** that the reading costs hands. Each of those two runs had one hand that
+/// stalled on a silent seat and the run without `D-070` between them had none
+/// (`split181415-9`), which read as harm growing with the dose -- until one of
+/// the three runs with the key read only while alone stalled the same way
+/// (`split185900-9`), and another of them walked seven seats' records inside
+/// ten seconds with no stall at all (`split182754-9`). Eight *clocks run out* were one hand
+/// seen from seven seats, not eight events. The rule stands on what the reading
+/// buys, which is nothing, and not on a harm six runs cannot show. The announcement is not gated: it is what makes
+/// this client findable by somebody who is alone, and it is one walk an hour,
+/// one more for a walk that reached nobody and one for an address that arrived
+/// late (`HourAnnounce`).
+///
+/// **And alone is not only the first minute.** `split182754-9`, the founder at
+/// 362 s: its last poker client left the network, the next discovery tick found
+/// it alone and read the hour's key, an answer named eight others 0.1 s later,
+/// and one second after the tick it was talking to a poker client again on a
+/// connection that answer had dialled -- six came back that way.
+fn reads_the_hours_keys(poker_clients_connected: usize) -> bool {
+    poker_clients_connected == 0
+}
+
+/// `D-070`: how far into every hour **this** client announces under the new
+/// hour's key: a moment of the first `HOUR_TURN_SPREAD_S` fixed by its peer id.
+///
+/// **The lobby is not our network** (`NETWORK_STACK.md` §3.5): an hour's key has
+/// twenty closest nodes, they are strangers, and at the turn of the hour every
+/// running client owes them a record. Made at the turn itself that is the whole
+/// lobby inside one discovery cycle; spread by identity it is a fifth of that a
+/// minute, and costs nothing, because everybody reads the hour before for twice
+/// as long as the spread.
+fn hour_turn_after_s(me: &libp2p::PeerId) -> u64 {
+    let bytes = me.to_bytes();
+    let n = bytes.len();
+    // The tail of a peer id is the tail of a public key or of its digest:
+    // uniform, public already, and the same at every start.
+    let tail = u64::from(bytes[n.saturating_sub(2)]) << 8 | u64::from(bytes[n.saturating_sub(1)]);
+    tail % HOUR_TURN_SPREAD_S
+}
+
+const LOBBY_HOUR_S: u64 = 3_600;
+/// How long into an hour the hour before is still read.
+const PREVIOUS_HOUR_READ_S: u64 = 600;
+/// Over how much of the start of an hour the clients' turns to its key are
+/// spread. With a discovery cycle and a walk on top, every turn is made and
+/// stored well inside `PREVIOUS_HOUR_READ_S`.
+const HOUR_TURN_SPREAD_S: u64 = 300;
+const _: () = assert!(HOUR_TURN_SPREAD_S + 180 <= PREVIOUS_HOUR_READ_S);
+/// How many providers of an **hour's** key are dialled for the first time per
+/// answer. Twice the lobby's own `DIALS_PER_ANSWER`, and it buys more with it:
+/// an hour's key holds the clients of one hour, not of two days, so its answers
+/// are short and most of what they name is alive. The bound is still a bound --
+/// a record is as unauthenticated here as anywhere (`NETWORK_STACK.md` §3.4),
+/// and a flood of them buys sixteen dials an answer and no more.
+const HOUR_DIALS_PER_ANSWER: usize = 16;
+
+/// `D-070`: this client's record under the hour's key -- which hour it was last
+/// walked for, and whether a walk has handed it to anybody.
+///
+/// `start_providing` returning `Ok` is a query that left this process and nothing
+/// more (`LobbyAnnounce`), so the hour's record is walked again every
+/// `REANNOUNCE_EVERY` **until a walk has finished having reached a node**, which
+/// is what hands the record on.
+///
+/// **Not until a node returns it, which is the lobby's own rule, and the first
+/// cut had it.** A record can only come back in an answer to a lookup, and the
+/// hour's keys are read by a client that knows nobody and by no other
+/// (`reads_the_hours_keys`). Measured, `split182754-9`: eight seats of nine met
+/// somebody inside the first minute, stopped reading, never saw their record come
+/// back and walked it again at 314 to 382 s -- twelve walks an hour for a record
+/// that needs one. What the read-back would add is a guard against nodes that
+/// were reached and stored nothing, and what that failure costs here is an hour
+/// in which this client is found under the lobby's own key alone, as it was
+/// before there were hours. A record that does come back is still said.
+///
+/// **And once more when an address arrives after the record went out.** The
+/// record carries the external addresses this client has when the walk's first
+/// phase ends (`libp2p-kad-0.49.0/src/behaviour.rs:1562-1563`), so whatever
+/// arrives while the walk is out is in it. A relay lost an hour in and another
+/// taken is not: the record on the network names a circuit that is gone. The
+/// lobby's own record waits for `libp2p-kad`'s twelve-hour republish for that;
+/// the hour's is walked again on the next discovery tick -- on the tick and
+/// nowhere else, because a reservation's addresses arrive as a burst and a walk
+/// for each would be a walk per address.
+///
+/// **An address the record already names is not one that arrived.** The first
+/// cut took every turn of AutoNAT's verdict to *public* for a new address, and
+/// AutoNAT tests each candidate apart, so a client with one address that passes
+/// and one that fails is told *public* again and again about the same address.
+/// Measured, `split184259-9`: two and three walks a seat in seven minutes, each a
+/// little after a *reachable from the internet* that said nothing new. So the
+/// addresses the last walk carried are kept, and only one that is not among them
+/// is owed a walk.
+#[derive(Debug, Default, Clone)]
+struct HourAnnounce {
+    /// The hour whose key was last walked.
+    hour: Option<u64>,
+    /// That walk: when it left, and whether it handed the record on.
+    record: LobbyAnnounce,
+    /// The external addresses this client had when that walk finished, which
+    /// are the ones the record on the network names. A walk reads them a few
+    /// seconds earlier, when its first phase ends, and an address that arrives
+    /// in that gap is taken for carried: the next hour's walk carries it.
+    carried: Vec<libp2p::Multiaddr>,
+    /// An external address the record does not name arrived after it went out.
+    outdated: bool,
+}
+
+impl HourAnnounce {
+    /// Whether to walk the hour's key now: at once if no hour was ever walked,
+    /// within an hour until a walk has handed the record on, and after the turn
+    /// of the hour from this client's own moment of it (`hour_turn_after_s`).
+    fn due(&self, unix_s: u64, turn_after_s: u64, now: std::time::Instant) -> bool {
+        match self.hour {
+            None => true,
+            Some(h) if h == lobby_hour(unix_s) => {
+                !self.record.delivered
+                    && self
+                        .record
+                        .dispatched
+                        .is_none_or(|at| now.saturating_duration_since(at) >= REANNOUNCE_EVERY)
+            }
+            Some(_) => unix_s % LOBBY_HOUR_S >= turn_after_s,
+        }
+    }
+
+    /// The same on the discovery tick, which also carries the walk an address
+    /// that arrived late is owed.
+    fn due_on_the_tick(&self, unix_s: u64, turn_after_s: u64, now: std::time::Instant) -> bool {
+        self.due(unix_s, turn_after_s, now)
+            || (self.outdated && self.hour == Some(lobby_hour(unix_s)))
+    }
+
+    /// `start_providing` returned `Ok` for `hour`'s key. Returns the hour this
+    /// client provided before, if it was another: that key is let go of, so
+    /// that nothing republishes it (`stop_providing` is local and takes nothing
+    /// back from the network).
+    fn record_dispatch(&mut self, hour: u64, now: std::time::Instant) -> Option<u64> {
+        let before = self.hour.replace(hour).filter(|h| *h != hour);
+        if before.is_some() {
+            self.record = LobbyAnnounce::default();
+            self.carried.clear();
+        }
+        self.outdated = false;
+        self.record.record_dispatch(now);
+        before
+    }
+
+    /// Whether `key` is the key this client last walked.
+    fn is_walking(&self, key: &libp2p::kad::RecordKey) -> bool {
+        self.hour.is_some_and(|h| *key == hour_namespace(h))
+    }
+
+    /// A walk of the hour's key finished `Ok` with this many successes, while
+    /// this client had these external addresses.
+    fn record_walk_finished(&mut self, successes: u32, external: Vec<libp2p::Multiaddr>) {
+        self.record.record_walk_finished(successes);
+        if successes > 0 {
+            self.carried = external;
+        }
+    }
+
+    /// An answer about `key` named this client. `true` on the first answer of an
+    /// hour that a node sent after a walk delivered -- said in the log, and no
+    /// part of the rule above.
+    fn hear_own_record(&mut self, key: &libp2p::kad::RecordKey, requests: u32) -> bool {
+        self.is_walking(key) && self.record.hear_own_record(requests)
+    }
+
+    /// An external address arrived. Owed a walk only if the last one is over
+    /// and handed on a record that does not name it: a walk still out carries
+    /// the address itself, and one that reached nobody is walked again anyway.
+    fn address_arrived(&mut self, address: &libp2p::Multiaddr) {
+        self.outdated |= self.record.delivered && !self.carried.contains(address);
+    }
+}
+
 /// A namespace string as the DHT key its provider records live under.
 ///
 /// go-libp2p's routing discovery maps a namespace to `CIDv1(raw, sha2-256(ns))`
@@ -1902,6 +2143,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // own record is the confirmation. `LobbyAnnounce` says why both halves of
     // that were dead letters until 2026-09-15.
     let mut announce = LobbyAnnounce::default();
+    // `D-070`: and its record under the hour's key, the lookups of an hour's key
+    // still running -- an answer is an hour's by the question it answers, not by
+    // a clock read when it arrives -- and who those answers have named, which is
+    // said when one of them turns out to be a poker client.
+    let mut hour_announce = HourAnnounce::default();
+    let mut hour_lookups: std::collections::HashSet<libp2p::kad::QueryId> =
+        std::collections::HashSet::new();
+    let mut named_this_hour: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+    // **Named is not reached, and the first run read it as if it were.**
+    // `split174430-9`: every seat was named all eight others by the hour's key,
+    // and the far seat had met three of them and asked to join before any hour's
+    // answer named anybody -- the line said of those meetings told nothing about
+    // what made them. So the dials an hour's answer issued are kept apart, and a
+    // meeting is the hour's key's only when the connection it was made on is one
+    // of them. What that still cannot say: that the lobby's own answer would not
+    // have dialled the same peer a second later.
+    let mut hour_dials: std::collections::HashSet<libp2p::swarm::ConnectionId> =
+        std::collections::HashSet::new();
+    let mut reached_by_hour: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
 
     // Every lookup of the lobby key still running, and whether it has found a
     // player other than this client. `public lobby: nobody else yet` is said
@@ -3964,6 +4226,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // about this machine; it is a claim about a relay's
                         // address, made by that relay.
                         swarm.add_external_address(address.clone());
+                        // `D-070`: a circuit that arrives after the hour's record
+                        // went out -- another relay's -- is an address that record
+                        // does not name, and the next discovery tick walks it
+                        // again (`HourAnnounce`).
+                        hour_announce.address_arrived(&address);
                         let _ = events.send(NodeEvent::Listening(address)).await;
 
                         // And join the lobby now, rather than waiting for the
@@ -3995,6 +4262,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let lookup = kad.get_providers(lobby_namespace());
                             lobby_lookups.insert(lookup, false);
                         }
+                        // `D-070`: and under the hour's key in the same breath,
+                        // for the same reason.
+                        let unix_s = super::node::now_unix_ms() / 1_000;
+                        let turn_after_s = hour_turn_after_s(swarm.local_peer_id());
+                        if asked_public_dht && hour_announce.due(unix_s, turn_after_s, now) {
+                            let hour = lobby_hour(unix_s);
+                            let kad = &mut swarm.behaviour_mut().ipfs_kad;
+                            if kad.start_providing(hour_namespace(hour)).is_ok() {
+                                if let Some(before) = hour_announce.record_dispatch(hour, now) {
+                                    kad.stop_providing(&hour_namespace(before));
+                                }
+                            }
+                            if reads_the_hours_keys(poker_peers.len()) {
+                                for h in lobby_hours_to_read(unix_s) {
+                                    hour_lookups.insert(kad.get_providers(hour_namespace(h)));
+                                }
+                            }
+                        }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         // Announce only a port something is actually bound to.
@@ -4011,6 +4296,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         lobby_dials.remove(&connection_id);
+                        // `D-070`: a connection made by a dial an hour's answer issued.
+                        if hour_dials.remove(&connection_id) {
+                            if reached_by_hour.len() >= 512 {
+                                reached_by_hour.clear();
+                            }
+                            reached_by_hour.insert(peer_id);
+                        }
                         state_peers += 1;
                         // `D-064`: a founder the search could not reach is here now.
                         let again: Vec<[u8; 32]> =
@@ -5328,6 +5620,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // configured.
                         if public {
                             swarm.add_external_address(ev.tested_addr.clone());
+                            // `D-070`: an address the hour's record may not name
+                            // -- by the address, not by the verdict turning to
+                            // *public*, which it does over and over about one
+                            // address (`HourAnnounce`).
+                            hour_announce.address_arrived(&ev.tested_addr);
                         } else {
                             swarm.remove_external_address(&ev.tested_addr);
                         }
@@ -5369,6 +5666,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         ..
                     } if budget < CONNECTION_CEILING => {
                         lobby_dials.remove(&connection_id);
+                        hour_dials.remove(&connection_id);
                         {
                             let raised = (budget + budget / 4).min(CONNECTION_CEILING);
                             budget = raised;
@@ -5391,6 +5689,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // that. It is this client's own limiter refusing a
                         // connection that was already established, which makes
                         // the peer provably alive and the failure ours.
+                        hour_dials.remove(&connection_id);
                         if let Some(peer) = lobby_dials.remove(&connection_id) {
                             if earns_a_fast_look(
                                 the_failure_mends_itself(&error),
@@ -5518,6 +5817,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
                                 .await;
+                            // `D-070`: said, because it is the measurement --
+                            // which of the clients this one meets it met on a
+                            // connection an hour's answer dialled, and which the
+                            // hour's key had only named while the meeting came
+                            // another way. Spent when said: a peer met again is
+                            // said of the connection it is met on.
+                            if reached_by_hour.remove(&peer_id) {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "{peer_id} is a poker client, reached by a dial an answer in the public lobby within the hour issued (D-070)"
+                                    )))
+                                    .await;
+                            } else if named_this_hour.contains(&peer_id) {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "{peer_id} is a poker client, named in the public lobby within the hour and met another way (D-070)"
+                                    )))
+                                    .await;
+                            }
                             // `D-040`: and ask it what it offers, now.
                             ask_lobby!(peer_id);
                         }
@@ -5571,17 +5889,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         match &result {
                             QueryResult::GetProviders(Err(e)) => {
                                 lobby_lookups.remove(&id);
+                                hour_lookups.remove(&id);
                                 let _ = events
                                     .send(NodeEvent::Warning(format!("DHT lookup failed: {e}")))
                                     .await;
                             }
                             QueryResult::StartProviding(r) => {
+                                // `D-070`: the hour's walk is told from the
+                                // lobby's own, in the log and in what it confirms.
+                                let hourly = matches!(r, Ok(done) if hour_announce.is_walking(&done.key));
                                 let _ = events
                                     .send(NodeEvent::Warning(match r {
+                                        Ok(_) if hourly => {
+                                            "announced in the public lobby for this hour (D-070)".to_owned()
+                                        }
                                         Ok(_) => "announced in the public lobby".to_owned(),
                                         Err(e) => format!("could not announce: {e}"),
                                     }))
                                     .await;
+                                if hourly {
+                                    hour_announce.record_walk_finished(
+                                        stats.num_successes(),
+                                        swarm.external_addresses().cloned().collect(),
+                                    );
+                                }
                                 // A walk of the lobby key that reached somebody
                                 // has handed the record on, and only after that
                                 // can a node's answer confirm it
@@ -5601,6 +5932,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers },
                         )) = &result
                         {
+                            hour_lookups.remove(&id);
                             let was_lobby = lobby_lookups.get(&id).copied();
                             // `S1-E`: what one walk of the lobby key costs and what it
                             // says about the DHT it walked -- how many nodes it asked,
@@ -5643,14 +5975,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // slice, so they are said as players and dialled as
                             // players -- the handler below makes no other
                             // distinction.
-                            let lobby = key == lobby_namespace()
+                            // `D-070`: an hour's providers are players too, said
+                            // as what they are: here within the hour.
+                            let hourly = hour_lookups.contains(&id);
+                            let lobby = hourly
+                                || key == lobby_namespace()
                                 || state
                                     .listening
                                     .slices
                                     .iter()
                                     .any(|s| !s.is_empty() && shard_namespace(s) == key);
+                            // **This client's own store answers first and names
+                            // this client** (`LobbyAnnounce`), so the hour's line
+                            // says how many of those it names are somebody else:
+                            // `split174430-9`'s *1 player within the hour* at 3 s
+                            // was the seat reading its own record.
+                            let others = providers.iter().filter(|p| *p != swarm.local_peer_id()).count();
                             let _ = events
-                                .send(NodeEvent::Warning(if lobby {
+                                .send(NodeEvent::Warning(if hourly {
+                                    format!(
+                                        "{} player(s) in the public lobby within the hour, {others} of them not this client (D-070)",
+                                        providers.len()
+                                    )
+                                } else if lobby {
                                     format!("{} player(s) in the public lobby", providers.len())
                                 } else {
                                     format!("{} relay(s) advertised in the DHT", providers.len())
@@ -5722,8 +6069,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         .into(),
                                                 ))
                                                 .await;
+                                        } else if hour_announce.hear_own_record(&key, stats.num_requests()) {
+                                            let _ = events
+                                                .send(NodeEvent::Warning(
+                                                    "public lobby: this client's own record for this hour came back from the network (D-070)"
+                                                        .into(),
+                                                ))
+                                                .await;
                                         }
                                         continue;
+                                    }
+                                    if hourly {
+                                        // Bounded like every book this loop keeps.
+                                        if named_this_hour.len() >= 512 {
+                                            named_this_hour.clear();
+                                        }
+                                        named_this_hour.insert(peer);
                                     }
                                     if let Some(found) = lobby_lookups.get_mut(&id) {
                                         *found = true;
@@ -5747,7 +6108,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         None => true,
                                     };
                                     if first {
-                                        if fresh >= DIALS_PER_ANSWER {
+                                        // `D-070`: an hour's answer is short and
+                                        // mostly alive; see `HOUR_DIALS_PER_ANSWER`.
+                                        let first_dials = if hourly { HOUR_DIALS_PER_ANSWER } else { DIALS_PER_ANSWER };
+                                        if fresh >= first_dials {
                                             continue;
                                         }
                                     } else if again >= REDIALS_PER_ANSWER {
@@ -5836,6 +6200,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // the stamp; what is recorded here is the
                                     // dial that will actually produce an event.
                                     if charge.is_some() {
+                                        if hourly {
+                                            hour_dials.insert(id);
+                                        }
                                         lobby_dials.insert(id, peer);
                                     }
                                     // Belt and braces. Every dial ends in an
@@ -5846,6 +6213,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // the shape this row has already been
                                     // caught by once.
                                     if lobby_dials.len() > 1024 {
+                                        hour_dials.clear();
                                         lobby_dials.clear();
                                     }
                                     match charge {
@@ -6206,6 +6574,38 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 )))
                                 .await;
                             }
+                        }
+                    }
+                    // `D-070`: the hour's key beside it -- walked until a node
+                    // returns the record, the hour before let go of, and read
+                    // **while this client has no poker client to talk to**
+                    // (`reads_the_hours_keys`): where the clients that are here
+                    // now are found without the two days of records the lobby's
+                    // own key has collected. Asked first, so that its answers
+                    // are the first to be dialled.
+                    let unix_s = super::node::now_unix_ms() / 1_000;
+                    let turn_after_s = hour_turn_after_s(swarm.local_peer_id());
+                    if reachable_here && hour_announce.due_on_the_tick(unix_s, turn_after_s, now) {
+                        let hour = lobby_hour(unix_s);
+                        match swarm.behaviour_mut().ipfs_kad.start_providing(hour_namespace(hour)) {
+                            Ok(_) => {
+                                if let Some(before) = hour_announce.record_dispatch(hour, now) {
+                                    swarm.behaviour_mut().ipfs_kad.stop_providing(&hour_namespace(before));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "the hour's lobby key could not be announced: {e} (D-070)"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+                    if reads_the_hours_keys(poker_peers.len()) {
+                        for h in lobby_hours_to_read(unix_s) {
+                            let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(hour_namespace(h));
+                            hour_lookups.insert(lookup);
                         }
                     }
                     // Read it every cycle either way: a client with nothing
@@ -16923,6 +17323,141 @@ mod tests {
         assert!(a.hear_own_record(3), "a node's answer after delivery confirms");
         assert!(!a.hear_own_record(7), "and says so once");
         assert!(!a.due(t0 + REANNOUNCE_EVERY * 100));
+    }
+
+    /// `D-070`: **an hour's key is the one constant two clients of different
+    /// builds must agree on to meet there**, so it is written out here and not
+    /// recomputed -- a test that recomputes what it checks passes whatever the
+    /// code does. Hour 494 000 began on 2026-05-10 at 08:00 UTC.
+    #[test]
+    fn an_hours_lobby_key_is_the_published_one() {
+        assert_eq!(
+            hex(hour_namespace(494_000).to_vec().as_slice()),
+            "12203d1090829c32d410fe8d89a9e211ed600d696b9650ea4216739698e23ba923be",
+            "sha2-256 of \"p2p-poker/main-lobby/v1/hour/494000\" under the 0x12 0x20 multihash prefix"
+        );
+        assert_eq!(
+            hex(hour_namespace(494_001).to_vec().as_slice()),
+            "12203b2f620ac121b4d3cb333e4b80fe5095a517469197bf1d583873b3e6cb0c162f",
+            "and the hour after it is another key altogether"
+        );
+        assert_eq!(lobby_hour(494_000 * 3_600), 494_000);
+        assert_eq!(lobby_hour(494_000 * 3_600 + 3_599), 494_000);
+        assert_eq!(lobby_hour(494_001 * 3_600), 494_001);
+        // No hour's key is the lobby's own or a slice's: a slice is named by
+        // hexadecimal digits (`PROTOCOL.md` §1.1) and never holds a `/`.
+        assert_ne!(hour_namespace(0), lobby_namespace());
+        assert_ne!(hour_namespace(0), shard_namespace("hour"));
+        assert_ne!(hour_namespace(494_000), shard_namespace("494000"));
+    }
+
+    /// `D-070`: **the hour before is read while the clients make their turn, and
+    /// every turn is over well before that reading stops.**
+    #[test]
+    fn the_hour_before_is_read_while_the_lobby_makes_its_turn() {
+        let h = 494_000u64;
+        let at = |s: u64| lobby_hours_to_read(h * LOBBY_HOUR_S + s);
+        assert_eq!(at(0), vec![h, h - 1], "at the turn everybody is still under the hour before");
+        assert_eq!(at(PREVIOUS_HOUR_READ_S - 1), vec![h, h - 1]);
+        assert_eq!(at(PREVIOUS_HOUR_READ_S), vec![h], "and then the hour's own key alone");
+        assert_eq!(at(LOBBY_HOUR_S - 1), vec![h]);
+        assert_eq!(lobby_hours_to_read(5), vec![0], "there is no hour before the first");
+
+        // Every client's own moment of the turn is inside the spread, fixed by
+        // its identity, and the identities are spread over it.
+        let mut moments = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let me = PeerId::from(identity::Keypair::generate_ed25519().public());
+            let s = hour_turn_after_s(&me);
+            assert!(s < HOUR_TURN_SPREAD_S);
+            assert_eq!(s, hour_turn_after_s(&me), "the same at every start");
+            moments.insert(s);
+        }
+        assert!(moments.len() > 32, "sixty-four identities, {} moments", moments.len());
+    }
+
+    /// `D-070`: **the hour's keys are read by a client that knows nobody, and by no
+    /// other** -- the bed priced a reading every cycle in hands
+    /// (`reads_the_hours_keys`).
+    #[test]
+    fn the_hours_keys_are_read_only_while_no_poker_client_is_connected() {
+        assert!(reads_the_hours_keys(0), "alone: this is what the key is for");
+        assert!(!reads_the_hours_keys(1), "one poker client is a way into the mesh");
+        assert!(!reads_the_hours_keys(8), "and a table's worth is a table being played");
+    }
+
+    /// `D-070`: **the hour's record is walked until a walk has handed it on, under
+    /// the next hour's key after the turn, and once more for an address that
+    /// arrived after it went out.** `HourAnnounce`.
+    #[test]
+    fn the_hours_record_is_walked_until_delivered_and_again_after_the_turn() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let h = 494_000u64;
+        let s0 = h * LOBBY_HOUR_S + 1_200;
+        let turn = 140u64;
+        let mut a = HourAnnounce::default();
+
+        assert!(a.due(s0, turn, t0), "never walked: at once, wherever in the hour");
+        assert_eq!(a.record_dispatch(h, t0), None, "nothing was provided before");
+        assert!(a.is_walking(&hour_namespace(h)));
+        assert!(!a.is_walking(&hour_namespace(h + 1)));
+        assert!(!a.is_walking(&lobby_namespace()));
+        assert!(!a.due(s0, turn, t0), "a dispatch is a walk, and the next one waits");
+
+        // A walk that reached nobody handed nothing on, and an answer naming
+        // this client under ANOTHER key says nothing about this one.
+        let here: libp2p::Multiaddr = "/ip4/198.51.100.7/udp/4001/quic-v1".parse().unwrap();
+        let there: libp2p::Multiaddr = "/ip4/203.0.113.9/udp/4001/quic-v1".parse().unwrap();
+        a.record_walk_finished(0, vec![here.clone()]);
+        assert!(!a.hear_own_record(&hour_namespace(h), 4));
+        assert!(a.due(s0 + 300, turn, t0 + REANNOUNCE_EVERY), "so it is walked again");
+        assert_eq!(a.record_dispatch(h, t0 + REANNOUNCE_EVERY), None, "the same hour: nothing to let go of");
+        a.record_walk_finished(37, vec![here.clone()]);
+        // Handed on, and that is the whole rule: a client that has met somebody
+        // reads no hour's key, so its record never comes back to it
+        // (`split182754-9`), and it must not walk every five minutes for that.
+        let later = t0 + REANNOUNCE_EVERY * 3;
+        assert!(!a.due(s0 + 900, turn, later), "delivered: not again within the hour");
+        assert!(!a.due_on_the_tick(s0 + 900, turn, later));
+        // A record that does come back is said, once, and changes nothing.
+        assert!(!a.hear_own_record(&lobby_namespace(), 4), "the lobby's own answer is not the hour's");
+        assert!(!a.hear_own_record(&hour_namespace(h), 0), "nor is this client's own store");
+        assert!(a.hear_own_record(&hour_namespace(h), 4), "a node's answer after delivery is said");
+        assert!(!a.hear_own_record(&hour_namespace(h), 4), "once");
+        assert!(!a.due(s0 + 900, turn, later));
+
+        // An address the record names is not one that arrived: AutoNAT says
+        // *public* of the same address over and over (`split184259-9`).
+        a.address_arrived(&here);
+        assert!(!a.due_on_the_tick(s0 + 900, turn, later), "nothing new: no walk");
+        // One it does not name is owed one walk, on the tick and nowhere else.
+        a.address_arrived(&there);
+        assert!(!a.due(s0 + 900, turn, later), "not from the arm the address arrived in");
+        assert!(a.due_on_the_tick(s0 + 900, turn, later), "on the next discovery tick");
+        assert_eq!(a.record_dispatch(h, later), None);
+        assert!(!a.due_on_the_tick(s0 + 901, turn, later + Duration::from_secs(1)), "once");
+
+        // The hour turns: nothing until this client's own moment of it, then the
+        // next hour's key, and the hour before is handed back to be let go of.
+        let next = (h + 1) * LOBBY_HOUR_S;
+        assert!(!a.due(next, turn, later), "at the turn itself it is not this client's moment yet");
+        assert!(!a.due(next + turn - 1, turn, later));
+        assert!(a.due(next + turn, turn, later), "from its own moment on");
+        assert_eq!(a.record_dispatch(h + 1, later), Some(h), "and the hour before is let go of");
+        assert!(a.is_walking(&hour_namespace(h + 1)));
+        assert!(!a.hear_own_record(&hour_namespace(h), 4), "the old hour's answer confirms nothing now");
+        assert!(!a.hear_own_record(&hour_namespace(h + 1), 4), "nor the new one's before its walk delivered");
+        a.record_walk_finished(12, vec![here.clone(), there.clone()]);
+        assert!(a.hear_own_record(&hour_namespace(h + 1), 4));
+
+        // An address that arrives while a walk is out is in the record that
+        // walk carries, and one after a walk that reached nobody is carried by
+        // the walk that failure is owed anyway.
+        let mut b = HourAnnounce::default();
+        b.record_dispatch(h, t0);
+        b.address_arrived(&there);
+        assert!(!b.due_on_the_tick(s0, turn, t0 + Duration::from_secs(1)));
     }
 
     /// **The premise `LobbyAnnounce` rests on, pinned against the library.**

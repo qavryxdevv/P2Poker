@@ -2157,7 +2157,8 @@ of them got worse.
 ### 8.1 What is published, by construction
 
 Every client provides one fixed key on the public DHT, and anyone who reads the
-source can compute it (`NETWORK_STACK.md` §3.2). A provider record carries the
+source can compute it (`NETWORK_STACK.md` §3.2) — and, since `D-070`, the key of
+every hour it runs in, which anyone can compute for any hour. A provider record carries the
 player's **persistent `PeerId`** — the identity that later sits at the table — and
 the swarm's confirmed external addresses, relay circuit addresses included. When
 the node, serving the DHT, answers a lookup of the lobby key, `libp2p-kad` fills in
@@ -2198,10 +2199,13 @@ only authentication is that a record must name the peer that sent it.
    and you have the historical one — every `PeerId` that ever sat there, and the
    addresses it was reachable at.
 2. **Attendance, per player rather than per IP.** A `PeerId` is persistent, so the
-   log is an attendance record that survives a change of address. The record
-   itself says *played recently* rather than *online now*, because it outlives the
+   log is an attendance record that survives a change of address. The lobby's own
+   record says *played recently* rather than *online now*, because it outlives the
    session; *online now* comes from the lobby reads, which a node on the walk sees
-   every cycle. Over weeks either is a behavioural profile — when this person
+   every cycle. **The hour keys (`D-070`) say *in which hours*, and say it
+   afterwards:** one record for every hour a client ran in, each kept two days, so
+   the last two days' attendance at an hour's resolution is there for an observer
+   who was not watching at the time (`NETWORK_STACK.md` §3.5). Over weeks either is a behavioural profile — when this person
    plays, how long, how often, which time zone.
 3. **Geolocation and ISP** by trivial GeoIP on the published addresses, often with
    a reverse-DNS hostname.

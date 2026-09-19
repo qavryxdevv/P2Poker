@@ -244,6 +244,17 @@ itself, unchanged and unversioned.
   only out of connected peers that share the topic, so without it a sliced lobby
   cannot hold a mesh at all.
 
+**The lobby's hours (`D-070`).** Beside the lobby's DHT provider key
+(`p2p-poker/main-lobby/v1`) a client provides the key of the current hour,
+`p2p-poker/main-lobby/v1/hour/<n>`, where `n` is the Unix time in seconds divided
+by 3600, rounded down and written in decimal, and looks it up while it has no
+poker client to talk to. A provider record outlives
+its client by two days; an hour's key names nobody who was not here within the
+hour, so it is where a newcomer finds a client that is running now
+(`NETWORK_STACK.md` §3.2). Nothing on the wire changes and nothing depends on
+it: a client that knows nothing of the hours meets everybody under the lobby's
+own key, exactly as before.
+
 `/p2p-poker/join/1` is new: the join exchange is a one-shot request-response RPC,
 not table-stream traffic (C-7 of `docs/research/PHASE0_FIXPLAN.md`; see §1.4 and
 §4.3). `/p2p-poker/lobby-chat/1` carries `SPEC_CS.md` §22's lobby chat (§7.7).

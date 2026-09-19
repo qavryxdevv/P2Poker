@@ -954,9 +954,9 @@ reach a relay is invisible rather than merely unplayable.
 | 2 | **Build the swarm** (§5) and `listen_on` `/ip4/0.0.0.0/udp/P/quic-v1`, `/ip4/0.0.0.0/tcp/P`, plus the `/ip6/::` equivalents. `P` is **0 unless `--port N` is given**: 0 lets the operating system choose afresh at every start, so two instances on one machine never collide, and a player who forwards a port on their router names it with `--port`, which binds that one number on QUIC and TCP alike (`run::listen_addrs`, §4.4). Nothing is persisted. Until 2026-09-15 this row said *`P` is chosen once, persisted, reused every run*, which the client has never done. **The `/ip6/::` half of this row was specified here and not implemented for the whole life of the client** — `S1-Y`, fixed 2026-09-02, and an IPv6 bind failure is reported rather than fatal. | `--port N` already in use | the IPv4 `listen_on` returns the bind error and the node does not start; the IPv6 half is reported and carried on without. There is no fallback to another port — this row used to promise one, persisted, and nothing implements it. |
 | 3 | ~~**Start the Mainline DHT** on its own UDP socket, `.port(0)`, with a deny-all `RequestFilter`.~~ **Gone.** There is no separate DHT socket and no request filter: discovery is a `kad::Behaviour` inside the same swarm, on the same transports, and §11.4 explains why this client deliberately *does* answer strangers' queries. | — | there is no "no-discovery mode" any more: if the swarm cannot bind, nothing runs. |
 | 4 | **Bootstrap the public Kademlia.** Dial the compiled entry point — one name, `/dnsaddr/bootstrap.libp2p.io` (`run::PUBLIC_ENTRY`), never a list of addresses — beside the peers the profile remembers (step 1). On the first `identify` from a peer that speaks `/ipfs/kad/1.0.0`, add its reachable listen addresses to the routing table and call `bootstrap()` once; after that `libp2p-kad`'s own periodic bootstrap keeps the table up (§11.4.1). | the entry is unreachable, or `bootstrap()` has no peer to start from (*"public DHT has no peers yet"*) | **normal**, never fatal, and there is no backoff ladder: while no relay has been seen after three relay searches, every discovery cycle dials the entry again (§9.5). The remembered peers are the way in on a day the entry is down. The failure figures this row carried until 2026-09-15 — *~3 of 35 cold starts failed on the first attempt*, *`router.bittorrent.com` is dead from this network* — were measured against Mainline's bootstrap and describe nothing that runs. |
-| 5 | **`start_providing(lobby_namespace())`** (§3.2) at the moment an external address first exists — for a client behind a NAT, the relay circuit's arrival — and **again every 300 s (`REANNOUNCE_EVERY`) until the announcement is confirmed**: a walk of this session has handed the record to at least one node, and a node has since answered a lookup of the lobby key with this client's own record. From then on `libp2p-kad` owns the republish loop at its 12 h interval (§10.1). | announce error; or a walk that reached few storing nodes, which `start_providing`'s `Ok` cannot show — it comes back `Ok` from a walk that asked nobody | the next walk is the repair: the first happens seconds after the relay reservation, when the routing table is thinnest, and the next five minutes later against a fuller one. **Until 2026-09-15 this row said *once … there is no repair*, and for a client behind a NAT that was what ran** although `79ea1d5` (2026-09-03) had written the repair — the circuit arm latched at dispatch, and the self-sighting meant to confirm was answered by the client's own store (§10.1, `S1-FI`). |
-| 6 | **`get_providers(lobby_namespace())`** → `HashSet<PeerId>` per responding node, emitted as each answers. Repeated every **60 s**. | zero providers | not an error, and the client says so out loud — *"public lobby: nobody else yet"* — because an answer of nobody and a question never asked look identical in a log that only reports findings. |
-| 7 | **Dial the providers** (§4.3), by `PeerId`, at most `DIALS_PER_ANSWER = 8` fresh ones **per answer, not per cycle** — the counter is declared inside the `FoundProviders` arm and resets on every response, and one query draws one response per node that answers (707 of them in a measured 420-second run). This table said *per cycle* until 2026-09-02, and so did the constant's own name; both were wrong, and the effect was to make the crawl read sixty times slower than it is. Start on the first responder's answer — do not wait for the walk to finish. | most candidates fail | expected: a lobby key holds providers who left up to 48 h ago. |
+| 5 | **`start_providing(lobby_namespace())`** (§3.2) at the moment an external address first exists — for a client behind a NAT, the relay circuit's arrival — and **again every 300 s (`REANNOUNCE_EVERY`) until the announcement is confirmed**: a walk of this session has handed the record to at least one node, and a node has since answered a lookup of the lobby key with this client's own record. From then on `libp2p-kad` owns the republish loop at its 12 h interval (§10.1). **And `start_providing(hour_namespace(h))` at the same moment (`D-070`, §3.2):** walked again every 300 s until a walk has finished having reached a node, which is what hands the record on — not until a node returns it, because a record comes back only in an answer to a lookup and the hour's keys are read by a client that knows nobody and by no other (step 6); under the next hour's key after every turn of the hour, at this client's own moment of the hour's first 300 s; and once more, on the next discovery cycle, when an external address the record does not name arrives after it went out. The key of the hour before is let go of, so nothing republishes it. | announce error; or a walk that reached few storing nodes, which `start_providing`'s `Ok` cannot show — it comes back `Ok` from a walk that asked nobody | the next walk is the repair: the first happens seconds after the relay reservation, when the routing table is thinnest, and the next five minutes later against a fuller one. **Until 2026-09-15 this row said *once … there is no repair*, and for a client behind a NAT that was what ran** although `79ea1d5` (2026-09-03) had written the repair — the circuit arm latched at dispatch, and the self-sighting meant to confirm was answered by the client's own store (§10.1, `S1-FI`). |
+| 6 | **`get_providers(lobby_namespace())`** → `HashSet<PeerId>` per responding node, emitted as each answers. Repeated every **60 s**. **`get_providers(hour_namespace(h))` is asked beside it and first — while this client has no poker client connected, and not after (`D-070`, §3.2)**; and the key of the hour before as well for an hour's first 600 s, while the clients make their turn. | zero providers | not an error, and the client says so out loud — *"public lobby: nobody else yet"* — because an answer of nobody and a question never asked look identical in a log that only reports findings. |
+| 7 | **Dial the providers** (§4.3), by `PeerId`, at most `DIALS_PER_ANSWER = 8` fresh ones **per answer, not per cycle** — the counter is declared inside the `FoundProviders` arm and resets on every response, and one query draws one response per node that answers (707 of them in a measured 420-second run). This table said *per cycle* until 2026-09-02, and so did the constant's own name; both were wrong, and the effect was to make the crawl read sixty times slower than it is. Start on the first responder's answer — do not wait for the walk to finish. An answer about an **hour's** key is allowed `HOUR_DIALS_PER_ANSWER = 16`: it names the clients of one hour and not of two days, so it is short and mostly alive (`D-070`). The cooldown book is one for all the keys, so a peer named under two of them is dialled once. | most candidates fail | expected: a lobby key holds providers who left up to 48 h ago — which is what the hour's key is for. |
 | 8 | **identify + AutoNAT v2 settle our external address.** Filter private/reserved addresses ourselves — AutoNAT v2 has no such guard and was measured confirming an RFC 1918 address as external [MEASURED]. `run::reachable` is that filter, and its IPv6 arm was blind to `fc00::/7` until 2026-09-02 (`S1-Y`). | no confirmation | stay in `Reachability::Unknown`; continue — but note that with no external address this client is **not in the lobby at all**, per the paragraph above. |
 | 9 | **Subscribe the GossipSub lobby topics** (§6). Can be done immediately after step 2; messages only flow once peers connect. | `SubscriptionError` | fatal configuration bug, not a runtime condition — fail loudly. |
 | 10 | **Snapshot request to several peers** (§7) over `request-response`. | fewer than 2 usable responses | retry once with a fresh peer set, then proceed on live gossip alone and show "lobby syncing". |
@@ -1049,6 +1049,42 @@ A lobby cut into slices (`S1-EX`) adds one key per slice it listens to,
 provide and look up that key, so the slice's GossipSub mesh has connected peers
 to form from. The slice strings and depths are `PROTOCOL.md` §1.1's; at depth
 zero there are no slices and only the lobby key above is used.
+
+**And one key for every hour of the clock (`D-070`)**, derived the same way:
+
+```
+hour namespace  = ASCII("p2p-poker/main-lobby/v1/hour/" || decimal(n))
+n               = floor(Unix time in seconds / 3600)
+
+hour 494000  12203d1090829c32d410fe8d89a9e211ed600d696b9650ea4216739698e23ba923be
+```
+
+`an_hours_lobby_key_is_the_published_one` pins that value, written out like the
+two above. Every client provides the key of the current hour beside the lobby's
+own, and **while it has no poker client connected** looks it up every cycle,
+before the lobby's own. After the turn of an
+hour a client moves to the new key at **its own moment of the hour's first
+300 s** — the last two bytes of its `PeerId`, modulo 300 — so that the twenty
+nodes closest to a new key are not handed the whole lobby inside one minute; and
+for an hour's first 600 s whoever reads, reads the hour before as well, which is
+where a client that has not made its turn yet still is. The hour's record is
+walked until a walk has handed it on (§2.1 step 5) — the lobby's own rule asks
+for more, a node returning the record, and that needs the reading a client with
+company no longer does.
+
+**Why a second key for the same lobby.** A record outlives its client by up to
+48 hours and nothing can withdraw it (§3.5), so the lobby's own key names
+everybody who was here since the day before yesterday — 43 records on
+2026-09-19, not one of them a running client — and nothing in a record says
+which of them is alive. **An hour's key can name nobody who was not here within
+the hour**: no honest client announces under it before it begins. It is where a
+newcomer finds a client that is running *now*, which is the first connection a
+lobby needs and the one `S1-AI` measured being lost among the dead; GossipSub
+brings the rest. The lobby's own key stays exactly what it was — read, dialled
+and announced under as before — so a client that knows nothing of the hour keys
+meets everybody there, and so does one whose clock is an hour wrong, which
+announces where nobody looks. A slice is at most four hexadecimal characters, so
+no slice's key is an hour's. What the hour's key costs in privacy is §3.5's.
 
 **The derivation is in `src/net/run.rs`'s `namespace`, computed rather than
 pasted**, and the test above writes the expected bytes out rather than
@@ -1184,6 +1220,19 @@ price §3.3 says is worth paying — but the user is the one paying it.
   times longer.** `DIALS_PER_ANSWER = 8` exists precisely because of this: *"a
   lobby key outlives the clients in it"*.
 
+* **An hour's key says *when*, and it says it afterwards (`D-070`).** The lobby's
+  own record says this `PeerId` was here at some time in the last two days. The
+  hour keys (§3.2) are one record for every hour a client ran in, each kept its
+  48 hours by nodes that differ from hour to hour: whoever looks up the 48 keys
+  of the last two days reads, **without having watched, in which of those hours
+  each `PeerId` was here** — an attendance record at an hour's resolution, which
+  the polling observer two bullets below has to be running at the time to
+  collect. That is the price of what the key is for: a record that says *now* is
+  the only kind that tells a newcomer whom to dial. It does move the audience —
+  the twenty closest nodes are another twenty every hour — and that costs the
+  grinding observer nothing worth the name, because the key of any hour to come
+  is computable today. The player must be told of it with the rest.
+
 * **And while it is running it refreshes only until somebody returns it.**
   `AddProviderJob` waits a full interval before its first run
   (`jobs.rs:268-279`), so inside a session shorter than 12 hours the crate never
@@ -1191,7 +1240,8 @@ price §3.3 says is worth paying — but the user is the one paying it.
   address, and again every 300 s until a node returns this client's own record
   (§10.1). Measured on 2026-09-15, a node returned it within about a minute of
   the first walk, so a session ordinarily publishes once, to the 20 nodes closest
-  to the key at that moment; one whose record nobody returns publishes every five
+  to the key at that moment — and once for every hour it runs in, to the 20
+  closest to that hour's key (`D-070`); one whose record nobody returns publishes every five
   minutes, more often than Mainline's 10-minute re-announce did. Until
   2026-09-15 this bullet said *publishes exactly once*, which was what ran for a
   client behind a NAT whatever happened to its walk (`S1-FI`). Those 20 nodes
@@ -1205,8 +1255,9 @@ price §3.3 says is worth paying — but the user is the one paying it.
   the walk learns the querier's **`PeerId`**, its **IP**, its **identify banner**,
   and the **exact key asked for**. The client asks every **60 seconds**
   (`run::run`'s discovery timer) — about **1440 times a day**, against the ~150 the Mainline
-  section counted — plus a second query for the relay namespace whenever there is
-  no reservation. **One walk asks 85 to 240 distinct nodes, about 125 as a rule,
+  section counted — plus, only while the client has met no poker client, one for
+  the hour's key beside it (`D-070`; two for an hour's first ten minutes), and
+  another for the relay namespace whenever there is no reservation. **One walk asks 85 to 240 distinct nodes, about 125 as a rule,
   and 24 to 132 of them answer** -- nine walks of three clients on one machine,
   2026-09-18 (`run164847-3`, the client's own *public lobby walk* line), against
   the 105-176 the Mainline section counted.
