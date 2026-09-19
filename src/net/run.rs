@@ -7517,6 +7517,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .is_some_and(|q| q < DEAF_QUIET_S);
                         let now = super::node::now_unix_ms();
                         let hand_now = t.hand.as_ref().map_or(0, |h| h.hand_id());
+                        // `S1-IH`: a copy carried by a member this client has not
+                        // been taught yet is the seat's **new process** saying it --
+                        // and an answer already given in this hand went out before
+                        // that process was in the group. *Talking* is read off the
+                        // seat's friend line as well as its group entries, and the
+                        // line of a process just started is up long before it is a
+                        // member; its first copy comes by the lobby's mesh inside the
+                        // founder's answer. So while the hand still waits on the
+                        // seat, the one answer a hand allows was said to nobody, and
+                        // with it the minute's one re-say of the hand (`run162035-3`:
+                        // a seat back five seconds after it died, answered at once by
+                        // both members, in the group sixteen seconds later, and never
+                        // answered again). Such an answer is owed once more.
+                        let fresh_carrier = item.claimed.is_some_and(|gk| !t.taught.contains(&gk));
+                        if let Some(a) = author.filter(|_| fresh_carrier) {
+                            if t.ratification_answered.remove(&a).is_some() {
+                                t.hand_said_again_for.remove(&a);
+                                t.hand_said_again_ms = 0;
+                                t.ratification_echo_ms = 0;
+                            }
+                        }
                         let answered = author
                             .and_then(|a| t.ratification_answered.get(&a).copied())
                             .is_some_and(|in_hand| in_hand == hand_now);

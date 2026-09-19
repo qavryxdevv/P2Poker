@@ -515,6 +515,9 @@ pub struct Trouble {
     /// the last twenty seconds: that seat's message said again, not a seat
     /// back under a fresh key (S1-DU), whose old entry has been quiet.
     pub claims_refused: AtomicU64,
+    /// `S1-DB`: entries of a seat's dead process this client dropped from a
+    /// group, the seat being there under a fresh key.
+    pub stale_dropped: AtomicU64,
     /// `D-045`: members this client dropped from a group by the table's
     /// word, and the times this client was itself removed by it.
     pub removed: AtomicU64,
@@ -1747,6 +1750,18 @@ fn sweep_table(
         t.group.is_some() && group_complete(t.confirmed.len(), t.roster.len()),
         Ordering::Relaxed,
     );
+
+    // `S1-DB`: what a seat's dead process left in the group goes, once the seat
+    // is back under a fresh key of its own binding. **After the counts above
+    // are out, never before them**: the node says its list and its ratification
+    // again when the group's count rises (`S1-DX`), which is how a seat back
+    // from a restart learns the session from every member. Dropped first, the
+    // old entry and the fresh one never stood in one count, no member saw
+    // anybody arrive, and the seat that was back sat at *ratified 2 of 3* for
+    // the rest of the run (`run162035-3`).
+    if let (Some(g), true) = (t.group, t.setup.binder.is_some()) {
+        drop_stale_twins(tox, t, g);
+    }
 
     // **A join that never finished, given up and started again** (`S1-AA`
     // shape (i)). Past `JOIN_GRACE` the chat is destroyed -- the one lever
@@ -3198,6 +3213,129 @@ fn entries_of(
         .collect()
 }
 
+/// `S1-DB`: how long a seat's older entry has to have been silent -- beside a
+/// fresh one that is a confirmed member under its own binding and speaks -- to
+/// be read as a dead process's. The library has a living member say something
+/// at least every twelve seconds (its ping), so fifteen is past anything a
+/// living entry shows, and a quarter of the 58 s the library itself waits.
+pub const STALE_TWIN_AFTER_S: u64 = 15;
+
+/// One group key a seat is or was known by, as the sweep reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TwinEntry {
+    key: [u8; 32],
+    /// Paired by the binding in its own name (`D-051`), which only the holder
+    /// of the seat's key can make -- not by a claim read off carried traffic.
+    bound: bool,
+    /// The group holds an entry for it right now.
+    present: bool,
+    confirmed: bool,
+    /// Seconds since the group last heard from it.
+    quiet: Option<u64>,
+}
+
+/// `S1-DB`: of one seat's group keys, the ones a dead process left behind.
+///
+/// A client that died and was started again enters the group under a new key
+/// pair (`S1-DU`), and the library keeps the old entry for 58 s and then goes
+/// on trying the dead key for ever -- ten handshakes, a minute's pause, ten
+/// more (`run155832-2`: the old key tried again at 212 s and at 302 s of a run
+/// whose seat had been back since 183 s). The library cannot know the two keys
+/// are one player; this client can, by the binding each carries.
+///
+/// **The proof is the fresh entry, and nothing else is.** A key is stale only
+/// beside another key of the same seat that is a confirmed member, **bound by
+/// its own name**, and heard from within `STALE_TWIN_AFTER_S`: a binding is
+/// the seat's signature over that member key, so only the seat's player can
+/// have started the process behind it, and a profile runs one client. Beside
+/// such a key, an older one is stale when it has been silent that long, or
+/// when the library has already dropped it and would try it again.
+///
+/// **What this never does:** judge a seat that has one key -- an outage is not
+/// a death, and the same process comes back under the same key; drop an entry
+/// that still speaks -- two living clients on one identity are `D-068`'s
+/// business and not this rule's; or act on a claim read off carried traffic,
+/// which anybody can carry (`S1-DW`).
+fn stale_twins(entries: &[TwinEntry]) -> Vec<[u8; 32]> {
+    let fresh = entries
+        .iter()
+        .filter(|e| e.bound && e.confirmed && e.quiet.is_some_and(|q| q < STALE_TWIN_AFTER_S))
+        .min_by_key(|e| e.quiet.unwrap_or(u64::MAX));
+    let Some(fresh) = fresh else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|e| e.key != fresh.key)
+        .filter(|e| match (e.present, e.confirmed, e.quiet) {
+            // Gone from the group already: the key the library would try again.
+            (false, _, _) => true,
+            (true, true, Some(q)) => q >= STALE_TWIN_AFTER_S,
+            // Still shaking hands, or a member with no reading: not judged.
+            _ => false,
+        })
+        .map(|e| e.key)
+        .collect()
+}
+
+/// `S1-DB`: drop what a seat's dead process left in the group, and forbid the
+/// library its return. The **entry** goes and the **seat** stays: it is here
+/// by its fresh entry, so nothing is said to the felt or the node about
+/// anybody leaving -- which is why this does not go through `member_gone`.
+fn drop_stale_twins(tox: &mut Tox, t: &mut TableState, g: u32) {
+    // Only a seat known by two keys is looked at, which is no seat at all on
+    // an ordinary sweep.
+    let mut keys_of: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    for (group_key, app) in t.known_as.iter() {
+        keys_of.entry(*app).or_default().push(*group_key);
+    }
+    keys_of.retain(|_, keys| keys.len() > 1);
+    if keys_of.is_empty() {
+        return;
+    }
+    let pairs = scan_pairs(tox, g);
+    for (app, keys) in keys_of {
+        let entries: Vec<TwinEntry> = keys
+            .iter()
+            .map(|key| {
+                let peer = pairs.iter().find(|(_, k)| k == key).map(|(p, _)| *p);
+                TwinEntry {
+                    key: *key,
+                    bound: t.bound.get(key) == Some(&app),
+                    present: peer.is_some(),
+                    confirmed: peer.is_some_and(|p| t.confirmed.contains(&p)),
+                    quiet: tox.peer_quiet_secs(g, key),
+                }
+            })
+            .collect();
+        for key in stale_twins(&entries) {
+            let peer = pairs.iter().find(|(_, k)| *k == key).map(|(p, _)| *p);
+            // For good: the process that held this key is gone and its secret
+            // with it, so whatever brings the key back is not the seat.
+            let was_member = tox.peer_drop(g, &key, true);
+            if let Some(p) = peer {
+                t.confirmed.remove(&p);
+                // The peer id is given to the next member that joins.
+                t.reassembler.forget(&p);
+                t.peer_keys.remove(&p);
+                t.peer_lines.remove(&p);
+            }
+            t.known_as.remove(&key);
+            t.bound.remove(&key);
+            t.unplaced.remove(&key);
+            t.meters.remove(&key);
+            t.trouble.stale_dropped.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "fault-harness")]
+            println!(
+                "fault-harness: a seat is back under a fresh key, so the entry its dead process left is {} (S1-DB)",
+                if was_member { "dropped from the table's group and not to come back" } else { "not to be tried again" }
+            );
+            #[cfg(not(feature = "fault-harness"))]
+            let _ = was_member;
+        }
+    }
+}
+
 /// `S1-DW`: whether a claim that `group_key` speaks for `app_key` is refused:
 /// another group key holds that application key, is a confirmed member, and
 /// has spoken within `quiet_limit` seconds. A seat back under a fresh key
@@ -3335,6 +3473,35 @@ mod tests {
             pending_invites(&set(&[1, 2, 3]), &friends, &[[2u8; 32]], &[]),
             vec![2]
         );
+    }
+
+    /// `S1-DB`: beside a fresh entry that is bound, confirmed and speaking, an
+    /// older key of the same seat is a dead process's once it has been silent
+    /// for `STALE_TWIN_AFTER_S`, or once the library has dropped it; and nothing
+    /// else is ever judged.
+    #[test]
+    fn a_seats_dead_entry_goes_only_beside_a_fresh_one_that_proves_it() {
+        let e = |key: u8, bound, present, confirmed, quiet| TwinEntry { key: [key; 32], bound, present, confirmed, quiet };
+        let fresh = e(2, true, true, true, Some(1));
+        // The return twenty seconds after the death: the old entry goes.
+        assert_eq!(stale_twins(&[e(1, true, true, true, Some(20)), fresh]), vec![[1u8; 32]]);
+        // A quick restart: the old entry has not been silent long enough yet.
+        assert!(stale_twins(&[e(1, true, true, true, Some(5)), fresh]).is_empty());
+        // The library dropped the old one already: forbidden to come back.
+        assert_eq!(stale_twins(&[e(1, true, false, false, None), fresh]), vec![[1u8; 32]]);
+        // Two living clients on one identity both speak: neither is judged.
+        assert!(stale_twins(&[e(1, true, true, true, Some(3)), fresh]).is_empty());
+        // One key, silent for a minute: an outage, not a death.
+        assert!(stale_twins(&[e(1, true, true, true, Some(60))]).is_empty());
+        // A fresh key paired by a claim read off carried traffic proves nothing.
+        assert!(stale_twins(&[e(1, true, true, true, Some(40)), e(2, false, true, true, Some(1))]).is_empty());
+        // Nor does a bound one that is not a confirmed member, or is silent itself.
+        assert!(stale_twins(&[e(1, true, true, true, Some(40)), e(2, true, true, false, Some(1))]).is_empty());
+        assert!(stale_twins(&[e(1, true, true, true, Some(40)), e(2, true, true, true, Some(30))]).is_empty());
+        // An entry still shaking hands is never the stale one.
+        assert!(stale_twins(&[e(3, true, true, false, None), fresh]).is_empty());
+        // Of two that speak, the freshest is the proof and the other is left.
+        assert!(stale_twins(&[e(1, true, true, true, Some(9)), fresh]).is_empty());
     }
 
     /// `S1-DU`: a seat's entries are all of them, and each reader chooses by
