@@ -104,6 +104,12 @@ pub enum LobbyAction {
     StartSearch(SearchRequest),
     /// `D-064`: the search's one button: give it up, now.
     CancelSearch,
+    /// `D-068`: open the album's window.
+    OpenAlbum,
+    /// `D-068`: the summary after a game has been looked at.
+    RewardsSeen,
+    /// `D-068`: the sentence about the rewards file has been read.
+    RewardsNoticeSeen,
 }
 
 /// What the create dialog collects.
@@ -442,6 +448,10 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     if let Some(f) = view.found.as_ref() {
         found_toast(ui.ctx(), f);
     }
+    // `D-068`: a card or a level earned, for a moment, in this window only.
+    if let Some(r) = view.reveal.as_ref() {
+        reveal_toast(ui.ctx(), r);
+    }
     // The chat box is in a column drawn inside a closure, so what it produced
     // is carried out here rather than assigned through a borrow the closure
     // does not have.
@@ -496,6 +506,9 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     // to fit the words "Players in the lobby" on a single line. The tables get
     // over half: the way into a game is there.
     let across = ui.available_width();
+    // `D-068`: a button on the card about the player, where no other button
+    // was pressed in the same pass.
+    let mut from_card: Option<LobbyAction> = None;
     match columns {
         3 => {
             egui::Panel::left("tables")
@@ -511,7 +524,11 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
                 .default_size((across * 0.24).clamp(230.0, 430.0))
                 .min_size(210.0)
                 .frame(frame())
-                .show(ui, |ui| info_column(ui, view, state));
+                .show(ui, |ui| {
+                    if let Some(a) = info_column(ui, view, state) {
+                        from_card = Some(a);
+                    }
+                });
             egui::CentralPanel::default().frame(frame()).show(ui, |ui| {
                 // The middle column can produce an action, so its result is
                 // taken rather than dropped.
@@ -553,6 +570,9 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     // A line typed into the chat box beats nothing else that happened this
     // frame: the other actions come from buttons, and a button and the Enter
     // key cannot both have been pressed in one pass.
+    if let Some(a) = from_card.filter(|_| action == LobbyAction::None) {
+        action = a;
+    }
     if let Some(text) = said {
         action = LobbyAction::Say(text);
     }
@@ -1250,6 +1270,21 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                                     RichText::new("Applies to both windows, at once.")
                                         .color(theme::TEXT_DIM)
                                         .size(14.0),
+                                );
+                                ui.add_space(10.0);
+                                // `D-068`: autonomy -- the whole of it can be put away.
+                                let mut shown = f.show_rewards();
+                                if ui.checkbox(&mut shown, "Show rewards and quests").changed() {
+                                    f.rewards = Some(shown);
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "Levels, cards, quests and table manners, kept on this computer only and \
+                                         shown to nobody else. Turned off, nothing of them is shown and your \
+                                         progress is still counted quietly.",
+                                    )
+                                    .color(theme::TEXT_DIM)
+                                    .size(14.0),
                                 );
                             }
                             SettingsTab::Sound => {
@@ -2189,7 +2224,21 @@ fn people_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
 /// `D-067`: the player's own card -- the avatar, the name, how long they have
 /// been here, and their record from this profile. Nothing on it is a ranking
 /// of anybody else; nothing on it asks for anything back.
-fn you_card(ui: &mut egui::Ui, view: &LobbyView) {
+fn you_card(ui: &mut egui::Ui, view: &LobbyView) -> Option<LobbyAction> {
+    let mut action = None;
+    // `D-068`: the end of a game first -- what it came to, truthfully, and
+    // what is nearest now; then the card itself.
+    if let Some(words) = view.rewards_notice {
+        if rewards_notice(ui, words) {
+            action = Some(LobbyAction::RewardsNoticeSeen);
+        }
+    }
+    if let Some(s) = view.rewards.as_ref().and_then(|r| r.summary.as_ref()) {
+        if game_summary(ui, s, view.rewards.as_ref().and_then(|r| r.goal.as_ref())) {
+            action = Some(LobbyAction::RewardsSeen);
+        }
+        ui.add_space(10.0);
+    }
     egui::Frame::new()
         .fill(theme::FIELD)
         .stroke(Stroke::new(1.0, theme::LINE))
@@ -2247,7 +2296,192 @@ fn you_card(ui: &mut egui::Ui, view: &LobbyView) {
                     );
                 }
             }
+            if let Some(r) = view.rewards.as_ref() {
+                if you_rewards(ui, r) {
+                    action = Some(LobbyAction::OpenAlbum);
+                }
+            }
         });
+    action
+}
+
+/// `D-068`: the rewards on the card about the player -- the level's chip with
+/// its bar, the meter, today's quests, the nearest goal, and the way into the
+/// album. Returns whether the album was asked for.
+fn you_rewards(ui: &mut egui::Ui, r: &super::rewards::YouRewards) -> bool {
+    use super::album;
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+        album::chip(ui.painter(), rect.center(), 20.0, &r.level);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.label(RichText::new(format!("Level {}", r.level.level)).color(theme::TEXT).size(16.0).strong());
+            let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(60.0), 8.0), egui::Sense::hover());
+            album::bar(ui.painter(), bar, r.level.into, r.level.span, theme::GOLD_EDGE);
+            ui.label(
+                RichText::new(format!("{} / {} XP", r.level.into, r.level.span)).color(theme::TEXT_DIM).size(12.0),
+            );
+        });
+    });
+    ui.add_space(6.0);
+    // The way into the album, high on the card: never under the fold.
+    let label = format!("Album \u{00b7} {} of 52 cards", r.cards_have);
+    let open = ui
+        .add(egui::Button::new(RichText::new(label).size(14.0)).min_size(egui::vec2(ui.available_width(), 30.0)))
+        .clicked();
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("Table manners {}", r.manners)).color(album::meter_colour(r.manners)).size(13.5));
+        ui.label(RichText::new(format!("\u{00b7} {}", r.season.rank)).color(theme::TEXT_DIM).size(13.5));
+        let (stars, _) = ui.allocate_exact_size(egui::vec2(44.0, 14.0), egui::Sense::hover());
+        for i in 0..3 {
+            album::star(
+                ui.painter(),
+                egui::pos2(stars.left() + 7.0 + i as f32 * 15.0, stars.center().y),
+                6.0,
+                i < r.season.lit,
+                theme::GOLD_ACTION,
+            );
+        }
+    });
+    if r.manners < 100 {
+        ui.add(egui::Label::new(RichText::new(r.manners_words).color(theme::TEXT_DIM).size(12.5)).wrap());
+    }
+    ui.add_space(8.0);
+    ui.label(RichText::new("Today").color(theme::TEXT_DIM).size(13.0));
+    for q in &r.daily {
+        ui.horizontal_wrapped(|ui| {
+            let colour = if q.done { theme::OK } else { theme::TEXT };
+            ui.add(egui::Label::new(RichText::new(&q.text).color(colour).size(13.5)).wrap());
+            let tail = if q.done { "done".to_string() } else { format!("{}/{}", q.have, q.need) };
+            ui.label(RichText::new(tail).color(theme::TEXT_DIM).size(12.5));
+        });
+    }
+    if r.weekly_to_pick {
+        ui.label(RichText::new("This week's challenge is yours to pick, in the album.").color(theme::GOLD_EDGE).size(13.0));
+    } else if let Some(w) = r.weekly.as_ref() {
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(RichText::new(format!("Week: {}", w.text)).color(theme::TEXT).size(13.5)).wrap());
+            ui.label(RichText::new(format!("{}/{}", w.have, w.need)).color(theme::TEXT_DIM).size(12.5));
+        });
+    }
+    if let Some(g) = r.goal.as_ref() {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Nearest card").color(theme::TEXT_DIM).size(13.0));
+        ui.add(egui::Label::new(RichText::new(&g.label).color(theme::TEXT).size(14.5).strong()).wrap());
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 7.0), egui::Sense::hover());
+        album::bar(ui.painter(), bar, g.have, g.need, theme::ACCENT);
+        let left = if g.left.is_empty() { format!("{} / {}", g.have, g.need) } else { g.left.clone() };
+        ui.label(RichText::new(left).color(theme::TEXT_DIM).size(12.5));
+    }
+    open
+}
+
+/// `D-068`: what the last game came to -- the peak and the end of it, said
+/// truthfully: the experience with its reasons, the cards, what is nearest.
+/// A game that was left says why and the way back, in the same calm colours.
+/// Returns whether it was acknowledged.
+fn game_summary(ui: &mut egui::Ui, s: &super::rewards::SummaryView, next: Option<&super::rewards::GoalLine>) -> bool {
+    let mut seen = false;
+    let edge = if s.left { theme::WARN } else { theme::GOLD_EDGE };
+    egui::Frame::new()
+        .fill(theme::FELT_EDGE)
+        .stroke(Stroke::new(1.0, edge))
+        .corner_radius(10.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let colour = if s.left { theme::TEXT } else { theme::GOLD_ACTION };
+            ui.add(egui::Label::new(RichText::new(&s.headline).color(colour).size(15.5).strong()).wrap());
+            ui.add_space(4.0);
+            for (why, xp) in &s.lines {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("+{xp}")).color(theme::GOLD_EDGE).size(13.0));
+                    ui.add(egui::Label::new(RichText::new(why).color(theme::ON_FELT_DIM).size(13.0)).wrap());
+                });
+            }
+            if let Some(level) = s.level_up {
+                ui.label(RichText::new(format!("Level {level} reached")).color(theme::GOLD_ACTION).size(14.0).strong());
+            }
+            for card in &s.cards {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("New card: {} {}", card.label(), card.title)).color(theme::TEXT).size(14.0),
+                    )
+                    .wrap(),
+                );
+            }
+            if !s.stars.is_empty() {
+                ui.label(RichText::new(&s.stars).color(theme::ON_FELT_DIM).size(13.0));
+            }
+            if let Some(g) = next {
+                let left = if g.left.is_empty() { format!("{} / {}", g.have, g.need) } else { g.left.clone() };
+                ui.add(
+                    egui::Label::new(RichText::new(format!("Nearest: {} \u{2014} {left}", g.label)).color(theme::TEXT).size(13.0))
+                        .wrap(),
+                );
+            }
+            ui.add_space(4.0);
+            if ui.add(egui::Button::new(RichText::new("OK").size(13.0))).clicked() {
+                seen = true;
+            }
+        });
+    seen
+}
+
+/// `D-068`: the one neutral sentence about the rewards file.
+fn rewards_notice(ui: &mut egui::Ui, words: &str) -> bool {
+    let mut seen = false;
+    egui::Frame::new().fill(theme::FIELD).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(10.0).inner_margin(10.0).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(words).color(theme::TEXT_DIM).size(13.0)).wrap());
+            if ui.add(egui::Button::new(RichText::new("OK").size(13.0))).clicked() {
+                seen = true;
+            }
+        },
+    );
+    ui.add_space(8.0);
+    seen
+}
+
+/// `D-068`: a card or a level earned, shown for a moment at the top of the
+/// lobby -- and only there, and only while no hand is being played: the table's
+/// window is never drawn over. Nothing to press, nothing that blinks.
+fn reveal_toast(ctx: &egui::Context, r: &super::lobby::RevealView) {
+    use super::lobby::REVEAL_MS;
+    let age = r.age_ms as f32;
+    let alpha = (age / 300.0).min((REVEAL_MS as f32 - age) / 600.0).clamp(0.0, 1.0);
+    egui::Area::new(egui::Id::new("reveal-toast"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 110.0))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::FELT_MID.gamma_multiply(alpha))
+                .stroke(Stroke::new(1.0, theme::GOLD_EDGE.gamma_multiply(alpha)))
+                .corner_radius(12.0)
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(card) = r.card {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(84.0, 68.0), egui::Sense::hover());
+                            ui.set_opacity(alpha);
+                            super::album::picture(&ui.painter_at(rect), rect, card.art, card.suit);
+                        }
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(RichText::new(&r.title).color(theme::GOLD_ACTION.gamma_multiply(alpha)).size(18.0).strong());
+                            ui.label(RichText::new(&r.text).color(theme::TEXT.gamma_multiply(alpha)).size(14.0));
+                        });
+                    });
+                });
+        });
+    super::table::paint_again(ctx, std::time::Duration::from_millis(80));
 }
 
 /// One number on the card, with its word under it.
@@ -2348,18 +2582,23 @@ fn table_info(ui: &mut egui::Ui, r: &TableRow, view: &LobbyView, state: &mut Lob
     }
 }
 
-fn info_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) {
-    you_card(ui, view);
-    ui.add_space(10.0);
-    group(ui, "Table", |ui| {
-        scroller(egui::ScrollArea::vertical())
-            .id_salt("info")
-            .auto_shrink([false, false])
-            .show(ui, |ui| match view.selected_row() {
+fn info_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Option<LobbyAction> {
+    // `D-068`: one scrolling column, as the narrow layouts have: the card
+    // about the player is taller with its quests, and at 200 % text nothing of
+    // it may fall off the pane.
+    let mut action = None;
+    scroller(egui::ScrollArea::vertical())
+        .id_salt("info")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            action = you_card(ui, view);
+            ui.add_space(10.0);
+            group(ui, "Table", |ui| match view.selected_row() {
                 Some(r) => table_info(ui, r, view, state),
                 None => how_it_works(ui),
             });
-    });
+        });
+    action
 }
 
 /// The people and the card in one scrolling column, for a window too narrow
@@ -2370,7 +2609,9 @@ fn side_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lobb
         .id_salt("side")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            you_card(ui, view);
+            if let Some(a) = you_card(ui, view) {
+                action = a;
+            }
             ui.add_space(10.0);
             group(ui, "Table", |ui| match view.selected_row() {
                 Some(r) => table_info(ui, r, view, state),

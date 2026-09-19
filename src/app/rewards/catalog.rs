@@ -208,6 +208,7 @@ pub enum Art {
     Deck(u16),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Card {
     pub id: &'static str,
     pub suit: Suit,

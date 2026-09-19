@@ -1176,16 +1176,77 @@ impl Rewards {
         self.award_cards(t, "", 0, "From your record");
     }
 
+    /// `--album-preview`: a sample of progress to draw the album from, with no
+    /// node and no profile -- a player a fortnight in, or (`all`) every card.
+    pub fn sample(all: bool, now: Now) -> Rewards {
+        let keys = Keys::derive(&ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]));
+        let mut r = Rewards::new(Progress::default(), keys);
+        r.progress.imported = true;
+        r.tick(now);
+        let t = r.stamp(now);
+        let stats: &[(&str, u64)] = &[
+            ("games", 12),
+            ("hands", 520),
+            ("wins", 2),
+            ("top_half", 5),
+            ("days", 5),
+            ("opponents", 9),
+            ("showdowns", 14),
+            ("sd_pair", 6),
+            ("sd_two_pair", 4),
+            ("sd_trips", 1),
+            ("sd_flush", 1),
+            ("sd_kinds", 4),
+            ("pocket_aces", 1),
+            ("finish_streak_best", 12),
+            ("finish_streak", 4),
+            ("good_standing", 6),
+            ("games_4", 6),
+            ("games_6", 3),
+            ("wins_4", 1),
+            ("bb_aces", 1),
+            ("day_streak", 3),
+        ];
+        for (metric, n) in stats {
+            r.progress.stats.insert((*metric).to_string(), *n);
+        }
+        if all {
+            for card in CARDS {
+                let have = r.progress.stat(card.metric).max(card.need);
+                r.progress.stats.insert(card.metric.to_string(), have);
+            }
+        }
+        r.award_cards(t, "Riverside", 2, "2nd place of 6");
+        r.progress.xp = if all { 61_000 } else { 4_100 };
+        r.progress.manners = if all { 100 } else { 80 };
+        r.progress.season.stars = if all { 19 } else { 7 };
+        r.progress.season.last_rank = Some(4);
+        r.progress.showcase = "D7".to_string();
+        r.progress.journal.clear();
+        r.progress.log(t, "xp", 140, "Game finished");
+        r.progress.log(t, "card", 0, "New card: \u{2666}7 Flush");
+        r.progress.log(t, "stars", 2, "Won a table of 4");
+        r.progress.log(t, "manners", -25, "You left a game in progress");
+        r.progress.log(t, "manners", 5, "A game played to its end");
+        r.take_notices();
+        r
+    }
+
     /// The nearest thing to aim at: the unearned card furthest along.
     pub fn next_goal(&self) -> Option<(&'static Card, u64)> {
-        CARDS
-            .iter()
-            .filter(|c| !c.hidden && !self.progress.cards.contains_key(c.id))
-            .map(|c| (c, self.progress.stat(c.metric).min(c.need)))
-            .max_by(|(a, ha), (b, hb)| {
-                // have/need compared without fractions; the smaller need on a tie.
-                (ha * b.need).cmp(&(hb * a.need)).then(b.need.cmp(&a.need))
-            })
+        let mut best: Option<(&'static Card, u64)> = None;
+        for c in CARDS.iter().filter(|c| !c.hidden && !self.progress.cards.contains_key(c.id)) {
+            let have = self.progress.stat(c.metric).min(c.need);
+            // have/need compared without fractions; on a tie the easier card
+            // (the lower rank, then the smaller need), and the first of those.
+            let better = best.is_none_or(|(b, hb)| {
+                (have * b.need).cmp(&(hb * c.need)).then(b.rank.cmp(&c.rank)).then(b.need.cmp(&c.need)).is_gt()
+            });
+            if better {
+                best = Some((c, have));
+            }
+        }
+        best
     }
 }
 

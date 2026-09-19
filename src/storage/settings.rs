@@ -89,6 +89,11 @@ pub struct Settings {
     /// and read as on.
     #[n(7)]
     pub relay: Option<bool>,
+    /// `D-068`: whether the rewards and the quests are shown. `None` reads as
+    /// shown. Off, nothing of them is drawn anywhere and progress is still
+    /// counted quietly, so turning them on again loses nothing.
+    #[n(8)]
+    pub rewards: Option<bool>,
 }
 
 /// `D-064`: the most past searches remembered.
@@ -233,6 +238,7 @@ impl Settings {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         }
     }
 
@@ -240,6 +246,12 @@ impl Settings {
     /// unless the player said no.
     pub fn relay(&self) -> bool {
         self.relay.unwrap_or(true)
+    }
+
+    /// `D-068`: whether rewards and quests are shown: yes unless the player
+    /// said no.
+    pub fn show_rewards(&self) -> bool {
+        self.rewards.unwrap_or(true)
     }
 
     /// `D-064`: the search's settings in force: the player's, or the defaults.
@@ -371,6 +383,7 @@ mod tests {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         };
         save(&dir, &s, &k).unwrap();
         assert_eq!(load(&dir, &k), s);
@@ -479,6 +492,7 @@ mod tests {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         };
         s.repair(&k);
         assert!(s.nickname.len() <= NAME_MAX);
@@ -492,6 +506,7 @@ mod tests {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         };
         s.repair(&k);
         assert!(!s.nickname.chars().any(|c| c.is_control()));
@@ -507,6 +522,7 @@ mod tests {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         };
         s.repair(&k);
         assert_eq!(s.nickname, Settings::defaults(&k).nickname);
@@ -528,6 +544,7 @@ mod tests {
                 auto_muck: None,
                 search: None,
                 relay: None,
+            rewards: None,
             };
             s.repair(&k);
             assert!(s.nickname.len() <= NAME_MAX, "{n}");
@@ -553,6 +570,7 @@ mod tests {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         };
         // Written past `save`'s own repair, the way a person editing the file
         // would.
@@ -569,6 +587,7 @@ mod tests {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         };
         std::fs::write(settings_path(&dir), minicbor::to_vec(&tiny).unwrap()).unwrap();
         assert_eq!(load(&dir, &k).text_percent, SCALE_MIN);
@@ -586,6 +605,7 @@ mod tests {
             auto_muck: None,
             search: None,
             relay: None,
+            rewards: None,
         };
         assert_eq!(s.zoom(), 1.0);
     }
@@ -607,6 +627,7 @@ mod tests {
                 auto_muck: None,
                 search: None,
                 relay: None,
+            rewards: None,
             },
             &k,
         )
@@ -622,6 +643,7 @@ mod tests {
                 auto_muck: None,
                 search: None,
                 relay: None,
+            rewards: None,
             },
             &k,
         )

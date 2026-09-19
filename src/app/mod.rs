@@ -3418,6 +3418,25 @@ impl AppState {
 
     /// `S1-HL`: the window opened or closed a table window; a line in the
     /// client log, so a window that flashed is a line and not a memory.
+    /// `D-068`: one line in the log of the table in `slot` -- what a game came
+    /// to for this player. The log's own line and nothing over the felt.
+    pub fn reward_line(&mut self, slot: u8, text: String) {
+        if slot == self.active_slot || !self.background.contains_key(&slot) {
+            self.log_table(crate::gui::table::LogKind::Normal, text);
+            return;
+        }
+        self.swap_slot(slot);
+        self.log_table(crate::gui::table::LogKind::Normal, text);
+        self.swap_slot(slot);
+    }
+
+    /// `D-068`: whether a hand is being played at any of this client's tables.
+    /// While one is, nothing earned is shown: it waits.
+    pub fn any_live_hand(&self) -> bool {
+        self.hand.as_ref().is_some_and(|h| !h.over)
+            || self.background.values().any(|t| t.hand.as_ref().is_some_and(|h| !h.over))
+    }
+
     pub fn note_window(&mut self, slot: u8, opened: bool) {
         self.note(format!(
             "table window for slot {slot} {}",

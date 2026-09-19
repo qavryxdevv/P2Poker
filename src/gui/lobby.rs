@@ -713,7 +713,29 @@ pub struct LobbyView {
     pub record: Option<crate::storage::results::Summary>,
     /// `D-067`: the search just found a game, for the word about it.
     pub found: Option<FoundView>,
+    /// `D-068`: the rewards on the card about the player; `None` with the
+    /// switch in the settings off, and nothing of them is drawn.
+    pub rewards: Option<super::rewards::YouRewards>,
+    /// `D-068`: one neutral sentence about the rewards file, when a load had
+    /// one to say.
+    pub rewards_notice: Option<&'static str>,
+    /// `D-068`: a card or a level to show for a moment -- only while no hand
+    /// is being played at any of this client's tables.
+    pub reveal: Option<RevealView>,
 }
+
+/// `D-068`: what the lobby shows for a moment when something was earned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevealView {
+    pub title: String,
+    pub text: String,
+    /// The card earned, where it is one.
+    pub card: Option<&'static crate::app::rewards::catalog::Card>,
+    pub age_ms: u64,
+}
+
+/// `D-068`: how long a reveal stays.
+pub const REVEAL_MS: u64 = 6_000;
 
 /// `D-064`: the search under way, as the modal window shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -889,6 +911,9 @@ impl LobbyView {
             session_s: 0,
             record: None,
             found: None,
+            rewards: None,
+            rewards_notice: None,
+            reveal: None,
         }
     }
 

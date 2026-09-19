@@ -210,6 +210,14 @@ fn main() {
         preview_table(&args);
         return;
     }
+    // `--album-preview`: the album drawn from a sample of progress, with no
+    // node and no profile -- for looking at the cards. `--preview-all` earns
+    // every card, `--preview-page N` opens a page, `--preview-flip ID` turns a
+    // card over, `--preview-scale N` is the text size in per cent.
+    if has("--album-preview") {
+        preview_album(&args);
+        return;
+    }
 
     // libp2p says a great deal through `tracing` and, without a subscriber,
     // says it to nobody. Every network question asked of this client so far has
@@ -656,6 +664,8 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         // ever sent: an `mpsc::Receiver` whose senders are all gone completes
         // immediately and for ever, and its `select!` arm would spin.
         let (commands, command_rx) = tokio::sync::mpsc::channel(16);
+        // `D-068`: the rewards' file, opened before the key goes to the node.
+        let mut rewards = p2p_poker::app::rewards::Host::open(&profile_dir, &app_key);
         tokio::spawn(async move {
             let cfg = p2p_poker::net::run::Run {
                 identity,
@@ -922,6 +932,17 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     }
                     let before = state.emitted;
                     let lost = matches!(event, NodeEvent::TableLost { .. });
+                    // `D-068`: the rewards are folded from the same words, with
+                    // or without a window; what a game came to is printed.
+                    rewards.on_event(&event);
+                    for notice in rewards.rewards.take_notices() {
+                        if let p2p_poker::app::rewards::Notice::TableLine { slot, text } = notice {
+                            println!("rewards: slot {slot}: {text}");
+                        }
+                    }
+                    if let Some(e) = rewards.flush() {
+                        println!("{e}");
+                    }
                     state.apply(event);
                     // `S1-FY`: a window keeps a table lost without its player
                     // asking, until the player closes it. This client has no
@@ -1328,6 +1349,11 @@ fn windowed(player: Player, run: Run) -> Started {
                 sound: p2p_poker::sound::Player::new(),
                 // `D-067`: the record behind the lobby's card about the player.
                 results: p2p_poker::storage::results::load(&profile_dir),
+                rewards: p2p_poker::app::rewards::Host::open(&profile_dir, &app_key),
+                album_open: false,
+                album_ui: Default::default(),
+                reveals: Default::default(),
+                reveal_since: None,
                 profile_dir,
                 app_key,
                 commands,
@@ -1739,6 +1765,56 @@ fn preview_table(args: &[String]) {
     );
 }
 
+/// `--album-preview`: the album from a sample of progress, with no node.
+fn preview_album(args: &[String]) {
+    use p2p_poker::gui::album;
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let rewards = p2p_poker::app::rewards::Rewards::sample(has("--preview-all"), p2p_poker::app::rewards::Now::system());
+    let scale = value("--preview-scale").and_then(|v| v.parse::<f32>().ok()).unwrap_or(100.0).clamp(80.0, 200.0) / 100.0;
+    let flipped = value("--preview-flip").and_then(|id| p2p_poker::app::rewards::catalog::card_by_id(&id)).map(|c| c.id);
+    let state = album::AlbumUi { page: value("--preview-page").and_then(|v| v.parse().ok()).unwrap_or(0), flipped };
+    struct Preview {
+        rewards: p2p_poker::app::rewards::Rewards,
+        state: album::AlbumUi,
+    }
+    impl eframe::App for Preview {
+        fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+            let view = p2p_poker::gui::rewards::album(&self.rewards, 0);
+            let now = p2p_poker::app::rewards::Now::system();
+            match album::draw(ui, &view, &mut self.state) {
+                album::AlbumAction::None => {}
+                album::AlbumAction::Swap(i) => {
+                    self.rewards.swap_daily(i, now);
+                }
+                album::AlbumAction::PickWeekly(i) => {
+                    self.rewards.pick_weekly(i, now);
+                }
+                album::AlbumAction::Showcase(id) => self.rewards.set_showcase(&id),
+            }
+        }
+    }
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([860.0, 720.0])
+            .with_min_inner_size(album::MIN_WINDOW)
+            .with_title("p2p-poker \u{2014} album preview")
+            .with_icon(window_icon()),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    let _ = eframe::run_native(
+        "p2p-poker-album-preview",
+        options,
+        Box::new(move |cc| {
+            render::install(&cc.egui_ctx);
+            p2p_poker::gui::table::style::install_fonts(&cc.egui_ctx);
+            cc.egui_ctx.set_zoom_factor(scale);
+            Ok(Box::new(Preview { rewards, state }))
+        }),
+    );
+}
+
 fn window_icon() -> std::sync::Arc<eframe::egui::IconData> {
     const PNG: &[u8] = include_bytes!("../assets/icon-256.png");
     let empty = || {
@@ -1804,6 +1880,15 @@ struct Client {
     /// `D-067`: this player's own record of finished tournaments, from the
     /// profile, for the lobby's card; written to as the node decides a place.
     results: p2p_poker::storage::results::Results,
+    /// `D-068`: the rewards, with their file.
+    rewards: p2p_poker::app::rewards::Host,
+    /// `D-068`: the album's window is open, and what it has turned over.
+    album_open: bool,
+    album_ui: p2p_poker::gui::album::AlbumUi,
+    /// `D-068`: what was earned and waits to be shown -- never while a hand is
+    /// being played -- and since when the first of them has been showing.
+    reveals: std::collections::VecDeque<p2p_poker::gui::lobby::RevealView>,
+    reveal_since: Option<std::time::Instant>,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
     commands: tokio::sync::mpsc::Sender<NodeCommand>,
     bounded: Option<u64>,
@@ -1878,11 +1963,129 @@ impl Client {
     fn drain(&mut self) -> bool {
         for _ in 0..EVENTS_PER_FRAME {
             match self.events.try_recv() {
-                Ok(event) => self.state.apply(event),
+                Ok(event) => {
+                    // `D-068`: the rewards hear the node's word before the
+                    // window's state consumes it.
+                    self.rewards.on_event(&event);
+                    self.state.apply(event);
+                }
                 Err(_) => return true,
             }
         }
         false
+    }
+
+    /// `D-068`: what the rewards earned since the last frame: a line for the
+    /// table's log, a card or a level queued for the lobby, and the file saved.
+    /// A save that fails is said once in the client log and owed; it never
+    /// stops anything.
+    fn reward_notices(&mut self) {
+        use p2p_poker::app::rewards::Notice;
+        use p2p_poker::gui::lobby::RevealView;
+        for notice in self.rewards.rewards.take_notices() {
+            match notice {
+                Notice::TableLine { slot, text } => self.state.reward_line(slot, text),
+                Notice::Card(id) => {
+                    if let Some(card) = p2p_poker::app::rewards::catalog::card_by_id(id) {
+                        self.reveals.push_back(RevealView {
+                            title: "New card".into(),
+                            text: format!("{} {}", card.label(), card.title),
+                            card: Some(card),
+                            age_ms: 0,
+                        });
+                    }
+                }
+                Notice::Level(level) => self.reveals.push_back(RevealView {
+                    title: format!("Level {level}"),
+                    text: format!("A {} chip.", p2p_poker::app::rewards::catalog::chip_of(level)),
+                    card: None,
+                    age_ms: 0,
+                }),
+                Notice::Break(words) => self.reveals.push_back(RevealView {
+                    title: "A short break?".into(),
+                    text: words.to_string(),
+                    card: None,
+                    age_ms: 0,
+                }),
+                Notice::Quest { .. } | Notice::Summary => {}
+            }
+        }
+        // Bounded, as everything fed from the network is.
+        while self.reveals.len() > 8 {
+            self.reveals.pop_front();
+        }
+        if let Some(e) = self.rewards.flush() {
+            self.state.log.push_back(e);
+        }
+    }
+
+    /// `D-068`: the reveal to show now, if any: only with the rewards shown,
+    /// and only while no hand is being played at any of this client's tables.
+    fn reveal_now(&mut self) -> Option<p2p_poker::gui::lobby::RevealView> {
+        if !self.ui.settings.show_rewards() {
+            self.reveals.clear();
+            return None;
+        }
+        if self.state.any_live_hand() {
+            self.reveal_since = None;
+            return None;
+        }
+        let first = self.reveals.front()?.clone();
+        let fresh = self.reveal_since.is_none();
+        let since = *self.reveal_since.get_or_insert_with(std::time::Instant::now);
+        let age_ms = since.elapsed().as_millis() as u64;
+        if age_ms >= p2p_poker::gui::lobby::REVEAL_MS {
+            self.reveals.pop_front();
+            self.reveal_since = None;
+            return self.reveal_now();
+        }
+        // The lobby's own notification sound, under its switch, as a card
+        // turns up -- and, by the line above, never while a hand is played.
+        let switches = self.ui.settings.sound();
+        if fresh && first.card.is_some() && switches.allows(p2p_poker::sound::Cue::LobbyChatNotify) {
+            self.sound.play(p2p_poker::sound::Cue::LobbyChatNotify, switches.volume);
+        }
+        Some(p2p_poker::gui::lobby::RevealView { age_ms, ..first })
+    }
+
+    /// `D-068`: the album, in its own window, as a table has one.
+    fn album_window(&mut self, ctx: &eframe::egui::Context) {
+        use eframe::egui::{ViewportBuilder, ViewportId};
+        let view = p2p_poker::gui::rewards::album(&self.rewards.rewards, p2p_poker::app::rewards::local_offset_min());
+        let mut ui_state = std::mem::take(&mut self.album_ui);
+        let mut action = p2p_poker::gui::album::AlbumAction::None;
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of("p2p-poker-album"),
+            ViewportBuilder::default()
+                .with_title("p2p-poker \u{2014} album")
+                .with_icon(window_icon())
+                .with_inner_size([860.0, 720.0])
+                .with_min_inner_size(p2p_poker::gui::album::MIN_WINDOW),
+            |ctx, _class| {
+                eframe::egui::CentralPanel::default().frame(eframe::egui::Frame::NONE).show(ctx, |ui| {
+                    action = p2p_poker::gui::album::draw(ui, &view, &mut ui_state);
+                });
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+            },
+        );
+        self.album_ui = ui_state;
+        if close {
+            self.album_open = false;
+        }
+        let now = p2p_poker::app::rewards::Now::system();
+        match action {
+            p2p_poker::gui::album::AlbumAction::None => {}
+            p2p_poker::gui::album::AlbumAction::Swap(i) => {
+                self.rewards.rewards.swap_daily(i, now);
+            }
+            p2p_poker::gui::album::AlbumAction::PickWeekly(i) => {
+                self.rewards.rewards.pick_weekly(i, now);
+            }
+            p2p_poker::gui::album::AlbumAction::Showcase(id) => self.rewards.rewards.set_showcase(&id),
+        }
     }
 
     fn table_window(&mut self, ctx: &eframe::egui::Context, slot: u8) {
@@ -2138,6 +2341,15 @@ impl Client {
     }
 }
 
+/// `D-068`: whatever the rewards still owe the disk is written as the client
+/// goes -- a save that failed earlier gets its last chance here.
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.rewards.rewards.changed = true;
+        let _ = self.rewards.flush();
+    }
+}
+
 impl eframe::App for Client {
     // eframe 0.36 hands the root viewport's `Ui` directly rather than a
     // `Context`; the panel is already open by the time this is called.
@@ -2161,6 +2373,9 @@ impl eframe::App for Client {
             // are read at the top of the next frame whenever that is.
             p2p_poker::gui::table::paint_again(&ctx, std::time::Duration::ZERO);
         }
+
+        // `D-068`: what the rewards earned from those words.
+        self.reward_notices();
 
         // `S1-CS`: a join nobody answers is called failed on the clock.
         self.state.tick_join();
@@ -2239,10 +2454,21 @@ impl eframe::App for Client {
         // `S1-EF`: every table this client sits at has its window, whatever
         // the lobby is showing.
         self.table_windows(&ctx);
+        // `D-068`: the album's window, while it is open and the rewards shown.
+        if self.album_open && self.ui.settings.show_rewards() {
+            self.album_window(&ctx);
+        }
 
         {
             {
                 let mut view = self.state.view();
+                // `D-068`: the rewards on the card -- nothing of them with the
+                // switch off.
+                if self.ui.settings.show_rewards() {
+                    view.rewards = Some(p2p_poker::gui::rewards::you(&self.rewards.rewards));
+                    view.rewards_notice = self.rewards.notice.map(|n| n.words());
+                    view.reveal = self.reveal_now();
+                }
                 // `D-067`: the card about the player -- how long this client
                 // has been open, and the record from the profile.
                 view.session_s = self.started.elapsed().as_secs();
@@ -2342,6 +2568,9 @@ impl eframe::App for Client {
                             self.tell(cmd);
                         }
                     }
+                    render::LobbyAction::OpenAlbum => self.album_open = true,
+                    render::LobbyAction::RewardsSeen => self.rewards.rewards.mark_summary_seen(),
+                    render::LobbyAction::RewardsNoticeSeen => self.rewards.notice = None,
                 }
             }
         }
