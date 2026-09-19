@@ -554,8 +554,19 @@ try {
         (& ssh @SshArgs $Where "powershell -NoProfile -EncodedCommand $enc" 2>&1) -join "`n"
     }
 
-    Write-Host '==> stopping any seat left running on the far end'
-    Invoke-Far $ssh $Target "Stop-Process -Name p2p-poker -Force -ErrorAction SilentlyContinue" | Out-Null
+    # **Only this bed's own seats, told by where their image lives** (`S1-IG`).
+    # This line was `Stop-Process -Name p2p-poker`, which stops every client on
+    # the far machine -- and the owner's own window client lives there, under
+    # another Windows user. A process whose path this login cannot read is not
+    # one this login started, so it is not a seat of this bed and is left alone;
+    # so is anything outside `$FarDir`. The seats of the run before are all
+    # under it, which is what the stop was ever for.
+    Write-Host "==> stopping any seat of this bed left running on the far end (under $FarDir only)"
+    $farPrefix = $FarDir.TrimEnd('\') + '\'
+    $stopOurs = "Get-Process -Name p2p-poker -ErrorAction SilentlyContinue | " +
+        "Where-Object { `$_.Path -and `$_.Path.StartsWith('$farPrefix', [StringComparison]::OrdinalIgnoreCase) } | " +
+        "Stop-Process -Force -ErrorAction SilentlyContinue"
+    Invoke-Far $ssh $Target $stopOurs | Out-Null
     Start-Sleep -Milliseconds 800
 
     Write-Host '==> copying the binary to the far end'
