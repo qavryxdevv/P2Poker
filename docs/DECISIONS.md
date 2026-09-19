@@ -6142,3 +6142,50 @@ profile. Two headless clients started on one `player.key` each said so within tw
 **Owed:** the owner's play, for the numbers; and the four items the prompt listed as *could* -- an encrypted body,
 the generation mirrored in `settings.cbor` against a rolled-back file, cosmetics for levels and finished suits, and
 data shaped for a later voluntary publication -- none of which is built.
+
+## D-069 — music while a search looks for a game
+
+**Decided 2026-09-19 by the project owner:** *play an accompanying track round and round while the automatic search
+is active; when a table is found, the music fades out; the track goes into the binary, under a suitable
+compression; a switch for it in the settings, on by default.*
+
+1. **When it plays.** While the search (`D-064`) is looking **and the player sits at no table**: the wait is what
+   the music is for. A search that goes on beside a game being played -- a second table wanted, or *search again* --
+   plays nothing, so no hand is ever accompanied. The moment either stops being so -- a table found, the search
+   given up -- the music **fades** over `MUSIC_FADE_OUT_MS` (1.8 s) and stops; it is never cut. It comes in over
+   `MUSIC_FADE_IN_MS` (0.9 s), and the next search hears the track from its beginning. The fade is heard as the
+   square of a level that moves in a straight line: a straight line in amplitude sounds like a drop at the end.
+2. **How loud.** `MUSIC_LEVEL_PERCENT` (30) of the volume the player chose for the sounds: an accompaniment under
+   the effects, not a performance. The track is shaped sample by sample on its own path, so no other sound of the
+   client is touched and the volume Windows keeps for the application is never moved.
+3. **The switch.** *Settings, Sound: Music while searching for a game* -- this client's own, under PokerTH's four,
+   and under the master switch. `SoundSettings::search_music` is `None` in a file written before it existed, which
+   reads as **on**, by the owner's word.
+4. **The track is in the binary** (`music::MUSIC_TRACK`, `assets/music/`): the client is one portable file
+   (`SPEC_CS.md` §22). **A suitable compression:** the owner's MP3 (192 kbit/s, 4.4 MB) became **Ogg Vorbis at
+   quality 3**, about 110 kbit/s -- 2.5 MB for three minutes of stereo at 44.1 kHz. Vorbis and not the MP3 as it
+   came, for three reasons: the size; an MP3 begins with a gap its encoder put there, heard every time a loop goes
+   round, and a Vorbis stream does not; and its decoder, `lewton`, is Rust and nothing else, where an MP3 would
+   have meant a second decoder or a codec of the operating system's that an edition of Windows may not carry.
+   Checked after the transcoding: the same length to the hundredth of a second, sample for sample in line with the
+   original (correlation 0.9988, no offset, level ratio 1.000), and **nothing in the file but the music** -- the
+   comments hold the encoder's name only (`the_track_in_the_binary_is_stereo_vorbis_and_small`).
+5. **Where the track comes from** is kept in `assets/music/README.md`: generated with Google's generative AI --
+   the owner's MP3 carried signed C2PA content credentials saying so -- and provided by the owner for the client.
+   The credentials are bound to the original's bytes and cannot be carried into a re-encoding, so the note holds the
+   origin instead. **Owed by the owner:** the licence line in that note.
+6. **A thread of its own** (`music::device`). The paint thread says only what should be (`Music::set`, a
+   comparison when nothing changed); the music's thread owns the `waveOut` device, decodes a twentieth of a second
+   at a time into four small buffers, and gives the device back once the fade has played out. A fifth of a second
+   is queued, which is how soon a fade is heard. A client that never searches never starts the thread and never
+   opens the device; a device that will not open is a search without music and nothing else. Off Windows the music
+   is silent, as the sounds are, and everything but the device still runs and is tested.
+
+**Measured:** `music::tests` -- the track decodes as stereo Vorbis at 44.1 kHz and is under 3 MB; it goes round at
+its end without a hole in the buffer that spans the turn; the envelope rises and falls monotonically in its two
+times, is still heard half way down, and turns round in the middle from where it is; the shaping never wraps a
+sample round. On the machine, by the peak meter of the client's own audio session (what Windows' volume mixer
+shows beside the application, no other program's sound in it): a steady signal while a search ran, peaks of a tenth
+to four tenths of full scale in the loud bars at the default volume; and from the click on *Cancel search* a fall
+through a quarter, a tenth, four hundredths, two hundredths to nothing over about a second and a half, and silence
+after it. By ear: the owner's.

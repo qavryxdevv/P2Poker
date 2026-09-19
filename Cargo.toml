@@ -95,6 +95,13 @@ egui_extras = { version = "0.36.1", features = ["image"] }
 rust-embed  = "8.12.0"
 image       = { version = "0.25.10", default-features = false, features = ["png"] }
 
+# --- music: D-069 ---------------------------------------------------------
+# The tune a search waits to is Ogg Vorbis inside the binary, decoded as it
+# plays. `lewton` is a Vorbis decoder in Rust and nothing else -- no C, no
+# codec of the operating system's to be missing on somebody's machine -- and
+# brings one crate the tree did not have, `ogg`.
+lewton = { version = "0.10.2", default-features = false, features = ["ogg"] }
+
 # --- runtime --------------------------------------------------------------
 tokio   = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 futures = "0.3"

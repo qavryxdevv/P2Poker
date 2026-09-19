@@ -1375,6 +1375,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 table_ui: Default::default(),
                 windows_shown: Default::default(),
                 sound: p2p_poker::sound::Player::new(),
+                music: p2p_poker::music::Music::new(),
                 // `D-067`: the record behind the lobby's card about the player.
                 results: p2p_poker::storage::results::load(&profile_dir),
                 rewards: p2p_poker::app::rewards::Host::open(&profile_dir, &app_key),
@@ -1909,6 +1910,8 @@ struct Client {
     windows_shown: std::collections::BTreeSet<u8>,
     /// PokerTH's sounds, played as the app owes them.
     sound: p2p_poker::sound::Player,
+    /// `D-069`: the tune a search waits to, on a thread of its own.
+    music: p2p_poker::music::Music,
     /// `D-067`: this player's own record of finished tournaments, from the
     /// profile, for the lobby's card; written to as the node decides a place.
     results: p2p_poker::storage::results::Results,
@@ -2600,6 +2603,12 @@ impl eframe::App for Client {
         // PokerTH's turn warning, and every sound owed since the last frame.
         self.state.tick_turn_warning();
         self.play_sounds();
+        // `D-069`: music while a search looks for a game and the player sits at
+        // no table; the moment either stops being so -- a table found, the
+        // search given up -- it fades away. A comparison when nothing changed.
+        let sound = self.ui.settings.sound();
+        let waiting = self.state.search.is_some() && self.state.slots().is_empty();
+        self.music.set(waiting && sound.plays_search_music(), sound.volume);
         // `--resume` in the window: the question is answered *rejoin* once.
         if self.resume && self.state.unfinished.is_some() {
             self.resume = false;

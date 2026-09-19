@@ -192,6 +192,11 @@ pub struct SoundSettings {
     /// *Blind raise notification*.
     #[n(5)]
     pub blind_raise: bool,
+    /// `D-069`: the music a search waits to -- this client's own switch, where
+    /// the five above are PokerTH's. `None` in a file written before it
+    /// existed, which reads as on (the owner, 2026-09-19).
+    #[n(6)]
+    pub search_music: Option<bool>,
 }
 
 impl Default for SoundSettings {
@@ -203,11 +208,18 @@ impl Default for SoundSettings {
             lobby_chat: true,
             network_game: true,
             blind_raise: true,
+            search_music: None,
         }
     }
 }
 
 impl SoundSettings {
+    /// `D-069`: whether the search's music plays: under the master switch, and
+    /// on unless the player said no.
+    pub fn plays_search_music(&self) -> bool {
+        self.on && self.search_music.unwrap_or(true)
+    }
+
     /// Whether `cue` plays under these switches.
     pub fn allows(&self, cue: crate::sound::Cue) -> bool {
         use crate::sound::Category;

@@ -73,10 +73,11 @@ corrected in place and the correction is recorded in §9.7.
 
 | Figure | Value | How |
 |---|---|---|
-| Crates **compiled into the client** | **442** | `cargo tree --edges normal --target x86_64-pc-windows-msvc`, unique name+version, minus `p2p-poker` itself |
-| Crates **recorded in `Cargo.lock`** | **645** | `[[package]]` entries, minus `p2p-poker` itself |
+| Crates **compiled into the client** | **444** | `cargo tree --edges normal --target x86_64-pc-windows-msvc`, unique name+version, minus `p2p-poker` itself |
+| Crates **recorded in `Cargo.lock`** | **647** | `[[package]]` entries, minus `p2p-poker` itself |
 | Locked but never compiled | **203** | the difference |
 
+**Re-measured 2026-09-19, after `D-069`'s music** (`lewton` and `ogg`, both compiled): 444 / 647 / 203.
 **Re-measured 2026-09-14, after `libp2p` 0.57** (`S1-FF`): 442 / 645 / 203, where the
 2026-08-31 figures were 461 / 659 / 198. **Re-measured 2026-08-31** before that: the
 compiled figure was right; the other two were not, and had been 646 / 185. `tests/corpus_dependencies.rs` now measures all three on
@@ -766,7 +767,7 @@ a register generated from the build graph, not from the manifest, is the right s
 | `quinn-udp` | 0.5.15 | platform UDP socket layer | `github.com/quinn-rs/quinn` | MIT OR Apache-2.0 | no open advisory |
 | `yamux` | 0.14.0 | stream muxer | `github.com/paritytech/yamux` | Apache-2.0 OR MIT | no open advisory. **The only major since `libp2p-yamux` 0.48**: 0.12.1, the compatibility copy `libp2p-yamux` 0.47 linked on purpose, carried GitHub's GHSA-vxx9-2994-q338 (a remote panic on a data frame with SYN set and a length of 262 145) and left with it |
 
-### 5.7 Hostile-input parsers (19)
+### 5.7 Hostile-input parsers (20)
 
 Everything here decodes bytes an attacker chooses. `SPEC_CS.md` §27 wants these
 fuzzed; none of them has been fuzzed by us.
@@ -850,11 +851,11 @@ counted as security-critical only if metrics are ever exposed on a socket; today
 nothing serves them, and if that changes it becomes an unauthenticated endpoint and
 moves into §5.9's category.
 
-**Registered total: 122 crates.**
+**Registered total: 123 crates.**
 
 ### 5.12 What is deliberately not registered
 
-The remaining **339** compiled crates are not individually registered. They are
+The remaining **340** compiled crates are not individually registered. They are
 dominated by the GUI and its platform stack (`eframe 0.36.1`, `egui_extras 0.36.1`,
 `image 0.25.10`, `rust-embed 8.12.0`, winit, glow, fonts, clipboard), the second
 renderer (`wgpu 30.0.1` with its `dx12` backend only, `wgpu-core`, `wgpu-hal`,
@@ -873,7 +874,12 @@ see our own assets. The same holds for what D-048 took from PokerTH: the table
 picture, the font, the sounds and the icons are compiled in with `include_bytes!` and
 `include_str!`, and our own readers of them -- the WAV reader in `sound.rs`, the SVG
 path filler in `gui/table/icons.rs` -- never see a byte from a peer. The notes about
-players (`storage/notes.rs`) are the local player's own file. The same holds for the renderer: `naga` compiles shaders, and the
+players (`storage/notes.rs`) are the local player's own file. **And for `D-069`'s music:** the Ogg Vorbis track is
+compiled in with `include_bytes!`, so `lewton 0.10.2` (`github.com/RustAudio/lewton`, MIT OR Apache-2.0) and
+`ogg 0.8.0` (`github.com/RustAudio/ogg`, BSD-3-Clause) -- a Vorbis decoder and its container, Rust and nothing
+else, no advisory open against either by `cargo audit` on 2026-09-19 -- only ever decode this client's own file.
+Both are direct or one step from direct, and both would move into §5.7 the day a track came from anywhere else.
+The count moved from 339 with them, and with `serde_json`, which `D-068` took into §5.7. The same holds for the renderer: `naga` compiles shaders, and the
 only shaders it ever sees are `egui`'s own, compiled in. **This assumption fails the moment anything peer-supplied is
 rendered** — an avatar, a table skin, a chat message with an image, a downloaded
 theme. If any of that is ever added, `image`, the font stack and the clipboard path

@@ -1477,6 +1477,15 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                                     ui.checkbox(&mut sound.lobby_chat, "Lobby chat notifications");
                                     ui.checkbox(&mut sound.network_game, "Network game notifications");
                                     ui.checkbox(&mut sound.blind_raise, "Blind raise notification");
+                                    // `D-069`: this client's own, under PokerTH's four.
+                                    let mut music = sound.search_music.unwrap_or(true);
+                                    if ui
+                                        .checkbox(&mut music, "Music while searching for a game")
+                                        .on_hover_text("Plays quietly while Find a game is looking, and fades out when a table is found")
+                                        .changed()
+                                    {
+                                        sound.search_music = Some(music);
+                                    }
                                 });
                                 if sound != f.sound() {
                                     f.sound = Some(sound);
