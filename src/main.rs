@@ -489,6 +489,7 @@ fn main() {
         also_join,
         also_at,
         search,
+        preview_rewards: has("--preview-rewards"),
     };
 
     if has("--headless") {
@@ -1180,6 +1181,10 @@ struct Run {
     /// `D-064`: `--search hu|6|9|auto [--search-tables N] [--search-again]`:
     /// the automatic search, from the start, for a scripted run of it.
     search: Option<p2p_poker::net::matchmaker::SearchRequest>,
+    /// `D-068`: `--preview-rewards`: the lobby shows a sample of what a game
+    /// came to and the words about a level and a card, for looking at them
+    /// without playing a game. Drawn only: nothing of it reaches the file.
+    preview_rewards: bool,
 }
 
 fn windowed(player: Player, run: Run) -> Started {
@@ -1210,6 +1215,7 @@ fn windowed(player: Player, run: Run) -> Started {
         also_join: _,
         also_at: _,
         search,
+        preview_rewards,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.
@@ -1374,8 +1380,9 @@ fn windowed(player: Player, run: Run) -> Started {
                 rewards: p2p_poker::app::rewards::Host::open(&profile_dir, &app_key),
                 album_open: false,
                 album_ui: Default::default(),
-                reveals: Default::default(),
+                reveals: if preview_rewards { preview_reveals() } else { Default::default() },
                 reveal_since: None,
+                preview_rewards,
                 backup_done: std::sync::mpsc::channel(),
                 backup_opened: None,
                 backups_listed: None,
@@ -1914,6 +1921,8 @@ struct Client {
     /// being played -- and since when the first of them has been showing.
     reveals: std::collections::VecDeque<p2p_poker::gui::lobby::RevealView>,
     reveal_since: Option<std::time::Instant>,
+    /// `--preview-rewards`: a sample summary is drawn on the lobby's card.
+    preview_rewards: bool,
     /// `D-068`: what the backup worker has finished, the backup a check opened
     /// (a restore stages exactly what was looked at), and when the folder was
     /// last read.
@@ -2463,6 +2472,57 @@ impl Client {
     }
 }
 
+/// `--preview-rewards`: the words about a level and two cards, the short one
+/// first -- the order that once set a card's name one letter to a line.
+fn preview_reveals() -> std::collections::VecDeque<p2p_poker::gui::lobby::RevealView> {
+    use p2p_poker::app::rewards::catalog::card_by_id;
+    use p2p_poker::gui::lobby::RevealView;
+    let card = |id: &str| {
+        let c = card_by_id(id);
+        RevealView {
+            title: "New card".into(),
+            text: c.map(|c| format!("{} {}", c.label(), c.title)).unwrap_or_default(),
+            card: c,
+            age_ms: 0,
+        }
+    };
+    [
+        RevealView { title: "Level 5".into(), text: "A White chip.".into(), card: None, age_ms: 0 },
+        card("H2"),
+        card("C4"),
+        RevealView {
+            title: "A short break?".into(),
+            text: "Two hours at the tables. A short break keeps the game sharp.".into(),
+            card: None,
+            age_ms: 0,
+        },
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// `--preview-rewards`: what a won heads-up game came to, as the lobby says it.
+fn preview_summary() -> p2p_poker::gui::rewards::SummaryView {
+    use p2p_poker::app::rewards::catalog::card_by_id;
+    p2p_poker::gui::rewards::SummaryView {
+        headline: "Game finished \u{00b7} +154 XP".into(),
+        lines: vec![
+            ("Game finished".into(), 60),
+            ("Hands played".into(), 2),
+            ("Won the game".into(), 24),
+            ("Table manners 100: +10 %".into(), 8),
+            ("New card: \u{2663}4 Five Down".into(), 30),
+            ("New card: \u{2665}2 Stayed to the End".into(), 30),
+            ("Quest: Finish a game at a table of 6 or more".into(), 120),
+        ],
+        cards: ["C4", "H2"].iter().filter_map(|id| card_by_id(id)).collect(),
+        quests: Vec::new(),
+        level_up: Some(5),
+        stars: "+2 stars this season".into(),
+        left: false,
+    }
+}
+
 /// `D-068`: what the backup worker sends back to the window.
 enum BackupDone {
     Made(Result<std::path::PathBuf, String>),
@@ -2595,6 +2655,11 @@ impl eframe::App for Client {
                 // switch off.
                 if self.ui.settings.show_rewards() {
                     view.rewards = Some(p2p_poker::gui::rewards::you(&self.rewards.rewards));
+                    if self.preview_rewards {
+                        if let Some(r) = view.rewards.as_mut() {
+                            r.summary = Some(preview_summary());
+                        }
+                    }
                     view.rewards_notice = self.rewards.notice.map(|n| n.words());
                     view.reveal = self.reveal_now();
                 }

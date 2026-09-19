@@ -487,7 +487,9 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     }
     // `D-068`: a card or a level earned, for a moment, in this window only.
     if let Some(r) = view.reveal.as_ref() {
-        reveal_toast(ui.ctx(), r);
+        // Under the word about a table found, while that is showing: the two
+        // are never drawn over each other.
+        reveal_toast(ui.ctx(), r, if view.found.is_some() { 200.0 } else { 110.0 });
     }
     // The chat box is in a column drawn inside a closure, so what it produced
     // is carried out here rather than assigned through a borrow the closure
@@ -2546,20 +2548,15 @@ fn you_rewards(ui: &mut egui::Ui, r: &super::rewards::YouRewards) -> bool {
     ui.add_space(8.0);
     ui.label(RichText::new("Today").color(theme::TEXT_DIM).size(13.0));
     for q in &r.daily {
-        ui.horizontal_wrapped(|ui| {
-            let colour = if q.done { theme::OK } else { theme::TEXT };
-            ui.add(egui::Label::new(RichText::new(&q.text).color(colour).size(13.5)).wrap());
-            let tail = if q.done { "done".to_string() } else { format!("{}/{}", q.have, q.need) };
-            ui.label(RichText::new(tail).color(theme::TEXT_DIM).size(12.5));
-        });
+        let colour = if q.done { theme::OK } else { theme::TEXT };
+        let tail = if q.done { "done".to_string() } else { format!("{}/{}", q.have, q.need) };
+        words_and_figure(ui, RichText::new(&q.text).color(colour).size(13.5), &tail);
     }
     if r.weekly_to_pick {
         ui.label(RichText::new("This week's challenge is yours to pick, in the album.").color(theme::GOLD_EDGE).size(13.0));
     } else if let Some(w) = r.weekly.as_ref() {
-        ui.horizontal_wrapped(|ui| {
-            ui.add(egui::Label::new(RichText::new(format!("Week: {}", w.text)).color(theme::TEXT).size(13.5)).wrap());
-            ui.label(RichText::new(format!("{}/{}", w.have, w.need)).color(theme::TEXT_DIM).size(12.5));
-        });
+        let tail = if w.done { "done".to_string() } else { format!("{}/{}", w.have, w.need) };
+        words_and_figure(ui, RichText::new(format!("Week: {}", w.text)).color(theme::TEXT).size(13.5), &tail);
     }
     if let Some(g) = r.goal.as_ref() {
         ui.add_space(8.0);
@@ -2589,23 +2586,35 @@ fn game_summary(ui: &mut egui::Ui, s: &super::rewards::SummaryView, next: Option
             ui.set_width(ui.available_width());
             let colour = if s.left { theme::TEXT } else { theme::GOLD_ACTION };
             ui.add(egui::Label::new(RichText::new(&s.headline).color(colour).size(15.5).strong()).wrap());
-            ui.add_space(4.0);
-            for (why, xp) in &s.lines {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("+{xp}")).color(theme::GOLD_EDGE).size(13.0));
-                    ui.add(egui::Label::new(RichText::new(why).color(theme::ON_FELT_DIM).size(13.0)).wrap());
-                });
+            ui.add_space(6.0);
+            // The figures in a column of their own, right-aligned, and every
+            // reason wrapping under its own first word -- not under the figure
+            // (the owner's screenshot, 2026-09-19). A new card is one of these
+            // lines already, so it is not said a second time below them.
+            ui.spacing_mut().item_spacing.y = 3.0;
+            let figures: Vec<String> = s.lines.iter().map(|(_, xp)| format!("+{xp}")).collect();
+            let column = figures
+                .iter()
+                .map(|f| ui.painter().layout_no_wrap(f.clone(), FontId::proportional(13.0), theme::GOLD_EDGE).size().x)
+                .fold(0.0_f32, f32::max)
+                .ceil();
+            for ((why, _), figure) in s.lines.iter().zip(&figures) {
+                let new_card = why.starts_with("New card");
+                let colour = if new_card { theme::TEXT } else { theme::ON_FELT_DIM };
+                figure_and_words(ui, column, figure, RichText::new(why).color(colour).size(13.0));
             }
+            // A card earned with no experience line of its own is still said.
+            for card in s.cards.iter().filter(|c| !s.lines.iter().any(|(why, _)| why.contains(c.title))) {
+                figure_and_words(
+                    ui,
+                    column,
+                    "",
+                    RichText::new(format!("New card: {} {}", card.label(), card.title)).color(theme::TEXT).size(13.0),
+                );
+            }
+            ui.add_space(4.0);
             if let Some(level) = s.level_up {
                 ui.label(RichText::new(format!("Level {level} reached")).color(theme::GOLD_ACTION).size(14.0).strong());
-            }
-            for card in &s.cards {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("New card: {} {}", card.label(), card.title)).color(theme::TEXT).size(14.0),
-                    )
-                    .wrap(),
-                );
             }
             if !s.stars.is_empty() {
                 ui.label(RichText::new(&s.stars).color(theme::ON_FELT_DIM).size(13.0));
@@ -2645,36 +2654,108 @@ fn rewards_notice(ui: &mut egui::Ui, words: &str) -> bool {
 /// `D-068`: a card or a level earned, shown for a moment at the top of the
 /// lobby -- and only there, and only while no hand is being played: the table's
 /// window is never drawn over. Nothing to press, nothing that blinks.
-fn reveal_toast(ctx: &egui::Context, r: &super::lobby::RevealView) {
+fn reveal_toast(ctx: &egui::Context, r: &super::lobby::RevealView, from_top: f32) {
     use super::lobby::REVEAL_MS;
     let age = r.age_ms as f32;
     let alpha = (age / 300.0).min((REVEAL_MS as f32 - age) / 600.0).clamp(0.0, 1.0);
+    let picture = egui::vec2(84.0, 68.0);
+    let room = ctx.content_rect().width();
     egui::Area::new(egui::Id::new("reveal-toast"))
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 110.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, from_top))
         .order(egui::Order::Foreground)
         .interactable(false)
         .show(ctx, |ui| {
+            ui.set_opacity(alpha);
+            // **The words' width is worked out here and never left to the
+            // area.** An area remembers the size of what it showed last and
+            // hands that to the next thing it shows, and a label that wraps
+            // never asks for more: so after a short *Level 5*, a card's name
+            // was set one letter to a line in the little width that was left
+            // beside its picture (the owner's screenshot, 2026-09-19).
+            let widest = [(r.title.as_str(), 18.0), (r.text.as_str(), 14.0)]
+                .iter()
+                .map(|(words, size)| {
+                    ui.painter().layout_no_wrap((*words).to_string(), FontId::proportional(*size), theme::TEXT).size().x
+                })
+                .fold(0.0_f32, f32::max);
+            let beside = if r.card.is_some() { picture.x + 12.0 } else { 0.0 };
+            let words = (widest + 4.0).clamp(120.0, (room - beside - 90.0).clamp(160.0, 440.0)).ceil();
             egui::Frame::new()
-                .fill(theme::FELT_MID.gamma_multiply(alpha))
-                .stroke(Stroke::new(1.0, theme::GOLD_EDGE.gamma_multiply(alpha)))
+                .fill(theme::FELT_MID)
+                .stroke(Stroke::new(1.0, theme::GOLD_EDGE))
                 .corner_radius(12.0)
                 .inner_margin(egui::Margin::symmetric(16, 12))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_top(|ui| {
                         if let Some(card) = r.card {
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(84.0, 68.0), egui::Sense::hover());
-                            ui.set_opacity(alpha);
+                            let (rect, _) = ui.allocate_exact_size(picture, egui::Sense::hover());
                             super::album::picture(&ui.painter_at(rect), rect, card.art, card.suit);
+                            ui.add_space(4.0);
                         }
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(RichText::new(&r.title).color(theme::GOLD_ACTION.gamma_multiply(alpha)).size(18.0).strong());
-                            ui.label(RichText::new(&r.text).color(theme::TEXT.gamma_multiply(alpha)).size(14.0));
-                        });
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(words, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.set_min_width(words);
+                                ui.set_max_width(words);
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                // Two lines of words, level with the middle of the picture.
+                                if r.card.is_some() {
+                                    ui.add_space(((picture.y - 44.0) / 2.0).max(0.0));
+                                }
+                                ui.add(egui::Label::new(RichText::new(&r.title).color(theme::GOLD_ACTION).size(18.0).strong()).wrap());
+                                ui.add(egui::Label::new(RichText::new(&r.text).color(theme::TEXT).size(14.0)).wrap());
+                            },
+                        );
                     });
                 });
         });
     super::table::paint_again(ctx, std::time::Duration::from_millis(80));
+}
+
+/// `D-068`: a figure in a column of its own, right-aligned, and the words
+/// beside it wrapping under their own first word.
+fn figure_and_words(ui: &mut egui::Ui, column: f32, figure: &str, words: RichText) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(column, 16.0), egui::Sense::hover());
+        ui.painter().text(
+            egui::pos2(rect.right(), rect.top()),
+            egui::Align2::RIGHT_TOP,
+            figure,
+            FontId::proportional(13.0),
+            theme::GOLD_EDGE,
+        );
+        let width = ui.available_width().max(40.0);
+        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.set_max_width(width);
+            ui.add(egui::Label::new(words).wrap());
+        });
+    });
+}
+
+/// `D-068`: words that may wrap, with a short figure kept at the right of
+/// their first line; the words wrap under themselves and never under it.
+fn words_and_figure(ui: &mut egui::Ui, words: RichText, figure: &str) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let figure_w =
+            ui.painter().layout_no_wrap(figure.to_string(), FontId::proportional(12.5), theme::TEXT_DIM).size().x.ceil();
+        let width = (ui.available_width() - figure_w - 8.0).max(40.0);
+        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            ui.add(egui::Label::new(words).wrap());
+        });
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(figure_w, 16.0), egui::Sense::hover());
+        ui.painter().text(
+            egui::pos2(rect.right(), rect.top() + 1.0),
+            egui::Align2::RIGHT_TOP,
+            figure,
+            FontId::proportional(12.5),
+            theme::TEXT_DIM,
+        );
+    });
 }
 
 /// One number on the card, with its word under it.
