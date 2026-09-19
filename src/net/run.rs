@@ -6099,6 +6099,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
             _ = presence_timer.tick() => {
                 let now = super::node::now_unix_ms();
+                // `D-068`: remembered, so this client's own presence is never
+                // read as a second copy of its profile.
+                state.signed_presence(now);
                 if let Ok(bytes) = super::lobbytalk::presence(&app_key, &nickname, now) {
                     // A failure here is `NoPeersSubscribedToTopic`, which is the
                     // ordinary state of a client nobody has met yet — and, as
@@ -13000,7 +13003,13 @@ async fn handle_gossip(
             let now = super::node::now_unix_ms();
             match super::lobbytalk::receive(&message.data, peer_bytes(&from), now, &mut state.limits)
             {
-                Ok(super::lobbytalk::Heard::Here { who, nickname }) => {
+                Ok(super::lobbytalk::Heard::Here { who, nickname, emitted_at_unix_ms }) => {
+                    // `D-068`: this player's key, under a stamp this client
+                    // never signed: the profile runs somewhere else as well.
+                    if state.is_profile_elsewhere(&who, me, emitted_at_unix_ms) {
+                        let _ = events.send(NodeEvent::ProfileElsewhere).await;
+                        return gossipsub::MessageAcceptance::Accept;
+                    }
                     let _ = events.send(NodeEvent::LobbyHere { who, nickname }).await;
                     gossipsub::MessageAcceptance::Accept
                 }

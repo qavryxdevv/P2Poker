@@ -54,8 +54,10 @@ pub const SAID_MAX: usize = 256;
 /// What arrived, once it has been checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heard {
-    /// Somebody is in the lobby, under this name.
-    Here { who: [u8; 32], nickname: String },
+    /// Somebody is in the lobby, under this name. `emitted_at_unix_ms` is the
+    /// signed envelope's own stamp: a client that hears its **own** key under a
+    /// stamp it never signed is hearing a second copy of its profile (`D-068`).
+    Here { who: [u8; 32], nickname: String, emitted_at_unix_ms: u64 },
     /// Somebody said something.
     Said {
         who: [u8; 32],
@@ -260,6 +262,7 @@ pub fn receive(
         _ => Heard::Here {
             who,
             nickname: body.nickname,
+            emitted_at_unix_ms: envelope.emitted_at_unix_ms,
         },
     })
 }
@@ -283,6 +286,31 @@ mod tests {
     const NOW: u64 = 1_700_000_000_000;
 
     #[test]
+    /// `D-068`: a presence under this player's key that this client never
+    /// signed is a second copy of the profile; this client's own words, come
+    /// back round the mesh or replayed at it, are not; nor is anybody else's.
+    fn a_second_copy_of_the_profile_is_told_from_this_clients_own_words() {
+        let k = key(1);
+        let me = k.verifying_key().to_bytes();
+        let mut state = crate::net::node::NodeState::new();
+        state.signed_presence(NOW);
+        let heard = |signer: &SigningKey, at: u64| match receive(&presence(signer, "A", at).unwrap(), [9u8; 32], at, &mut RateLimiter::new()).unwrap() {
+            Heard::Here { who, emitted_at_unix_ms, .. } => (who, emitted_at_unix_ms),
+            other => panic!("{other:?}"),
+        };
+        let (who, at) = heard(&k, NOW);
+        assert!(!state.is_profile_elsewhere(&who, &me, at), "this client's own presence, replayed");
+        let (who, at) = heard(&k, NOW + 7);
+        assert!(state.is_profile_elsewhere(&who, &me, at), "the same key under a stamp never signed here");
+        let (who, at) = heard(&key(2), NOW + 7);
+        assert!(!state.is_profile_elsewhere(&who, &me, at), "another player");
+        for i in 0..40 {
+            state.signed_presence(NOW + 100 + i);
+        }
+        assert!(state.own_presence.len() <= 16, "bounded");
+    }
+
+    #[test]
     fn a_presence_round_trips() {
         let k = key(1);
         let bytes = presence(&k, "Alice", NOW).unwrap();
@@ -291,7 +319,8 @@ mod tests {
             receive(&bytes, [9u8; 32], NOW, &mut limits).unwrap(),
             Heard::Here {
                 who: k.verifying_key().to_bytes(),
-                nickname: "Alice".into()
+                nickname: "Alice".into(),
+                emitted_at_unix_ms: NOW,
             }
         );
     }

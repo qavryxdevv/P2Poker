@@ -5973,3 +5973,171 @@ never repeated (`AppState::search_found`, set from `SearchEnded`'s started slots
 search; `LobbyView::found`). Measured on the LAN: a headless seeker and the window both searching heads-up found
 each other in 46 s, the window said *2 of 2 seated · yours · ready*, then *a table is about to start*, and the
 card showed on the lobby as the table's window opened (`found_run.ps1`, photographed every two seconds).
+
+## D-068 — rewards, quests and one penalty, kept on the player's own machine
+
+**Decided 2026-09-19 by the project owner**, who asked for the thing that makes a poker community take to a client
+and stay: *a psychologically effective system of rewards and penalties, for the most motivation, popularity and
+appeal* -- fair, without a gambling trick in it, **liked and not compulsive** -- local for now, in one JSON file
+that survives a crash and is not easily edited; and, in the same afternoon, a backup of the profile that can be
+carried to another machine (always under a password), and a safeguard against one profile running on two machines
+at once.
+
+1. **The case.** A client nobody has a reason to open twice is an empty lobby, and an empty lobby is no game. What
+   brings a player back is a reason that survives a bad evening: *every finished game moves me on, even a lost one*.
+   What empties a table is a player who walks out of a running Sit & Go, and until now that cost them nothing.
+2. **Three axes, three meanings, never mixed.** *Effort* is experience and the level, which **never fall**.
+   *Performance* is the season's stars. *Conduct* is the **Table manners** meter -- not *fair play*, which in this
+   lobby means a provably fair shuffle (`D-067`). A poker player can tell luck from merit at a glance: a number that
+   mixes them reads as a slot machine on a good day and as an insult on a bad one. When each number means one thing,
+   a reward reads as earned and a penalty as fair.
+3. **Reward what the player controls.** Poker's variance is enormous, and a system that pays for results alone
+   punishes a good player for a bad night. So at least two thirds of all experience is for games played to the
+   end, hands played, quests and conduct; the result mostly moves the stars. Measured by
+   `two_thirds_of_the_experience_is_for_effort` over ninety simulated games.
+4. **Loss aversion is the strongest lever, and overdone it empties a room fastest.** A loss weighs about twice what
+   the same gain does, so only three things may ever fall: the season's stars (with floors, and never in a
+   newcomer's first two ranks), the manners meter (for a deliberate leave only), and a streak. Every fall says why
+   and how it is undone, and the way back is short: a leave costs 25 of 100 and each finished game returns 5.
+5. **The goal gradient, and a head start.** The nearest goal is always in sight with a bar
+   (`Rewards::next_goal`: the unearned card furthest along, the easier on a tie); level two comes inside the first
+   game; a returning player's record (`results.cbor`) is read in once, so they do not start from nothing.
+6. **Collecting** (the unfinished set nags, the finished one satisfies). The album is a deck of fifty-two cards in
+   the manner of the ice-hockey cards of a childhood: four suits are four sets -- ♣ *The Regular* (effort), ♦ *The
+   Hands* (what held up at a showdown), ♥ *Good Company* (staying to the end, players met), ♠ *The Results* -- the
+   two the easiest of a suit and the ace the hardest, framed bronze, silver, gold and holo. A locked card lies face
+   down with how it is earned and how far it is; the back of an earned card remembers the moment: the date, the
+   table, the place. A finished suit pays once.
+7. **Autonomy.** The week's challenge is the player's pick of three; one daily quest a day may be swapped; the card
+   shown on the lobby's card is theirs to choose; and the whole of it turns off in the settings (*Show rewards and
+   quests*), progress still counted quietly so that turning it on again loses nothing.
+8. **Peak and end.** Every game ends on something good and true: what it earned, reason by reason, what is new,
+   what is nearest. A loss is a place, named neutrally.
+9. **Surprise without gambling.** Eight jokers outside the fifty-two are found only by playing. The *Bad Beat* set
+   turns an evening's worst moment -- a full house beaten, aces cracked -- into a keepsake, as a card room's
+   bad-beat jackpot does. **No reward is ever drawn by lot**: a card is earned by a deed.
+10. **A fresh start.** Monday brings new weekly challenges and a new month a new season, begun three ranks under
+    where the last one ended. People take things up again at the turn of a calendar.
+11. **Respect.** Rest is paid, not grind: whole days away fill a pool a finished game draws on (as *rested
+    experience* does elsewhere); past eight games in a day a game's completion earns half; after three rough games
+    in a row, or two hours at the tables, the lobby says one calm sentence about a break, once a sitting. A room of
+    players on tilt falls apart.
+
+**The lines that are not crossed, whatever they would do for the numbers.**
+- **Nothing is earned more easily by playing worse.** No quest and no card is about a decision at the table -- no
+  *go all-in five times*, no *win with seven-deuce*, no *call a river* -- because that spoils the game of everybody
+  else at the table. Cards honour results. `nothing_rewards_playing_worse` reads every text of the catalogue.
+- Nothing for merely opening the client; no virtual chips as a currency (they would be mistaken for the table's and
+  pull the room towards a casino); no random packs, wheels or loot boxes.
+- No false urgency, no countdown to a streak's loss, no *come back*, and nothing after a loss that says *win it
+  back*. No invented *almost*; a true *one more game* is said.
+- **Never the network and never one hand's luck.** An outage, a disconnection, a timeout, a seat the table put out
+  (`OutForGood`) and a leave from a table that was not safe (`TableUnsafe`) cost nothing. In doubt: nothing.
+- Experience and the level never fall, and nothing here ever blocks play. The rewards decide nothing about any
+  game, are worth no money and are not for sale; no accessibility setting is ever unlocked by them.
+- Purely local: nothing of it crosses the wire, `PROTOCOL.md` is untouched, and no opponent sees any of it.
+
+**`D-067` point 3 is amended by this.** It said *no streak, no daily reward* of the lobby of 2026-09-18, against
+the cheap versions of both. The owner's word a day later brings quests and a run of days in under the lines above:
+the day's bonus is for the first **finished game** and never for a login, a day a week is forgiven without asking,
+and nothing ever counts down to a loss.
+
+**The penalty, exactly.** The player's own command (`LeftTable`, which the node sends for that and nothing else:
+every other way out is `TableLost`) at a Sit & Go that is set (`TableReal`) and has dealt a hand, before this seat
+finished. The game's experience is not granted, the run of finished games ends, the season counts it as last place
+under the same floors, and the meter falls 25. **Excused**, each by the node's own word: the table was ever
+unsafe; it had put this seat out; it was lost first; this client's own line was down; the hand stood waiting for a
+seat that was away (`StageStands`, or `HandWaiting` past twenty seconds); every other player still in the game was
+off the line (`SeatLink`, `SeatLeft`) -- the heads-up opponent gone is this case. A cash game is left at will: the
+node now says which kind a table is (`TableParams.tournament`), so the window never guesses. A seat **sitting
+out** when the game ends, with a sound line, keeps its place and its hands' experience and is paid no completion
+bonus -- otherwise walking away from the keyboard would be the free way to leave. A game the client never came
+back to is settled half a day later as nobody's fault: its hands are paid and nothing is taken.
+
+**The numbers** (one table, `app::rewards::catalog`; a starting point, to be tuned from play). A game finished 60
+and 10 for each player beyond two at the first hand -- a fuller table is worth more, which is what the search tries
+for (`D-064`); 2 a hand to 60 a game; the win 12 and a top half 4 per player; the first game of a day 50; manners
+at 90 adds 10 %, at 70 5 %; a card 30, 60, 120, 250 by rarity and a suit 500; quests 40 to 90 a day and 300 to 400
+a week. A level begins at `100(n-1) + 20(n-1)(n-2)`: quick at first, slower later; ten levels to a chip's colour --
+white, red, green, black, purple, gold. Stars: three to a rank, ten ranks named after the hands, High Card to Royal
+Flush; a win two (three at a table of six or more), a top half one, a bottom half minus one, the third top half in
+a row one more; nothing lost below Two Pair; floors at Two Pair, Straight, Full House and Straight Flush.
+**The pace, measured** by `the_pace_of_a_month` (thirty days of simulated Sit & Gos with real cards at the
+showdowns): at three games a day something new at least every second game of the first week, the first suit
+complete between the twentieth and the thirtieth day, between half and nine tenths of the deck after a month and the whole of it not for
+months; at one game a day a month still reaches level eight and fourteen cards; at eight a day the deck is still
+not done.
+
+**The file, `progress.json`** (`storage::progress`). JSON by the owner's word, where the rest of the profile is
+CBOR; `serde` and `serde_json` were in the lockfile already. The envelope is
+`{"format":1,"generation":N,"seal":"<hex>","body":{...}}`.
+- **A crash at any moment costs the last change at most.** A save is a flushed `progress.json.tmp`, `progress.json`
+  renamed to `.bak`, the temporary file renamed in. A load takes the valid copy with the highest generation of the
+  three and finishes an interrupted rename before anything else is written. A write that fails (a virus scanner
+  holding the file) is owed and tried again at the next change and at exit; the state in memory is never lost, and
+  no fault of the file ever stops a game. Tested with the save stopped at each of its steps.
+- **An edited file is noticed.** The seal is a BLAKE3 keyed hash over the format, the generation and the exact
+  bytes of the body, under `blake3::derive_key(context, the profile's secret application key)`. A value changed in
+  an editor fails it, and so does a file from another profile. Such a file is **never deleted**: it is set aside
+  as `progress.rejected-<time>.json` (three at most), the last valid copy is used -- a clean start only where there
+  is none -- and the lobby says one neutral sentence with no accusation in it, because a failing disk does this too.
+  A file of a newer format is never overwritten. The body holds whole numbers, strings, lists and ordered maps
+  only, so the same state writes the same bytes.
+- **`seal`, not `mac`.** The owner read *MAC* as the network card's address, and rightly asked what happens on
+  another machine and on a phone that shows a new address to every network it joins. **Nothing of the machine is
+  in the key**: no network address, host name, disk, path or user. The key is the profile's alone, so a profile
+  restored elsewhere reads its own file there as it did here
+  (`a_profile_moves_to_another_machine_with_its_rewards`).
+- **The threat model, honestly.** The file discourages; it does not secure. The key is in the profile and the code
+  is public: whoever reads both can compute the seal, and whoever puts back an older copy of the whole profile
+  goes back in time. That is why nothing another player can see stands on this file, and why anything published
+  later (the owner's ranking idea) must stand on something else.
+- Every game is counted once, by a keyed hash of its session and seat -- never the session itself -- and goes on
+  across a restart from what the file held. Opponents met are counted by keyed hashes, never names or keys. The
+  clock's high-water mark is kept: a clock turned back earns nothing new, and a jump forward turns the day, the
+  week and the season once each. Every list is bounded.
+
+**In the window.** The lobby's card about the player (`D-067`) gains the level as a casino chip with its bar, the
+way into the album, the meter, the season's rank and stars, today's quests and the nearest card; after a game it
+says what the game came to, once. The album is a window of its own, as a table has. **Nothing is ever drawn over a
+live hand**: a card or a level earned waits and is shown at the top of the lobby only, and only while no hand is
+being played at any of this client's tables; the table's window gets one line in its log. **Every picture is drawn
+by the painter** from chips, cards and felt, one per card, chosen for what the card is about: none is somebody
+else's image, so none needs a licence. A penalty is never red. `--album-preview` draws the album from a sample of
+progress with no node.
+
+**The profile's backup** (`storage::backup`, *Settings, Profile*). One file holding the player key, the settings,
+the record, the notes and the rewards. **Always under a password** of eight characters or more -- it holds the
+secret key, and whoever reads that sits down as this player -- stretched with Argon2id (64 MiB, three passes,
+written into the header) and sealed with ChaCha20-Poly1305 with the header as associated data; both crates were in
+`Cargo.toml` from the beginning. A wrong password and an altered file are not told apart. **The player travels and
+the machine does not**: the network identity, the Tox key, the record of an unfinished game and the lock stay
+behind, so the file is the same on any operating system and a restore never gives two machines one network
+identity. A backup names files from a fixed list and nothing in it chooses a path. **A restore is staged and takes
+the profile's place at the next start**, under the profile's lock and before a file of it is read, because the
+running client holds the old key in memory and would write its own files over the new ones as it closes; what it
+replaces is kept in `backups/replaced-<time>`. The work is done on a thread of its own, never the paint thread.
+
+**One profile, one machine at a time** (`NodeEvent::ProfileElsewhere`). The profile's lock (`S1-FV`) covers one
+directory; a backup restored elsewhere is a second directory. The network can tell, **with no change to the
+protocol**: the lobby's presence is signed by the player key and stamped, so a client that hears its own key under
+a stamp it never signed is hearing a second copy of its profile; its own words coming back round the mesh, or
+replayed at it to raise a false alarm, carry stamps it remembers signing. While that is heard -- and for the two
+and a half minutes a presence stays live after the last one -- the lobby shows a band saying so and starts no new
+game (*Find a game*, *Create table* and *Join* are refused with the reason); **a game being played is never
+touched**, as nothing closes a table but its player. It is a courtesy against a mistake and not a defence: two
+copies that cannot hear each other's lobby are not found out, and the founder of a table already refuses a second
+seat to the same key.
+
+**Measured.** Forty-seven new unit tests: the file (a changed byte, another profile's file, a cut and an empty file,
+a crash at each step of a save, a newer format, the bound on set-aside files), the engine (the newcomer's first
+game, a loss that costs nothing, the penalty and every excuse, one game counted once across a restart, the clock,
+two tables at once, the season, the quests, the pace of a month), the words, the backup and the second copy.
+On the bed, `run115712-3` (three local seats, fifty hands, one client killed outright at 150 s and started again
+at 190 s on the same profile): every profile held a sealed `progress.json` some hundred generations on; the killed
+client's game went on from the eighteen hands its file held to forty-six; the seat that went out was told *Game
+finished* with its experience and its first card; and no client read its own presence as a second copy of its
+profile. Two headless clients started on one `player.key` each said so within two minutes.
+**Owed:** the owner's play, for the numbers; and the four items the prompt listed as *could* -- an encrypted body,
+the generation mirrored in `settings.cbor` against a rolled-back file, cosmetics for levels and finished suits, and
+data shaped for a later voluntary publication -- none of which is built.

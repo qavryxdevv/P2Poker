@@ -21,7 +21,7 @@ use crate::app::rewards::catalog::{Art, Rarity, Suit};
 
 /// The album's card, in points, before the window's zoom.
 pub const CARD: egui::Vec2 = vec2(150.0, 214.0);
-pub const MIN_WINDOW: egui::Vec2 = vec2(520.0, 420.0);
+pub const ALBUM_MIN_WINDOW: egui::Vec2 = vec2(520.0, 420.0);
 
 const fn rgb(v: u32) -> Color32 {
     Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)

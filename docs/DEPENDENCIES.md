@@ -791,6 +791,7 @@ fuzzed; none of them has been fuzzed by us.
 | `idna` | 1.1.0 | IDNA in URL parsing | `github.com/servo/rust-url` | MIT OR Apache-2.0 | no open advisory; RUSTSEC-2024-0421 patched `>= 1.0.0` |
 | `url` | 2.5.8 | URL parsing for UPnP control endpoints | `github.com/servo/rust-url` | MIT OR Apache-2.0 | no open advisory |
 | `serde` | 1.0.229 | derive-based decoding across the tree | `github.com/serde-rs/serde` | MIT OR Apache-2.0 | no open advisory. **Not used for our signed envelope** — that is `minicbor`, because `serde` does not guarantee a canonical encoding |
+| `serde_json` | 1.0.151 | `D-068`: the player's own `progress.json` (with `raw_value`, for the exact bytes its seal is computed over), and the Tox node list | `github.com/serde-rs/json` | MIT OR Apache-2.0 | no open advisory. Local files and one fetched document only; **nothing signed or sent is JSON** |
 | `bytes` | 1.12.1 | buffer type carrying all decoded frames | `github.com/tokio-rs/bytes` | MIT | no open advisory |
 
 ### 5.8 Discovery — Mainline DHT. **Removed from the build; kept as a record (0)**

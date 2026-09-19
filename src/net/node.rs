@@ -548,6 +548,13 @@ pub enum NodeEvent {
         seconds: Option<u64>,
         adequate: bool,
     },
+    /// `D-068`: this player's key signed a presence in the lobby that this
+    /// client did not send: the same profile is running somewhere else, from a
+    /// backup restored on a second machine. One profile is one player; the
+    /// window says so and starts no new game until it stops. Nothing of the
+    /// protocol changes: the presence is the one §4 always had, and a replay of
+    /// this client's own is told apart by the stamps it remembers signing.
+    ProfileElsewhere,
     /// `D-002` point 3 (`S1-FK`): what this client's own relay carries now --
     /// how many poker clients hold a reservation on it, and how many circuits
     /// cross it. Sent when either changes.
@@ -691,6 +698,9 @@ impl NodeEvent {
             | Self::Seated { .. }
             | Self::Roster { .. }
             | Self::RosterKeys { .. }
+            // `D-068`: the lobby puts a band up at once: a second copy of the
+            // profile is worth a frame.
+            | Self::ProfileElsewhere
             | Self::TableReal { .. }
             | Self::HandBegan { .. }
             | Self::SittingOut { .. }
@@ -831,6 +841,9 @@ pub struct NodeState {
     public: bool,
     /// `D-064`: the clients searching for a game, as the queue topic says.
     pub queue: crate::net::matchmaker::Queue,
+    /// `D-068`: the stamps of the presences this client signed lately, so that
+    /// its own words coming back round the mesh are not read as a second copy.
+    pub own_presence: std::collections::VecDeque<u64>,
 }
 
 impl Default for NodeState {
@@ -848,7 +861,23 @@ impl NodeState {
             heard: (0, std::time::Instant::now()),
             public: false,
             queue: crate::net::matchmaker::Queue::new(),
+            own_presence: std::collections::VecDeque::new(),
         }
+    }
+
+    /// `D-068`: remember a presence this client signed; sixteen are plenty for
+    /// the two minutes a presence stays live.
+    pub fn signed_presence(&mut self, emitted_at_unix_ms: u64) {
+        self.own_presence.push_back(emitted_at_unix_ms);
+        while self.own_presence.len() > 16 {
+            self.own_presence.pop_front();
+        }
+    }
+
+    /// `D-068`: whether a verified presence is a **second copy of this
+    /// profile**: this player's key, under a stamp this client never signed.
+    pub fn is_profile_elsewhere(&self, who: &[u8; 32], me: &[u8; 32], emitted_at_unix_ms: u64) -> bool {
+        who == me && !self.own_presence.contains(&emitted_at_unix_ms)
     }
 
     pub fn set_public(&mut self, public: bool) {

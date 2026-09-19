@@ -261,6 +261,28 @@ fn main() {
             p2p_poker::storage::profile::ProfileLock::none()
         }
     };
+    // `D-068`: a profile restored from a backup takes its place here, under the
+    // lock and before a single file of the profile is read. What it replaces is
+    // kept in the backups folder.
+    match p2p_poker::storage::backup::apply_pending(&dir, p2p_poker::net::node::now_unix_ms()) {
+        Ok(true) => println!("a profile restored from a backup was put in place"),
+        Ok(false) => {}
+        // A restore half made is a profile without its player key, and a client
+        // started on that would make a new player of it. The staging is whole
+        // until the last step, so stopping here loses nothing: the next start
+        // finishes what this one could not.
+        Err(e) => {
+            let words = format!(
+                "The profile restored from a backup could not be put in place:\n\n{e}\n\nNothing is lost. Close any \
+                 program that has the profile folder open and start P2Poker again."
+            );
+            eprintln!("{words}");
+            if !has("--headless") {
+                tell_the_player("P2Poker could not finish the restore", &words);
+            }
+            std::process::exit(4);
+        }
+    }
     let identity = match p2p_poker::storage::profile::load_or_create_identity(&dir) {
         Ok(k) => k,
         Err(e) => {
@@ -1354,6 +1376,9 @@ fn windowed(player: Player, run: Run) -> Started {
                 album_ui: Default::default(),
                 reveals: Default::default(),
                 reveal_since: None,
+                backup_done: std::sync::mpsc::channel(),
+                backup_opened: None,
+                backups_listed: None,
                 profile_dir,
                 app_key,
                 commands,
@@ -1797,7 +1822,7 @@ fn preview_album(args: &[String]) {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([860.0, 720.0])
-            .with_min_inner_size(album::MIN_WINDOW)
+            .with_min_inner_size(album::ALBUM_MIN_WINDOW)
             .with_title("p2p-poker \u{2014} album preview")
             .with_icon(window_icon()),
         renderer: eframe::Renderer::Glow,
@@ -1889,6 +1914,12 @@ struct Client {
     /// being played -- and since when the first of them has been showing.
     reveals: std::collections::VecDeque<p2p_poker::gui::lobby::RevealView>,
     reveal_since: Option<std::time::Instant>,
+    /// `D-068`: what the backup worker has finished, the backup a check opened
+    /// (a restore stages exactly what was looked at), and when the folder was
+    /// last read.
+    backup_done: (std::sync::mpsc::Sender<BackupDone>, std::sync::mpsc::Receiver<BackupDone>),
+    backup_opened: Option<p2p_poker::storage::backup::Contents>,
+    backups_listed: Option<std::time::Instant>,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
     commands: tokio::sync::mpsc::Sender<NodeCommand>,
     bounded: Option<u64>,
@@ -2048,6 +2079,97 @@ impl Client {
         Some(p2p_poker::gui::lobby::RevealView { age_ms, ..first })
     }
 
+    /// `D-068`: a backup is a second of key stretching and a file: made on a
+    /// thread of its own, never on the paint thread, which is woken when it is
+    /// done.
+    fn make_backup(&mut self, ctx: &eframe::egui::Context, password: String) {
+        let (dir, tx, ctx) = (self.profile_dir.clone(), self.backup_done.0.clone(), ctx.clone());
+        self.ui.backup.busy = true;
+        self.ui.backup.error = None;
+        self.ui.backup.made = None;
+        // What the rewards still owe the disk goes first, so the backup holds it.
+        self.rewards.rewards.changed = true;
+        let _ = self.rewards.flush();
+        std::thread::spawn(move || {
+            let password = zeroize::Zeroizing::new(password);
+            let now = p2p_poker::app::rewards::Now::system();
+            let made = p2p_poker::storage::backup::create(&dir, &password, now.unix_ms, now.offset_min)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BackupDone::Made(made));
+            ctx.request_repaint();
+        });
+    }
+
+    fn check_backup(&mut self, ctx: &eframe::egui::Context, path: String, password: String) {
+        let (tx, ctx) = (self.backup_done.0.clone(), ctx.clone());
+        self.ui.backup.busy = true;
+        self.ui.backup.error = None;
+        std::thread::spawn(move || {
+            let password = zeroize::Zeroizing::new(password);
+            let opened = p2p_poker::storage::backup::read(std::path::Path::new(&path), &password).map_err(|e| e.to_string());
+            let _ = tx.send(BackupDone::Checked(opened));
+            ctx.request_repaint();
+        });
+    }
+
+    /// `D-068`: what the worker finished, told to the settings' page; and the
+    /// folder's backups, read every few seconds while that page is open.
+    fn backup_answers(&mut self) {
+        use zeroize::Zeroize;
+        while let Ok(done) = self.backup_done.1.try_recv() {
+            let b = &mut self.ui.backup;
+            b.busy = false;
+            match done {
+                BackupDone::Made(Ok(path)) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    b.made = Some(format!("Saved as {name} in the backups folder. Keep the password: nothing opens it without."));
+                    b.password.zeroize();
+                    b.repeat.zeroize();
+                    self.backups_listed = None;
+                }
+                BackupDone::Checked(Ok(contents)) => {
+                    let when = p2p_poker::app::rewards::date_words(contents.created_unix_ms, p2p_poker::app::rewards::local_offset_min());
+                    let who = contents.player().unwrap_or_default();
+                    let holds: Vec<&str> = contents
+                        .names()
+                        .into_iter()
+                        .map(|n| match n {
+                            "player.key" => "player key",
+                            "settings.cbor" => "settings",
+                            "results.cbor" => "record",
+                            "notes.cbor" => "notes",
+                            "progress.json" => "rewards",
+                            other => other,
+                        })
+                        .collect();
+                    b.checked = Some(format!("Backup of player {who}, made {when}. Holds: {}.", holds.join(", ")));
+                    b.restore_password.zeroize();
+                    self.backup_opened = Some(contents);
+                }
+                BackupDone::Made(Err(e)) | BackupDone::Checked(Err(e)) => b.error = Some(e),
+            }
+        }
+        let on_page = matches!(self.ui.dialog, Some(render::Dialog::Settings(_)))
+            && self.ui.settings_tab == render::SettingsTab::Profile;
+        if on_page && self.backups_listed.is_none_or(|at| at.elapsed() >= Duration::from_secs(3)) {
+            self.backups_listed = Some(std::time::Instant::now());
+            self.ui.backup.found = p2p_poker::storage::backup::list(&self.profile_dir)
+                .into_iter()
+                .map(|p| (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p.display().to_string()))
+                .collect();
+        }
+    }
+
+    /// `D-068`: no new game from a profile that is running somewhere else as
+    /// well; said in the client log, beside the band the lobby shows.
+    fn refused_elsewhere(&mut self) -> bool {
+        if !self.state.profile_is_elsewhere() {
+            return false;
+        }
+        self.state.log.push_back("not started: this profile is also running on another device".into());
+        true
+    }
+
     /// `D-068`: the album, in its own window, as a table has one.
     fn album_window(&mut self, ctx: &eframe::egui::Context) {
         use eframe::egui::{ViewportBuilder, ViewportId};
@@ -2061,7 +2183,7 @@ impl Client {
                 .with_title("p2p-poker \u{2014} album")
                 .with_icon(window_icon())
                 .with_inner_size([860.0, 720.0])
-                .with_min_inner_size(p2p_poker::gui::album::MIN_WINDOW),
+                .with_min_inner_size(p2p_poker::gui::album::ALBUM_MIN_WINDOW),
             |ctx, _class| {
                 eframe::egui::CentralPanel::default().frame(eframe::egui::Frame::NONE).show(ctx, |ui| {
                     action = p2p_poker::gui::album::draw(ui, &view, &mut ui_state);
@@ -2341,6 +2463,12 @@ impl Client {
     }
 }
 
+/// `D-068`: what the backup worker sends back to the window.
+enum BackupDone {
+    Made(Result<std::path::PathBuf, String>),
+    Checked(Result<p2p_poker::storage::backup::Contents, String>),
+}
+
 /// `D-068`: whatever the rewards still owe the disk is written as the client
 /// goes -- a save that failed earlier gets its last chance here.
 impl Drop for Client {
@@ -2376,6 +2504,7 @@ impl eframe::App for Client {
 
         // `D-068`: what the rewards earned from those words.
         self.reward_notices();
+        self.backup_answers();
 
         // `S1-CS`: a join nobody answers is called failed on the clock.
         self.state.tick_join();
@@ -2479,6 +2608,10 @@ impl eframe::App for Client {
                     // `D-043`: turn to another of this client's tables -- the
                     // window's state and the node's active slot together.
                     render::LobbyAction::Focus(slot) => self.turn_to(slot),
+                    // `D-068`: one profile is one player -- no new game while it
+                    // runs on another device as well.
+                    render::LobbyAction::Create(_) | render::LobbyAction::Sit { .. } | render::LobbyAction::StartSearch(_)
+                        if self.refused_elsewhere() => {}
                     render::LobbyAction::Create(t) => self.tell(NodeCommand::CreateTable {
                         kind: t.kind,
                         name: t.name,
@@ -2567,6 +2700,22 @@ impl eframe::App for Client {
                         if let Some(cmd) = self.state.cancel_search() {
                             self.tell(cmd);
                         }
+                    }
+                    render::LobbyAction::MakeBackup(password) => self.make_backup(&ctx, password),
+                    render::LobbyAction::CheckBackup { path, password } => self.check_backup(&ctx, path, password),
+                    render::LobbyAction::StageRestore => {
+                        if let Some(contents) = self.backup_opened.take() {
+                            match p2p_poker::storage::backup::stage_restore(&self.profile_dir, &contents) {
+                                Ok(()) => self.ui.backup.staged = true,
+                                Err(e) => self.ui.backup.error = Some(format!("The restore could not be prepared: {e}")),
+                            }
+                        }
+                    }
+                    render::LobbyAction::ShowBackups => {
+                        let folder = p2p_poker::storage::backup::backups_dir(&self.profile_dir);
+                        let _ = std::fs::create_dir_all(&folder);
+                        #[cfg(windows)]
+                        let _ = std::process::Command::new("explorer").arg(&folder).spawn();
                     }
                     render::LobbyAction::OpenAlbum => self.album_open = true,
                     render::LobbyAction::RewardsSeen => self.rewards.rewards.mark_summary_seen(),

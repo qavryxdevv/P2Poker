@@ -110,6 +110,36 @@ pub enum LobbyAction {
     RewardsSeen,
     /// `D-068`: the sentence about the rewards file has been read.
     RewardsNoticeSeen,
+    /// `D-068`: make a backup of the profile under this password.
+    MakeBackup(String),
+    /// `D-068`: open this backup with this password and say what it holds.
+    CheckBackup { path: String, password: String },
+    /// `D-068`: put the backup just opened in the profile's place at the next start.
+    StageRestore,
+    /// `D-068`: show the folder the backups are in.
+    ShowBackups,
+}
+
+/// `D-068`: the settings' Profile page: what is being typed, and what the
+/// client answered. The work itself -- a second of key stretching, and a file
+/// -- is never done on the paint thread: the page asks, and is told.
+#[derive(Debug, Clone, Default)]
+pub struct BackupUi {
+    pub password: String,
+    pub repeat: String,
+    /// A backup or a check is being made.
+    pub busy: bool,
+    /// The last backup made, as words.
+    pub made: Option<String>,
+    pub error: Option<String>,
+    /// The backups in the profile's folder, newest first: `(name, path)`.
+    pub found: Vec<(String, String)>,
+    pub restore_path: String,
+    pub restore_password: String,
+    /// What the backup just opened holds, in words.
+    pub checked: Option<String>,
+    /// A restore is staged: it takes the profile's place at the next start.
+    pub staged: bool,
 }
 
 /// What the create dialog collects.
@@ -218,6 +248,8 @@ pub struct LobbyUi {
     pub settings: Settings,
     /// The settings dialog's page, kept while the client runs.
     pub settings_tab: SettingsTab,
+    /// `D-068`: the settings' Profile page.
+    pub backup: BackupUi,
     /// `D-067`: how the list is ordered.
     pub sort: Sort,
     /// `D-067`: the format the big button searches for, opened on what the
@@ -242,10 +274,13 @@ pub enum SettingsTab {
     Sound,
     Table,
     Network,
+    /// `D-068`: the profile's backup and restore.
+    Profile,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 4] = [SettingsTab::General, SettingsTab::Sound, SettingsTab::Table, SettingsTab::Network];
+    pub const ALL: [SettingsTab; 5] =
+        [SettingsTab::General, SettingsTab::Sound, SettingsTab::Table, SettingsTab::Network, SettingsTab::Profile];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -253,6 +288,7 @@ impl SettingsTab {
             SettingsTab::Sound => "Sound",
             SettingsTab::Table => "Table",
             SettingsTab::Network => "Network",
+            SettingsTab::Profile => "Profile",
         }
     }
 }
@@ -277,6 +313,7 @@ impl LobbyUi {
             side_open: false,
             settings,
             settings_tab: SettingsTab::default(),
+            backup: BackupUi::default(),
         }
     }
 }
@@ -495,6 +532,10 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
         });
     if state.fair_open {
         fair_window(ui.ctx(), state);
+    }
+    // `D-068`: the profile is running on another device as well.
+    if view.profile_elsewhere {
+        egui::Panel::top("profile-elsewhere").frame(egui::Frame::NONE).show(ui, profile_elsewhere_band);
     }
 
     egui::Panel::bottom("network")
@@ -977,6 +1018,140 @@ fn found_toast(ctx: &egui::Context, f: &super::lobby::FoundView) {
     super::table::paint_again(ctx, std::time::Duration::from_millis(80));
 }
 
+/// `D-068`: the settings' Profile page -- a backup of the profile under a
+/// password, and a profile restored from one. Both only ask: the work is the
+/// client's, off the paint thread.
+fn profile_page(ui: &mut egui::Ui, b: &mut BackupUi) -> Option<LobbyAction> {
+    use crate::storage::backup::PASSWORD_MIN;
+    let mut action = None;
+    let dim = |text: &str| RichText::new(text).color(theme::TEXT_DIM).size(14.0);
+    ui.label(RichText::new("Back up this profile").color(theme::TEXT).size(16.0).strong());
+    ui.add(
+        egui::Label::new(dim(
+            "One file with your player key, settings, record, notes and rewards. Carry it to another \
+             computer and restore it there: nothing in it belongs to this machine.",
+        ))
+        .wrap(),
+    );
+    ui.add_space(6.0);
+    field_row(ui, "Password", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut b.password).password(true));
+    });
+    field_row(ui, "Again", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut b.repeat).password(true));
+    });
+    let long_enough = b.password.chars().count() >= PASSWORD_MIN;
+    let same = b.password == b.repeat;
+    let hint = if !long_enough {
+        format!("A backup is always under a password of at least {PASSWORD_MIN} characters.")
+    } else if !same {
+        "The two passwords differ.".to_string()
+    } else {
+        "A forgotten password is a lost backup: nothing opens it without.".to_string()
+    };
+    ui.add(egui::Label::new(dim(&hint)).wrap());
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui.add_enabled(long_enough && same && !b.busy, egui::Button::new("Create backup")).clicked() {
+            action = Some(LobbyAction::MakeBackup(b.password.clone()));
+        }
+        if ui.button("Show backups folder").clicked() {
+            action = Some(LobbyAction::ShowBackups);
+        }
+    });
+    if let Some(made) = b.made.as_ref() {
+        ui.add(egui::Label::new(RichText::new(made).color(theme::OK).size(14.0)).wrap());
+    }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(RichText::new("Restore a profile from a backup").color(theme::TEXT).size(16.0).strong());
+    ui.add(
+        egui::Label::new(dim(
+            "Pick a backup from the folder, type its path, or drop the file on this window. It replaces this \
+             profile's player key, settings, record, notes and rewards at the next start; what it replaces is \
+             kept in the backups folder. Use a profile on one device at a time.",
+        ))
+        .wrap(),
+    );
+    ui.add_space(6.0);
+    // A backup file dropped on the window fills the path in.
+    let dropped = ui.ctx().input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
+    if let Some(path) = dropped {
+        b.restore_path = path.display().to_string();
+        b.checked = None;
+    }
+    if !b.found.is_empty() {
+        egui::ComboBox::from_id_salt("backups-found")
+            .selected_text(
+                b.found.iter().find(|(_, p)| *p == b.restore_path).map_or("Backups in the folder\u{2026}", |(n, _)| n.as_str()),
+            )
+            .width(ui.available_width().min(380.0))
+            .show_ui(ui, |ui| {
+                for (name, path) in &b.found {
+                    if ui.selectable_label(*path == b.restore_path, name).clicked() {
+                        b.restore_path = path.clone();
+                        b.checked = None;
+                    }
+                }
+            });
+    }
+    field_row(ui, "File", |ui| {
+        if ui.add(egui::TextEdit::singleline(&mut b.restore_path)).changed() {
+            b.checked = None;
+        }
+    });
+    field_row(ui, "Password", |ui| {
+        if ui.add(egui::TextEdit::singleline(&mut b.restore_password).password(true)).changed() {
+            b.checked = None;
+        }
+    });
+    ui.add_space(4.0);
+    if b.staged {
+        ui.add(
+            egui::Label::new(
+                RichText::new("Ready. Close p2p-poker and start it again: the restored profile takes its place then.")
+                    .color(theme::OK)
+                    .size(14.0),
+            )
+            .wrap(),
+        );
+    } else if let Some(words) = b.checked.as_ref() {
+        ui.add(egui::Label::new(RichText::new(words).color(theme::TEXT).size(14.0)).wrap());
+        if ui.add_enabled(!b.busy, egui::Button::new("Restore at the next start")).clicked() {
+            action = Some(LobbyAction::StageRestore);
+        }
+    } else {
+        let ready = !b.restore_path.trim().is_empty() && !b.restore_password.is_empty() && !b.busy;
+        if ui.add_enabled(ready, egui::Button::new("Open backup")).clicked() {
+            action = Some(LobbyAction::CheckBackup { path: b.restore_path.trim().to_string(), password: b.restore_password.clone() });
+        }
+    }
+    if b.busy {
+        ui.label(dim("Working\u{2026}"));
+    }
+    if let Some(e) = b.error.as_ref() {
+        ui.add(egui::Label::new(RichText::new(e).color(theme::WARN).size(14.0)).wrap());
+    }
+    action
+}
+
+/// `D-068`: the notice that this profile runs somewhere else as well -- a band
+/// under the header, not a window over the lobby: the games it shows go on.
+fn profile_elsewhere_band(ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(theme::FIELD)
+        .stroke(Stroke::new(1.0, theme::WARN))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .outer_margin(egui::Margin { left: 5, right: 5, top: 4, bottom: 0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(super::lobby::PROFILE_ELSEWHERE).color(theme::WARN).size(14.5)).wrap());
+        });
+}
+
 /// The create and sit-down dialogs, which are the only two places this client
 /// asks a player for anything.
 /// `D-002`: what relaying costs the player, in the terms `NETWORK_STACK.md` §9.6
@@ -1337,6 +1512,11 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                                 }
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(relay_terms()).color(theme::TEXT_DIM).size(14.0));
+                            }
+                            SettingsTab::Profile => {
+                                if let Some(a) = profile_page(ui, &mut state.backup) {
+                                    action = Some(a);
+                                }
                             }
                         });
 
@@ -2332,6 +2512,19 @@ fn you_rewards(ui: &mut egui::Ui, r: &super::rewards::YouRewards) -> bool {
     let open = ui
         .add(egui::Button::new(RichText::new(label).size(14.0)).min_size(egui::vec2(ui.available_width(), 30.0)))
         .clicked();
+    // The card the player chose to show, as its picture and its name.
+    if let Some(card) = r.showcase {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(74.0, 60.0), egui::Sense::hover());
+            album::picture(&ui.painter_at(rect), rect, card.art, card.suit);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new("On show").color(theme::TEXT_DIM).size(12.5));
+                ui.add(egui::Label::new(RichText::new(format!("{} {}", card.label(), card.title)).color(theme::TEXT).size(14.0)).wrap());
+            });
+        });
+    }
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(format!("Table manners {}", r.manners)).color(album::meter_colour(r.manners)).size(13.5));

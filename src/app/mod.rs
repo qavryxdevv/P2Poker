@@ -560,6 +560,8 @@ pub struct AppState {
     /// `D-067`: the places this player finished in since the window last
     /// wrote them to the profile's record (`storage::results`).
     pub results_owed: Vec<crate::storage::results::Entry>,
+    /// `D-068`: when this profile was last heard running somewhere else.
+    pub profile_elsewhere: Option<std::time::Instant>,
     /// `D-067`: the search found a game -- the table's name and when -- for
     /// the lobby's word about it, shown for a moment and then not again.
     pub search_found: Option<(String, std::time::Instant)>,
@@ -1133,6 +1135,16 @@ impl AppState {
             }
             NodeEvent::Relaying { reserved, circuits } => {
                 self.status.relaying = (reserved, circuits);
+            }
+            // `D-068`: the same profile on a second machine, said once a spell.
+            NodeEvent::ProfileElsewhere => {
+                if !self.profile_is_elsewhere() {
+                    self.note(
+                        "this profile is also running on another device: one profile is one player, close one of the two"
+                            .to_string(),
+                    );
+                }
+                self.profile_elsewhere = Some(std::time::Instant::now());
             }
             NodeEvent::NoRelayFound { cycles } => {
                 self.note(format!(
@@ -3513,8 +3525,17 @@ impl AppState {
     }
 
     /// The snapshot the panes read.
+    /// `D-068`: whether this profile was heard running elsewhere within the
+    /// time a presence stays live, and a little over: it is said on the
+    /// heartbeat, so silence for that long is the other copy closed.
+    pub fn profile_is_elsewhere(&self) -> bool {
+        let live = std::time::Duration::from_millis(crate::protocol::constants::PRESENCE_TTL_MS + 30_000);
+        self.profile_elsewhere.is_some_and(|at| at.elapsed() < live)
+    }
+
     pub fn view(&self) -> LobbyView {
         let mut v = LobbyView::from(&self.lobby, self.status.clone());
+        v.profile_elsewhere = self.profile_is_elsewhere();
         v.selected = self.selected;
         v.log = self.log.iter().cloned().collect();
         v.me = self.me.clone();

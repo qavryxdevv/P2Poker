@@ -722,7 +722,15 @@ pub struct LobbyView {
     /// `D-068`: a card or a level to show for a moment -- only while no hand
     /// is being played at any of this client's tables.
     pub reveal: Option<RevealView>,
+    /// `D-068`: this profile is running on another device as well. No new game
+    /// is started from here until it is not; a game under way is never touched.
+    pub profile_elsewhere: bool,
 }
+
+/// `D-068`: what the lobby says while the profile runs in two places.
+pub const PROFILE_ELSEWHERE: &str = "This profile is also running on another device. One profile is one player: \
+     close p2p-poker on one of the two. Until then no new game is started from here; a game you are \
+     playing goes on.";
 
 /// `D-068`: what the lobby shows for a moment when something was earned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -914,6 +922,7 @@ impl LobbyView {
             rewards: None,
             rewards_notice: None,
             reveal: None,
+            profile_elsewhere: false,
         }
     }
 
