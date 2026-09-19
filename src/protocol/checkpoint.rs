@@ -512,6 +512,16 @@ pub enum PrefixOutcome {
 ///
 /// `table_closed` selects between them, and it is the only difference: the guard
 /// is one predicate, read by these two rows and by nothing else.
+///
+/// **Specified, tested, and called by nothing -- by decision** (`S1-CH`, the
+/// project owner, 2026-09-19; `PROTOCOL.md` `Q-10`). The client runs the
+/// checkpoint-8 route of the solitary-stage rule (`StateHashOutcome::Diverged`
+/// into §6.3's freeze) and no path raises a `SolitaryDivergence`: T63 is the one
+/// transition that opens a closed table again, the two wins a bidirectional
+/// partition leaves behind are play money, and what a client keeps about a
+/// finished game has no road back from a win. This, `SolitaryFloor`,
+/// `RetainedHands` and `HandRecord` stay as the trigger's tested half, to be
+/// wired when a tournament win first means something outside its table.
 pub fn on_solitary_divergence(
     floor: &SolitaryFloor,
     current_hand: u64,

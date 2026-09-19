@@ -1692,7 +1692,11 @@ The eighth pass, against `DECISIONS.md` **K-9**, **L7** and **D-014**, takes the
   or the rule loses a race it cannot afford: the contradicting event arrives after a solitary hand
   has closed, forty of those hands close in about five minutes (§12.1.2), and a peer that reached
   `TableClosed` first would reject the only evidence that its "tournament won" was one half of a
-  fork.
+  fork. **Specified and not run, by the project owner's decision of 2026-09-19** (`DECISIONS.md`
+  `S1-CH`, `PROTOCOL.md` `Q-10`): the client runs the checkpoint route of the solitary-stage rule and
+  no path of it raises a `SolitaryDivergence`, so neither row fires today. The rows stay as the
+  specification of the trigger, to be wired when a tournament win first means something outside the
+  table it was won at.
 * **T64, T65 and T66 are added (D-014).** A removal for cause voids the hand and takes the offender
   out of every set at once. Three rows, because the disposition differs by what is live: a hand
   (T64, which voids it), a boundary (T65, which does not), and **the setup chain (T66, which
