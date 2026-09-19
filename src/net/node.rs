@@ -223,6 +223,11 @@ pub enum NodeEvent {
         /// the advert's `action_timeout_ms`; the grace and the time bank run
         /// on beyond it.
         action_ms: u64,
+        /// `D-068`: a Sit & Go, as against a cash game -- the advert's mode.
+        /// A tournament is played to an end and a cash game is left whenever
+        /// its player likes, and what the window keeps about a game finished
+        /// or left must not have to guess which this is.
+        tournament: bool,
     },
     /// This client has a seat at a table being formed.
     Seated { key: [u8; 32], seat: u8 },

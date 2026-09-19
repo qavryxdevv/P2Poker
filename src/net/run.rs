@@ -12466,6 +12466,7 @@ async fn report_params(events: &Events, f: &Formation) {
             small_blind: ad.small_blind,
             big_blind: ad.big_blind,
             action_ms: u64::from(ad.action_timeout_ms),
+            tournament: ad.mode == super::lobby::Mode::TournamentSngPlayMoney.code(),
         })
         .await;
 }

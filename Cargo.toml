@@ -77,6 +77,10 @@ getrandom = { version = "0.4.3",  default-features = false, features = ["std", "
 zeroize   = { version = "1.9.0",  default-features = false, features = ["alloc", "derive"] }
 subtle    = { version = "2.6.1",  default-features = false }
 minicbor  = { version = "2.3.0",  default-features = false, features = ["std", "derive"] }
+# `D-068`: the derive for `progress.json`'s body. Already in the tree through
+# libp2p's `serde` feature, so this adds the edge and nothing to the lockfile.
+# **Never for a signed envelope** -- that is `minicbor`, whose encoding is canonical.
+serde     = { version = "1", features = ["derive"] }
 argon2           = { version = "0.6.0",  default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 
@@ -103,7 +107,7 @@ netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Media", "Win32_Media_Audio", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Media", "Win32_Media_Audio", "Win32_UI_WindowsAndMessaging", "Win32_System_Time"] }
 # The second renderer, and the reason the client starts on a machine with no
 # graphics driver. Only the Direct3D 12 backend is compiled: it is the one that
 # can reach WARP, the software rasteriser every Windows 10 already carries.
@@ -202,7 +206,7 @@ cc = "1"
 # fetches the vendored C at pinned commits and builds libsodium.
 [features]
 default = ["tox"]
-tox = ["dep:attohttpc", "dep:serde_json"]
+tox = ["dep:attohttpc"]
 
 # **A way to make faults happen on purpose, so that the code which answers them
 # can be measured rather than reasoned about.**
@@ -253,6 +257,10 @@ default-features = false
 # before that target is taken seriously.
 features = ["tls-native", "compress"]
 
+# `D-068`: no longer optional. `progress.json` is JSON by the owner's word, read
+# and written in every build, so the crate that was here for one document under
+# `tox` is a plain dependency now. `raw_value` keeps the exact bytes of the
+# file's body, which is what its keyed hash is computed over.
 [dependencies.serde_json]
 version = "1"
-optional = true
+features = ["raw_value"]

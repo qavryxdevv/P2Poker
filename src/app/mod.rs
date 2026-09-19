@@ -22,6 +22,8 @@ use crate::gui::lobby::{LobbyView, NetworkStatus, RelayStatus};
 use crate::net::lobby::LobbyStore;
 use crate::net::node::{NodeCommand, NodeEvent};
 
+/// `D-068`: rewards, quests and the one penalty, folded from the node's words.
+pub mod rewards;
 /// `S1-CS`: the table window's view, derived here so it can be tested.
 mod table;
 mod tablelog;
@@ -2067,6 +2069,7 @@ impl AppState {
                 small_blind,
                 big_blind,
                 action_ms,
+                tournament: _,
             } => {
                 let t = self.table(key);
                 t.name = name;
@@ -4754,6 +4757,7 @@ mod tests {
             small_blind: 50,
             big_blind: 100,
             action_ms: 30_000,
+            tournament: true,
         };
         let mut s = AppState::new();
         s.apply(NodeEvent::Seated { key, seat: 0 });
@@ -5370,6 +5374,7 @@ mod tests {
             small_blind: 50,
             big_blind: 100,
             action_ms: 30_000,
+            tournament: true,
         });
         s.clock_for(Some(1), 0);
         s.tick_opponent();
@@ -5409,7 +5414,7 @@ mod tests {
         s.apply(NodeEvent::Seated { key, seat: 0 });
         s.apply(NodeEvent::Roster { key, seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key, session: [9u8; 32] });
-        s.apply(NodeEvent::TableParams { key, name: "t".into(), seats: 2, needed: 2, small_blind: 50, big_blind: 100, action_ms: 30_000 });
+        s.apply(NodeEvent::TableParams { key, name: "t".into(), seats: 2, needed: 2, small_blind: 50, big_blind: 100, action_ms: 30_000, tournament: true });
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         s.apply(NodeEvent::HandBegan { hand_id: 7, button: 0, dealt_in: vec![0, 1], small_blind: 50, big_blind: 100 });
         s.apply(NodeEvent::NotYourTurn { hand_id: 7, seat: Some(1), elapsed_ms: 5_000 });

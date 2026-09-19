@@ -494,6 +494,7 @@ mod tests {
             small_blind: 50,
             big_blind: 100,
             action_ms: 30_000,
+            tournament: true,
         });
         s.apply(NodeEvent::TableReal { key: KEY, session: [9u8; 32] });
         s
