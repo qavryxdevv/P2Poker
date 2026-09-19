@@ -1,0 +1,352 @@
+# 0040 - a group's relays stay awake, and a peer the first handshake attempt does not
+#        reach is looked for on this client's own relays as well.
+#
+# S1-AA, re-opened 2026-09-19 by its own census: patch 0029 booked its falsifier -- "a reap
+# with attempts 8-10, last packet 30 s ago ... would mean the target's relay path is the
+# whole story and the timeout was never the lever" -- and that evening it came, in two of
+# six runs of the 8+1 rig. runs/split201156-9, read to the line:
+#
+#   * The far seat (relay-only) shook hands with the founder at 13.8 s, and its sync over
+#     relays was slow that evening: it read "group 0 seen" at 32 s and the founder on the
+#     group's line only at 42.5 s, so the eight seats here were told of it between 38 and
+#     84 s, not at 15 to 20 s as on a good evening.
+#   * By then every seat here had put its relays to sleep (27 to 38 s): their peers were
+#     all direct, and a relay sleeps when every connection that locks it is asleep. That
+#     is a messenger's economy. In a group it closes the one door a relay-only member can
+#     knock at: a member is announced by ONE relay of its own (GCA_MAX_ANNOUNCED_TCP_RELAYS
+#     is 1 and that is the wire's), the request goes there out of band, and a relay
+#     delivers out of band only to a client that is CONNECTED to it.
+#   * And the other direction hangs on one relay too, drawn at random by whoever answers
+#     the sync (create_sync_announce). One seat could not connect to the relay it was
+#     given for the far seat -- ten seconds, slot killed -- and all ten attempts of the
+#     entry's thirty seconds read "no TCP relay carried it either: 0 online, 0 registered",
+#     while both ends held half a dozen healthy relays of the same short public list.
+#   * Four of the eight never shook hands with the far seat in 120 s; five reaped it. The
+#     founder gave the far seat's place away (D-060: it could not hear two seats for 20 s),
+#     and the table was played by eight. Where the far seat was known BEFORE the relays
+#     slept -- most runs -- nothing was reaped.
+#
+# The change, local, nothing on the wire:
+#   (a) TCP_connection.c: an instance can be told its relays stay awake
+#       (p2p_poker_tcp_relays_stay_awake), and do_tcp_conns puts none of them to sleep;
+#       group_chats.c says so for every group's own instance (init_gc_tcp_connection).
+#       The main instance, net_crypto's, is untouched.
+#   (b) group_chats.c, send_gc_handshake_packet: a peer that has not shaken hands by the
+#       second attempt is registered on up to four of this client's own connected relays
+#       (p2p_poker_register_on_own_relays; two of a connection's six slots stay free for
+#       the relays the peer shares once confirmed). Once per entry, and said at DEBUG.
+#       Both ends run it, so a relay they share carries the request out of band at once
+#       and reads ONLINE as soon as both have asked.
+#
+# THE PREDICTION IS BOOKED BEFORE THE RUN, plain 8+1 runs read with
+# tools/read-join-phase.py:
+#   1. no seat reaps the far seat's entry in the join phase, and the far seat reaps nobody;
+#   2. every seat here that is told of the far seat shakes hands with it within fifteen
+#      seconds of being told, whenever that is;
+#   3. the far seat is never given back for not hearing the table (D-060's MESH_GRACE).
+# THE FALSIFIER: a reap of "attempts 10" on an entry for which (b)'s line was printed with
+# one or more relays added. That would mean the two ends share no relay, or that a
+# request a relay carries out of band is lost further on -- and that neither sleeping
+# relays nor the single announced relay is the lever.
+#
+# THE RUNS (2026-09-19, the 8+1 rig, read with tools/read-far-seat-join.py).
+#
+# A plain run (runs/split211403-9) held, and so did one with the far seat started sixty
+# seconds late (-FarDelay 60, runs/split212307-9) -- and so did the SAME late start WITHOUT
+# this patch (runs/split213510-9): seats whose relays had slept seven to nine times shook
+# hands with the late far seat in two to five seconds. **So a late arrival onto sleeping
+# relays is not, by itself, the failure, and the first reading above claimed more than it
+# had.** What the bad evening run had besides was a relay that could not be connected to.
+#
+# That is reproduced on demand by a knob this patch adds under P2P_POKER_FAULT_HARNESS:
+# P2P_POKER_DEAD_ANNOUNCED_RELAY=1 makes the one relay a relay-only member is announced
+# by an address nothing routes under a key no relay holds. A second, P2P_POKER_NO_0040=1,
+# switches this patch off, so that a control and its treatment are ONE binary
+# (tools/table-run-split.ps1 -DeadAnnouncedRelay, -NoPatch0040, -FarDelay). Both ends
+# blind, back to back:
+#
+#   without 0040 (runs/split214815-9)        with 0040 (runs/split215607-9)
+#   the far seat played 0 hands              24 hands opened by nine seats
+#   2 of 7 seats never in contact with it    every seat in contact 10.8 to 12.0 s after
+#   4 more only after 15 to 40 s               being told (widened at +2.6 to 2.9 s, by 3
+#   4 to 20 attempts carried by nothing        own relays each), 2 attempts by nothing
+#   4 seats reaped it (6 reaps), the far 2   no reap at either end
+#   2 seats given back (D-060)               nobody given back
+#
+# which is the shape of runs/split201156-9 to the line. The booked prediction held in all
+# three runs with the patch and failed in the control it was built to fail in. What the
+# two runs do NOT separate is (a) from (b): with both announced relays dead the road
+# found is a relay the two ends share, which needs (b) at one end and an awake relay at
+# the other. And what no run here shows is that the natural failure was this and nothing
+# else: one seat of that run matched the knob's state exactly, three others' attempts left
+# by a relay and were never answered. S1-AA stays owed a census of plain evening runs.
+#
+# Vendored tree patched in place. Re-apply on a toxcore bump with
+#   git apply patches/0040-*.patch
+# and check tools/build-tox.ps1's markers for 0040 in TCP_connection.c and group_chats.c.
+diff --git a/vendor/c-toxcore/toxcore/TCP_connection.c b/vendor/c-toxcore/toxcore/TCP_connection.c
+index 84df5f3..2515d0c 100644
+--- a/vendor/c-toxcore/toxcore/TCP_connection.c
++++ b/vendor/c-toxcore/toxcore/TCP_connection.c
+@@ -58,6 +58,9 @@ struct TCP_Connections {
+     bool onion_status;
+     uint16_t onion_num_conns;
+ 
++    /* p2p-poker (patch 0040): a group's instance keeps its relays awake. */
++    bool p2p_poker_relays_stay_awake;
++
+     /* Network profile for all TCP client packets. */
+     Net_Profile *_Nullable net_profile;
+ };
+@@ -1625,6 +1628,53 @@ int add_tcp_number_relay_connection(const TCP_Connections *tcp_c, int connection
+     return 0;
+ }
+ 
++void p2p_poker_tcp_relays_stay_awake(TCP_Connections *tcp_c)
++{
++    tcp_c->p2p_poker_relays_stay_awake = true;
++}
++
++/* p2p-poker (patch 0040): a peer that one named relay does not reach is also looked
++ * for on the relays this client is connected to already.
++ *
++ * Both ends draw their relays from the same short public list, so they usually
++ * share one and do not know which. A routing request costs one small packet a
++ * relay; where the peer is connected the relay carries an out-of-band packet to it
++ * at once, and says ONLINE as soon as the peer asks for this client too -- which it
++ * does, running the same code. */
++uint32_t p2p_poker_register_on_own_relays(const TCP_Connections *tcp_c, int connections_number, uint32_t leave_free)
++{
++    const TCP_Connection_to *con_to = get_connection(tcp_c, connections_number);
++
++    if (con_to == nullptr) {
++        return 0;
++    }
++
++    uint32_t used = 0;
++
++    for (uint32_t i = 0; i < MAX_FRIEND_TCP_CONNECTIONS; ++i) {
++        if (con_to->connections[i].tcp_connection != 0) {
++            ++used;
++        }
++    }
++
++    uint32_t added = 0;
++
++    for (uint32_t i = 0; i < tcp_c->tcp_connections_length && used + leave_free < MAX_FRIEND_TCP_CONNECTIONS; ++i) {
++        const TCP_con *tcp_con = get_tcp_connection(tcp_c, i);
++
++        if (tcp_con == nullptr || tcp_con->status != TCP_CONN_CONNECTED) {
++            continue;
++        }
++
++        if (add_tcp_number_relay_connection(tcp_c, connections_number, i) == 0) {
++            ++used;
++            ++added;
++        }
++    }
++
++    return added;
++}
++
+ /** @brief Add a TCP relay tied to a connection.
+  *
+  * This should be called with the same relay by two peers who want to create a TCP connection with each other.
+@@ -1909,8 +1959,32 @@ static void do_tcp_conns(const Logger *_Nonnull logger, TCP_Connections *_Nonnul
+                 tcp_relay_on_online(tcp_c, i);
+             }
+ 
++            /* p2p-poker (patch 0040): and never in a group's own instance.
++             *
++             * A relay goes to sleep when every connection that locks it is asleep,
++             * and a connection is asleep while its peer is direct. That is a
++             * messenger's economy: two friends who reach each other directly need
++             * no relay between them. A group is not two friends. A member that can
++             * be reached through relays alone is told of every other member by ONE
++             * relay of that member's (the announce has room for one), and sends its
++             * handshake request there out of band -- which the relay delivers only
++             * to a client that is CONNECTED to it. A seat whose peers were all
++             * direct had put every relay it has to sleep, that one included, some
++             * thirty seconds after joining: its address in the group was a closed
++             * door, and it stayed closed until something else woke the relay.
++             *
++             * Measured, runs/split201156-9 (2026-09-19, eight seats on one machine,
++             * the ninth far and relay-only): every local seat slept its relays
++             * between 27 and 38 s; the far seat, whose sync with the founder was
++             * slow that evening, was made known to them between 38 and 84 s; four
++             * of the eight never shook hands with it in 120 s and five reaped its
++             * entry (attempts 10, last packet 30 s ago -- the falsifier patch 0029
++             * booked for itself). In the runs where the far seat was known BEFORE
++             * the relays slept, nothing was reaped. The cost of staying awake is
++             * the handful of idle relay connections a table has anyway. */
+             /* p2p-poker (patch 0027): and it carries no awake peer's out-of-band path. */
+             if (tcp_con->status == TCP_CONN_CONNECTED
++                    && !tcp_c->p2p_poker_relays_stay_awake
+                     && !tcp_con->onion && tcp_con->lock_count > 0
+                     && tcp_con->lock_count == tcp_con->sleep_count
+                     && !p2p_poker_relay_carries_awake_oob(tcp_c, i)
+diff --git a/vendor/c-toxcore/toxcore/TCP_connection.h b/vendor/c-toxcore/toxcore/TCP_connection.h
+index 492eba4..e5f392a 100644
+--- a/vendor/c-toxcore/toxcore/TCP_connection.h
++++ b/vendor/c-toxcore/toxcore/TCP_connection.h
+@@ -230,6 +230,21 @@ uint32_t tcp_connection_to_online_tcp_relays(const TCP_Connections *_Nonnull tcp
+  */
+ int add_tcp_number_relay_connection(const TCP_Connections *_Nonnull tcp_c, int connections_number, unsigned int tcp_connections_number);
+ 
++/** p2p-poker (patch 0040): the relays of this instance are never put to sleep.
++ *
++ * For a group's own instance. See `do_tcp_conns` for what a sleeping relay cost a
++ * member that can be reached through relays alone.
++ */
++void p2p_poker_tcp_relays_stay_awake(TCP_Connections *_Nonnull tcp_c);
++
++/** p2p-poker (patch 0040): register a connection on this client's own connected relays,
++ * leaving `leave_free` of its slots for the relays the peer names itself.
++ *
++ * return how many relays the connection was added to.
++ */
++uint32_t p2p_poker_register_on_own_relays(const TCP_Connections *_Nonnull tcp_c, int connections_number,
++        uint32_t leave_free);
++
+ /** @brief Add a TCP relay tied to a connection.
+  *
+  * This should be called with the same relay by two peers who want to create a TCP connection with each other.
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 8b629ed..bae3c35 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -1675,6 +1675,9 @@ static bool send_gc_sync_response(const GC_Chat *_Nonnull chat, GC_Connection *_
+ 
+ static bool send_gc_peer_exchange(const GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn);
+ static bool send_gc_handshake_packet(const GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn, uint8_t handshake_type, uint8_t request_type, uint8_t join_type);
++#ifdef P2P_POKER_FAULT_HARNESS
++static bool p2p_poker_patch_0040_is_off(void);  /* p2p-poker (patch 0040, the fault harness): see its definition */
++#endif /* P2P_POKER_FAULT_HARNESS */
+ static bool send_gc_oob_handshake_request(const GC_Chat *_Nonnull chat, const GC_Connection *_Nonnull gconn);
+ 
+ /** @brief Unpacks a sync announce.
+@@ -1739,6 +1742,34 @@ static bool unpack_gc_sync_announce(GC_Chat *_Nonnull chat, const uint8_t *_Nonn
+             if (chat->tcp_conn == nullptr) {
+                 return false;
+             }
++#ifdef P2P_POKER_FAULT_HARNESS
++            /* p2p-poker (patch 0040, the fault harness): P2P_POKER_DEAD_ANNOUNCED_RELAY=1
++             * makes the ONE relay a relay-only member is announced by a relay this
++             * client cannot connect to -- an address nothing routes (192.0.2.1,
++             * TEST-NET-1) under a key no relay holds, so that the relay is not found
++             * among the ones this client already has. It is S1-AA's join-phase
++             * failure on demand: in runs/split201156-9 a seat's slot for the far
++             * seat's relay sat at "connecting" for ten seconds, was killed, and all
++             * ten attempts of the entry's thirty seconds were carried by nothing.
++             * A member with an address of its own is left alone. */
++            if (!announce.ip_port_is_set) {
++                static int dead = -1;
++
++                if (dead < 0) {
++                    const char *v = getenv("P2P_POKER_DEAD_ANNOUNCED_RELAY");
++                    dead = (v != nullptr && v[0] == '1') ? 1 : 0;
++                }
++
++                if (dead == 1) {
++                    ip_reset(&announce.tcp_relays[i].ip_port.ip);
++                    announce.tcp_relays[i].ip_port.ip.family = net_family_ipv4();
++                    announce.tcp_relays[i].ip_port.ip.ip.v4.uint32 = net_htonl(0xC0000201u);
++                    announce.tcp_relays[i].public_key[0] ^= 0xffu;
++                    announce.tcp_relays[i].public_key[1] ^= 0xffu;
++                    LOGGER_DEBUG(chat->log, "p2p-poker: fault-harness: the relay a relay-only member was announced by is made one this client cannot connect to");
++                }
++            }
++#endif /* P2P_POKER_FAULT_HARNESS */
+             const int add_tcp_result = add_tcp_relay_connection(chat->tcp_conn, new_gconn->tcp_connection_num,
+                                        &announce.tcp_relays[i].ip_port,
+                                        announce.tcp_relays[i].public_key);
+@@ -5717,6 +5748,35 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn,
+     const bool try_tcp_fallback = gconn->handshake_attempts % 2 == 1 && gconn->tcp_relays_count > 0;
+     ++gconn->handshake_attempts;
+ 
++    /* p2p-poker (patch 0040): a peer the first attempt did not reach is looked for on
++     * this client's own relays as well.
++     *
++     * A member learned from a sync is known by its address, if it has one, and by
++     * ONE of its relays, drawn at random by whoever answered the sync
++     * (create_sync_announce; GCA_MAX_ANNOUNCED_TCP_RELAYS is 1 and that is the
++     * wire's). For a relay-only member that one relay is the whole road: if this
++     * client cannot connect to it -- ten seconds, then the slot is killed -- every
++     * attempt of the thirty seconds an unconfirmed entry lives is carried by
++     * nothing, and the entry is reaped. Measured, runs/split201156-9: a seat's ten
++     * attempts toward the far seat all read "no TCP relay carried it either", 0
++     * online, 0 registered, while both held half a dozen healthy relays of the same
++     * public list.
++     *
++     * Once, at the second attempt: a first attempt that finds its peer has shaken
++     * hands within the three seconds between the two, as every pair on one network
++     * does, and costs nothing. Two slots of the six are left for the relays the
++     * peer shares itself once it is confirmed. Local; nothing on the wire changes. */
++    if (!gconn->handshaked && !gconn->p2p_poker_widened && gconn->handshake_attempts >= 2
++#ifdef P2P_POKER_FAULT_HARNESS
++            && !p2p_poker_patch_0040_is_off()
++#endif /* P2P_POKER_FAULT_HARNESS */
++       ) {
++        gconn->p2p_poker_widened = true;
++        const uint32_t added = p2p_poker_register_on_own_relays(chat->tcp_conn, gconn->tcp_connection_num, 2);
++        LOGGER_DEBUG(chat->log, "p2p-poker: peer %u did not answer the first handshake attempt; looked for on %u of this client's own relays beside the %u it was announced by",
++                     gconn->public_key_hash, added, gconn->tcp_relays_count);
++    }
++
+     int ret = -1;
+ 
+     if (!try_tcp_fallback && gcc_direct_conn_is_possible(chat, gconn)) {
+@@ -8111,6 +8171,24 @@ static void add_tcp_relays_to_chat(const GC_Session *c, GC_Chat *chat)
+     mem_delete(chat->mem, tcp_relays);
+ }
+ 
++#ifdef P2P_POKER_FAULT_HARNESS
++/* p2p-poker (patch 0040, the fault harness): P2P_POKER_NO_0040=1 runs this build
++ * WITHOUT patch 0040 -- relays sleep as upstream's do and no peer is looked for on
++ * this client's own relays -- so that a control and its treatment are one binary
++ * and differ in nothing else. */
++static bool p2p_poker_patch_0040_is_off(void)
++{
++    static int off = -1;
++
++    if (off < 0) {
++        const char *v = getenv("P2P_POKER_NO_0040");
++        off = (v != nullptr && v[0] == '1') ? 1 : 0;
++    }
++
++    return off == 1;
++}
++#endif /* P2P_POKER_FAULT_HARNESS */
++
+ static bool init_gc_tcp_connection(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat)
+ {
+     const Messenger *m = c->messenger;
+@@ -8124,6 +8202,16 @@ static bool init_gc_tcp_connection(const GC_Session *_Nonnull c, GC_Chat *_Nonnu
+ 
+     chat->tcp_conn = tcp_conn;
+ 
++    /* p2p-poker (patch 0040): a group's relays stay awake. The relay a member is
++     * announced by is the only door a relay-only member can knock at, and a
++     * sleeping relay is a closed one. See do_tcp_conns. */
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (!p2p_poker_patch_0040_is_off())
++#endif /* P2P_POKER_FAULT_HARNESS */
++    {
++        p2p_poker_tcp_relays_stay_awake(chat->tcp_conn);
++    }
++
+     add_tcp_relays_to_chat(c, chat);
+ 
+     set_packet_tcp_connection_callback(chat->tcp_conn, &handle_gc_tcp_packet, c->messenger);
+diff --git a/vendor/c-toxcore/toxcore/group_common.h b/vendor/c-toxcore/toxcore/group_common.h
+index c5b314b..ff289cf 100644
+--- a/vendor/c-toxcore/toxcore/group_common.h
++++ b/vendor/c-toxcore/toxcore/group_common.h
+@@ -140,6 +140,7 @@ typedef struct GC_Connection {
+ 
+     bool        confirmed;  /* true if this peer has given us their info */
+     bool        handshaked;  /* true if we've successfully handshaked with this peer */
++    bool        p2p_poker_widened;  /* p2p-poker (patch 0040): this peer has been looked for on this client's own relays */
+     uint16_t    handshake_attempts;
+     uint64_t    last_handshake_request;
+     uint64_t    last_handshake_response;

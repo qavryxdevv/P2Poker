@@ -1675,6 +1675,9 @@ static bool send_gc_sync_response(const GC_Chat *_Nonnull chat, GC_Connection *_
 
 static bool send_gc_peer_exchange(const GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn);
 static bool send_gc_handshake_packet(const GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn, uint8_t handshake_type, uint8_t request_type, uint8_t join_type);
+#ifdef P2P_POKER_FAULT_HARNESS
+static bool p2p_poker_patch_0040_is_off(void);  /* p2p-poker (patch 0040, the fault harness): see its definition */
+#endif /* P2P_POKER_FAULT_HARNESS */
 static bool send_gc_oob_handshake_request(const GC_Chat *_Nonnull chat, const GC_Connection *_Nonnull gconn);
 
 /** @brief Unpacks a sync announce.
@@ -1739,6 +1742,34 @@ static bool unpack_gc_sync_announce(GC_Chat *_Nonnull chat, const uint8_t *_Nonn
             if (chat->tcp_conn == nullptr) {
                 return false;
             }
+#ifdef P2P_POKER_FAULT_HARNESS
+            /* p2p-poker (patch 0040, the fault harness): P2P_POKER_DEAD_ANNOUNCED_RELAY=1
+             * makes the ONE relay a relay-only member is announced by a relay this
+             * client cannot connect to -- an address nothing routes (192.0.2.1,
+             * TEST-NET-1) under a key no relay holds, so that the relay is not found
+             * among the ones this client already has. It is S1-AA's join-phase
+             * failure on demand: in runs/split201156-9 a seat's slot for the far
+             * seat's relay sat at "connecting" for ten seconds, was killed, and all
+             * ten attempts of the entry's thirty seconds were carried by nothing.
+             * A member with an address of its own is left alone. */
+            if (!announce.ip_port_is_set) {
+                static int dead = -1;
+
+                if (dead < 0) {
+                    const char *v = getenv("P2P_POKER_DEAD_ANNOUNCED_RELAY");
+                    dead = (v != nullptr && v[0] == '1') ? 1 : 0;
+                }
+
+                if (dead == 1) {
+                    ip_reset(&announce.tcp_relays[i].ip_port.ip);
+                    announce.tcp_relays[i].ip_port.ip.family = net_family_ipv4();
+                    announce.tcp_relays[i].ip_port.ip.ip.v4.uint32 = net_htonl(0xC0000201u);
+                    announce.tcp_relays[i].public_key[0] ^= 0xffu;
+                    announce.tcp_relays[i].public_key[1] ^= 0xffu;
+                    LOGGER_DEBUG(chat->log, "p2p-poker: fault-harness: the relay a relay-only member was announced by is made one this client cannot connect to");
+                }
+            }
+#endif /* P2P_POKER_FAULT_HARNESS */
             const int add_tcp_result = add_tcp_relay_connection(chat->tcp_conn, new_gconn->tcp_connection_num,
                                        &announce.tcp_relays[i].ip_port,
                                        announce.tcp_relays[i].public_key);
@@ -5717,6 +5748,35 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn, 
     const bool try_tcp_fallback = gconn->handshake_attempts % 2 == 1 && gconn->tcp_relays_count > 0;
     ++gconn->handshake_attempts;
 
+    /* p2p-poker (patch 0040): a peer the first attempt did not reach is looked for on
+     * this client's own relays as well.
+     *
+     * A member learned from a sync is known by its address, if it has one, and by
+     * ONE of its relays, drawn at random by whoever answered the sync
+     * (create_sync_announce; GCA_MAX_ANNOUNCED_TCP_RELAYS is 1 and that is the
+     * wire's). For a relay-only member that one relay is the whole road: if this
+     * client cannot connect to it -- ten seconds, then the slot is killed -- every
+     * attempt of the thirty seconds an unconfirmed entry lives is carried by
+     * nothing, and the entry is reaped. Measured, runs/split201156-9: a seat's ten
+     * attempts toward the far seat all read "no TCP relay carried it either", 0
+     * online, 0 registered, while both held half a dozen healthy relays of the same
+     * public list.
+     *
+     * Once, at the second attempt: a first attempt that finds its peer has shaken
+     * hands within the three seconds between the two, as every pair on one network
+     * does, and costs nothing. Two slots of the six are left for the relays the
+     * peer shares itself once it is confirmed. Local; nothing on the wire changes. */
+    if (!gconn->handshaked && !gconn->p2p_poker_widened && gconn->handshake_attempts >= 2
+#ifdef P2P_POKER_FAULT_HARNESS
+            && !p2p_poker_patch_0040_is_off()
+#endif /* P2P_POKER_FAULT_HARNESS */
+       ) {
+        gconn->p2p_poker_widened = true;
+        const uint32_t added = p2p_poker_register_on_own_relays(chat->tcp_conn, gconn->tcp_connection_num, 2);
+        LOGGER_DEBUG(chat->log, "p2p-poker: peer %u did not answer the first handshake attempt; looked for on %u of this client's own relays beside the %u it was announced by",
+                     gconn->public_key_hash, added, gconn->tcp_relays_count);
+    }
+
     int ret = -1;
 
     if (!try_tcp_fallback && gcc_direct_conn_is_possible(chat, gconn)) {
@@ -8111,6 +8171,24 @@ static void add_tcp_relays_to_chat(const GC_Session *c, GC_Chat *chat)
     mem_delete(chat->mem, tcp_relays);
 }
 
+#ifdef P2P_POKER_FAULT_HARNESS
+/* p2p-poker (patch 0040, the fault harness): P2P_POKER_NO_0040=1 runs this build
+ * WITHOUT patch 0040 -- relays sleep as upstream's do and no peer is looked for on
+ * this client's own relays -- so that a control and its treatment are one binary
+ * and differ in nothing else. */
+static bool p2p_poker_patch_0040_is_off(void)
+{
+    static int off = -1;
+
+    if (off < 0) {
+        const char *v = getenv("P2P_POKER_NO_0040");
+        off = (v != nullptr && v[0] == '1') ? 1 : 0;
+    }
+
+    return off == 1;
+}
+#endif /* P2P_POKER_FAULT_HARNESS */
+
 static bool init_gc_tcp_connection(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat)
 {
     const Messenger *m = c->messenger;
@@ -8123,6 +8201,16 @@ static bool init_gc_tcp_connection(const GC_Session *_Nonnull c, GC_Chat *_Nonnu
     }
 
     chat->tcp_conn = tcp_conn;
+
+    /* p2p-poker (patch 0040): a group's relays stay awake. The relay a member is
+     * announced by is the only door a relay-only member can knock at, and a
+     * sleeping relay is a closed one. See do_tcp_conns. */
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (!p2p_poker_patch_0040_is_off())
+#endif /* P2P_POKER_FAULT_HARNESS */
+    {
+        p2p_poker_tcp_relays_stay_awake(chat->tcp_conn);
+    }
 
     add_tcp_relays_to_chat(c, chat);
 

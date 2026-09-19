@@ -36,6 +36,7 @@ OVERTAKEN = "arrived in order while a copy of it waited in the ring"
 CLEARED = re.compile(r"a leftover in the receive ring is cleared, not replayed: slot (\d+) held message (\d+) while (\d+) is awaited")
 CLOCK = re.compile(r"^my clock has run out on seat (\d+)")
 OPENS = re.compile(r"^hand #(\d+) opens")
+END_OF_RUN_S = 8
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -56,6 +57,7 @@ def fold(path):
     incidents = collections.defaultdict(list)
     opens = []
     laps = []
+    last = 0.0
     for name in logs:
         hand = None
         for raw in io.open(name, encoding="utf-8", errors="replace").read().splitlines():
@@ -63,6 +65,7 @@ def fold(path):
             if not m:
                 continue
             t, x = float(m.group(2)), m.group(3).strip()
+            last = max(last, t)
             if x.startswith("toxcore"):
                 toxlines += 1
                 w = WRAP.search(x)
@@ -101,12 +104,19 @@ def fold(path):
             print("   OVERTAKEN and CLEARED: no such line -- a build from before patch 0039, or a run in which the race was never run")
     print("   hands opened at the founder %d; between two openings median %s s, longest %s s" % (
         len(opens), "%.1f" % statistics.median(gaps) if gaps else "-", "%.1f" % max(gaps) if gaps else "-"))
-    if incidents:
-        for (hand, seat), ts in sorted(incidents.items(), key=lambda kv: min(kv[1])):
-            print("   STALLED: hand #%s waited on seat %d -- %d seat(s) ran out of clock on it, %.0f to %.0f s" % (
-                hand, seat, len(ts), min(ts), max(ts)))
-    else:
-        print("   no clock ran out: no hand stalled on a seat")
+    # A harness stops its seats a few seconds apart, so the last hand of a run can see a clock run out
+    # on a seat that has simply been stopped. That is the run ending, not a hand stalling
+    # (`split215607-9`: one clock, on the founder, at the run's last second).
+    stalled = {k: ts for k, ts in incidents.items() if min(ts) < last - END_OF_RUN_S}
+    ended = {k: ts for k, ts in incidents.items() if k not in stalled}
+    for (hand, seat), ts in sorted(stalled.items(), key=lambda kv: min(kv[1])):
+        print("   STALLED: hand #%s waited on seat %d -- %d seat(s) ran out of clock on it, %.0f to %.0f s" % (
+            hand, seat, len(ts), min(ts), max(ts)))
+    for (hand, seat), ts in sorted(ended.items(), key=lambda kv: min(kv[1])):
+        print("   the run's end, not a stall: hand #%s, %d clock(s) on seat %d in the last %d s of the logs" % (
+            hand, len(ts), seat, END_OF_RUN_S))
+    if not stalled:
+        print("   no hand stalled on a seat")
 
 
 def main():

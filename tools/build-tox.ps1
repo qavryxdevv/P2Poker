@@ -268,6 +268,15 @@ $patched = @(
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'p2p-poker (patch 0039): a leftover in the receive ring is cleared, never replayed.'
        Why    = '0039: S1-II. The receive ring''s drain took whatever sat in the awaited message''s slot for the awaited message, so an entry left behind a lap of the ring earlier -- a copy stored out of order and then overtaken by its own retransmission -- was replayed, acknowledged under its old id and counted as the awaited message, and the real one was dropped as a duplicate: a lossless stream lost one message to one receiver, and a hand stalled on a seat that lacked what every other seat had. The sender''s half is upstream''s own line, Wrap-around on message N with N from the first lap' }
+    @{ File   = 'toxcore/TCP_connection.c'
+       Marker = 'p2p-poker (patch 0040): and never in a group''s own instance.'
+       Why    = '0040a: S1-AA. A relay sleeps when every connection that locks it is asleep, which is a messenger''s economy; in a group the relay a member is announced by is the only door a relay-only member can knock at, and an out-of-band request is delivered only to a client CONNECTED to the relay. A group''s own TCP instance keeps its relays awake; net_crypto''s is untouched' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0040): a peer the first attempt did not reach is looked for on'
+       Why    = '0040b: S1-AA. A member learned from a sync is known by ONE relay, drawn at random by whoever answered (the announce has room for one, and that is the wire''s); a seat that cannot connect to it had no road to that member for the thirty seconds its entry lives, reaped it, and the founder gave the seat away (runs/split201156-9; on demand, runs/split214815-9). A peer that has not shaken hands by the second attempt is registered on up to four of this client''s own connected relays' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0040, the fault harness): P2P_POKER_DEAD_ANNOUNCED_RELAY=1'
+       Why    = '0040c: S1-AA''s instrument. The knob that makes the one announced relay of a relay-only member unreachable, and P2P_POKER_NO_0040, which switches the patch off so a control and its treatment are one binary (tools/table-run-split.ps1 -DeadAnnouncedRelay, -NoPatch0040). Entirely inside #ifdef P2P_POKER_FAULT_HARNESS' }
 )
 
 Step 'checking the patches are in the vendored source'

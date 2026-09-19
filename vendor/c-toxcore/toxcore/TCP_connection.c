@@ -58,6 +58,9 @@ struct TCP_Connections {
     bool onion_status;
     uint16_t onion_num_conns;
 
+    /* p2p-poker (patch 0040): a group's instance keeps its relays awake. */
+    bool p2p_poker_relays_stay_awake;
+
     /* Network profile for all TCP client packets. */
     Net_Profile *_Nullable net_profile;
 };
@@ -1625,6 +1628,53 @@ int add_tcp_number_relay_connection(const TCP_Connections *tcp_c, int connection
     return 0;
 }
 
+void p2p_poker_tcp_relays_stay_awake(TCP_Connections *tcp_c)
+{
+    tcp_c->p2p_poker_relays_stay_awake = true;
+}
+
+/* p2p-poker (patch 0040): a peer that one named relay does not reach is also looked
+ * for on the relays this client is connected to already.
+ *
+ * Both ends draw their relays from the same short public list, so they usually
+ * share one and do not know which. A routing request costs one small packet a
+ * relay; where the peer is connected the relay carries an out-of-band packet to it
+ * at once, and says ONLINE as soon as the peer asks for this client too -- which it
+ * does, running the same code. */
+uint32_t p2p_poker_register_on_own_relays(const TCP_Connections *tcp_c, int connections_number, uint32_t leave_free)
+{
+    const TCP_Connection_to *con_to = get_connection(tcp_c, connections_number);
+
+    if (con_to == nullptr) {
+        return 0;
+    }
+
+    uint32_t used = 0;
+
+    for (uint32_t i = 0; i < MAX_FRIEND_TCP_CONNECTIONS; ++i) {
+        if (con_to->connections[i].tcp_connection != 0) {
+            ++used;
+        }
+    }
+
+    uint32_t added = 0;
+
+    for (uint32_t i = 0; i < tcp_c->tcp_connections_length && used + leave_free < MAX_FRIEND_TCP_CONNECTIONS; ++i) {
+        const TCP_con *tcp_con = get_tcp_connection(tcp_c, i);
+
+        if (tcp_con == nullptr || tcp_con->status != TCP_CONN_CONNECTED) {
+            continue;
+        }
+
+        if (add_tcp_number_relay_connection(tcp_c, connections_number, i) == 0) {
+            ++used;
+            ++added;
+        }
+    }
+
+    return added;
+}
+
 /** @brief Add a TCP relay tied to a connection.
  *
  * This should be called with the same relay by two peers who want to create a TCP connection with each other.
@@ -1909,8 +1959,32 @@ static void do_tcp_conns(const Logger *_Nonnull logger, TCP_Connections *_Nonnul
                 tcp_relay_on_online(tcp_c, i);
             }
 
+            /* p2p-poker (patch 0040): and never in a group's own instance.
+             *
+             * A relay goes to sleep when every connection that locks it is asleep,
+             * and a connection is asleep while its peer is direct. That is a
+             * messenger's economy: two friends who reach each other directly need
+             * no relay between them. A group is not two friends. A member that can
+             * be reached through relays alone is told of every other member by ONE
+             * relay of that member's (the announce has room for one), and sends its
+             * handshake request there out of band -- which the relay delivers only
+             * to a client that is CONNECTED to it. A seat whose peers were all
+             * direct had put every relay it has to sleep, that one included, some
+             * thirty seconds after joining: its address in the group was a closed
+             * door, and it stayed closed until something else woke the relay.
+             *
+             * Measured, runs/split201156-9 (2026-09-19, eight seats on one machine,
+             * the ninth far and relay-only): every local seat slept its relays
+             * between 27 and 38 s; the far seat, whose sync with the founder was
+             * slow that evening, was made known to them between 38 and 84 s; four
+             * of the eight never shook hands with it in 120 s and five reaped its
+             * entry (attempts 10, last packet 30 s ago -- the falsifier patch 0029
+             * booked for itself). In the runs where the far seat was known BEFORE
+             * the relays slept, nothing was reaped. The cost of staying awake is
+             * the handful of idle relay connections a table has anyway. */
             /* p2p-poker (patch 0027): and it carries no awake peer's out-of-band path. */
             if (tcp_con->status == TCP_CONN_CONNECTED
+                    && !tcp_c->p2p_poker_relays_stay_awake
                     && !tcp_con->onion && tcp_con->lock_count > 0
                     && tcp_con->lock_count == tcp_con->sleep_count
                     && !p2p_poker_relay_carries_awake_oob(tcp_c, i)

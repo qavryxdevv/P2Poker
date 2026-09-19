@@ -3263,6 +3263,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             ends.retain(|at| at.elapsed() < FLAP_WINDOW);
                             ends.push(now_i);
                         }
+                        // `S1-AA`: and the seat's clocks end with the seat. They are kept on
+                        // this founder's tick -- dropped for whoever the roster no longer holds,
+                        // started for whoever it holds now -- so a seat given back and taken
+                        // again INSIDE one tick was never seen to have left and kept the moment
+                        // it first sat down. Measured, `split201156-9`: the far seat given back
+                        // at 69.0 s, seated again 1.1 s later, judged as settled from its first
+                        // second back -- no `GROUP_JOIN_GRACE`, `MESH_GRACE` alone, twenty seconds
+                        // to come into a group whose word had just removed its key for good --
+                        // given back again at 91.0 s and then refused for sitting down too often.
+                        // The table was played by eight.
+                        forget_the_seating(&mut $t.sat_down_ms, &mut $t.seat_since, leaving_key.as_ref(), seat);
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "seat {seat} {why} and the seat is free again"
@@ -13166,6 +13177,23 @@ const LEFT_WORD_GROUP_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// hearing it, lasts before the founder gives the seat back.
 const MESH_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// `S1-AA`: a seat given back takes its clocks with it -- when its player sat down
+/// (`sat_down_ms`, by key) and since when the seat has been on the roster
+/// (`seat_since`, by number) -- so that whoever sits there next, the same player
+/// included, is given `GROUP_JOIN_GRACE` from the moment of sitting down and not
+/// from a sitting that has ended. See `release_the_seat!` for what it cost.
+fn forget_the_seating(
+    sat_down_ms: &mut std::collections::HashMap<[u8; 32], u64>,
+    seat_since: &mut std::collections::HashMap<u8, tokio::time::Instant>,
+    key: Option<&[u8; 32]>,
+    seat: u8,
+) {
+    if let Some(k) = key {
+        sat_down_ms.remove(k);
+    }
+    seat_since.remove(&seat);
+}
+
 /// `D-060`: how long a seat that hears every seat may go without saying it is
 /// ready, once every seat hears every seat.
 const READY_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
@@ -17324,6 +17352,38 @@ mod tests {
         assert!(a.hear_own_record(3), "a node's answer after delivery confirms");
         assert!(!a.hear_own_record(7), "and says so once");
         assert!(!a.due(t0 + REANNOUNCE_EVERY * 100));
+    }
+
+    /// `S1-AA`: **a seat given back and taken again inside one founder tick is a new
+    /// sitting.** The tick keeps a clock for whoever the roster holds and drops it for
+    /// whoever it does not, so a seat that was free for one second between two ticks
+    /// was never seen free, and its player came back to the clock of its first sitting
+    /// (`split201156-9`).
+    #[test]
+    fn a_seat_given_back_takes_its_clocks_with_it() {
+        let key = [7u8; 32];
+        let other = [9u8; 32];
+        let first_sat = 1_000u64;
+        let mut sat_down_ms = std::collections::HashMap::from([(key, first_sat), (other, 1_500)]);
+        let then = tokio::time::Instant::now();
+        let mut seat_since = std::collections::HashMap::from([(1u8, then), (2u8, then)]);
+
+        forget_the_seating(&mut sat_down_ms, &mut seat_since, Some(&key), 1);
+        assert!(!sat_down_ms.contains_key(&key), "the player's sitting has ended");
+        assert!(!seat_since.contains_key(&1), "and so has the seat's time on the roster");
+        assert_eq!(sat_down_ms.get(&other), Some(&1_500), "nobody else's clock is touched");
+        assert!(seat_since.contains_key(&2));
+
+        // The founder's tick, as it runs after the same player has sat down again at
+        // the same seat: it starts a clock only where there is none.
+        let back_at = 70_000u64;
+        sat_down_ms.entry(key).or_insert(back_at);
+        assert_eq!(sat_down_ms.get(&key), Some(&back_at), "a new sitting, timed from now");
+        assert_ne!(sat_down_ms.get(&key), Some(&first_sat));
+
+        // A seat given back whose key is not known here still frees the seat's own clock.
+        forget_the_seating(&mut sat_down_ms, &mut seat_since, None, 2);
+        assert!(!seat_since.contains_key(&2));
     }
 
     /// `D-070`: **an hour's key is the one constant two clients of different

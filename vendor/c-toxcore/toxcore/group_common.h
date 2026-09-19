@@ -140,6 +140,7 @@ typedef struct GC_Connection {
 
     bool        confirmed;  /* true if this peer has given us their info */
     bool        handshaked;  /* true if we've successfully handshaked with this peer */
+    bool        p2p_poker_widened;  /* p2p-poker (patch 0040): this peer has been looked for on this client's own relays */
     uint16_t    handshake_attempts;
     uint64_t    last_handshake_request;
     uint64_t    last_handshake_response;

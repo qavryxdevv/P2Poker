@@ -230,6 +230,21 @@ uint32_t tcp_connection_to_online_tcp_relays(const TCP_Connections *_Nonnull tcp
  */
 int add_tcp_number_relay_connection(const TCP_Connections *_Nonnull tcp_c, int connections_number, unsigned int tcp_connections_number);
 
+/** p2p-poker (patch 0040): the relays of this instance are never put to sleep.
+ *
+ * For a group's own instance. See `do_tcp_conns` for what a sleeping relay cost a
+ * member that can be reached through relays alone.
+ */
+void p2p_poker_tcp_relays_stay_awake(TCP_Connections *_Nonnull tcp_c);
+
+/** p2p-poker (patch 0040): register a connection on this client's own connected relays,
+ * leaving `leave_free` of its slots for the relays the peer names itself.
+ *
+ * return how many relays the connection was added to.
+ */
+uint32_t p2p_poker_register_on_own_relays(const TCP_Connections *_Nonnull tcp_c, int connections_number,
+        uint32_t leave_free);
+
 /** @brief Add a TCP relay tied to a connection.
  *
  * This should be called with the same relay by two peers who want to create a TCP connection with each other.

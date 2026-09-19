@@ -79,6 +79,34 @@ param(
     # and never saw our table. With it off every seat finds every other by the
     # one road, which is what `two-network-ssh.ps1` proved carries a table.
     [bool]$NoMdns = $true,
+    # `-FarDelay <seconds>` starts the far seats that much later than the rest.
+    #
+    # `S1-AA`'s join-phase shape on demand. The failure turns on WHEN the seats
+    # here are told of a relay-only member: told within twenty seconds of their
+    # own join they shake hands with it at the second attempt; told after their
+    # relays have gone to sleep -- thirty to forty seconds in, their own peers
+    # all being direct -- half of them never do, reap its entry, and the founder
+    # gives its seat away (`runs/split201156-9`, where a slow sync did it by
+    # chance, two evenings' runs in six). Sixty seconds puts every run there. The
+    # far log's clock still starts with the run, so its seconds line up with the
+    # seats' here; the far client plays for that much less, and ends with them.
+    [ValidateRange(0, 600)][int]$FarDelay = 0,
+    # `-DeadAnnouncedRelay` makes the one relay a relay-only member is announced
+    # by a relay the receiving client cannot connect to, at EVERY seat, both
+    # ends (`P2P_POKER_DEAD_ANNOUNCED_RELAY`, patch 0040's knob in the carrier).
+    #
+    # What `S1-AA`'s join phase fails on when it fails: a member learned from a
+    # sync is known by ONE relay, drawn at random by whoever answered, and a
+    # seat that cannot connect to it has no road to that member for the thirty
+    # seconds its entry lives. With both ends blind this way the two announced
+    # relays are worth nothing, and what is measured is whether the pair finds
+    # a relay they share anyway. Needs the fault harness at both ends.
+    [switch]$DeadAnnouncedRelay,
+    # `-NoPatch0040` runs every seat WITHOUT patch 0040 (`P2P_POKER_NO_0040`): a
+    # group's relays sleep as upstream's do, and no peer is looked for on a
+    # client's own relays. The control for `-DeadAnnouncedRelay`, from the same
+    # binary, so the two runs differ in nothing else.
+    [switch]$NoPatch0040,
     # `-Stall <seconds> -StallSeat <n>` starves one far seat's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -404,6 +432,9 @@ $header = @(
     "seats  $seats  ($Here here, $There on $Target)"
     "for    $Seconds s"
     "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
+    "far    $(if ($FarDelay -gt 0) { "the far seat(s) start $FarDelay s after the rest - a late relay-only arrival, S1-AA's join-phase shape" } else { 'started with the rest' })"
+    "0040   $(if ($NoPatch0040) { 'OFF at every seat - the control (fault-harness)' } else { 'as built' })"
+    "relay  $(if ($DeadAnnouncedRelay) { 'the relay a relay-only member is announced by is one no seat can connect to, at both ends (fault-harness; patch 0040)' } else { 'announced relays as they come' })"
     "tox    $(if ($faultHarness) { 'log on - the BINARY carries the fault harness' } else { 'log OFF - the binary has no fault harness; toxcore writes nothing, so do not read a zero as an absence' })"
     "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
     "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness; a frame the transport delivered inside the window is discarded, which a real outage under 58 s does not do - S1-CM)" } else { 'no forced outage' })"
@@ -600,7 +631,8 @@ try {
     # --- the far seats, started first so they are looking before the table is
     #     hosted. They join by name, and a name they have not heard of yet is
     #     simply a name they keep waiting for.
-    Write-Host "==> starting $There seat(s) on the far end"
+    if ($FarDelay -ge $Seconds) { throw "-FarDelay $FarDelay leaves the far seat no time to play in a run of $Seconds s." }
+    Write-Host "==> starting $There seat(s) on the far end$(if ($FarDelay -gt 0) { ", $FarDelay s after the rest" })"
     $farScript = @"
 `$jobs = @()
 for (`$i = 0; `$i -lt $There; `$i++) {
@@ -624,11 +656,14 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     `$jobs += Start-Job -ArgumentList `$p, `$log, `$i -ScriptBlock {
         param(`$p, `$log, `$seat)
         if ($Stall -gt 0 -and `$seat -eq $StallSeat) { `$env:P2P_POKER_STALL_JOIN = '$Stall' }
+        if ($(if ($DeadAnnouncedRelay) { '$true' } else { '$false' })) { `$env:P2P_POKER_DEAD_ANNOUNCED_RELAY = '1' }
+        if ($(if ($NoPatch0040) { '$true' } else { '$false' })) { `$env:P2P_POKER_NO_0040 = '1' }
         if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_MS = '$DelayCerts' }
         if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and $DelayCertsUntil -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_UNTIL_S = '$DelayCertsUntil' }
         `$start = Get-Date
         `$inv = [System.Globalization.CultureInfo]::InvariantCulture
-        & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay $(if ($Think -gt 0) { "$Think" }) --for $Seconds --profile `$p --join $table 2>&1 |
+        if ($FarDelay -gt 0) { Start-Sleep -Seconds $FarDelay }
+        & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay $(if ($Think -gt 0) { "$Think" }) --for $($Seconds - $FarDelay) --profile `$p --join $table 2>&1 |
             ForEach-Object { (Get-Date).ToUniversalTime().ToString('HH:mm:ss.fff', `$inv) + ' ' + ((((Get-Date) - `$start).TotalSeconds).ToString('F1', `$inv)).PadLeft(7) + '  ' + `$_ } |
             Out-File -FilePath `$log -Encoding utf8
     }
@@ -714,6 +749,12 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         # else's. Naming a seat would invite a run that drops nothing.
         if ($DropConfirm -gt 0 -and $i -eq 0) {
             $knobs['P2P_POKER_DROP_CONFIRM'] = "$DropConfirm"
+        }
+        if ($DeadAnnouncedRelay) {
+            $knobs['P2P_POKER_DEAD_ANNOUNCED_RELAY'] = '1'
+        }
+        if ($NoPatch0040) {
+            $knobs['P2P_POKER_NO_0040'] = '1'
         }
         if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"
