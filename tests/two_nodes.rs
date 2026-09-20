@@ -51,20 +51,29 @@ fn node() -> Swarm<PokerBehaviour> {
     .expect("the stack builds")
 }
 
+/// `D-072`: a **Sit-and-Go**, because that is what this client files. A cash
+/// advert is legal on the wire and `lobby::admit` still takes it, but `receive`
+/// refuses to file one, so a fixture that stayed cash would be testing the
+/// refusal and calling it a crossing. What crosses here is the table a player
+/// can actually be offered; that the other kind does not is
+/// `net::advert::tests::a_cash_table_is_not_filed_and_its_sender_is_not_blamed`.
+///
+/// A tournament's buy-in is its stack, both bounds (§6): everybody starts with
+/// the same chips, so there is nothing for a range to say.
 fn demo_ad(name: &str) -> TableAd {
     let (action, grace, crypto, delay) = (20_000u32, 5_000u32, 30_000u32, 7_000u32);
     let seats = 6u8;
     TableAd {
         game: 1,
-        mode: Mode::CashPlayMoney.code(),
+        mode: Mode::TournamentSngPlayMoney.code(),
         preset_id: "CUSTOM".into(),
         table_name: name.into(),
         small_blind: 10,
         big_blind: 20,
         ante: 0,
-        min_buyin: 200,
+        min_buyin: 2_000,
         max_buyin: 2_000,
-        start_stack: 0,
+        start_stack: 2_000,
         players: 1,
         max_players: seats,
         min_players_to_start: 2,
@@ -180,7 +189,7 @@ async fn run() -> LobbyStore {
                     from[..take].copy_from_slice(&bytes[..take]);
 
                     receive(&message.data, from, NOW, &mut limits, &mut store)
-                        .expect("an honest advert, over a real mesh");
+                        .expect("an honest Sit-and-Go, over a real mesh");
                     return store;
                 }
             }

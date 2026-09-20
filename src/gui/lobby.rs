@@ -441,13 +441,14 @@ pub enum Filter {
 }
 
 impl Filter {
-    pub const ALL: [Filter; 5] = [
-        Filter::All,
-        Filter::Open,
-        Filter::SitAndGo,
-        Filter::Cash,
-        Filter::WaitingForPlayers,
-    ];
+    /// `D-072`: `Cash` is not offered. A cash advert is refused before it is
+    /// filed, so the choice could only ever show an empty list -- and a
+    /// filter that is always empty reads as a lobby with nobody in it. The
+    /// variant itself stays: it is what a row's own game text is matched
+    /// against, and `sit_and_go` on a `TableRow` is still a question about a
+    /// table somebody else is offering.
+    pub const ALL: [Filter; 4] =
+        [Filter::All, Filter::Open, Filter::SitAndGo, Filter::WaitingForPlayers];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -1414,6 +1415,20 @@ mod tests {
         assert_eq!(visible(&rows, "", Filter::Open).len(), 1);
         assert_eq!(visible(&rows, "", Filter::Cash).len(), 3, "all three are cash");
         assert_eq!(visible(&rows, "", Filter::SitAndGo).len(), 0);
+    }
+
+    /// `D-072`: the row a player clicks has no *cash game* in it. That filter
+    /// could now only ever answer with an empty list, and a filter that is
+    /// always empty reads as a lobby with nobody in it rather than as a game
+    /// this client does not deal. The variant itself stays -- it is how a row's
+    /// own words are matched, and a table reached by a resume still has them.
+    #[test]
+    fn the_filter_row_does_not_offer_a_game_this_client_will_not_deal() {
+        assert_eq!(Filter::ALL.len(), 4);
+        assert!(!Filter::ALL.contains(&Filter::Cash), "{:?}", Filter::ALL);
+        assert!(Filter::ALL.contains(&Filter::SitAndGo));
+        // And the variant still says what it always said, to whoever asks it.
+        assert_eq!(Filter::Cash.label(), "cash game");
     }
 
     /// A table that cannot start yet is the one a player can do something about.

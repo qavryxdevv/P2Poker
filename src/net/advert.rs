@@ -382,6 +382,16 @@ pub enum NotAccepted {
     BadSignature,
     /// §7.2 rules 2 to 5.
     Refused(AdRejected),
+    /// `D-072`: a game this client does not deal -- today, the cash game.
+    ///
+    /// **This client's policy and not the protocol's rule.** `lobby::admit` is
+    /// §7.2 and a cash advert passes it: the mode is legal, and an older client
+    /// may still offer one honestly. What this says is that this build plays
+    /// Sit and Go, so the advert is not filed -- one gate, above the store, so
+    /// no later caller can reach a cash table through the list, the counts, a
+    /// search or a join. Like a budget and unlike a forgery, it is never scored
+    /// against whoever sent it.
+    NotPlayed,
     /// §7.2 rules 6 and 7, or the lobby is full.
     NotTaken(NotTaken),
 }
@@ -499,11 +509,35 @@ pub fn receive(
     // The hash of the bytes that arrived, not of a re-encoding: it is what a
     // `JOIN_REQUEST` names, and the founder looks it up against an advert it
     // signed itself.
+    // `D-072`: the last gate before the store, and the store stays storage.
+    if !plays(&ad) {
+        return Err(NotAccepted::NotPlayed);
+    }
     let advert_hash = crate::protocol::transcript::event_hash(&signed.body);
     store
         .offer(table_key, ad, params, advert_hash, now_ms)
         .map_err(NotAccepted::NotTaken)?;
     Ok(table_key)
+}
+
+/// `D-072`: whether this client deals the game an advert offers.
+///
+/// Asked in **one** place -- by [`receive`], before an advert is filed -- and
+/// that is what keeps every later path away from a cash table: a table the
+/// store never held cannot be listed, counted, searched for or joined, because
+/// all of those name a table by the key the store holds.
+///
+/// Today the question is the mode alone: a Sit-and-Go is played and a cash game
+/// is not. The wire's `Mode::CashPlayMoney` is untouched -- a client must be
+/// able to READ any advert, and a mode this build will not deal is not a mode
+/// the protocol stops carrying.
+///
+/// **A resume is deliberately not refused** (`S1-CR`): a player restarting into
+/// this build was already seated at that table with those chips, and a hand in
+/// progress is not an offer to start one. `D-072` deactivates the cash game as
+/// something this client starts or sits down at.
+pub fn plays(ad: &TableAd) -> bool {
+    ad.mode == lobby::Mode::TournamentSngPlayMoney.code()
 }
 
 /// Re-verify an advertisement handed over **outside** the lobby.
@@ -585,18 +619,23 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
+    /// A `CUSTOM` Sit-and-Go, because `D-072` deactivated the cash game and
+    /// `receive` no longer files one. The tests below are about the gate, the
+    /// store and the signature and not about the mode, so the fixture carries
+    /// the tournament's own rule -- §7.2 rule 2: the buy-in **is** the stack,
+    /// both bounds -- and nothing else changes.
     fn ad() -> TableAd {
         let mut a = TableAd {
             game: 1,
-            mode: 1,
+            mode: 2,
             preset_id: "CUSTOM".into(),
             table_name: "Riverside".into(),
             small_blind: 10,
             big_blind: 20,
             ante: 0,
-            min_buyin: 200,
+            min_buyin: 2_000,
             max_buyin: 2_000,
-            start_stack: 0,
+            start_stack: 2_000,
             players: 1,
             max_players: 6,
             min_players_to_start: 2,
@@ -720,6 +759,46 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.get(&seen).unwrap().ad.table_name, "Riverside");
         assert_eq!(store.joinable().count(), 1);
+    }
+
+    /// **`D-072`: a cash advert is not filed, and its sender is not blamed.**
+    ///
+    /// The cash game is deactivated in this build. `lobby::admit` is §7.2 and
+    /// still passes the advert -- the mode is legal and an older client may
+    /// offer one honestly -- so the refusal is this client's own policy, taken
+    /// at the last gate before the store. That is what keeps a cash table out
+    /// of the list, the counts, a search and a join at once, without making
+    /// `LobbyStore` mode-aware.
+    ///
+    /// The breaks that must make this fail: file it anyway, or answer with a
+    /// reason that blames the sender.
+    #[test]
+    fn a_cash_table_is_not_filed_and_its_sender_is_not_blamed() {
+        let table = key(1);
+        let mut cash = ad();
+        cash.mode = 1;
+        // §7.2 rule 2 the other way round: a cash table's stack is not set.
+        cash.start_stack = 0;
+        cash.min_buyin = 200;
+        cash.max_buyin = 2_000;
+        // The protocol takes it: this is a legal advert, not a malformed one.
+        assert!(lobby::admit(&cash, NOW).is_ok(), "a cash advert is legal §7.2");
+        assert!(!plays(&cash), "and this build does not deal it");
+        assert!(plays(&ad()), "the Sit-and-Go is what it deals");
+
+        let wire = publish(&cash, &table).expect("an advert publishes");
+        let mut store = LobbyStore::new();
+        let mut limits = RateLimiter::new();
+        let refused = receive(&wire, [9u8; 32], NOW, &mut limits, &mut store);
+        assert!(matches!(refused, Err(NotAccepted::NotPlayed)), "{refused:?}");
+        assert_eq!(store.len(), 0, "nothing of it is held");
+        assert_eq!(store.joinable().count(), 0);
+
+        // And the same client files the same table when it is a Sit-and-Go, so
+        // the refusal is about the game and not about the sender or the bytes.
+        let wire = publish(&ad(), &table).expect("an advert publishes");
+        assert!(receive(&wire, [9u8; 32], NOW, &mut limits, &mut store).is_ok());
+        assert_eq!(store.len(), 1);
     }
 
     /// The identity is the key that signed it and nothing else, so two receivers
@@ -996,7 +1075,10 @@ mod tests {
         let base = ad();
         let included: Vec<Change> = vec![
             ("game", Box::new(|a: &mut TableAd| a.game = 2)),
-            ("mode", Box::new(|a: &mut TableAd| a.mode = 2)),
+            // To the OTHER mode, whichever the fixture holds: `D-072` made the
+            // fixture a Sit-and-Go, and a mutation to the value already there
+            // moves no digest and proves nothing.
+            ("mode", Box::new(|a: &mut TableAd| a.mode = 1)),
             ("preset_id", Box::new(|a: &mut TableAd| a.preset_id = "RATED_SNG_POKERTH_V1".into())),
             ("small_blind", Box::new(|a: &mut TableAd| a.small_blind = 25)),
             ("big_blind", Box::new(|a: &mut TableAd| a.big_blind = 40)),

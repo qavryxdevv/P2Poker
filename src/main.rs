@@ -14,7 +14,7 @@
 //! p2p-poker --profile DIR        keep the profile somewhere other than beside
 //!                                the binary
 //! p2p-poker --host N --seats 6   a six-handed Sit-and-Go
-//! p2p-poker --host N --cash      a cash table, which deals with two
+//! p2p-poker --host N --seats 2   a two-seat Sit-and-Go: it deals when both sit
 //! p2p-poker --renderer software  draw without a graphics driver
 //! p2p-poker --no-mdns             do not look for players by multicast
 //! p2p-poker --port 4242           listen on a fixed port, to forward on a router
@@ -314,6 +314,18 @@ fn main() {
             .collect::<String>()
     );
 
+    // `D-072`: the cash game is deactivated, and `--cash` is refused rather
+    // than ignored -- here rather than inside the branch below, because
+    // `--then-host` founds a table too and a flag that is obeyed by one and
+    // silently dropped by the other is worse than either. A run that asked for
+    // a cash table and quietly got a Sit and Go is measured as a cash table by
+    // whoever wrote the script; a run that stopped is read.
+    if has("--cash") {
+        eprintln!("--cash: the cash game is deactivated in this build (D-072).");
+        eprintln!("A two-process test asks for `--seats 2`: a Sit and Go deals when it is full.");
+        std::process::exit(2);
+    }
+
     // Hosting is a command like any other, taken by the same path the button
     // takes. It used to be a second construction here, with its own table
     // advertisement built by hand — two ways to start a table is two places for
@@ -321,21 +333,18 @@ fn main() {
     let hosted = value_of("--host").map(|name| {
         use p2p_poker::net::lobby::TableKind;
         use p2p_poker::protocol::constants::{RATED_START_STACK, RATED_SEATS};
-        // A Sit-and-Go by default, ten-handed and therefore rated — the same
-        // table the button founds. `--seats` sizes it; `--cash` makes it a cash
-        // table instead, which is what a two-process test wants because a
-        // Sit-and-Go deals only when every seat is full.
+        // A Sit-and-Go, ten-handed and therefore rated — the same table the
+        // button founds, sized by `--seats`. It deals when every seat is full
+        // and reads neither `--min` nor the buy-in, which are the cash table's
+        // fields; `D-072` deactivated the cash game, so a two-process test asks
+        // for `--seats 2` and the table deals when both are in.
         let seats = value_of("--seats")
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(RATED_SEATS)
             .clamp(2, RATED_SEATS);
         println!("hosting  {name}");
         NodeCommand::CreateTable {
-            kind: if has("--cash") {
-                TableKind::Cash
-            } else {
-                TableKind::SitAndGo
-            },
+            kind: TableKind::SitAndGo,
             name,
             seats,
             min_players: value_of("--min")
@@ -361,7 +370,7 @@ fn main() {
             .unwrap_or(RATED_SEATS)
             .clamp(2, RATED_SEATS);
         NodeCommand::CreateTable {
-            kind: if has("--cash") { TableKind::Cash } else { TableKind::SitAndGo },
+            kind: TableKind::SitAndGo,
             name,
             seats,
             min_players: value_of("--min").and_then(|v| v.parse::<u8>().ok()).unwrap_or(2).clamp(2, seats),
@@ -2808,6 +2817,18 @@ impl eframe::App for Client {
                             "the donation page {}: {}",
                             if opened { "was opened in the browser" } else { "could not be opened; it is at" },
                             render::DONATION_URL
+                        ));
+                    }
+                    // `D-072`: the issue tracker, in the player's own browser.
+                    // Nothing of this client goes with it -- the address carries
+                    // no query, and what the report says is what the player
+                    // types.
+                    render::LobbyAction::OpenBugReports => {
+                        let opened = open_in_browser(render::BUG_REPORT_URL);
+                        self.state.log.push_back(format!(
+                            "the bug report page {}: {}",
+                            if opened { "was opened in the browser" } else { "could not be opened; it is at" },
+                            render::BUG_REPORT_URL
                         ));
                     }
                     render::LobbyAction::OpenAlbum => self.album_open = true,

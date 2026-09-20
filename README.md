@@ -76,8 +76,10 @@ blinds 50/100 doubling every eleven hands, and it deals when all ten are in.
 Those numbers are not a choice — they are `RATED_SNG_POKERTH_V1`, read out of
 PokerTH's own `RANKING_GAME_*` constants, and every client derives the same
 parameters from the name alone. That is what lets two people who have never
-spoken agree on the game before either sits down. A custom cash table is one
-click away for everything else.
+spoken agree on the game before either sits down. Any other number of seats is
+the same game with its numbers spelled out in the advert, one slider away. The
+cash game is deactivated in this build: every table this client founds, and
+every table it will sit down at, is a Sit-and-Go.
 
 Two clients on one machine are two players only if they keep two profiles — the
 protocol refuses a second seat to the same node at the same table, deliberately:

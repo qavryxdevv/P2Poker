@@ -120,6 +120,8 @@ pub enum LobbyAction {
     ShowBackups,
     /// `D-071`: open the donation page, `DONATION_URL`, in the browser.
     OpenDonationPage,
+    /// `D-072`: open the bug reports page, `BUG_REPORT_URL`, in the browser.
+    OpenBugReports,
 }
 
 /// `D-071`: the page the strip's *Support the project* button opens: the
@@ -133,6 +135,20 @@ pub enum LobbyAction {
 /// repository keeps, so an address changes without a release and never
 /// without a commit. `tests/donation_page.rs` holds this link to that file.
 pub const DONATION_URL: &str = "https://github.com/qavryxdevv/P2Poker/blob/master/DONATE.md";
+
+/// `D-072`: where a player reports a bug -- the repository's issue tracker, with
+/// the form already open.
+///
+/// A constant of the build for the same reason `DONATION_URL` is: an address the
+/// client sends a player to is not something the network may choose. It carries
+/// no query beyond the template, so nothing of this machine or this player goes
+/// out in it; what goes in the report is what the player types.
+pub const BUG_REPORT_URL: &str = "https://github.com/qavryxdevv/P2Poker/issues/new";
+
+/// `D-072`: what the About page calls this build. The number comes from
+/// `Cargo.toml` and the word from here, so a release that is no longer a beta is
+/// one line, not a search.
+pub const RELEASE_STAGE: &str = "beta";
 
 /// `D-068`: the settings' Profile page: what is being typed, and what the
 /// client answered. The work itself -- a second of key stretching, and a file
@@ -290,11 +306,19 @@ pub enum SettingsTab {
     Network,
     /// `D-068`: the profile's backup and restore.
     Profile,
+    /// `D-072`: what this build is, and where a bug goes.
+    About,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 5] =
-        [SettingsTab::General, SettingsTab::Sound, SettingsTab::Table, SettingsTab::Network, SettingsTab::Profile];
+    pub const ALL: [SettingsTab; 6] = [
+        SettingsTab::General,
+        SettingsTab::Sound,
+        SettingsTab::Table,
+        SettingsTab::Network,
+        SettingsTab::Profile,
+        SettingsTab::About,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -303,6 +327,7 @@ impl SettingsTab {
             SettingsTab::Table => "Table",
             SettingsTab::Network => "Network",
             SettingsTab::Profile => "Profile",
+            SettingsTab::About => "About",
         }
     }
 }
@@ -1040,6 +1065,68 @@ fn found_toast(ctx: &egui::Context, f: &super::lobby::FoundView) {
     super::table::paint_again(ctx, std::time::Duration::from_millis(80));
 }
 
+/// `D-072`: what this build is, and the one button that leaves the client from
+/// here -- the bug report.
+///
+/// **A beta says so where a player looks for it.** The word is
+/// [`RELEASE_STAGE`] and the number is the crate's own, so the two cannot drift
+/// apart and a release that stops being a beta is one line.
+///
+/// The button opens the repository's issue form in the browser (`D-071`'s
+/// `open_in_browser`, which takes a plain `https` address and nothing else).
+/// **It sends nothing**: no log, no profile, no address -- a report is what the
+/// player types, and a client that posted its own state somewhere would be
+/// making that decision for them.
+fn about_page(ui: &mut egui::Ui) -> Option<LobbyAction> {
+    let mut action = None;
+    ui.label(
+        RichText::new(format!("P2Poker {} {}", env!("CARGO_PKG_VERSION"), RELEASE_STAGE))
+            .color(theme::TEXT)
+            .size(19.0)
+            .strong(),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(
+            "A beta: it is played and it is not finished. Tables, hands and the album are real, \
+             and a build may still change what it does between versions.",
+        )
+        .color(theme::TEXT_DIM)
+        .size(14.0),
+    );
+    ui.add_space(10.0);
+    ui.label(RichText::new("No house. No server. No rake. No ads.").color(theme::OK).size(14.0));
+    ui.label(
+        RichText::new("Play money only. Nothing here is a wager and nothing is cashed out.")
+            .color(theme::TEXT_DIM)
+            .size(14.0),
+    );
+    ui.add_space(14.0);
+    ui.label(RichText::new("Found something wrong?").color(theme::TEXT).size(15.0).strong());
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "The report opens in your browser and this client sends nothing with it. What helps \
+             most: what you did, what happened, and what you expected instead.",
+        )
+        .color(theme::TEXT_DIM)
+        .size(14.0),
+    );
+    ui.add_space(8.0);
+    if ui
+        .add(
+            egui::Button::new(RichText::new("Report a bug").color(theme::INK_ON_GOLD).strong())
+                .fill(theme::GOLD_ACTION)
+                .min_size(egui::vec2(150.0, 32.0)),
+        )
+        .on_hover_text("Opens the project's issue tracker on GitHub in your browser.")
+        .clicked()
+    {
+        action = Some(LobbyAction::OpenBugReports);
+    }
+    action
+}
+
 /// `D-068`: the settings' Profile page -- a backup of the profile under a
 /// password, and a profile restored from one. Both only ask: the work is the
 /// client's, off the paint thread.
@@ -1228,11 +1315,11 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                     field_row(ui, "Name", |ui| {
                         ui.add(egui::TextEdit::singleline(&mut f.name).char_limit(32));
                     });
-                    field_row(ui, "Game", |ui| {
-                        ui.selectable_value(&mut f.kind, TableKind::SitAndGo, "Sit & Go");
-                        ui.selectable_value(&mut f.kind, TableKind::Cash, "Cash game");
-                    });
-
+                    // `D-072`: no Game row. The cash game is deactivated in this
+                    // client, so a chooser with one choice in it would be a
+                    // question with one answer -- and the branch below stays
+                    // whole rather than being deleted, because the kind is still
+                    // a field of the protocol and of `NewTable`.
                     if f.kind == TableKind::SitAndGo {
                         field_row(ui, "Seats", |ui| {
                             ui.add(egui::Slider::new(&mut f.seats, 2..=RATED_SEATS));
@@ -1546,6 +1633,11 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                             }
                             SettingsTab::Profile => {
                                 if let Some(a) = profile_page(ui, &mut state.backup) {
+                                    action = Some(a);
+                                }
+                            }
+                            SettingsTab::About => {
+                                if let Some(a) = about_page(ui) {
                                     action = Some(a);
                                 }
                             }
@@ -3337,6 +3429,30 @@ mod tests {
                 "a colour drawn on a panel is not legible on it"
             );
         }
+    }
+
+    /// **`D-072`: the About page says what this build is, and where a bug
+    /// goes.**
+    ///
+    /// The word and the number are separate on purpose: the number is the
+    /// crate's, so it cannot be forgotten at a release, and the word is one
+    /// constant, so a build that stops being a beta is one line. The bug
+    /// address is `https` and the project's own, like the donation page, and it
+    /// carries no query -- nothing of this machine or this player is in it.
+    #[test]
+    fn the_about_page_says_the_build_and_where_a_bug_goes() {
+        assert_eq!(RELEASE_STAGE, "beta", "this build is a beta and says so");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0", "the number comes from Cargo.toml");
+        assert!(BUG_REPORT_URL.starts_with("https://github.com/"), "{BUG_REPORT_URL}");
+        assert!(BUG_REPORT_URL.ends_with("/issues/new"), "the issue form, already open");
+        assert!(!BUG_REPORT_URL.contains('?'), "no query: the client sends nothing with it");
+        // The two addresses this client will open are the same repository.
+        let repo = |u: &str| u.split('/').take(5).collect::<Vec<_>>().join("/");
+        assert_eq!(repo(BUG_REPORT_URL), repo(DONATION_URL));
+        // And About is a page of the settings, last, after the profile.
+        assert_eq!(SettingsTab::ALL.len(), 6);
+        assert_eq!(SettingsTab::ALL.last(), Some(&SettingsTab::About));
+        assert_eq!(SettingsTab::About.label(), "About");
     }
 
     /// `D-071`: the donation button sits in the middle of the strip while the
