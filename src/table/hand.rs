@@ -8764,6 +8764,31 @@ impl Hand {
     }
 
     /// Hold an event that belongs to a stage this client has not reached.
+    /// `S1-IN`: what a frame of **another** hand of this table says, keeping
+    /// nothing -- `(hand id, the seat that signed it)`.
+    ///
+    /// [`Hand::hold`] answers the same question and may keep the bytes on its
+    /// way past, which a **frozen** client must not do: §6.3 step 1 stops the
+    /// hand. It does not stop the news that the table has gone on without it,
+    /// and that news is the only way out of a freeze -- `D-038`'s *drop the
+    /// branch and rejoin from the copies*, which until this row was latched
+    /// inside the very handler the freeze skips, so a frozen client stayed
+    /// frozen for the life of the process.
+    ///
+    /// Verified the way `hold` verifies: the table identity and the signature
+    /// are checked against the hand the frame names, and only the position is
+    /// relaxed. `None` for this hand's own frames, for junk, and for a frame of
+    /// another table.
+    pub fn another_hand(&self, bytes: &[u8]) -> Option<(u64, Option<SeatIdx>)> {
+        let (kind, hand_id, _) = chained::peek(bytes, PEEK_CAP).ok()?;
+        if hand_id == self.open.hand_id {
+            return None;
+        }
+        let opened =
+            chained::open_in_hand(bytes, FRAME_CAP, kind, &self.open.table_id, hand_id).ok()?;
+        Some((hand_id, self.seat_of_key(&opened.sender)))
+    }
+
     pub fn hold(&mut self, bytes: Vec<u8>) -> Holding {
         // **Verified before it is kept, and this is the cheapest attack in the
         // set without it.** `on_event` routes on `peek`, which checks no
@@ -12553,6 +12578,46 @@ mod tests {
     /// there **muted**, inherits the held copies, and never signs hand 2
     /// twice. Hand 2 dies on both — it cannot complete without seat 1's
     /// signature — and hand 3 opens at one genesis on both.
+    /// **`S1-IN`: a frozen client may still read who says the table has moved
+    /// on, and keep nothing.**
+    ///
+    /// §6.3 step 1 stops the hand; `S1-CI` proves the reconciliation round
+    /// cannot release the freeze, so `D-038`'s *drop the branch and rejoin from
+    /// the copies* is the only way out -- and its evidence is a verified frame
+    /// of a later hand. `hold` answers the same question and may keep the bytes
+    /// on the way past, which a frozen client must not do.
+    ///
+    /// The break that must make this fail: answer for this hand's own frames
+    /// too, or skip the verification and answer for anybody's bytes.
+    #[test]
+    fn another_hands_frame_is_read_without_keeping_anything() {
+        // `opening3`'s roster is keys 10, 11 and 12; a hand only knows the seats of its own roster.
+        let keys: Vec<SigningKey> = (10..13).map(key).collect();
+        let (mut a, from_a) = Hand::open(opening3(0), &keys[0], NOW, 30_000).unwrap();
+        let (b, _) = Hand::open(opening3(1), &keys[1], NOW, 30_000).unwrap();
+        let Send::Broadcast(init_a) = &from_a[0];
+
+        // Seat 1 is playing the same hand: seat 0's frame is not another hand's.
+        assert_eq!(b.another_hand(init_a), None, "the hand this client is playing");
+        // Nor is junk, nor a frame of another table.
+        assert_eq!(b.another_hand(b"not a frame at all"), None);
+        assert_eq!(b.another_hand(&[]), None);
+
+        // Move seat 0 on to hand 2 and let it speak there.
+        let t = NOW + 60_000;
+        // `abort_now` ends the hand where it is called; the copy is for the others.
+        let _ = a.abort_now(Abort::Deadline, &keys[0], t).unwrap();
+        let next = a.next_hand().expect("an aborted hand has a successor");
+        let (_a2, from_a2) = Hand::open(next, &keys[0], NOW, 30_000).unwrap();
+        let Send::Broadcast(init_a2) = &from_a2[0];
+
+        // Seat 1, still on hand 1, reads it as seat 0's word about hand 2 --
+        // and nothing of it is kept.
+        let before = b.held();
+        assert_eq!(b.another_hand(init_a2), Some((2, Some(0))), "seat 0 signed hand 2");
+        assert_eq!(b.held(), before, "a read keeps nothing");
+    }
+
     #[test]
     fn a_late_certificate_re_derives_the_next_hand_and_the_table_converges_at_the_hand_after() {
         let keys: Vec<SigningKey> = (10..15).map(key).collect();

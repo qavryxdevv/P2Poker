@@ -5319,6 +5319,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // has stopped, which is a different thing
                                     // and must not cost anybody peer score.
                                     None if t.frozen.is_some() => {
+                                        // `S1-IN`: **the freeze stops the hand,
+                                        // not the news.** A verified frame of a
+                                        // LATER hand is another seat's signature
+                                        // on the proposition that the table has
+                                        // moved past this one, and `D-038`'s
+                                        // *drop the branch and rejoin from the
+                                        // copies* is the only way out of a
+                                        // freeze that §6.3's round cannot
+                                        // release (`S1-CI`). Reading it was
+                                        // latched inside the handler this arm
+                                        // skips, so a frozen client could never
+                                        // become adrift and stayed frozen for
+                                        // the life of the process. Nothing is
+                                        // kept and nothing of this hand is
+                                        // touched.
+                                        note_the_table_moved_on(
+                                            h,
+                                            &message.data,
+                                            &mut t.ahead,
+                                            &mut t.adrift,
+                                        );
                                         Some(gossipsub::MessageAcceptance::Ignore)
                                     }
                                     // §4.10's hand boundary window, for the same
@@ -8356,8 +8377,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 &events,
                             )
                             .await
-                                && t.frozen.is_none()
-                                && !boundary_event(
+                            {
+                                if t.frozen.is_some() {
+                                    // `S1-IN`: the carrier's copy of the same
+                                    // news, for the same reason as the
+                                    // gossipsub arm above.
+                                    note_the_table_moved_on(
+                                        h,
+                                        &item.bytes,
+                                        &mut t.ahead,
+                                        &mut t.adrift,
+                                    );
+                                } else if !boundary_event(
                                     &item.bytes,
                                     h,
                                     &mut t.boundaries,
@@ -8367,8 +8398,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &events,
                                 )
                                 .await
-                            {
-                                let _ = hand_event!(t, h, &item.bytes);
+                                {
+                                    let _ = hand_event!(t, h, &item.bytes);
+                                }
                             }
                         }
                         // Taken, and this peer's own `STATE_ACK` is due.
@@ -15414,6 +15446,26 @@ fn short_hash(h: &[u8; 32]) -> String {
 /// this client never saw -- but the table's copies of its running hand are
 /// evidence enough to adopt it (`S1-CR`), and the latch now hands over to
 /// `rejoin_from_copies!`.
+/// `S1-IN`: what a **frozen** client may still learn from a frame it will not
+/// apply -- that the table has gone on without it.
+///
+/// §6.3 step 1 stops the hand: no hand event is accepted or emitted. The route
+/// out of a freeze is `D-038`'s, and `S1-CI` proves §6.3's own reconciliation
+/// round cannot release one, so `D-038` is the only route there is. Its latch
+/// sat inside the handler the freeze skips, so a frozen client never became
+/// adrift and stayed frozen for the life of the process, and the register said
+/// the opposite. `Hand::another_hand` keeps nothing and touches no queue.
+fn note_the_table_moved_on(
+    h: &crate::table::hand::Hand,
+    bytes: &[u8],
+    ahead: &mut std::collections::HashMap<u8, u64>,
+    adrift: &mut Option<(u64, u64)>,
+) {
+    if let Some((hand_id, seat)) = h.another_hand(bytes) {
+        note_a_hand_ahead(h, hand_id, seat, ahead, adrift);
+    }
+}
+
 fn note_a_hand_ahead(
     h: &crate::table::hand::Hand,
     hand_id: u64,
