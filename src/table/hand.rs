@@ -1918,10 +1918,11 @@ pub struct Hand {
     patience: Vec<u8>,
     /// When the stage now open was reached, on this peer's own clock.
     ///
-    /// A **cryptographic** stage that stalls is what
-    /// [`STAGE_DEADLINE_FACTOR`] bounds, and it is bounded per stage rather
-    /// than per hand because the hand's own budget has to accommodate a whole
-    /// legal hand of human thinking and is therefore tens of minutes.
+    /// A **cryptographic** stage that stalls is what the table's
+    /// `crypto_step_timeout_ms` bounds ([`Hand::expired_budget`]), and it is
+    /// bounded per stage rather than per hand because the hand's own budget
+    /// has to accommodate a whole legal hand of human thinking and is
+    /// therefore tens of minutes. (A `STAGE_DEADLINE_FACTOR` did this once.)
     stage_at_ms: u64,
     /// The sequence `stage_at_ms` belongs to, so the clock restarts when — and
     /// only when — the hand actually moves.

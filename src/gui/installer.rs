@@ -2,7 +2,7 @@
 //! that says what was really done and where it is.
 //!
 //! The same split as the lobby's: **what is said is decided by plain
-//! functions** ([`offer_words`], [`done_lines`]) that a test reads, and the
+//! functions** (`offer_words`, `done_lines`) that a test reads, and the
 //! drawing below puts their answers on the screen. The work itself -- hashing,
 //! copying, the shell's COM -- never runs on the paint thread: the window asks,
 //! and is told.

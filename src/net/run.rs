@@ -907,8 +907,11 @@ struct TableRun {
     /// roster rather than from the chain.
     ever_dealt: bool,
     /// **Hand 1 waits for the Tox group to hold every seat**, bounded by
-    /// `GROUP_WAIT_MS`, after which it deals anyway — which is what this client
-    /// did before the gate existed. See `hand_one_may_open`.
+    /// `GROUP_STALL_MS` without a new arrival and by `GROUP_WAIT_MAX_MS` in all,
+    /// after which it deals anyway — which is what this client did before the
+    /// gate existed — unless the group holds no other seat at all, where a hand
+    /// would reach nobody and none is opened. See `hand_one_may_open`. (The one
+    /// clock this had at first, `GROUP_WAIT_MS`, is what `S1-H` still calls it.)
     /// **The boundary checkpoint's retained values, and the readmission set they
     /// write** (§4.9). `boundaries` holds each retained hand's checkpoint — its
     /// two stages and the comparison — and `readmitted` is `A`, read and cleared
@@ -1045,8 +1048,8 @@ struct TableRun {
     out_told: bool,
     /// `D-051`: the seats this client cut off for flooding the table's group,
     /// with when -- its votes about them carry the flood cause, it votes for no
-    /// return of theirs, and one still in the game `UNSAFE_AFTER_MS` later
-    /// makes the table not safe.
+    /// return of theirs, and one still in the game `UNSAFE_AFTER` later makes
+    /// the table not safe.
     flooders: std::collections::BTreeMap<u8, std::time::Instant>,
     /// `D-051`: when members that are no seat were cut off here.
     strangers: Vec<std::time::Instant>,
@@ -16824,9 +16827,13 @@ const GROUP_WAIT_MAX_MS: u64 = 300_000;
 /// deadline. Measured: a seat in the group from 15.1 s that received not one
 /// fragment before 66.2 s while the founder played to hand 22.
 ///
-/// After `GROUP_WAIT_MS` this returns `true` regardless, which is **exactly what
-/// the client did before this gate existed**. So the worst case is unchanged and
-/// the ordinary case is a table whose first hand everybody can hear.
+/// After `GROUP_STALL_MS` with no new seat, or `GROUP_WAIT_MAX_MS` whatever the
+/// group is doing, this returns `true`, which is **exactly what the client did
+/// before this gate existed**. So the worst case is unchanged and the ordinary
+/// case is a table whose first hand everybody can hear. The one exception is
+/// below: with **no** other seat in the group there is nobody to deal to, and
+/// the answer stays `false`. (`S1-H` wrote this with one clock, `GROUP_WAIT_MS`
+/// at a minute; the two above replaced it and the name outlived it here.)
 ///
 /// `held_since` is `None` until the first refusal, so the clock starts when there
 /// is something to wait for rather than when the process did.
