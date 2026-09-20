@@ -72,9 +72,22 @@ jobs:
         shell: pwsh
         run: ./tools/build-tox.ps1
 
+      - name: Name nothing of the machine it is built on
+        # S1-EN: rustc writes every dependency's source path into the binary, and build.rs refuses a release
+        # build until those paths are mapped away. The first run of this workflow stopped exactly there -- the
+        # project's own guard, working on a machine that is not the owner's. The same script the owner runs.
+        shell: pwsh
+        run: ./tools/remap-build-paths.ps1
+
       - name: Build the client (release, locked to Cargo.lock)
         shell: pwsh
         run: cargo build --release --locked
+
+      - name: And it does not
+        # Read from the built file, not from the flags: the runner's profile, user, computer name and
+        # checkout path must not be in it, as the owner's are not in his.
+        shell: pwsh
+        run: ./tools/check-build-paths.ps1
 
       - name: It starts, and says which version it is
         shell: pwsh
