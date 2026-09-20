@@ -652,7 +652,7 @@ no open advisory) is a proc-macro and is counted with the unregistered remainder
 | `aead` | 0.6.1 | AEAD traits | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
 | `cipher` | 0.5.2 | block/stream cipher traits | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
 | `universal-hash` | 0.6.1 | universal-hash traits | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
-| `windows-sys` | 0.61.2 | DPAPI key slot on Windows; since D-048 also the table's sounds through WinMM (`waveOut*`, features `Win32_Media` and `Win32_Media_Audio`) | `github.com/microsoft/windows-rs` | MIT OR Apache-2.0 | no open advisory; Windows-only path, and the only OS-keystore path implemented |
+| `windows-sys` | 0.61.2 | DPAPI key slot on Windows; since D-048 also the table's sounds through WinMM (`waveOut*`, features `Win32_Media` and `Win32_Media_Audio`); since D-071 `ShellExecuteW` to open the donation page in the browser (feature `Win32_UI_Shell`) | `github.com/microsoft/windows-rs` | MIT OR Apache-2.0 | no open advisory; Windows-only path, and the only OS-keystore path implemented |
 
 ### 5.4 Randomness — the whole set, including what we do not use (8)
 

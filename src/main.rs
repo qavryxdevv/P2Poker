@@ -544,6 +544,48 @@ fn tell_the_player(title: &str, words: &str) {
 #[cfg(not(windows))]
 fn tell_the_player(_title: &str, _words: &str) {}
 
+/// `D-071`: whether `url` is an address this client will hand to the system to
+/// open: a plain `https://` one and nothing else.
+///
+/// The one address it opens is a constant of its own build, so this guards the
+/// next caller rather than this one. Nothing given to the system here can be
+/// run as a command line -- no shell reads it -- but whatever is given is
+/// *opened*, and opening a path or a `file:` address runs a program.
+fn is_a_web_address(url: &str) -> bool {
+    url.strip_prefix("https://").is_some_and(|rest| {
+        !rest.is_empty()
+            && url.len() <= 2_048
+            && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/?#[]@!$&()*+,;=:%".contains(&b))
+    })
+}
+
+/// `D-071`: the address shown in the system's browser. `false` when it was
+/// refused, or the system had nothing to open it with.
+fn open_in_browser(url: &str) -> bool {
+    if !is_a_web_address(url) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (verb, file) = (wide("open"), wide(url));
+        // SAFETY: both strings are NUL-terminated UTF-16 that outlive the call;
+        // a null owner, no parameters and no directory are what the function
+        // documents for opening an address. It answers above 32 on success.
+        let answer = unsafe {
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        };
+        answer as usize > 32
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener).arg(url).spawn().is_ok()
+    }
+}
+
 /// The child's arguments: ours, with the renderer settled.
 ///
 /// Separate from the spawn so it can be tested, because the one thing that must
@@ -2757,6 +2799,17 @@ impl eframe::App for Client {
                         #[cfg(windows)]
                         let _ = std::process::Command::new("explorer").arg(&folder).spawn();
                     }
+                    // `D-071`: the donation page, in the player's own browser. The
+                    // address is said in the log either way: a player whose
+                    // system opened nothing can still read where it is.
+                    render::LobbyAction::OpenDonationPage => {
+                        let opened = open_in_browser(render::DONATION_URL);
+                        self.state.log.push_back(format!(
+                            "the donation page {}: {}",
+                            if opened { "was opened in the browser" } else { "could not be opened; it is at" },
+                            render::DONATION_URL
+                        ));
+                    }
                     render::LobbyAction::OpenAlbum => self.album_open = true,
                     render::LobbyAction::RewardsSeen => self.rewards.rewards.mark_summary_seen(),
                     render::LobbyAction::RewardsNoticeSeen => self.rewards.notice = None,
@@ -2922,5 +2975,32 @@ mod tests {
         assert!(!retry_due(None, Some(JOIN_RETRY_EVERY - Duration::from_millis(1))));
         assert!(!retry_due(Some(JOIN_ASK_LINGERS - Duration::from_millis(1)), Some(JOIN_RETRY_EVERY)), "one is in flight");
         assert!(retry_due(Some(JOIN_ASK_LINGERS), Some(JOIN_ASK_LINGERS.max(JOIN_RETRY_EVERY))));
+    }
+
+    /// `D-071`: the client hands the system a plain `https://` address to open
+    /// and nothing else -- above all nothing the system would *run*.
+    #[test]
+    fn only_a_plain_web_address_is_handed_to_the_system() {
+        assert!(is_a_web_address(render::DONATION_URL), "the one address the client opens");
+        assert!(is_a_web_address("https://example.org/a-b_c.d~e?f=g&h=%20#i"));
+        for refused in [
+            "",
+            "https://",
+            "http://github.com/qavryxdevv/P2Poker",
+            "file:///C:/Windows/System32/calc.exe",
+            "C:\\Windows\\System32\\calc.exe",
+            "calc.exe",
+            "javascript:alert(1)",
+            " https://github.com/",
+            "https://github.com/ --new-window file:///C:/",
+            "https://github.com/\"&calc",
+            "https://github.com/\n",
+            "https://github.com/\u{10d}esky",
+            "HTTPS://github.com/",
+        ] {
+            assert!(!is_a_web_address(refused), "{refused:?} would be handed to the system");
+        }
+        assert!(!is_a_web_address(&format!("https://example.org/{}", "a".repeat(2_048))), "longer than any address");
+        assert!(!open_in_browser("C:\\Windows\\System32\\calc.exe"), "refused before the system is asked");
     }
 }

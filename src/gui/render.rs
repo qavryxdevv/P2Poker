@@ -118,7 +118,21 @@ pub enum LobbyAction {
     StageRestore,
     /// `D-068`: show the folder the backups are in.
     ShowBackups,
+    /// `D-071`: open the donation page, `DONATION_URL`, in the browser.
+    OpenDonationPage,
 }
+
+/// `D-071`: the page the strip's *Support the project* button opens: the
+/// donation addresses, in the project's own repository.
+///
+/// **A constant of the build, and nothing else.** No setting, no file and no
+/// word from another player reaches this string: an address a donor is sent to
+/// is money, and one that the network could change is one a stranger could
+/// change. The addresses themselves are not in the binary either -- they are
+/// on that page, which `tools/donation-page.py` writes and whose history the
+/// repository keeps, so an address changes without a release and never
+/// without a commit. `tests/donation_page.rs` holds this link to that file.
+pub const DONATION_URL: &str = "https://github.com/qavryxdevv/P2Poker/blob/master/DONATE.md";
 
 /// `D-068`: the settings' Profile page: what is being typed, and what the
 /// client answered. The work itself -- a second of key stretching, and a file
@@ -540,9 +554,12 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
         egui::Panel::top("profile-elsewhere").frame(egui::Frame::NONE).show(ui, profile_elsewhere_band);
     }
 
+    // `D-071`: the strip's one button that leaves the client, where no other
+    // button was pressed in the same pass.
+    let mut donate = false;
     egui::Panel::bottom("network")
         .frame(frame())
-        .show(ui, |ui| network_strip(ui, view, state));
+        .show(ui, |ui| donate = network_strip(ui, view, state));
 
     // Proportions rather than pixel counts: 560 and 280 are answers to one
     // window size only, and on a wide one they left the middle column too narrow
@@ -615,6 +632,9 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     // key cannot both have been pressed in one pass.
     if let Some(a) = from_card.filter(|_| action == LobbyAction::None) {
         action = a;
+    }
+    if donate && action == LobbyAction::None {
+        action = LobbyAction::OpenDonationPage;
     }
     if let Some(text) = said {
         action = LobbyAction::Say(text);
@@ -2932,33 +2952,79 @@ fn field(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
 
 /// The bottom strip: one light and one word a player reads -- and, when they
 /// ask, everything the connection is doing, with the client log (`D-067`).
-fn network_strip(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) {
+///
+/// `D-071`: and in its middle the one button that leaves the client, for the
+/// donation page. Returns whether that was pressed.
+fn network_strip(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> bool {
     let s = &view.status;
-    ui.horizontal(|ui| {
-        let (word, tone) = s.headline();
-        let colour = tone_colour(tone);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-        ui.painter().circle_filled(rect.center(), 5.0, colour);
-        if tone == Tone::Ok {
-            ui.painter().circle_stroke(rect.center(), 6.5, Stroke::new(1.0, colour.gamma_multiply(0.4)));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = if state.diagnostics_open { "Hide details" } else { "Network details" };
-            if ui
-                .add(egui::Button::new(RichText::new(label).color(theme::TEXT_DIM).size(14.0)).frame(false))
-                .clicked()
-            {
-                state.diagnostics_open = !state.diagnostics_open;
-                ui.ctx().request_repaint();
+    let (word, tone) = s.headline();
+    let colour = tone_colour(tone);
+    // Three things on one row, and the middle one in the middle of the strip
+    // rather than wherever the other two leave off: so the row is laid out by
+    // hand. It is allocated first, to lie under what is drawn on it.
+    let row = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), DONATE_HEIGHT));
+    ui.allocate_rect(row, egui::Sense::hover());
+
+    // The right end first: what it takes decides where the middle may sit.
+    let details = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                let label = if state.diagnostics_open { "Hide details" } else { "Network details" };
+                if ui
+                    .add(egui::Button::new(RichText::new(label).color(theme::TEXT_DIM).size(14.0)).frame(false))
+                    .clicked()
+                {
+                    state.diagnostics_open = !state.diagnostics_open;
+                    ui.ctx().request_repaint();
+                }
+            },
+        )
+        .response
+        .rect;
+
+    let light = 12.0 + ui.spacing().item_spacing.x;
+    let word_width = egui::WidgetText::from(RichText::new(word).strong())
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+        .size()
+        .x;
+    let widths = DONATE_FORMS.map(|words| donate_width(ui, words));
+    let mut donate = false;
+    let mut word_ends = details.left() - STRIP_GAP;
+    if let Some((form, x)) = donate_place(
+        row.left() + light + word_width + STRIP_GAP,
+        details.left() - STRIP_GAP,
+        row.center().x,
+        &widths,
+    ) {
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(x, row.center().y),
+            egui::vec2(widths[form], DONATE_HEIGHT - 2.0),
+        );
+        donate = donate_button(ui, rect, DONATE_FORMS[form]).clicked();
+        word_ends = rect.left() - STRIP_GAP;
+    }
+
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(row.min, egui::pos2(word_ends.max(row.left()), row.bottom())))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 5.0, colour);
+            if tone == Tone::Ok {
+                ui.painter().circle_stroke(rect.center(), 6.5, Stroke::new(1.0, colour.gamma_multiply(0.4)));
             }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(RichText::new(word).color(colour).strong()).truncate());
-            });
-        });
-    });
+            ui.add(egui::Label::new(RichText::new(word).color(colour).strong()).truncate());
+        },
+    );
+    // The children were laid out inside the row; what follows goes under it.
+    ui.advance_cursor_after_rect(row);
 
     if !state.diagnostics_open {
-        return;
+        return donate;
     }
     ui.add_space(4.0);
     ui.separator();
@@ -3026,6 +3092,138 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) {
                 ui.label(RichText::new(line).color(theme::TEXT_DIM).monospace().size(13.5));
             }
         });
+    donate
+}
+
+/// `D-071`: the strip's row, and the donation button a hair under it.
+const DONATE_HEIGHT: f32 = 30.0;
+/// The room kept between the strip's three things.
+const STRIP_GAP: f32 = 14.0;
+/// The forms the donation button takes as the strip narrows: the words, one
+/// word, the heart alone.
+const DONATE_FORMS: [&str; 3] = ["Support the project", "Support", ""];
+const DONATE_HEART: f32 = 15.0;
+
+/// How wide the button is with these words on it.
+fn donate_width(ui: &egui::Ui, words: &str) -> f32 {
+    if words.is_empty() {
+        return DONATE_HEART + 20.0;
+    }
+    DONATE_HEART + 8.0 + style::text_width(ui.painter(), words, 14.0, style::Weight::DemiBold) + 30.0
+}
+
+/// `D-071`: the form of the donation button a strip has room for -- an index
+/// into `widths`, widest first -- and the x of its centre: the strip's own
+/// centre while that is free, else as near to it as the neighbours let it
+/// come. `left` is where the headline ends and `right` where the details
+/// button begins, the gaps counted.
+///
+/// **The headline is never cut for it.** The word about the line is what the
+/// strip is for, and the longest of them -- *no way in from the internet* --
+/// is the one a player most needs whole. The button gives way form by form,
+/// and on a strip with no room for the heart alone it is not drawn.
+fn donate_place(left: f32, right: f32, centre: f32, widths: &[f32]) -> Option<(usize, f32)> {
+    let (form, width) = widths.iter().enumerate().find(|(_, w)| right - left >= **w)?;
+    Some((form, centre.clamp(left + width / 2.0, right - width / 2.0)))
+}
+
+/// `D-071`: the button that opens the donation page. A heart and three words
+/// on a pill that is warm where everything around it is cool: the one rose
+/// thing in the window, which is what brings the eye to it, and nothing else
+/// does.
+///
+/// **It does not move, blink or count.** A frame on the software rasteriser
+/// costs half a second (`D-056`), so an idle lobby paints nothing, and a button
+/// that pulsed for attention would be the only thing in the client that did.
+/// Nor does it appear at a win, or say what others gave: the lobby asks for
+/// nothing back (`result_words`), and this asks once, quietly, in one place.
+/// Under the pointer it warms and the heart grows -- the pointer's own frames.
+fn donate_button(ui: &mut egui::Ui, rect: egui::Rect, words: &str) -> egui::Response {
+    let resp = ui
+        .interact(rect, ui.id().with("donate"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(
+            "No house, no rake, no ads: P2Poker is free, and lives on gifts.\n\
+             Opens the donation page on GitHub in your browser (Bitcoin, USDT).",
+        );
+    let hot = resp.hovered();
+    let p = ui.painter();
+    let r = rect.height() / 2.0;
+    style::glow(p, rect, r, if hot { 14.0 } else { 10.0 }, style::faded(theme::ROSE, if hot { 0.50 } else { 0.22 }));
+    let [top, bottom] = donate_fill(hot);
+    style::gradient_rect(p, rect, r, &[(0.0, top), (1.0, bottom)]);
+    p.rect_stroke(
+        rect,
+        r,
+        Stroke::new(1.0, style::mix(theme::ROSE, theme::GOLD_EDGE, if hot { 0.15 } else { 0.45 })),
+        egui::StrokeKind::Inside,
+    );
+    let size = if hot { DONATE_HEART + 2.0 } else { DONATE_HEART };
+    let [ink, words_ink] = donate_inks(hot);
+    if words.is_empty() {
+        heart(p, rect.center(), size, ink);
+        return resp;
+    }
+    let words_width = style::text_width(p, words, 14.0, style::Weight::DemiBold);
+    let left = rect.center().x - (DONATE_HEART + 8.0 + words_width) / 2.0;
+    heart(p, egui::pos2(left + DONATE_HEART / 2.0, rect.center().y), size, ink);
+    style::text(
+        p,
+        egui::pos2(left + DONATE_HEART + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        words,
+        14.0,
+        style::Weight::DemiBold,
+        words_ink,
+    );
+    resp
+}
+
+/// The donation button's fill, top and bottom: the panel's cool greys warmed
+/// towards the rose, and further under the pointer.
+fn donate_fill(hot: bool) -> [Color32; 2] {
+    [
+        style::mix(theme::PANEL_LIGHT, theme::ROSE, if hot { 0.40 } else { 0.24 }),
+        style::mix(theme::PANEL, theme::ROSE, if hot { 0.24 } else { 0.12 }),
+    ]
+}
+
+/// The heart's colour and the words' on that fill: the rose and the felt's
+/// warm cream, both lit under the pointer.
+fn donate_inks(hot: bool) -> [Color32; 2] {
+    if hot {
+        [style::mix(theme::ROSE, Color32::WHITE, 0.18), Color32::WHITE]
+    } else {
+        [theme::ROSE, theme::ON_FELT_DIM]
+    }
+}
+
+/// A heart `width` across, centred on `at`: a square stood on its corner with a
+/// disc on each of its two upper sides. Drawn as shapes because the fonts'
+/// heart is a suit -- the album's, the cards' -- and sits off-centre in its
+/// line. One opaque colour, so the three pieces' soft edges vanish into each
+/// other where they overlap.
+fn heart(p: &egui::Painter, at: egui::Pos2, width: f32, colour: Color32) {
+    // With `d` the square's half diagonal and the discs' radius `d / sqrt 2`, the
+    // shape is `d (1 + sqrt 2)` across, reaches `d / 2 + d / sqrt 2` above the
+    // square's centre and `d` below it: so that centre lies half the difference
+    // under the middle of the shape, which is what `at` names.
+    let d = width / (1.0 + std::f32::consts::SQRT_2);
+    let lobe = d * std::f32::consts::FRAC_1_SQRT_2;
+    let top = d / 2.0 + lobe;
+    let mid = egui::pos2(at.x, at.y + (top - d) / 2.0);
+    p.circle_filled(egui::pos2(mid.x - d / 2.0, mid.y - d / 2.0), lobe, colour);
+    p.circle_filled(egui::pos2(mid.x + d / 2.0, mid.y - d / 2.0), lobe, colour);
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(mid.x, mid.y + d),
+            egui::pos2(mid.x + d, mid.y),
+            egui::pos2(mid.x, mid.y - d),
+            egui::pos2(mid.x - d, mid.y),
+        ],
+        colour,
+        Stroke::NONE,
+    ));
 }
 
 /// The colour of the status line, which follows the worst true thing.
@@ -3132,12 +3330,65 @@ mod tests {
             theme::DANGER,
             theme::GOLD_ACTION,
             theme::GOLD_EDGE,
+            theme::ROSE,
         ] {
             assert!(
                 theme::separation(theme::PANEL, c) >= 150,
                 "a colour drawn on a panel is not legible on it"
             );
         }
+    }
+
+    /// `D-071`: the donation button sits in the middle of the strip while the
+    /// middle is free, moves no further from it than its neighbours push it,
+    /// and gives way to the headline form by form: the word about the line is
+    /// never cut for it.
+    #[test]
+    fn the_donation_button_keeps_the_middle_and_gives_way_to_the_headline() {
+        let widths = [190.0, 100.0, 35.0];
+        assert_eq!(donate_place(200.0, 1_000.0, 600.0, &widths), Some((0, 600.0)), "a wide strip: the words, centred");
+        assert_eq!(
+            donate_place(200.0, 650.0, 600.0, &widths),
+            Some((0, 555.0)),
+            "the details button near the middle: the words still, against it"
+        );
+        assert_eq!(
+            donate_place(520.0, 700.0, 600.0, &widths),
+            Some((1, 600.0)),
+            "the long headline: one word, and the headline whole"
+        );
+        assert_eq!(donate_place(560.0, 600.0, 600.0, &widths), Some((2, 582.5)), "the heart alone, left of the middle");
+        assert_eq!(donate_place(300.0, 330.0, 600.0, &widths), None, "no room: not drawn");
+        assert_eq!(donate_place(700.0, 650.0, 600.0, &widths), None, "the neighbours overlap: not drawn");
+        // Wherever the neighbours stand, the button lies between them.
+        for left in (0..1_200).step_by(37) {
+            for right in (0..1_200).step_by(41) {
+                let (left, right) = (left as f32, right as f32);
+                if let Some((form, x)) = donate_place(left, right, 600.0, &widths) {
+                    let half = widths[form] / 2.0;
+                    assert!(x - half >= left && x + half <= right, "{left}..{right}: form {form} at {x}");
+                    assert!(form == 0 || right - left < widths[form - 1], "{left}..{right}: a wider form had room");
+                }
+            }
+        }
+    }
+
+    /// `D-071`: the button's words and its heart are legible on its own fill,
+    /// which is no palette surface: at rest and under the pointer, at the top
+    /// of the gradient and at the bottom.
+    #[test]
+    fn the_donation_buttons_words_are_legible_on_it() {
+        for hot in [false, true] {
+            for fill in donate_fill(hot) {
+                for ink in donate_inks(hot) {
+                    assert!(theme::separation(fill, ink) >= 150, "hot {hot}: {ink:?} on {fill:?}");
+                }
+            }
+        }
+        // The forms are what `donate_place` is given, widest first.
+        assert!(DONATE_FORMS[0].len() > DONATE_FORMS[1].len() && DONATE_FORMS[2].is_empty());
+        // And the page it opens is the project's own, over https.
+        assert!(DONATION_URL.starts_with("https://github.com/") && DONATION_URL.ends_with("/DONATE.md"));
     }
 
     /// `D-067`: the columns follow the width in points. Three on a wide

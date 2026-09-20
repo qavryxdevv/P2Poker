@@ -91,6 +91,10 @@ pub const ON_FELT_DIM: Color32 = rgb(0xE6D6A8);
 pub const OK: Color32 = rgb(0x35C48C);
 pub const WARN: Color32 = rgb(0xF2A63B);
 pub const DANGER: Color32 = rgb(0xEF5B5B);
+/// `D-071`: the heart on the button that opens the donation page, and the
+/// warmth of that button. A rose well to the pink of `DANGER`, because a red
+/// mark on the status strip otherwise reads as something wrong with the line.
+pub const ROSE: Color32 = rgb(0xFF5C8A);
 
 // ---------------------------------------------------------------------------
 // The table, sampled from the reference photograph
@@ -230,6 +234,7 @@ mod tests {
             ("danger", DANGER),
             ("gold", GOLD_ACTION),
             ("gold edge", GOLD_EDGE),
+            ("rose", ROSE),
         ];
 
         for (sname, surface) in surfaces {

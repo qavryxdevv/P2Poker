@@ -6287,3 +6287,101 @@ each first-cut run had one hand stall and the run without `D-070` had none, but 
 (`split185900-9`), and another of those walked seven seats' records inside ten seconds with no stall (`split182754-9`).
 The stalls are `S1-II`'s, and were read to their cause the same evening: the carrier's receive ring replayed a leftover
 a lap of 2048 messages old and lost one message to one seat (patch 0039) -- nothing of the lobby's. Correction (a) stands on what the reading buys, which is nothing.
+
+## D-071 — a button for gifts: the lobby opens the donation page, and the page is written by a tool that reads its own QR codes back
+
+**Decided 2026-09-20 by the project owner:** *add to the lobby, at the bottom in the middle, a psychologically
+attractive button for financial contributions; it opens in the browser an attractive document in the repository
+with the public addresses, the currencies' logos and QR codes -- Bitcoin SegWit and Tether USDT on the TRON network;
+check that the addresses are valid; and a script, run by one `.bat` file, that asks for the addresses, verifies
+them and changes them on GitHub, QR codes included.*
+
+1. **The button** is in the middle of the network strip (`network_strip`, `donate_button`): a heart and *Support
+   the project* on a pill. **What makes it attractive is warmth, and nothing else**: it is the one rose thing in a
+   window of cool greys, gold and felt, so the eye comes to it unasked; the heart is drawn as shapes (the fonts'
+   heart is a suit -- the album's, the cards'); the words offer and do not ask; under the pointer the pill warms,
+   the heart grows and the cursor becomes a hand; and the tooltip gives the reason in one line -- *no house, no
+   rake, no ads: P2Poker is free, and lives on gifts* -- and says what the click does. **What it does not do:** it
+   does not move, blink or pulse -- a frame on the software rasteriser costs half a second (`D-056`), an idle lobby
+   paints nothing, and a button that pulsed for attention would be the only thing in the client that did; it does
+   not appear at a win, count what others gave, or come back as a window -- the lobby asks for nothing back
+   (`gui::lobby::result_words`), and this asks once, quietly, in one place. **The strip is for the line's word
+   first**: the button takes the strip's centre while that is free, moves no further than its neighbours push it,
+   and gives way form by form -- the words, then *Support*, then the heart alone, then nothing -- before one letter
+   of the headline is cut (`donate_place`); the longest headline, *no way in from the internet*, is the one a
+   player most needs whole.
+2. **What it opens** is `gui::render::DONATION_URL`, **a constant of the build**: no setting, file or word from the
+   network reaches that string, because an address a donor is sent to is money, and one the network could change is
+   one a stranger could change. **The addresses themselves are not in the binary**: they are on the page, so an
+   address changes without a release, and never without a commit. The system opens it (`ShellExecuteW`, the
+   operation *open*: `windows-sys`'s `Win32_UI_Shell`; `xdg-open` and `open` elsewhere), and only after
+   `is_a_web_address` has passed it -- a plain `https://` address: nothing handed over can be run as a command
+   line, since no shell reads it, but whatever is handed over is *opened*, and opening a path runs a program. The
+   client's log says the address either way, so a player whose system opened nothing can still read where it is.
+3. **The page** is `DONATE.md` at the repository's root: for each currency its mark (**drawn for this project** --
+   a tilted B on orange, a barred T on green; nobody's artwork file is copied), its QR code as an SVG with its
+   quiet zone on white so that it reads on GitHub's dark theme too, the address in a code block (GitHub gives it a
+   copy button), and the network in words -- *Bitcoin only*; *TRON (TRC-20) only, the same coin over another
+   network does not arrive*. It says that **a donation is a gift: it buys no chips, no rank and no advantage**
+   (the game is play money, `README.md`), and what to do before sending: compare the first six and the last six
+   characters, because clipboard malware swaps an address for a thief's own, which is a perfectly valid one. The
+   Bitcoin code says `bitcoin:` and the address (BIP-21), TRON's the address alone.
+4. **The page is derived, never edited**: `tools/donation-page.py` writes it (`--write` makes the same bytes from
+   the same addresses, `--check` says whether the files are those bytes). **An address is taken only if its
+   checksum holds and it is of the kind the page says**: a mainnet native SegWit address under bech32 or bech32m
+   (BIP-173, BIP-350) -- a testnet or legacy one is refused by name; for TRON, Base58Check over 21 bytes beginning
+   `0x41` -- an Ethereum-style one is refused by name. **A QR code is published only if an independent decoder
+   reads the address back out of it.** The encoder is the tool's own (byte mode, level M, versions 1 to 6); the
+   decoder is OpenCV's, which shares no code with it; what is decoded is the SVG **file**, parsed back into
+   modules. Two readings are asked of every code, whole and with six modules flipped (which passes only if the
+   error-correction codewords are right): OpenCV's decoder *told where the corners are* must read exactly the text
+   -- that is the proof of the encoder -- and a detector that has to *find* the code in a picture, as a camera
+   does, must read it at one size of several; any answer that is not the text refuses the code, whoever gives it.
+   A detector's *not found* alone does not: OpenCV's classic detector misses perfectly good codes in a perfectly
+   sharp picture (below). Without OpenCV nothing is written: a QR code nobody has read is a guess.
+5. **`--set` is the one way an address changes**, and the owner's `.bat` runs it (in the owner's language; the
+   `.bat` is not in the repository, because it names a path on a machine). It refuses to start unless the clone is
+   on `master` -- the branch the button opens -- holds no unpushed commit (a push would publish it as well, and
+   whoever made it has not said it is ready) and is level with GitHub. It shows the address published now, takes
+   the new one or Enter, refuses a bad one in words and asks again, shows *was* and *will be* in groups of four
+   characters, and wants the word typed. Then it writes, commits **those paths only**, pushes, and asks GitHub
+   whether it holds the new commit. Anything failing on the way puts the files and the commit back as they were:
+   a page changed on one disk alone is a page nobody can check against GitHub.
+6. **Held by the tests.** `tests/donation_page.rs` checks both checksums again **in Rust, with code that shares
+   nothing with the tool's**, on every run: the link is https, to GitHub, to `DONATE.md` on the branch the tool
+   publishes from; one address between each pair of markers; the page calls its Bitcoin address what it is;
+   every picture shown is a file that is here; each QR file is titled with exactly what the page says it encodes
+   (the hand edit the tool cannot be asked about: the page changed and not the picture); and its own checkers take
+   the BIPs' vectors and refuse a test network's address, the wrong checksum for a witness version, the other
+   chain's address and **every single wrong character** in the page's two addresses (1 209 and 1 938 of them).
+   It does not read a QR code: that takes a decoder, and `--check` is where it is.
+   `gui::render::tests::the_donation_button_keeps_the_middle_and_gives_way_to_the_headline`,
+   `the_donation_buttons_words_are_legible_on_it` (its fill is no palette surface), and
+   `only_a_plain_web_address_is_handed_to_the_system`.
+
+**The two addresses, checked 2026-09-20.** `bc1qgecm...c3hud`: Bitcoin main network, witness version 0, a 20-byte
+program -- native SegWit, P2WPKH; bech32 holds. `TTn7xZ...3nzJv`: 21 bytes beginning `0x41`, the TRON main network;
+Base58Check holds. By three implementations that share no code: the tool's, the decode-and-encode-again of the
+owner's key generator kit, and the Rust test's. **A checksum says an address is well formed, not whose it is**: that
+these two are the owner's is the owner's to compare with the wallet, and a wallet's scan of both codes is the
+owner's too.
+
+**Measured.** *The encoder* (`--selftest`, OpenCV 4.12): a random text of every length from 1 to 106 bytes --
+14, 12, 16, 20, 22 and 22 codes of versions 1 to 6 -- each read back exactly by the decoder told its corners, whole
+and with six modules flipped, and each found and read by a detector on its own; 107 bytes refused. OpenCV's classic
+detector did not find seven of the 106 at ten pixels a module, and one of them at none of eight pictures, while its
+own decoder read all seven once told the corners and the other detector found all 106 at the first size: which is
+why *not found* by one detector is reported and not held against a code. *Whether the self-test can fail*, by
+breaking the encoder under it: error-correction codewords all zero -- refused; sixty modules flipped instead of six
+-- refused; the SVG read back mirrored -- refused; one character of the text another one -- refused, with the wrong
+text quoted; and one error-correction codeword wrong -- **passes**, as it must, since that is what the codewords are
+for. *Whether the Rust test can fail*, by editing the page by hand: one character of the Bitcoin address -- three
+of four tests fail; the TRON address replaced by another valid one in the page only -- the title check fails; a
+testnet address -- two fail; the page put back -- four pass. *What a browser draws*: Chromium drew both published
+SVG files at 130, 260 (the size on the page) and 520 pixels, and every module's centre was read back from the
+canvas: 0 of 1 681 and 0 of 1 369 differ from what the tool's parser says the file draws, no pixel left undrawn,
+and against a matrix with one module flipped the same comparison reports exactly one.
+
+**What is NOT shown.** That a phone's wallet scans the codes -- OpenCV and a browser are not a wallet, and the
+owner's scan of both is the last check. That the button brings a gift: it was built to be seen and to be honest, and
+what it earns is nobody's to promise.

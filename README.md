@@ -199,6 +199,13 @@ The design is written down before it is built, and the documents are normative:
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — every decision, including the ones that were withdrawn
 - [`NEXT.md`](NEXT.md) — where the work is now
 
+## Supporting it
+
+There is no house here to take a rake, no ads and nothing to buy. If the client gave you a good evening at
+the tables, [`DONATE.md`](DONATE.md) is how it keeps going: two addresses, each with its QR code, and the
+lobby's *Support the project* button opens the same page. A donation is a gift -- it buys no chips, no
+rank and no advantage at any table.
+
 ## What this is not
 
 **It is not a gambling product.** It plays for play money. There is no cashier,

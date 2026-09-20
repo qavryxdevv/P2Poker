@@ -12,6 +12,7 @@ profile/
 /dist/
 
 # Editor / OS noise
+__pycache__/
 .vscode/
 .idea/
 Thumbs.db
