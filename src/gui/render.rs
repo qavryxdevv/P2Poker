@@ -1753,9 +1753,24 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
             if own_scroll {
                 body(ui);
             } else {
-                egui::ScrollArea::vertical()
+                // `S1-IR`: **`min_scrolled_height`, or the dialog eats its own
+                // buttons.** A scroll area inside a window that sizes itself to
+                // its content is a loop -- the window asks the area how tall it
+                // is, the area asks the window how much room there is -- and it
+                // settles wherever it first lands. Measured: `body_height` was
+                // 650 and the viewport settled at about 365, so *Create* sat
+                // below the fold of a window with 300 points of room to spare,
+                // and only the wheel found it. Naming the height a scrolling
+                // viewport must have ends the loop: the area is the content's
+                // height when it fits, and the room it was given when it does
+                // not. The settings page had already met this and says so above
+                // its own `min_scrolled_height`. The bar is always drawn beside
+                // it, as everywhere else in this file, so a body that really is
+                // too tall says so before the wheel is turned.
+                scroller(egui::ScrollArea::vertical())
                     .id_salt("dialog-body")
                     .max_height(body_height)
+                    .min_scrolled_height(body_height)
                     .auto_shrink([false, true])
                     .show(ui, body);
             }
