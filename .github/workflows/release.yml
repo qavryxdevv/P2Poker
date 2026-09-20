@@ -1,0 +1,144 @@
+# D-074: the release is built where anybody can see it being built, and GitHub signs what it built.
+#
+# A tag `v*` (or a manual run) builds the Windows client on a GitHub-hosted runner from exactly the tagged commit,
+# writes its SHA-256 beside it, and asks GitHub for a **build provenance attestation**: a statement, signed through
+# Sigstore with a certificate that exists for minutes and is bound to THIS workflow in THIS repository at THIS commit,
+# that the file with that digest came out of this run. Nobody holds a signing key -- there is none to steal -- and
+# the statement goes into a public transparency log.
+#
+# Anybody can then check a download against the source it claims to be:
+#
+#     gh attestation verify p2p-poker.exe --repo qavryxdevv/P2Poker
+#
+# What it proves: this file is what this repository's workflow built from that commit. What it does NOT prove: that
+# the source is good -- read it -- and it is not a Windows code-signing certificate, so SmartScreen still asks.
+#
+# Every action is pinned to a commit, not to a tag: a tag can be moved, and a moved tag in a signing workflow is a
+# way to sign somebody else's build under this repository's name. Only GitHub's own actions are used.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    # VS 2022 and its v143 toolset, which is where tools/build-tox.ps1 and build.rs expect libsodium to be built.
+    runs-on: windows-2022
+    timeout-minutes: 120
+    permissions:
+      contents: write          # to publish the release
+      id-token: write          # to ask Sigstore for the short-lived certificate
+      attestations: write      # to store the attestation
+      artifact-metadata: write # what actions/attest asks for beside it
+    env:
+      # .cargo/config.toml holds the owner's machine to 19 jobs; a hosted runner has four cores and 16 GB.
+      CARGO_BUILD_JOBS: 4
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust, stable, as the runner ships it
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: libsodium, static, from the vendored source
+        shell: pwsh
+        run: ./tools/build-tox.ps1
+
+      - name: Build the client (release, locked to Cargo.lock)
+        shell: pwsh
+        run: cargo build --release --locked
+
+      - name: It starts, and says which version it is
+        shell: pwsh
+        run: |
+          # `--cash` is refused (D-072) before a window or the node is started, so this shows that the file runs
+          # and says its version, in a second, on a machine with no display. It makes a throwaway profile beside
+          # the binary on the way, which the runner throws away with the rest. Through `cmd` so that a line on
+          # stderr is a line and not a PowerShell error; the refusal's exit code 2 is the one expected.
+          # Backslashes, because to `cmd` a forward slash begins a switch.
+          $out = cmd /c 'target\release\p2p-poker.exe --cash 2>&1' | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 2) { throw "expected the refusal's exit code 2, got $LASTEXITCODE" }
+          if ($out -notmatch 'p2p-poker [0-9]+[.][0-9]+[.][0-9]+') { throw 'the client did not say its version' }
+          $global:LASTEXITCODE = 0
+
+      - name: SHA-256, as other tools print it
+        id: digest
+        shell: pwsh
+        run: |
+          $exe = 'target/release/p2p-poker.exe'
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  p2p-poker.exe" | Out-File -Encoding ascii -NoNewline 'target/release/p2p-poker.exe.sha256'
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "### p2p-poker.exe`n`n``$hash```n`n$((Get-Item $exe).Length) bytes, built from ``${{ github.sha }}``" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Attest the build's provenance
+        id: attest
+        # Free plans attest public repositories only. While this one was private the step is skipped and the
+        # release says so, rather than the whole workflow going red for a reason that is not a fault.
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: target/release/p2p-poker.exe
+
+      - name: Keep the attestation beside the file, for checking offline
+        if: ${{ steps.attest.outputs.bundle-path != '' }}
+        shell: pwsh
+        run: Copy-Item '${{ steps.attest.outputs.bundle-path }}' 'target/release/p2p-poker.exe.sigstore.json'
+
+      - name: Keep the build with the run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: p2p-poker-windows-x64
+          if-no-files-found: error
+          path: |
+            target/release/p2p-poker.exe
+            target/release/p2p-poker.exe.sha256
+            target/release/p2p-poker.exe.sigstore.json
+
+      - name: Publish the release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $files = @('target/release/p2p-poker.exe', 'target/release/p2p-poker.exe.sha256')
+          if (Test-Path 'target/release/p2p-poker.exe.sigstore.json') { $files += 'target/release/p2p-poker.exe.sigstore.json' }
+          $attested = if ('${{ steps.attest.outputs.attestation-url }}') { "Build provenance: ${{ steps.attest.outputs.attestation-url }}" } else { 'Not attested: the repository was private when this was built.' }
+          $fence = '```'
+          $notes = @(
+            '**Windows x64, one portable file.** Start it and it offers to install itself (D-073); decline, and it runs from the folder it is in.',
+            '',
+            'SHA-256: `${{ steps.digest.outputs.sha256 }}`',
+            '',
+            'Check that this file is what this repository built from this tag:',
+            '',
+            $fence,
+            'gh attestation verify p2p-poker.exe --repo ${{ github.repository }}',
+            $fence,
+            '',
+            $attested,
+            '',
+            'A beta. Play money only. It is not signed with a Windows certificate, so SmartScreen will ask before the first start.'
+          ) -join "`n"
+          $notes | Out-File -Encoding utf8 'release-notes.md'
+          gh release create $tag @files --repo '${{ github.repository }}' --title "P2Poker $tag" --notes-file 'release-notes.md' --prerelease --verify-tag

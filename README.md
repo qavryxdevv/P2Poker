@@ -176,6 +176,24 @@ asked, and neither is a folder that already has a player in it. The About tab
 says where this copy lives, and offers to install a portable one with its
 profile moved along, so you stay the same player. `D-073` has the reasoning.
 
+### And a download can be checked against this source
+
+Releases are not built on anybody's own machine. A tag starts this repository's
+workflow on one of GitHub's, which builds the client from exactly that commit
+and has GitHub sign a statement of it -- through Sigstore, with a certificate
+that lives for minutes and is bound to this workflow in this repository. Nobody
+holds a signing key, so there is none to steal. To check a file you downloaded:
+
+```bash
+gh attestation verify p2p-poker.exe --repo qavryxdevv/P2Poker
+```
+
+Its SHA-256 is on the release page and beside it as `p2p-poker.exe.sha256`.
+That proves *where the file came from* -- this source, that tag -- and not that
+the source is good, which is what reading it is for. It is also **not** a
+Windows code-signing certificate, so SmartScreen still asks before the first
+start. `D-074` has the reasoning.
+
 ## Testing
 
 ```bash
