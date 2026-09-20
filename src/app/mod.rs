@@ -98,15 +98,27 @@ pub fn worth_logging(line: &str) -> bool {
     /// *could not join the public lobby* and *no other poker client has been
     /// reached yet* are this client saying it cannot be played with, which is
     /// the first thing a reader of this file wants to know.
-    const DROP: [&str; 8] = [
+    const DROP: [&str; 10] = [
         "joined the lobby mesh",
         // The space is load-bearing: without it this also matches *could not
         // jo-IN THE PUBLIC LOBBY*, which is the opposite of chatter.
         " in the public lobby",
         "lobby: answered",
         "is now a direct connection",
+        // `S1-IO`: **and its opposite**, which is the ordinary state. The good
+        // news was dropped and the routine one kept, so a hole punch that gave
+        // up wrote a line per peer per attempt: **1 494 of the 12 563 lines
+        // (11.9 %, 117 KiB) of the owner's own file**, 734 of them about
+        // different peers, and `NETWORK_STACK.md` §9.4 says in as many words
+        // that *still relayed* is a normal steady state and never an error.
+        "stays relayed",
         "dial failed",
         "relay said no",
+        // `S1-IO`: the relay key's providers, counted once per ANSWER of the
+        // query and so several times a cycle -- **1 605 lines, 12.8 %, 74 KiB**
+        // of the same file. Which relay this client holds is on the strip, and
+        // a relay that says no is dropped two lines above.
+        "relay(s) advertised in the DHT",
         "from the DHT refused",
         "NOT enough to carry a hand",
     ];
@@ -3743,6 +3755,10 @@ mod tests {
             "relay said no: Failed to get Reservation.",
             "707 private address(es) from the DHT refused (2106 this run)",
             "12D3KooWDffC… is now a direct connection",
+            // `S1-IO`: measured on the owner's own file, where these two were
+            // 24.7% of 12 563 lines and 191 KiB of a bound of 1 024.
+            "12D3KooWDffC… stays relayed",
+            "12 relay(s) advertised in the DHT",
         ] {
             assert!(!worth_logging(line), "dropped: {line}");
         }

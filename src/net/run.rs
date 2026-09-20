@@ -18864,19 +18864,46 @@ mod a_joiner_before_the_first_hand {
         assert_eq!(joiner_leaves_because(false, false, None, false, false, false, false), None);
     }
 
-    /// `S1-E`: the twenty closest of five thousand random nodes put the DHT at
-    /// about five thousand -- within a factor of two, which is what twenty
-    /// samples of a uniform keyspace can say -- and four are the fewest it reads.
+    /// `S1-E`: the twenty closest of five thousand nodes put the DHT at about
+    /// five thousand -- within a factor of two, which is what twenty samples of
+    /// a uniform keyspace can say -- and four are the fewest it reads.
+    ///
+    /// **`S1-IP`: the five thousand are derived, not drawn.** This test used
+    /// `PeerId::random()` and asserted a **single sample** of a heavy-tailed
+    /// estimator was within a factor of two, which is true of the typical draw
+    /// and not of every draw: it failed the chain on 2026-09-20 with an
+    /// estimate of 10 276, and a measurement of **500 draws** put the median at
+    /// 5 248 (the truth is 5 000) with **12 outside the band -- one run in 42**.
+    /// A red chain that is really a coin toss teaches a reader to run it again
+    /// instead of looking, which is the one thing a test must never teach. The
+    /// ids come from a counter through `ed25519_from_bytes` now, so the draw is
+    /// fixed, the estimate is a number this test states, and the statistical
+    /// claim lives where it belongs: in this sentence, with its measurement.
     #[test]
     fn the_closest_nodes_to_a_key_say_how_big_the_dht_is() {
         let key = lobby_namespace();
         let target = libp2p::kad::KBucketKey::new(key.clone());
-        let mut all: Vec<libp2p::PeerId> = (0..5_000).map(|_| libp2p::PeerId::random()).collect();
+        let mut all: Vec<libp2p::PeerId> = (0..5_000u32)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                libp2p::identity::Keypair::ed25519_from_bytes(seed)
+                    .expect("a key pair from a seed")
+                    .public()
+                    .to_peer_id()
+            })
+            .collect();
         all.sort_by_key(|p| libp2p::kad::KBucketKey::from(*p).distance(&target));
         let n = dht_size_from_closest(&key, &all[..20]).expect("twenty nodes");
-        assert!((2_500..=10_000).contains(&n), "an estimate of {n} for 5 000 nodes");
+        assert_eq!(n, THE_ESTIMATE_OF_THIS_DRAW, "the estimator changed, or the draw did");
+        assert!((2_500..=10_000).contains(&n), "and this draw is within the factor of two");
         assert_eq!(dht_size_from_closest(&key, &all[..3]), None);
     }
+
+    /// What `the_closest_nodes_to_a_key_say_how_big_the_dht_is` derives from its
+    /// fixed five thousand. Written out rather than recomputed: a test that
+    /// recomputes the thing it checks passes whatever the code does.
+    const THE_ESTIMATE_OF_THIS_DRAW: u64 = 6_234;
 
     /// `S1-HZ`: a founder's lobby answer keeps it alive through its silence in the
     /// group only when it came after the silence began -- within one gap between
