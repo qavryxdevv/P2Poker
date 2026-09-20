@@ -8,6 +8,8 @@ pub mod joinrpc;
 pub mod joinwire;
 pub mod lobby;
 pub mod lobbytalk;
+/// `S1-IV`: what a lookup of a provider key found, said once, when it ends.
+pub mod lookups;
 pub mod matchmaker;
 pub mod tabletalk;
 pub mod node;

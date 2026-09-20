@@ -24,6 +24,14 @@ NOT TOLD APART` for a log from before the dials were kept apart, where no meetin
 by the key could have been said -- an absent instrument, not a zero; `NOT SHOWN`
 otherwise. A log with no D-070 line at all is a client built before D-070, and is said
 as that rather than counted as a seat the key failed.
+
+**Which build wrote the log (`S1-IV`).** Only a binary built to be measured -- the
+`fault-harness` feature, which is what the bed runs -- says every ANSWER of a lookup, and
+the sizes of the answers and the moment one first named somebody else are read from
+those lines. A player's build says one line a LOOKUP, when it ends: who all its answers
+named. A log that holds only those is read as that -- its lookups are counted and the
+first that named somebody else is timed at its END -- and never as a key that returned
+nothing: an absent instrument, not a zero.
 """
 import pathlib
 import re
@@ -34,6 +42,10 @@ LINE = re.compile(r"^\ufeff?(\d\d:\d\d:\d\d\.\d{3})\s+(-?[0-9.]+)\s\s(.*)$")
 HOUR_ANSWER = re.compile(
     r"^(\d+) player\(s\) in the public lobby within the hour(?:, (\d+) of them not this client)? \(D-070\)")
 LOBBY_ANSWER = re.compile(r"^(\d+) player\(s\) in the public lobby$")
+# `S1-IV`: the line of a whole lookup, which every build says when the lookup ends.
+HOUR_LOOKUP = re.compile(
+    r"^(?:at least )?(\d+) player\(s\) in the public lobby within the hour, (\d+) of them not this client \(D-070; ")
+LOBBY_LOOKUP = re.compile(r"^(?:at least )?(\d+) player\(s\) in the public lobby, (\d+) of them not this client \(")
 REACHED = re.compile(r"^(\S+) is a poker client, reached by a dial an answer in the public lobby within the hour issued")
 NAMED = re.compile(r"^(\S+) is a poker client, named in the public lobby within the hour")
 MET = re.compile(r"^another poker client: (\S+)")
@@ -84,6 +96,8 @@ def main():
         reached, named, met = {}, {}, {}
         walked = returned = first_other = asked = None
         counts_others = True
+        lookups, first_other_lookup = [], None
+        lobby_lookups = []
         for t, text in lines:
             m = HOUR_ANSWER.match(text)
             if m:
@@ -92,6 +106,16 @@ def main():
                     counts_others = False
                 elif first_other is None and int(m.group(2)) > 0:
                     first_other = t
+                continue
+            m = HOUR_LOOKUP.match(text)
+            if m:
+                lookups.append((int(m.group(1)), int(m.group(2))))
+                if first_other_lookup is None and int(m.group(2)) > 0:
+                    first_other_lookup = t
+                continue
+            m = LOBBY_LOOKUP.match(text)
+            if m:
+                lobby_lookups.append((int(m.group(1)), int(m.group(2))))
                 continue
             m = LOBBY_ANSWER.match(text)
             if m:
@@ -115,7 +139,7 @@ def main():
                 returned = t
             elif text.startswith("asking to join") and asked is None:
                 asked = t
-        if not hour and walked is None and not named and not reached:
+        if not hour and not lookups and walked is None and not named and not reached:
             print("%-10s no D-070 line: a client built before it, or a log that is not a seat's" % log.stem)
             continue
         seats += 1
@@ -128,8 +152,18 @@ def main():
         print("%-10s   first poker client met %s; asked to join %s; an hour's answer first named somebody else %s" % (
             "", sec(first_met), sec(asked),
             sec(first_other) if counts_others else "? (a log from before the line counted others)"))
-        print("%-10s   the hour's key: %s" % ("", summary(hour)))
-        print("%-10s   the lobby's own: %s" % ("", summary(lobby)))
+        if hour or not lookups:
+            print("%-10s   the hour's key: %s" % ("", summary(hour)))
+        if lookups:
+            print("%-10s   the hour's lookups: %d ended, the most one named %d (%d of them not this client)%s" % (
+                "", len(lookups), max(n for n, _ in lookups), max(o for _, o in lookups),
+                "" if hour else "; A PLAYER'S BUILD -- it says no answer by itself (S1-IV), so the answers' sizes are"
+                " not in this log, and the first LOOKUP that named somebody else ended %s" % sec(first_other_lookup)))
+        if lobby or not lobby_lookups:
+            print("%-10s   the lobby's own: %s" % ("", summary(lobby)))
+        if lobby_lookups:
+            print("%-10s   the lobby's own lookups: %d ended, the most one named %d (%d of them not this client)" % (
+                "", len(lobby_lookups), max(n for n, _ in lobby_lookups), max(o for _, o in lobby_lookups)))
         if counts_others:
             print("%-10s   poker clients met: %d; on a connection an hour's answer dialled: %d%s; named by the hour's key and met another way: %d" % (
                 "", len(met), len(reached),

@@ -470,6 +470,19 @@ fn reads_the_hours_keys(poker_clients_connected: usize) -> bool {
     poker_clients_connected == 0
 }
 
+/// `S1-IV`: whether every single answer of a provider lookup is said, beside
+/// the one line the lookup says when it ends (`net::lookups`).
+///
+/// Only in a binary built to be measured. `tools/read-hour-key.py` reads the
+/// answers one by one -- their sizes, and the moment an hour's answer first
+/// named somebody who is not this client -- and the runs it has read are
+/// compared with the runs it will read, so the line keeps its shape there. A
+/// player's client says the lookup's line and nothing per answer: those lines
+/// were 30 % of a log whose window holds five hundred.
+fn says_every_answer() -> bool {
+    cfg!(feature = "fault-harness")
+}
+
 /// `D-070`: how far into every hour **this** client announces under the new
 /// hour's key: a moment of the first `HOUR_TURN_SPREAD_S` fixed by its peer id.
 ///
@@ -2188,6 +2201,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // vacuous confirmation was all that kept it quiet.
     let mut lobby_lookups: std::collections::HashMap<libp2p::kad::QueryId, bool> =
         std::collections::HashMap::new();
+    // `S1-IV`: and what every lookup of a provider key has been answered so
+    // far, to be said once when it ends -- Kademlia reports a lookup answer by
+    // answer, most answers name nobody, and a line for each was 30 % of a log.
+    let mut lookups: super::lookups::Lookups<libp2p::kad::QueryId, libp2p::PeerId> =
+        super::lookups::Lookups::default();
 
     // Whether this client has offered itself as a relay. Once only: the record
     // is republished by Kademlia on its own.
@@ -4287,6 +4305,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             let lookup = kad.get_providers(lobby_namespace());
                             lobby_lookups.insert(lookup, false);
+                            lookups.asked(lookup, super::lookups::Asked::Lobby);
                         }
                         // `D-070`: and under the hour's key in the same breath,
                         // for the same reason.
@@ -4302,7 +4321,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if reads_the_hours_keys(poker_peers.len()) {
                                 for h in lobby_hours_to_read(unix_s) {
-                                    hour_lookups.insert(kad.get_providers(hour_namespace(h)));
+                                    let lookup = kad.get_providers(hour_namespace(h));
+                                    hour_lookups.insert(lookup);
+                                    lookups.asked(lookup, super::lookups::Asked::Hour);
                                 }
                             }
                         }
@@ -6002,6 +6023,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             QueryResult::GetProviders(Err(e)) => {
                                 lobby_lookups.remove(&id);
                                 hour_lookups.remove(&id);
+                                // `S1-IV`: what it had found before it failed
+                                // is still what it found.
+                                if let Some(found) = lookups.ended(&id, swarm.local_peer_id()) {
+                                    let _ = events.send(NodeEvent::Warning(found.words())).await;
+                                }
                                 let _ = events
                                     .send(NodeEvent::Warning(format!("DHT lookup failed: {e}")))
                                     .await;
@@ -6046,6 +6072,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         {
                             hour_lookups.remove(&id);
                             let was_lobby = lobby_lookups.get(&id).copied();
+                            // `S1-IV`: the lookup's one line -- who all its
+                            // answers named, each once (`net::lookups`).
+                            if let Some(found) = lookups.ended(&id, swarm.local_peer_id()) {
+                                let _ = events.send(NodeEvent::Warning(found.words())).await;
+                            }
                             // `S1-E`: what one walk of the lobby key costs and what it
                             // says about the DHT it walked -- how many nodes it asked,
                             // and the size its closest nodes put the DHT at, which is
@@ -6103,18 +6134,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // `split174430-9`'s *1 player within the hour* at 3 s
                             // was the seat reading its own record.
                             let others = providers.iter().filter(|p| *p != swarm.local_peer_id()).count();
-                            let _ = events
-                                .send(NodeEvent::Warning(if hourly {
-                                    format!(
-                                        "{} player(s) in the public lobby within the hour, {others} of them not this client (D-070)",
-                                        providers.len()
-                                    )
-                                } else if lobby {
-                                    format!("{} player(s) in the public lobby", providers.len())
-                                } else {
-                                    format!("{} relay(s) advertised in the DHT", providers.len())
-                                }))
-                                .await;
+                            // `S1-IV`: **an answer is one DHT node's reply, and
+                            // most name nobody.** Said one by one, a lookup that
+                            // found thirty-one players read *1*, *24*, *31* and
+                            // then *0 player(s)* a dozen times within a second,
+                            // and those lines were 30 % of a seat's log
+                            // (`split190546-9`: 7 443 of 24 643, 4 203 of them
+                            // saying 0). The lookup says what it found once,
+                            // when it ends. The answer's own line stays where a
+                            // run is measured by it -- `tools/read-hour-key.py`
+                            // reads the sizes of the answers and the moment one
+                            // first named somebody else -- and only there.
+                            lookups.heard(&id, providers.iter());
+                            if says_every_answer() {
+                                let _ = events
+                                    .send(NodeEvent::Warning(if hourly {
+                                        format!(
+                                            "{} player(s) in the public lobby within the hour, {others} of them not this client (D-070)",
+                                            providers.len()
+                                        )
+                                    } else if lobby {
+                                        format!("{} player(s) in the public lobby", providers.len())
+                                    } else {
+                                        format!("{} relay(s) advertised in the DHT", providers.len())
+                                    }))
+                                    .await;
+                            }
                             // **A few, not all.** Every provider was dialled
                             // every cycle, and a lobby key accumulates records
                             // from clients that are long gone - a dozen dead
@@ -6718,6 +6763,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         for h in lobby_hours_to_read(unix_s) {
                             let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(hour_namespace(h));
                             hour_lookups.insert(lookup);
+                            lookups.asked(lookup, super::lookups::Asked::Hour);
                         }
                     }
                     // Read it every cycle either way: a client with nothing
@@ -6725,6 +6771,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // can reach is a table it can sit at.
                     let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
                     lobby_lookups.insert(lookup, false);
+                    lookups.asked(lookup, super::lookups::Asked::Lobby);
                     // `S1-EX`: and the same for each slice of the lobby this
                     // client listens to, which is what makes a sliced lobby
                     // able to hold a mesh at all -- see `shard_namespace`. At
@@ -6742,7 +6789,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if reachable_here {
                             let _ = swarm.behaviour_mut().ipfs_kad.start_providing(key.clone());
                         }
-                        swarm.behaviour_mut().ipfs_kad.get_providers(key);
+                        let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(key);
+                        lookups.asked(lookup, super::lookups::Asked::Lobby);
                     }
                 }
 
@@ -6763,7 +6811,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // repaired.
                 if !have_reservation {
                     relay_searches += 1;
-                    swarm.behaviour_mut().ipfs_kad.get_providers(relay_namespace());
+                    let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(relay_namespace());
+                    lookups.asked(lookup, super::lookups::Asked::Relays);
                     if relay_searches >= 3 && !seen_a_relay {
                         let _ = events
                             .send(NodeEvent::NoRelayFound {
@@ -19451,5 +19500,48 @@ mod back_at_the_table {
         let to = from + code[from..].find("\n}\n").expect("its end");
         assert!(code[from..to].contains("report_params(events, f).await"), "report_roster says the parameters");
         assert_eq!(code.matches("report_params(").count(), 2, "and it is the one caller: its definition and that call");
+    }
+
+    /// `S1-IV`: every lookup of a provider key is entered in the book that says
+    /// its one line, its every answer is tallied there, and both of its ends say
+    /// it -- road by road, because a lookup started beside the book is a lookup
+    /// that says nothing at all in a player's client.
+    ///
+    /// The break that must make this fail: start a lookup and drop its id
+    /// (`swarm.behaviour_mut().ipfs_kad.get_providers(relay_namespace());`).
+    #[test]
+    fn every_provider_lookup_is_tallied_and_says_its_line_once() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let mut started = 0;
+        for (at, _) in code.match_indices(".get_providers(") {
+            let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+            let line = code[line_start..].lines().next().unwrap_or_default();
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            started += 1;
+            let after: Vec<&str> = code[at..].lines().skip(1).take(3).collect();
+            assert!(
+                line.contains("let lookup = ") && after.iter().any(|l| l.contains("lookups.asked(lookup, super::lookups::Asked::")),
+                "a lookup is started and not entered in the book: {line}"
+            );
+        }
+        assert_eq!(started, 6, "the lobby's key and the hours' on two roads, a slice's and the relays' on one");
+        assert_eq!(code.matches("lookups.heard(&id, providers.iter())").count(), 1, "every answer is tallied");
+        assert_eq!(code.matches("lookups.ended(&id, swarm.local_peer_id())").count(), 2, "a finished lookup and a failed one");
+        // And the answer's own line is said only behind the one rule.
+        let answer = code.find("lookups.heard(&id, providers.iter())").expect("the tally");
+        let said = code[answer..].find("relay(s) advertised in the DHT\", providers.len())").expect("the answer's line");
+        assert!(code[answer..answer + said].contains("if says_every_answer() {"), "an answer is said only where a run is measured");
+        assert_eq!(code.matches("relay(s) advertised in the DHT\"").count(), 1);
+        // And the rule is the build's and nothing a run can switch on: a
+        // player's client has no way to say every answer.
+        let rule = code.find("fn says_every_answer() -> bool {").expect("the rule");
+        assert_eq!(
+            code[rule..].lines().nth(1).map(str::trim),
+            Some("cfg!(feature = \"fault-harness\")"),
+            "only a binary built to be measured says every answer"
+        );
     }
 }

@@ -2109,11 +2109,18 @@ impl AppState {
                 // PokerTH's *network game notification*: somebody sat down
                 // while the table fills; the table set says the rest.
                 let grew = t.session.is_none() && !t.roster.is_empty() && n > t.roster.len();
+                // `S1-IV`: said when the number is another one. The node says
+                // the roster with every formation message it takes, a repeat
+                // included, and the owner's own file held this line 600 times
+                // for 60 changes of the number.
+                let another = n != t.roster.len();
                 t.roster = seats;
                 if grew {
                     self.sound_cues.push(crate::sound::Cue::PlayerConnected);
                 }
-                self.note(format!("{n} seated"));
+                if another {
+                    self.note(format!("{n} seated"));
+                }
             }
             NodeEvent::RosterKeys { key, keys } => {
                 self.table(key).keys = keys.into_iter().collect();
@@ -4186,6 +4193,43 @@ mod tests {
         }
         // And the memory of it is bounded, because the ids come from an open DHT.
         assert!(s.said_in_lobby.len() <= LOBBY_SAID_MAX);
+    }
+
+    /// `S1-IV`: *N seated* is said when N is another number, and not with every
+    /// roster the node reports.
+    ///
+    /// The node reports the roster with every formation message it takes --
+    /// every repeat a joining topic peer is said again included -- and the
+    /// window wrote the line each time. Measured in the owner's own client log:
+    /// **600 sayings for 60 changes of the number**, and 538 for 33 in the second
+    /// profile's; the file folds a repeat that follows itself, the window's 500
+    /// lines fold nothing.
+    ///
+    /// The break that must make this fail: note the line unconditionally.
+    #[test]
+    fn the_seated_count_is_said_when_it_changes() {
+        let mut s = AppState::new();
+        let key = [7u8; 32];
+        let roster = |n: u8| NodeEvent::Roster { key, seats: (0..n).map(|i| (i, format!("p{i}"), 1_000)).collect() };
+        let said = |s: &AppState| s.log.iter().filter(|l| l.ends_with(" seated")).cloned().collect::<Vec<_>>();
+        for _ in 0..100 {
+            s.apply(roster(2));
+        }
+        assert_eq!(said(&s), ["2 seated"], "a hundred reports of one roster");
+        s.apply(roster(3));
+        for _ in 0..100 {
+            s.apply(roster(3));
+        }
+        // A seat given up is a change as much as a seat taken.
+        s.apply(roster(2));
+        assert_eq!(said(&s), ["2 seated", "3 seated", "2 seated"]);
+        // Another table's count is its own: what was said of one table keeps
+        // nothing of another unsaid.
+        s.apply(NodeEvent::Roster { key: [8u8; 32], seats: vec![(0, "a".into(), 1), (1, "b".into(), 1)] });
+        assert_eq!(said(&s).last().map(String::as_str), Some("2 seated"));
+        assert_eq!(said(&s).len(), 4, "{:?}", said(&s));
+        // And the roster itself is taken every time, said or not.
+        assert_eq!(s.seated.as_ref().map(|t| t.roster.len()), Some(2));
     }
 
     #[test]
