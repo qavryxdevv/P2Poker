@@ -148,20 +148,34 @@ jobs:
           if (Test-Path 'target/release/p2p-poker.exe.sigstore.json') { $files += 'target/release/p2p-poker.exe.sigstore.json' }
           $attested = if ('${{ steps.attest.outputs.attestation-url }}') { "Build provenance: ${{ steps.attest.outputs.attestation-url }}" } else { 'Not attested: the repository was private when this was built.' }
           $fence = '```'
+          $size = [math]::Round((Get-Item 'target/release/p2p-poker.exe').Length / 1MB)
+          $base = 'https://github.com/${{ github.repository }}'
           $notes = @(
-            '**Windows x64, one portable file.** Start it and it offers to install itself (D-073); decline, and it runs from the folder it is in.',
+            '## Download',
             '',
-            'SHA-256: `${{ steps.digest.outputs.sha256 }}`',
+            "**[p2p-poker.exe]($base/releases/download/$tag/p2p-poker.exe)** - Windows x64, one portable file, $size MB.",
             '',
-            'Check that this file is what this repository built from this tag:',
+            'Start it and it offers to install itself: a copy in your user folder, a shortcut on the desktop and in the Start menu, no administrator rights, nothing in the registry. Decline, and it runs from the folder it is in.',
+            '',
+            'A beta. Play money only. It is not signed with a Windows certificate, so SmartScreen asks before the first start (*More info*, then *Run anyway*).',
+            '',
+            '## This build is verified',
+            '',
+            'GitHub built this file on its own machines from exactly this tag, and **signed a statement that it did** (a build provenance attestation, through Sigstore). That is already done - nothing is pending.',
+            '',
+            'SHA-256 of `p2p-poker.exe`:',
+            '`${{ steps.digest.outputs.sha256 }}`',
+            '',
+            'Anyone who wants to check it for themselves can, with GitHub''s own tool:',
             '',
             $fence,
             'gh attestation verify p2p-poker.exe --repo ${{ github.repository }}',
             $fence,
             '',
-            $attested,
-            '',
-            'A beta. Play money only. It is not signed with a Windows certificate, so SmartScreen will ask before the first start.'
+            "It answers that the file was built by this repository's release.yml from refs/tags/$tag, and it refuses any other file. $attested"
           ) -join "`n"
           $notes | Out-File -Encoding utf8 'release-notes.md'
-          gh release create $tag @files --repo '${{ github.repository }}' --title "P2Poker $tag" --notes-file 'release-notes.md' --prerelease --verify-tag
+          # A full release, marked latest: the owner's word, 2026-09-20. A pre-release is never what GitHub calls
+          # the latest, so the repository's front page showed no release and its files sat folded away; that the
+          # client is a beta is said in the title and on its own About page, not by hiding the download.
+          gh release create $tag @files --repo '${{ github.repository }}' --title "P2Poker $($tag.TrimStart('v')) beta" --notes-file 'release-notes.md' --latest --verify-tag

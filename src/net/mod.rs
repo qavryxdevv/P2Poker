@@ -14,6 +14,8 @@ pub mod node;
 pub mod peerbook;
 pub mod plaintext;
 pub mod portmap;
+/// `S1-IS`: when this client says its subscriptions again, and of whom it asks what.
+pub mod reannounce;
 pub mod relay;
 pub mod shard;
 pub mod run;

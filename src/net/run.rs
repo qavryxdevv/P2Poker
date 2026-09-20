@@ -2022,6 +2022,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // whether it was one without asking `identify` about a peer already gone.
     let mut poker_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // `S1-IS`: the poker clients whose subscriptions are still to be looked at,
+    // a few seconds after each was identified, and when topics were last said
+    // again. See `net::reannounce`.
+    let mut reannounce: super::reannounce::Reannounce<libp2p::PeerId> = Default::default();
     // `S1-HK`: when the first poker peer came on the line -- the search reads
     // the queue's silence as a reading only `QUEUE_WARM_S` after it.
     let mut poker_line_since: Option<std::time::Instant> = None;
@@ -4417,6 +4421,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // actually went anywhere, and seventeen
                         // direct-connection events for eight arrivals.
                         if num_established == 0 && poker_peers.remove(&peer_id) {
+                            reannounce.gone(&peer_id);
                             relay_admits.forget(&peer_id);
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: true })
@@ -5885,12 +5890,41 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // two direct connections. The other two formed the
                             // table without it and played seventeen hands as
                             // seats [1, 2].
-                            if !peer_has_our_topics(&swarm, &peer_id, &topics, t.table_topic.as_ref())
-                            {
-                                let mut which: Vec<&gossipsub::IdentTopic> =
-                                    vec![&topics.lobby, &topics.lobby_chat];
-                                which.extend(t.table_topic.as_ref());
-                                announce_topics(&mut swarm, &which);
+                            //
+                            // **`S1-IS`: and that check was aimed wrong twice over.** It
+                            // asked EVERY poker client to hold this client's own table
+                            // topic -- which a player who is not at this table never
+                            // does, so the answer was *no* on every meeting with every
+                            // stranger -- and it asked here, at the identify, before the
+                            // peer's own hello can have arrived on this very connection.
+                            // Measured in one nine-seat run: about two meetings in three
+                            // ended in a re-announce to everybody, 3 828 *joined the
+                            // lobby mesh* lines by eight peers, and every one of them
+                            // made a founder shout its advert and every seat say its
+                            // formation again over the table's Tox group.
+                            //
+                            // So the peer is only noted here. It is looked at
+                            // `reannounce::LOOK_AFTER` later on the stall tick, asked
+                            // only for what it can hold, and a re-announce is made at
+                            // most every `reannounce::AT_MOST_EVERY`.
+                            if old_reannounce() {
+                                // fault-harness: the rule as it stood, for the control run.
+                                if !peer_has_our_topics(&swarm, &peer_id, &topics, t.table_topic.as_ref()) {
+                                    let mut which: Vec<&gossipsub::IdentTopic> =
+                                        vec![&topics.lobby, &topics.lobby_chat];
+                                    which.extend(t.table_topic.as_ref());
+                                    announce_topics(&mut swarm, &which);
+                                    reannounce.announced(std::time::Instant::now());
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "said this client's topics again, {} of them, at the identify of {peer_id} (the rule before S1-IS; {} so far)",
+                                            which.len(),
+                                            reannounce.said
+                                        )))
+                                        .await;
+                                }
+                            } else {
+                                reannounce.met(peer_id, std::time::Instant::now());
                             }
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
@@ -8568,7 +8602,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         (t.table_topic.as_ref(), t.table.is_some(), t.hand.is_none())
                     {
                         let hash = topic.hash();
-                        let missing = poker_peers.iter().any(|p| {
+                        // `S1-IS`: of the peers AT this table. Asked of every poker
+                        // client connected, a stranger in the lobby was *missing*
+                        // for ever and the three repeats below were always spent.
+                        let missing = poker_peers.iter().filter(|p| at_this_table(t, p)).any(|p| {
                             !swarm.behaviour().gossipsub.all_peers().any(|(q, subs)| {
                                 q == p && subs.contains(&&hash)
                             })
@@ -8907,6 +8944,62 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = stall.tick() => {
+                // `S1-IS`: the poker clients identified a few seconds ago. By now a
+                // hello that was going to arrive has arrived; what GossipSub still
+                // does not know of a peer -- **of what that peer can hold** -- is a
+                // hello that was lost, and that is what saying the topics again is
+                // for. One re-announce tells everybody, so they are bounded, and
+                // only the kind that is missing is said again: a table's topic
+                // disturbs the seats of that table and not the whole lobby.
+                {
+                    let now = std::time::Instant::now();
+                    for peer in reannounce.due(now) {
+                        if !swarm.is_connected(&peer) {
+                            continue;
+                        }
+                        let known: Vec<gossipsub::TopicHash> = swarm
+                            .behaviour()
+                            .gossipsub
+                            .all_peers()
+                            .filter(|(p, _)| **p == peer)
+                            .flat_map(|(_, subs)| subs.into_iter().cloned())
+                            .collect();
+                        let lobby_pair = [topics.lobby.hash(), topics.lobby_chat.hash()];
+                        let at: Vec<&gossipsub::IdentTopic> = tables
+                            .iter()
+                            .filter(|t| at_this_table(t, &peer))
+                            .filter_map(|t| t.table_topic.as_ref())
+                            .collect();
+                        let at_hashes: Vec<gossipsub::TopicHash> = at.iter().map(|t| t.hash()).collect();
+                        let lost = super::reannounce::missing(&known, &super::reannounce::wanted(&lobby_pair, &at_hashes));
+                        if lost.is_empty() {
+                            reannounce.was_fine();
+                            continue;
+                        }
+                        if !reannounce.may_announce(now) {
+                            reannounce.later(peer, now);
+                            continue;
+                        }
+                        let mut which: Vec<&gossipsub::IdentTopic> = Vec::new();
+                        if lost.iter().any(|h| lobby_pair.contains(h)) {
+                            which.push(&topics.lobby);
+                            which.push(&topics.lobby_chat);
+                        }
+                        which.extend(at.iter().copied().filter(|t| lost.contains(&t.hash())));
+                        announce_topics(&mut swarm, &which);
+                        reannounce.announced(now);
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "said this client's topics again, {} of them: {peer} was not known to hold {} of what it should, {} s after it was identified ({} so far, {} look(s) found nothing missing; S1-IS)",
+                                which.len(),
+                                lost.len(),
+                                super::reannounce::LOOK_AFTER.as_secs(),
+                                reannounce.said,
+                                reannounce.fine
+                            )))
+                            .await;
+                    }
+                }
                 for which in 0..tables.len() {
                     let t = &mut tables[which];
                     mark_table(&events, &mut marked, t).await;
@@ -14661,6 +14754,22 @@ async fn begin_hand_with(
 /// the transport. Neither GossipSub nor a Tox group keeps history, and a peer
 /// that joined after a publish never sees it — measured on both, and on the Tox
 /// side it killed a hand with neither end reporting anything wrong.
+/// `S1-IS`: whether `peer` is at this table -- its founder, or a seat of its
+/// roster. Only such a peer can be expected to hold the table's topic.
+fn at_this_table(t: &TableRun, peer: &libp2p::PeerId) -> bool {
+    let bytes = peer.to_bytes();
+    t.table
+        .as_ref()
+        .is_some_and(|f| f.founder_peer_id() == bytes.as_slice() || f.roster().seats().iter().any(|s| s.peer_id == bytes))
+}
+
+/// **fault-harness only.** `P2P_POKER_OLD_REANNOUNCE=1` keeps the rule as it
+/// stood before `S1-IS` -- judged at the identify, every poker client asked for
+/// this client's table topic -- so that control and treatment are one binary.
+fn old_reannounce() -> bool {
+    cfg!(feature = "fault-harness") && std::env::var_os("P2P_POKER_OLD_REANNOUNCE").is_some()
+}
+
 /// Is this peer known to subscribe to every topic this client holds?
 ///
 /// GossipSub delivers to grafted mesh peers, and a peer it does not know is

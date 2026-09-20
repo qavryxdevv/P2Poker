@@ -107,6 +107,11 @@ param(
     # client's own relays. The control for `-DeadAnnouncedRelay`, from the same
     # binary, so the two runs differ in nothing else.
     [switch]$NoPatch0040,
+    # `-OldReannounce` runs every seat with the re-announce rule as it stood before
+    # `S1-IS` (`P2P_POKER_OLD_REANNOUNCE`): judged at the identify, and every poker
+    # client asked for the seat's own table topic. The control for that row, from
+    # the same binary. Needs the fault harness at both ends.
+    [switch]$OldReannounce,
     # `-Stall <seconds> -StallSeat <n>` starves one far seat's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -434,6 +439,7 @@ $header = @(
     "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
     "far    $(if ($FarDelay -gt 0) { "the far seat(s) start $FarDelay s after the rest - a late relay-only arrival, S1-AA's join-phase shape" } else { 'started with the rest' })"
     "0040   $(if ($NoPatch0040) { 'OFF at every seat - the control (fault-harness)' } else { 'as built' })"
+    "topics $(if ($OldReannounce) { 'said again by the rule BEFORE S1-IS at every seat - the control (fault-harness)' } else { 'said again as built (S1-IS)' })"
     "relay  $(if ($DeadAnnouncedRelay) { 'the relay a relay-only member is announced by is one no seat can connect to, at both ends (fault-harness; patch 0040)' } else { 'announced relays as they come' })"
     "tox    $(if ($faultHarness) { 'log on - the BINARY carries the fault harness' } else { 'log OFF - the binary has no fault harness; toxcore writes nothing, so do not read a zero as an absence' })"
     "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
@@ -658,6 +664,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($Stall -gt 0 -and `$seat -eq $StallSeat) { `$env:P2P_POKER_STALL_JOIN = '$Stall' }
         if ($(if ($DeadAnnouncedRelay) { '$true' } else { '$false' })) { `$env:P2P_POKER_DEAD_ANNOUNCED_RELAY = '1' }
         if ($(if ($NoPatch0040) { '$true' } else { '$false' })) { `$env:P2P_POKER_NO_0040 = '1' }
+        if ($(if ($OldReannounce) { '$true' } else { '$false' })) { `$env:P2P_POKER_OLD_REANNOUNCE = '1' }
         if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_MS = '$DelayCerts' }
         if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and $DelayCertsUntil -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_UNTIL_S = '$DelayCertsUntil' }
         `$start = Get-Date
@@ -755,6 +762,9 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         }
         if ($NoPatch0040) {
             $knobs['P2P_POKER_NO_0040'] = '1'
+        }
+        if ($OldReannounce) {
+            $knobs['P2P_POKER_OLD_REANNOUNCE'] = '1'
         }
         if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"

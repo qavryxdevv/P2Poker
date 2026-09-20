@@ -6,6 +6,16 @@ rather than promised.
 
 Written in Rust. One portable executable.
 
+> ## [Download P2Poker for Windows](https://github.com/qavryxdevv/P2Poker/releases/latest)
+>
+> One file, 45 MB: **[p2p-poker.exe](https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe)**.
+> Start it and it offers to install itself — a copy in your user folder and a shortcut on the desktop, no
+> administrator rights, nothing in the registry — or runs from the folder it is in. A beta; **play money only**.
+>
+> Every release is built by GitHub from this source and GitHub signs a statement of it:
+> [how to check a download](#and-a-download-can-be-checked-against-this-source). It is not signed with a Windows
+> certificate, so SmartScreen asks before the first start (*More info*, then *Run anyway*).
+
 ![The table window with all ten seats taken, in PokerTH's Green Casino style](docs/images/table-ten-seats.png)
 
 *The table window with all ten seats taken, drawn from the client's built-in
@@ -13,13 +23,15 @@ sample hand (`--table-preview --preview-seats 10 --preview-odds --preview-chat
 --preview-showcase`). The look follows PokerTH's Green Casino table; see
 [`assets/pokerth/PROVENANCE.md`](assets/pokerth/PROVENANCE.md).*
 
-> **Status: in progress.** The poker engine, the protocol layer and the mental
-> poker construction are complete and tested. Two clients discover each other,
-> exchange signed table advertisements, and **form a table** — a roster every
-> seat has ratified, ending in a session identity all of them compute
-> identically. What is not yet wired is the hand itself: the engine deals one
-> between three peers in memory, and nothing yet carries the deck messages
-> between two processes. See [`NEXT.md`](NEXT.md).
+> **Status: a playable beta.** Players find each other in a public lobby with no
+> server behind it, sit down at Sit-and-Go tables of two to ten, and play whole
+> tournaments: every deck is shuffled by all the seats together and every card
+> is proved, a seat that goes silent is timed out by a certificate the others
+> sign, and a player whose client or line dropped comes back to the same game.
+> *Find a game* seats you automatically; an album of cards and quests keeps
+> score of nothing but play money. What is open, owed or the owner's to decide is
+> kept honestly in the register of [`docs/DECISIONS.md`](docs/DECISIONS.md)
+> (`S1-*`), and [`NEXT.md`](NEXT.md) is the working log it grew out of.
 
 ---
 
@@ -175,6 +187,12 @@ Anything started with arguments — a script, a relay, a test bed — is never
 asked, and neither is a folder that already has a player in it. The About tab
 says where this copy lives, and offers to install a portable one with its
 profile moved along, so you stay the same player. `D-073` has the reasoning.
+
+### Download
+
+The newest release is always at
+<https://github.com/qavryxdevv/P2Poker/releases/latest>, and the file itself at
+<https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe>.
 
 ### And a download can be checked against this source
 
