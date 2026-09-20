@@ -6343,9 +6343,10 @@ them and changes them on GitHub, QR codes included.*
    sharp picture (below). Without OpenCV nothing is written: a QR code nobody has read is a guess.
 5. **`--set` is the one way an address changes**, and the owner's `.bat` runs it (in the owner's language; the
    `.bat` is not in the repository, because it names a path on a machine). It refuses to start unless the clone is
-   on `master` -- the branch the button opens -- holds no unpushed commit (a push would publish it as well, and
-   whoever made it has not said it is ready) and is level with GitHub. It shows the address published now, takes
-   the new one or Enter, refuses a bad one in words and asks again, shows *was* and *will be* in groups of four
+   on `master` -- the branch the button opens -- knows who commits in it, holds no unpushed commit (a push would
+   publish it as well, and whoever made it has not said it is ready) and is level with GitHub. It shows the address published now, takes
+   the new one or Enter, refuses a bad one in words -- the owner's words: every answer the two checkers can give has
+   a Czech line and an address that must get it, held by `--selftest` -- and asks again, shows *was* and *will be* in groups of four
    characters, and wants the word typed. Then it writes, commits **those paths only**, pushes, and asks GitHub
    whether it holds the new commit. Anything failing on the way puts the files and the commit back as they were:
    a page changed on one disk alone is a page nobody can check against GitHub.
@@ -6387,7 +6388,16 @@ client with a throwaway profile: photographed at 1 196, 900, 560 and 420 pixels 
 words pushed off the middle by the details button; the heart alone beside a whole headline -- under the pointer
 with its tooltip, and with the details open under its row. One click opened the system's browser on
 `DONATE.md` at `master`, and the lobby's log said *the donation page was opened in the browser* with the address.
-*The page as GitHub makes it*: GitHub's own Markdown API keeps the centring, the pictures' sizes and the two code
+*`--set`, end to end*, on a scratch clone whose origin was a bare repository on the same disk, so that GitHub
+was never touched: with no author configured -- refused before the first question; a testnet address, a wrong
+character, an Ethereum-style address and a wrong character again -- each refused in its own words, then two
+published addresses taken, the word typed, **one commit holding `DONATE.md` and the two QR files and nothing
+else**, pushed, found on the origin, and `--check` passing on it; Enter twice -- nothing written; the word typed
+in lower case -- nothing written; the origin refusing the push by a hook -- the commit gone again, the files as
+they were, the tree clean; the hook removed and the real addresses set back -- **the three files byte for byte
+what the repository holds**; and a commit left waiting in the clone -- refused before the first question. The
+first such run is why the author is asked about at the start: the clone had none, and the tool took every
+answer before git refused the commit (it put everything back, and said so). *The page as GitHub makes it*: GitHub's own Markdown API keeps the centring, the pictures' sizes and the two code
 blocks, and its HTML was looked at in a browser in a dark and a light setting.
 
 **What is NOT shown.** **That a donor sees the page at all: the repository is private** (`S1-IK`, found on the

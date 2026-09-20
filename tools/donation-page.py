@@ -474,6 +474,8 @@ def selftest(lengths=None):
         wrong.append("%d bytes were taken, and do not fit" % (LONGEST + 1))
     except ValueError:
         pass
+    wrong += refusals_problems()
+    print("addresses refused, each for its own reason and each reason with a line in Czech: %d" % len(REFUSED))
     print("codes made, by version:", ", ".join("%d: %d" % kv for kv in sorted(per_version.items())))
     print("not found by a detector in some picture (its decoder read every one of them, told the corners): %d" % len(missed))
     for line in missed:
@@ -698,6 +700,7 @@ WORDS = {
         "ahead": "This clone holds %s commit(s) not pushed to GitHub yet, and a push would publish them as well.\nPush or drop them first. Nothing was written.",
         "behind": "This clone is behind GitHub and could not be brought up to date. Nothing was written:",
         "unseen": "The push reported no error, but GitHub does not show the new commit. Look at the repository before anything else.",
+        "nobody": "git does not know who commits in this clone (user.name and user.email are not set). Nothing was written.",
     },
     "cs": {
         "intro": "Zmena darovacich adres P2Poker na GitHubu.\nDokud na konci nepotvrdite, nic se nezapise ani neodesle. Ctrl+C kdykoli skonci.",
@@ -727,8 +730,90 @@ WORDS = {
         "ahead": "Tento klon obsahuje %s commit(u), ktere jeste nejsou na GitHubu, a push by zverejnil i je.\nNejdriv je odeslete nebo zruste. Nic nebylo zapsano.",
         "behind": "Tento klon je pozadu za GitHubem a nepodarilo se ho srovnat. Nic nebylo zapsano:",
         "unseen": "Push nehlasil chybu, ale GitHub novy commit neukazuje. Nejdriv se podivejte do repozitare.",
+        "nobody": "git nevi, kdo v tomto klonu commituje (neni nastaveno user.name a user.email). Nic nebylo zapsano.",
     },
 }
+# Why an address was refused, in the owner's language. The checkers answer in English, and `--selftest` holds every
+# answer they can give to a line here.
+REASONS_CS = {
+    "empty": "prazdne",
+    "a legacy address (1... or 3...); the page says native SegWit, which begins bc1":
+        "stara adresa (1... nebo 3...); stranka uvadi native SegWit, ktera zacina bc1",
+    "a TESTNET address: coins sent to it on the real network are lost":
+        "adresa TESTOVACI site: mince poslane na ni v ostre siti jsou ztracene",
+    "upper and lower case mixed, which bech32 forbids": "smichana velka a mala pismena, coz bech32 zakazuje",
+    "not a bech32 address": "neni to adresa bech32",
+    "not a Bitcoin mainnet address (it must begin bc1)": "neni to adresa hlavni site Bitcoinu (musi zacinat bc1)",
+    "a character that bech32 does not have": "znak, ktery bech32 nema",
+    "the checksum does not hold: a character is wrong": "kontrolni soucet nesedi: nektery znak je spatne",
+    "not a witness program": "neni to witness program",
+    "witness version 0 under the wrong checksum": "witness verze 0 pod spatnym druhem kontrolniho souctu",
+    "witness version 1 or above under the wrong checksum": "witness verze 1 a vyssi pod spatnym druhem kontrolniho souctu",
+    "a version 0 program of the wrong length": "program verze 0 ma spatnou delku",
+    "an Ethereum-style address: this page takes USDT on the TRON network, whose addresses begin T":
+        "adresa ve stylu Etherea: tato stranka prijima USDT v siti TRON, jejiz adresy zacinaji T",
+    "a character that base58 does not have (0, O, I and l are not in it)":
+        "znak, ktery base58 nema (0, O, I a l v nem nejsou)",
+    "not 25 bytes under Base58Check": "po dekodovani Base58Check to neni 25 bajtu",
+    "not a TRON mainnet address (they begin T)": "neni to adresa hlavni site TRON (ty zacinaji T)",
+}
+def _segwit_string(version, program, const):
+    """A `bc1` string of this witness version and program under this checksum constant -- well formed or not: the
+    refusals below need strings whose checksum holds and whose contents are wrong, which nobody publishes."""
+    acc = bits = 0
+    data = [version]
+    for byte in program:
+        acc = (acc << 8) | byte
+        bits += 8
+        while bits >= 5:
+            bits -= 5
+            data.append((acc >> bits) & 31)
+    if bits:
+        data.append((acc << (5 - bits)) & 31)
+    mod = _polymod([3, 3, 0, 2, 3] + data + [0] * 6) ^ const
+    return "bc1" + "".join(BECH32[d] for d in data + [(mod >> 5 * (5 - i)) & 31 for i in range(6)])
+
+
+# An address for every answer the two checkers can give, and the answer it must get.
+REFUSED = [
+    (bitcoin_problem, _segwit_string(0, bytes(41), 1), "not a witness program"),
+    (bitcoin_problem, _segwit_string(0, bytes(21), 1), "a version 0 program of the wrong length"),
+    (bitcoin_problem, _segwit_string(0, bytes(20), BECH32M_CONST), "witness version 0 under the wrong checksum"),
+    (bitcoin_problem, _segwit_string(1, bytes(32), 1), "witness version 1 or above under the wrong checksum"),
+    (bitcoin_problem, "", "empty"),
+    (bitcoin_problem, "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "a legacy address (1... or 3...); the page says native SegWit, which begins bc1"),
+    (bitcoin_problem, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "a TESTNET address: coins sent to it on the real network are lost"),
+    (bitcoin_problem, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kV8f3t4", "upper and lower case mixed, which bech32 forbids"),
+    (bitcoin_problem, "bc1q", "not a bech32 address"),
+    (bitcoin_problem, "ltc1qw508d6qejxtdg4y5r3zarvary0c5xw7kgmn4n9", "not a Bitcoin mainnet address (it must begin bc1)"),
+    (bitcoin_problem, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3tb", "a character that bech32 does not have"),
+    (bitcoin_problem, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5", "the checksum does not hold: a character is wrong"),
+    (bitcoin_problem, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kemeawh", "witness version 0 under the wrong checksum"),
+    (bitcoin_problem, "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqh2y7hd", "witness version 1 or above under the wrong checksum"),
+    (tron_problem, "", "empty"),
+    (tron_problem, "0x52908400098527886E0F7030069857D2E4169EE7", "an Ethereum-style address: this page takes USDT on the TRON network, whose addresses begin T"),
+    (tron_problem, "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj60", "a character that base58 does not have (0, O, I and l are not in it)"),
+    (tron_problem, "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj", "not 25 bytes under Base58Check"),
+    (tron_problem, "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6u", "the checksum does not hold: a character is wrong"),
+    (tron_problem, "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "not a TRON mainnet address (they begin T)"),
+]
+
+
+def refusals_problems():
+    """What is wrong with the refusals: an address that gets another answer than it must, or an answer that the
+    owner's language has no line for."""
+    wrong = []
+    # The strings made here are made right: BIP-173's own program gives BIP-173's own address, and it is taken.
+    made = _segwit_string(0, bytes.fromhex("751e76e8199196d454941c45d1b3a323f1433bd6"), 1)
+    if made != "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" or bitcoin_problem(made) is not None:
+        wrong.append("BIP-173's program makes %r here, which is not its address" % made)
+    for checker, address, want in REFUSED:
+        got = checker(address)
+        if got != want:
+            wrong.append("%s(%r) answers %r, and should answer %r" % (checker.__name__, address, got, want))
+        if got is not None and got not in REASONS_CS:
+            wrong.append("no Czech line for the answer %r" % got)
+    return wrong
 TRACKED = ["DONATE.md", "docs/donate"]
 # The branch the client's button opens the page on (`DONATION_URL` in src/gui/render.rs).
 BRANCH = "master"
@@ -756,6 +841,9 @@ def repository_problem(w):
     branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if branch != BRANCH:
         return w["branch"] % (BRANCH, branch)
+    # Asked now, not found out at the commit: a clone with no author would take the answers and then refuse.
+    if not all(git("config", "--get", key).stdout.strip() for key in ("user.name", "user.email")):
+        return w["nobody"]
     fetched = git("fetch", "--quiet", "origin", BRANCH)
     if fetched.returncode != 0:
         return w["fetch"] + "\n" + fetched.stderr.strip()
@@ -791,7 +879,7 @@ def set_addresses(lang):
             if wrong is None:
                 chosen[key] = typed
                 break
-            print("   %s: %s" % (w["refused"], wrong))
+            print("   %s: %s" % (w["refused"], REASONS_CS.get(wrong, wrong) if lang == "cs" else wrong))
         print()
     if chosen == current:
         print(w["nothing"])
