@@ -737,13 +737,180 @@ pub const PROFILE_ELSEWHERE: &str = "This profile is also running on another dev
 pub struct RevealView {
     pub title: String,
     pub text: String,
-    /// The card earned, where it is one.
+    /// The card earned, where it is one -- the rarest of them, where they are several.
     pub card: Option<&'static crate::app::rewards::catalog::Card>,
     pub age_ms: u64,
+    /// How long this one stays: longer for several cards than for one.
+    pub stays_ms: u64,
 }
 
 /// `D-068`: how long a reveal stays.
 pub const REVEAL_MS: u64 = 6_000;
+
+/// What each further card of one reveal adds to [`REVEAL_MS`], and the most a
+/// reveal stays: four names take longer to read than one, and not for ever.
+pub const REVEAL_MORE_MS: u64 = 1_500;
+pub const REVEAL_MAX_MS: u64 = 12_000;
+
+/// How long a reveal has to have been up, when a hand begins, to count as seen.
+/// Under the five seconds a table pauses between two hands, so that a reveal
+/// that comes up as a hand ends is over when the next one begins.
+pub const REVEAL_SEEN_MS: u64 = 2_500;
+
+/// How many cards one reveal names; the rest are counted.
+const REVEAL_NAMES: usize = 4;
+
+/// How many reveals wait at most. Bounded, as everything fed from the network is.
+const REVEALS_KEPT: usize = 8;
+
+/// One thing waiting to be revealed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Waiting {
+    /// Cards earned, which wait together and are revealed as one.
+    Cards(Vec<&'static crate::app::rewards::catalog::Card>),
+    Words { title: String, text: String },
+}
+
+/// What [`Reveals::now`] gives the window: the reveal, and whether this is the
+/// moment its sound is played.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    pub view: RevealView,
+    pub sound: bool,
+}
+
+/// `D-068`: what waits to be revealed at the top of the lobby, and the rule that
+/// **each thing is revealed once**.
+///
+/// **It used to be revealed after every hand, for as long as the game lasted.**
+/// Nothing is shown while a hand is played, so a reveal waits for the pause
+/// between two hands -- five seconds -- and it had to be up for [`REVEAL_MS`],
+/// six, to leave the queue. The next hand took it down a second short, reset its
+/// clock, and the pause after that hand brought the same card up again as new,
+/// with its sound: a card that had been in the album for half an hour was
+/// announced forty times over in a game of forty hands (the owner, 2026-09-20).
+///
+/// So a reveal that was up for [`REVEAL_SEEN_MS`] when a hand begins has been
+/// seen and is gone; one cut shorter than that comes back once more, in full,
+/// and says nothing the second time. And the cards that wait together are one
+/// reveal -- *3 new cards*, the rarest of them pictured -- where they were a
+/// run of eight reveals of six seconds each after a good game, beside a summary
+/// that names every one of them anyway.
+///
+/// The clock is the caller's, in milliseconds that only go forward.
+#[derive(Debug, Default)]
+pub struct Reveals {
+    waiting: std::collections::VecDeque<Waiting>,
+    /// Since when the first of them is up, if it is.
+    up_since_ms: Option<u64>,
+    /// Whether the first of them has made its sound.
+    sounded: bool,
+}
+
+impl Reveals {
+    /// A card was earned. It joins the cards that wait behind the reveal that is
+    /// up, so what is being read never changes under the reader.
+    pub fn card(&mut self, card: &'static crate::app::rewards::catalog::Card) {
+        let already = self.waiting.iter().any(|w| matches!(w, Waiting::Cards(c) if c.iter().any(|x| x.id == card.id)));
+        if already {
+            return;
+        }
+        let last_is_up = self.up_since_ms.is_some() && self.waiting.len() == 1;
+        match self.waiting.back_mut() {
+            Some(Waiting::Cards(cards)) if !last_is_up => cards.push(card),
+            _ => self.waiting.push_back(Waiting::Cards(vec![card])),
+        }
+        self.bound();
+    }
+
+    /// Something said in words: a level, a break.
+    pub fn words(&mut self, title: impl Into<String>, text: impl Into<String>) {
+        self.waiting.push_back(Waiting::Words { title: title.into(), text: text.into() });
+        self.bound();
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    /// The oldest reveal that is not up goes first.
+    fn bound(&mut self) {
+        while self.waiting.len() > REVEALS_KEPT {
+            if self.up_since_ms.is_some() {
+                self.waiting.remove(1);
+            } else {
+                self.waiting.pop_front();
+            }
+        }
+    }
+
+    /// The reveal to show at `now_ms`, if any. `may_show` is false while a hand
+    /// is being played at any of this client's tables, and nothing is shown then.
+    pub fn now(&mut self, now_ms: u64, may_show: bool) -> Option<Shown> {
+        if !may_show {
+            if let Some(since) = self.up_since_ms.take() {
+                if now_ms.saturating_sub(since) >= REVEAL_SEEN_MS {
+                    self.waiting.pop_front();
+                    self.sounded = false;
+                }
+            }
+            return None;
+        }
+        loop {
+            let first = self.waiting.front()?;
+            let stays_ms = match first {
+                Waiting::Cards(cards) => {
+                    (REVEAL_MS + REVEAL_MORE_MS * (cards.len() as u64).saturating_sub(1)).min(REVEAL_MAX_MS)
+                }
+                Waiting::Words { .. } => REVEAL_MS,
+            };
+            let since = *self.up_since_ms.get_or_insert(now_ms);
+            let age_ms = now_ms.saturating_sub(since);
+            if age_ms >= stays_ms {
+                self.waiting.pop_front();
+                self.up_since_ms = None;
+                self.sounded = false;
+                continue;
+            }
+            let sound = !self.sounded && matches!(first, Waiting::Cards(_));
+            let view = match first {
+                Waiting::Cards(cards) => {
+                    let names: Vec<String> =
+                        cards.iter().take(REVEAL_NAMES).map(|c| format!("{} {}", c.label(), c.title)).collect();
+                    let more = cards.len().saturating_sub(REVEAL_NAMES);
+                    // The first of the rarest: `max_by_key` alone would take the last.
+                    let rarest = cards.iter().rev().max_by_key(|c| c.rarity()).copied();
+                    // Broken between two names and never inside one: left to the
+                    // label, the fifth card's *and 1 more* ended a line on *1* and put
+                    // *more* alone under it (photographed, 2026-09-20).
+                    let mut lines: Vec<String> =
+                        names.chunks(names.len().div_ceil(2).max(2)).map(|l| l.join(" \u{00b7} ")).collect();
+                    if more > 0 {
+                        if let Some(last) = lines.last_mut() {
+                            last.push_str(&format!(" and {more} more"));
+                        }
+                    }
+                    RevealView {
+                        title: if cards.len() == 1 { "New card".into() } else { format!("{} new cards", cards.len()) },
+                        text: lines.join("\n"),
+                        card: rarest,
+                        age_ms,
+                        stays_ms,
+                    }
+                }
+                Waiting::Words { title, text } => {
+                    RevealView { title: title.clone(), text: text.clone(), card: None, age_ms, stays_ms }
+                }
+            };
+            self.sounded = true;
+            return Some(Shown { view, sound });
+        }
+    }
+}
 
 /// `D-064`: the search under way, as the modal window shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -991,6 +1158,175 @@ mod tests {
     use crate::protocol::constants::hand_deadline_min_ms;
 
     const NOW: u64 = 1_700_000_000_000;
+
+    fn the_card(id: &str) -> &'static crate::app::rewards::catalog::Card {
+        crate::app::rewards::catalog::card_by_id(id).expect("a card of the catalogue")
+    }
+
+    /// A table as it is played: a hand of `HAND_MS`, then the five seconds it pauses
+    /// before the next. Returns every reveal that came up (title, whether it
+    /// sounded) -- one entry for each time something NEW was on the screen.
+    fn played(reveals: &mut Reveals, from_ms: u64, hands: u32) -> (Vec<(String, bool)>, u64) {
+        const HAND_MS: u64 = 10_000;
+        const PAUSE_MS: u64 = 5_000;
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        let mut up: Option<String> = None;
+        let mut now = from_ms;
+        for _ in 0..hands {
+            for phase in [(HAND_MS, false), (PAUSE_MS, true)] {
+                let end = now + phase.0;
+                while now < end {
+                    match reveals.now(now, phase.1) {
+                        Some(shown) => {
+                            let words = format!("{}: {}", shown.view.title, shown.view.text);
+                            if up.as_deref() != Some(words.as_str()) {
+                                seen.push((words.clone(), shown.sound));
+                                up = Some(words);
+                            } else {
+                                assert!(!shown.sound, "a reveal sounds as it comes up and not while it stays");
+                            }
+                        }
+                        None => up = None,
+                    }
+                    now += 100;
+                }
+            }
+        }
+        (seen, now)
+    }
+
+    /// `D-068`, the owner's tables, 2026-09-20: **a card is revealed once, however
+    /// many hands are played after it.** It was revealed after every hand: the
+    /// pause between two hands is five seconds, a reveal had to be up for six to
+    /// leave the queue, and the hand that took it down reset its clock -- the same
+    /// card came up as new, with its sound, forty times in a game of forty hands.
+    #[test]
+    fn a_card_is_revealed_once_however_many_hands_are_played() {
+        let mut reveals = Reveals::default();
+        reveals.card(the_card("D2"));
+        let (seen, _) = played(&mut reveals, 0, 40);
+        assert_eq!(seen, vec![("New card: \u{2666}2 Showdown".to_string(), true)], "once, with its sound once");
+        assert!(reveals.is_empty(), "and it is gone from the queue, not waiting for a quiet minute");
+    }
+
+    /// A reveal that a hand took down before anybody can have read it comes back
+    /// once more, in full -- and says nothing the second time.
+    #[test]
+    fn a_reveal_cut_short_comes_back_silent_and_one_that_was_seen_does_not() {
+        let mut reveals = Reveals::default();
+        reveals.card(the_card("C4"));
+        let first = reveals.now(1_000, true).expect("up");
+        assert!(first.sound);
+        assert_eq!(first.view.age_ms, 0);
+        assert!(reveals.now(1_000 + REVEAL_SEEN_MS - 1, true).is_some());
+        assert!(reveals.now(1_000 + REVEAL_SEEN_MS - 1, false).is_none(), "a hand began: nothing over a hand");
+        let again = reveals.now(20_000, true).expect("it had not been up long enough to be seen");
+        assert!(!again.sound, "the second time it is silent");
+        assert_eq!(again.view.age_ms, 0, "and shown in full, from its beginning");
+        assert!(reveals.now(20_000 + REVEAL_SEEN_MS, false).is_none());
+        assert!(reveals.now(40_000, true).is_none(), "up for long enough when the hand began: seen, and gone");
+        assert!(reveals.is_empty());
+    }
+
+    /// **The cards that wait together are one reveal.** A good game left a run of
+    /// eight, six seconds each, beside a summary that names every card anyway.
+    #[test]
+    fn cards_that_wait_together_are_one_reveal() {
+        let mut reveals = Reveals::default();
+        for id in ["D4", "D6", "DJ", "C4", "C6"] {
+            reveals.card(the_card(id));
+        }
+        reveals.card(the_card("D6"));
+        let shown = reveals.now(0, true).expect("up");
+        assert_eq!(shown.view.title, "5 new cards", "the card told twice is one card");
+        assert_eq!(
+            shown.view.text,
+            "\u{2666}4 Two Pair \u{00b7} \u{2666}6 Straight\n\u{2666}J The Ladder \u{00b7} \u{2663}4 Five Down and 1 more",
+            "two lines, broken between two names"
+        );
+        let mut three = Reveals::default();
+        for id in ["S2", "S3", "C2"] {
+            three.card(the_card(id));
+        }
+        assert_eq!(
+            three.now(0, true).expect("up").view.text,
+            "\u{2660}2 Top Half \u{00b7} \u{2660}3 First Win\n\u{2663}2 First Game"
+        );
+        let mut two = Reveals::default();
+        two.card(the_card("S2"));
+        two.card(the_card("S3"));
+        assert_eq!(two.now(0, true).expect("up").view.text, "\u{2660}2 Top Half \u{00b7} \u{2660}3 First Win", "two names are one line");
+        assert_eq!(shown.view.card.map(|c| c.id), Some("DJ"), "the rarest of them is the one pictured");
+        assert_eq!(shown.view.stays_ms, REVEAL_MS + 4 * REVEAL_MORE_MS, "and it stays longer than one card does");
+        assert!(shown.sound);
+        assert!(reveals.now(shown.view.stays_ms - 1, true).is_some());
+        assert!(reveals.now(shown.view.stays_ms, true).is_none(), "one reveal, and then nothing");
+
+        // Never for ever, however many.
+        let mut many = Reveals::default();
+        for c in crate::app::rewards::catalog::CARDS.iter().take(30) {
+            many.card(c);
+        }
+        let shown = many.now(0, true).expect("up");
+        assert_eq!(shown.view.title, "30 new cards");
+        assert!(shown.view.text.ends_with("and 26 more"));
+        assert_eq!(shown.view.stays_ms, REVEAL_MAX_MS);
+    }
+
+    /// What is being read does not change under the reader: a card earned while
+    /// a reveal is up waits behind it -- with whatever else is earned meanwhile.
+    #[test]
+    fn a_card_earned_while_a_reveal_is_up_waits_behind_it() {
+        let mut reveals = Reveals::default();
+        reveals.card(the_card("C2"));
+        assert_eq!(reveals.now(0, true).expect("up").view.title, "New card");
+        reveals.card(the_card("S2"));
+        reveals.card(the_card("S3"));
+        let still = reveals.now(1_000, true).expect("still up");
+        assert_eq!(still.view.text, "\u{2663}2 First Game", "the reveal that is up is not rewritten");
+        assert!(!still.sound);
+        let next = reveals.now(REVEAL_MS, true).expect("the two that waited, as one");
+        assert_eq!(next.view.title, "2 new cards");
+        assert!(next.sound, "a new reveal, so its sound");
+
+        // Words are never folded into cards, and keep their order among them.
+        let mut mixed = Reveals::default();
+        mixed.words("Level 5", "A White chip.");
+        mixed.card(the_card("H2"));
+        mixed.words("A short break?", "Two hours at the tables.");
+        mixed.card(the_card("C4"));
+        let came_up: Vec<(String, bool)> = (0..4)
+            .map(|i| mixed.now(i * REVEAL_MS, true).expect("four reveals"))
+            .map(|s| (s.view.title, s.sound))
+            .collect();
+        let expected = [("Level 5", false), ("New card", true), ("A short break?", false), ("New card", true)];
+        assert_eq!(came_up.len(), expected.len());
+        for ((title, sound), (want_title, want_sound)) in came_up.iter().zip(expected) {
+            assert_eq!((title.as_str(), *sound), (want_title, want_sound), "a card sounds; a level and a break do not");
+        }
+    }
+
+    /// Bounded, and the reveal that is up is never the one dropped.
+    #[test]
+    fn the_reveals_that_wait_are_bounded() {
+        let mut reveals = Reveals::default();
+        reveals.words("Level 2", "A White chip.");
+        assert!(reveals.now(0, true).is_some());
+        for level in 3..40 {
+            reveals.words(format!("Level {level}"), "A chip.");
+        }
+        assert_eq!(reveals.now(1, true).expect("still up").view.title, "Level 2");
+        let mut titles = Vec::new();
+        let mut now = 1;
+        while let Some(shown) = reveals.now(now, true) {
+            if titles.last() != Some(&shown.view.title) {
+                titles.push(shown.view.title);
+            }
+            now += 500;
+        }
+        assert_eq!(titles.len(), REVEALS_KEPT);
+        assert_eq!(titles.last().map(String::as_str), Some("Level 39"), "the newest are the ones kept");
+    }
 
     fn ad(players: u8) -> TableAd {
         let mut a = TableAd {

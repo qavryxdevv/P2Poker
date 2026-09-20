@@ -2664,9 +2664,8 @@ fn rewards_notice(ui: &mut egui::Ui, words: &str) -> bool {
 /// lobby -- and only there, and only while no hand is being played: the table's
 /// window is never drawn over. Nothing to press, nothing that blinks.
 fn reveal_toast(ctx: &egui::Context, r: &super::lobby::RevealView, from_top: f32) {
-    use super::lobby::REVEAL_MS;
     let age = r.age_ms as f32;
-    let alpha = (age / 300.0).min((REVEAL_MS as f32 - age) / 600.0).clamp(0.0, 1.0);
+    let alpha = (age / 300.0).min((r.stays_ms as f32 - age) / 600.0).clamp(0.0, 1.0);
     let picture = egui::vec2(84.0, 68.0);
     let room = ctx.content_rect().width();
     egui::Area::new(egui::Id::new("reveal-toast"))
@@ -2689,6 +2688,19 @@ fn reveal_toast(ctx: &egui::Context, r: &super::lobby::RevealView, from_top: f32
                 .fold(0.0_f32, f32::max);
             let beside = if r.card.is_some() { picture.x + 12.0 } else { 0.0 };
             let words = (widest + 4.0).clamp(120.0, (room - beside - 90.0).clamp(160.0, 440.0)).ceil();
+            // Several cards are one reveal and their names take a second line:
+            // the words stay level with the middle of the picture, by the lines
+            // they will really take -- the ones written, and any the width adds.
+            let text_lines: f32 = r
+                .text
+                .lines()
+                .map(|line| {
+                    let wide = ui.painter().layout_no_wrap(line.to_string(), FontId::proportional(14.0), theme::TEXT).size().x;
+                    (wide / words).ceil().max(1.0)
+                })
+                .sum::<f32>()
+                .clamp(1.0, 4.0);
+            let words_high = 24.0 + 20.0 * text_lines;
             egui::Frame::new()
                 .fill(theme::FELT_MID)
                 .stroke(Stroke::new(1.0, theme::GOLD_EDGE))
@@ -2708,9 +2720,9 @@ fn reveal_toast(ctx: &egui::Context, r: &super::lobby::RevealView, from_top: f32
                                 ui.set_min_width(words);
                                 ui.set_max_width(words);
                                 ui.spacing_mut().item_spacing.y = 2.0;
-                                // Two lines of words, level with the middle of the picture.
+                                // The words, level with the middle of the picture.
                                 if r.card.is_some() {
-                                    ui.add_space(((picture.y - 44.0) / 2.0).max(0.0));
+                                    ui.add_space(((picture.y - words_high) / 2.0).max(0.0));
                                 }
                                 ui.add(egui::Label::new(RichText::new(&r.title).color(theme::GOLD_ACTION).size(18.0).strong()).wrap());
                                 ui.add(egui::Label::new(RichText::new(&r.text).color(theme::TEXT).size(14.0)).wrap());

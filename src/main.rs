@@ -1382,7 +1382,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 album_open: false,
                 album_ui: Default::default(),
                 reveals: if preview_rewards { preview_reveals() } else { Default::default() },
-                reveal_since: None,
+                reveal_clock: std::time::Instant::now(),
                 preview_rewards,
                 backup_done: std::sync::mpsc::channel(),
                 backup_opened: None,
@@ -1922,8 +1922,9 @@ struct Client {
     album_ui: p2p_poker::gui::album::AlbumUi,
     /// `D-068`: what was earned and waits to be shown -- never while a hand is
     /// being played -- and since when the first of them has been showing.
-    reveals: std::collections::VecDeque<p2p_poker::gui::lobby::RevealView>,
-    reveal_since: Option<std::time::Instant>,
+    reveals: p2p_poker::gui::lobby::Reveals,
+    /// What `reveals` counts its milliseconds from.
+    reveal_clock: std::time::Instant,
     /// `--preview-rewards`: a sample summary is drawn on the lobby's card.
     preview_rewards: bool,
     /// `D-068`: what the backup worker has finished, the backup a check opened
@@ -2024,38 +2025,22 @@ impl Client {
     /// stops anything.
     fn reward_notices(&mut self) {
         use p2p_poker::app::rewards::Notice;
-        use p2p_poker::gui::lobby::RevealView;
         for notice in self.rewards.rewards.take_notices() {
             match notice {
                 Notice::TableLine { slot, text } => self.state.reward_line(slot, text),
+                // The cards that wait together are revealed as one (`Reveals`).
                 Notice::Card(id) => {
                     if let Some(card) = p2p_poker::app::rewards::catalog::card_by_id(id) {
-                        self.reveals.push_back(RevealView {
-                            title: "New card".into(),
-                            text: format!("{} {}", card.label(), card.title),
-                            card: Some(card),
-                            age_ms: 0,
-                        });
+                        self.reveals.card(card);
                     }
                 }
-                Notice::Level(level) => self.reveals.push_back(RevealView {
-                    title: format!("Level {level}"),
-                    text: format!("A {} chip.", p2p_poker::app::rewards::catalog::chip_of(level)),
-                    card: None,
-                    age_ms: 0,
-                }),
-                Notice::Break(words) => self.reveals.push_back(RevealView {
-                    title: "A short break?".into(),
-                    text: words.to_string(),
-                    card: None,
-                    age_ms: 0,
-                }),
+                Notice::Level(level) => self.reveals.words(
+                    format!("Level {level}"),
+                    format!("A {} chip.", p2p_poker::app::rewards::catalog::chip_of(level)),
+                ),
+                Notice::Break(words) => self.reveals.words("A short break?", words),
                 Notice::Quest { .. } | Notice::Summary => {}
             }
-        }
-        // Bounded, as everything fed from the network is.
-        while self.reveals.len() > 8 {
-            self.reveals.pop_front();
         }
         if let Some(e) = self.rewards.flush() {
             self.state.log.push_back(e);
@@ -2064,31 +2049,21 @@ impl Client {
 
     /// `D-068`: the reveal to show now, if any: only with the rewards shown,
     /// and only while no hand is being played at any of this client's tables.
+    /// Each reveal once, and its sound once: `Reveals` says why that needed saying.
     fn reveal_now(&mut self) -> Option<p2p_poker::gui::lobby::RevealView> {
         if !self.ui.settings.show_rewards() {
             self.reveals.clear();
             return None;
         }
-        if self.state.any_live_hand() {
-            self.reveal_since = None;
-            return None;
-        }
-        let first = self.reveals.front()?.clone();
-        let fresh = self.reveal_since.is_none();
-        let since = *self.reveal_since.get_or_insert_with(std::time::Instant::now);
-        let age_ms = since.elapsed().as_millis() as u64;
-        if age_ms >= p2p_poker::gui::lobby::REVEAL_MS {
-            self.reveals.pop_front();
-            self.reveal_since = None;
-            return self.reveal_now();
-        }
+        let now_ms = self.reveal_clock.elapsed().as_millis() as u64;
+        let shown = self.reveals.now(now_ms, !self.state.any_live_hand())?;
         // The lobby's own notification sound, under its switch, as a card
         // turns up -- and, by the line above, never while a hand is played.
         let switches = self.ui.settings.sound();
-        if fresh && first.card.is_some() && switches.allows(p2p_poker::sound::Cue::LobbyChatNotify) {
+        if shown.sound && switches.allows(p2p_poker::sound::Cue::LobbyChatNotify) {
             self.sound.play(p2p_poker::sound::Cue::LobbyChatNotify, switches.volume);
         }
-        Some(p2p_poker::gui::lobby::RevealView { age_ms, ..first })
+        Some(shown.view)
     }
 
     /// `D-068`: a backup is a second of key stretching and a file: made on a
@@ -2475,33 +2450,24 @@ impl Client {
     }
 }
 
-/// `--preview-rewards`: the words about a level and two cards, the short one
-/// first -- the order that once set a card's name one letter to a line.
-fn preview_reveals() -> std::collections::VecDeque<p2p_poker::gui::lobby::RevealView> {
+/// `--preview-rewards`: the words about a level, then a card, then a break, then
+/// five cards that waited together -- the short one first, the order that once
+/// set a card's name one letter to a line, and the long one last, whose names
+/// take a second line.
+fn preview_reveals() -> p2p_poker::gui::lobby::Reveals {
     use p2p_poker::app::rewards::catalog::card_by_id;
-    use p2p_poker::gui::lobby::RevealView;
-    let card = |id: &str| {
-        let c = card_by_id(id);
-        RevealView {
-            title: "New card".into(),
-            text: c.map(|c| format!("{} {}", c.label(), c.title)).unwrap_or_default(),
-            card: c,
-            age_ms: 0,
+    let mut reveals = p2p_poker::gui::lobby::Reveals::default();
+    reveals.words("Level 5", "A White chip.");
+    if let Some(c) = card_by_id("H2") {
+        reveals.card(c);
+    }
+    reveals.words("A short break?", "Two hours at the tables. A short break keeps the game sharp.");
+    for id in ["D4", "D6", "DJ", "C4", "C6"] {
+        if let Some(c) = card_by_id(id) {
+            reveals.card(c);
         }
-    };
-    [
-        RevealView { title: "Level 5".into(), text: "A White chip.".into(), card: None, age_ms: 0 },
-        card("H2"),
-        card("C4"),
-        RevealView {
-            title: "A short break?".into(),
-            text: "Two hours at the tables. A short break keeps the game sharp.".into(),
-            card: None,
-            age_ms: 0,
-        },
-    ]
-    .into_iter()
-    .collect()
+    }
+    reveals
 }
 
 /// `--preview-rewards`: what a won heads-up game came to, as the lobby says it.
