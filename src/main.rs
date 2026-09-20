@@ -16,6 +16,10 @@
 //! p2p-poker --host N --seats 6   a six-handed Sit-and-Go
 //! p2p-poker --host N --seats 2   a two-seat Sit-and-Go: it deals when both sit
 //! p2p-poker --renderer software  draw without a graphics driver
+//! p2p-poker --install            offer to install on this computer (`D-073`);
+//!                                with no argument at all and no profile beside
+//!                                it, a first run offers that by itself
+//! p2p-poker --portable           never offer: run from the folder it is in
 //! p2p-poker --no-mdns             do not look for players by multicast
 //! p2p-poker --port 4242           listen on a fixed port, to forward on a router
 //! p2p-poker --autoplay [ms]       act at once (or after ms): a measurement mode
@@ -235,6 +239,16 @@ fn main() {
     }
 
     println!("p2p-poker {}", env!("CARGO_PKG_VERSION"));
+
+    // `D-073`: a first run with nothing beside it is offered a home, in a
+    // window of its own and **before the profile is looked at** -- a profile
+    // made beside a download is exactly what the offer exists to prevent, and a
+    // process that never held a profile or started a node is one that can hand
+    // over to the installed copy without two clients ever having run.
+    #[cfg(windows)]
+    if let Some(code) = maybe_install(&args) {
+        std::process::exit(code);
+    }
 
     let dir = value_of("--profile")
         .map(std::path::PathBuf::from)
@@ -533,6 +547,124 @@ fn main() {
     if outcome != Started::Ok {
         std::process::exit(1);
     }
+}
+
+/// `D-073`: the installer's turn, if this start is one. `None`: start the
+/// client as always. `Some(code)`: the installer ran, and this process ends.
+///
+/// Asked in two steps so that a scripted start -- every bed seat, every relay --
+/// costs a look at its own arguments and nothing else: the system is asked
+/// where this user's folders are only when the arguments leave the question
+/// open.
+#[cfg(windows)]
+fn maybe_install(args: &[String]) -> Option<i32> {
+    use p2p_poker::install::{self, Decision, Facts};
+    let rest: Vec<String> = args.iter().skip(1).cloned().collect();
+    let by_arguments = Facts { args: rest.clone(), supported: true, at_home: false, player_here: false };
+    if install::decide(&by_arguments) == Decision::RunHere {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let folder = exe.parent()?;
+    let facts = Facts {
+        args: rest,
+        supported: true,
+        at_home: install::shell::places().is_some_and(|p| install::same_place(folder, &p.install_dir())),
+        player_here: install::holds_a_player(&folder.join("profile")),
+    };
+    if install::decide(&facts) == Decision::RunHere {
+        return None;
+    }
+    Some(installer_window(args, exe))
+}
+
+/// `D-073`: the installer's window, and what the player chose in it carried
+/// out **after the window is gone** -- the installed copy is started as this
+/// process ends, never beside it.
+#[cfg(windows)]
+fn installer_window(args: &[String], exe: std::path::PathBuf) -> i32 {
+    use p2p_poker::gui::installer::{InstallerApp, Outcome, WINDOW_SIZE};
+    let asked = args.iter().position(|a| a == "--renderer").and_then(|i| args.get(i + 1)).cloned();
+    let draw = if asked.as_deref() == Some("software") { Draw::Software } else { Draw::Gl };
+    let outcome = std::sync::Arc::new(std::sync::Mutex::new(Outcome::Quit));
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size(WINDOW_SIZE)
+            .with_min_inner_size([520.0, 420.0])
+            .with_title("P2Poker \u{2014} install")
+            .with_icon(window_icon()),
+        renderer: match draw {
+            Draw::Gl => eframe::Renderer::Glow,
+            Draw::Software => eframe::Renderer::Wgpu,
+        },
+        wgpu_options: software_wgpu(),
+        centered: true,
+        ..Default::default()
+    };
+    let (slot, source) = (outcome.clone(), exe.clone());
+    let result = eframe::run_native(
+        "p2p-poker-install",
+        options,
+        Box::new(move |cc| {
+            println!("installer open ({})", if draw == Draw::Gl { "gl" } else { "software" });
+            p2p_poker::gui::table::drawing_without_a_gpu(draw == Draw::Software);
+            render::install(&cc.egui_ctx);
+            p2p_poker::gui::table::style::install_fonts(&cc.egui_ctx);
+            Ok(Box::new(InstallerApp::new(&cc.egui_ctx, source, slot)))
+        }),
+    );
+    if let Err(e) = result {
+        // The same second attempt the client makes for itself: no OpenGL 2.0 is
+        // a virtual machine, and a virtual machine deserves the offer too. The
+        // child keeps `--install` if it was given, and `decide` reads a bare
+        // `--renderer software` as the first run it still is.
+        if draw == Draw::Gl && asked.is_none() && is_a_driver_problem(&e) {
+            println!("No OpenGL 2.0 on this machine. Starting again in software.");
+            return again_in_software(args);
+        }
+        explain_window_failure(&e.to_string(), draw);
+        return 1;
+    }
+    let chosen = outcome.lock().map(|o| o.clone()).unwrap_or_default();
+    match chosen {
+        Outcome::Quit => 0,
+        Outcome::RunHere => {
+            let mut command = std::process::Command::new(&exe);
+            command.arg("--portable");
+            if let Some(r) = asked {
+                command.args(["--renderer", &r]);
+            }
+            match command.spawn() {
+                Ok(_) => 0,
+                Err(e) => {
+                    tell_the_player("P2Poker could not be started", &format!("{}\n\n{e}", exe.display()));
+                    1
+                }
+            }
+        }
+        Outcome::Start(program) => match p2p_poker::install::shell::start(&program) {
+            Ok(()) => {
+                println!("installed copy started");
+                0
+            }
+            Err(e) => {
+                let words = format!("P2Poker is installed, but it could not be started from here:\n\n{}\n\n{e}\n\nStart it from its shortcut.", program.display());
+                tell_the_player("P2Poker could not be started", &words);
+                1
+            }
+        },
+    }
+}
+
+/// `D-073`: where this copy lives, for the About page. Asked once.
+fn home_view() -> Option<render::HomeView> {
+    let exe = std::env::current_exe().ok()?;
+    let folder = exe.parent()?.to_path_buf();
+    #[cfg(windows)]
+    let installed = p2p_poker::install::shell::places().is_some_and(|p| p2p_poker::install::same_place(&folder, &p.install_dir()));
+    #[cfg(not(windows))]
+    let installed = false;
+    Some(render::HomeView { folder, installed, can_install: cfg!(windows), busy: false })
 }
 
 /// `S1-FV`: a word to a player who started the client from its icon, where a
@@ -1422,7 +1554,11 @@ fn windowed(player: Player, run: Run) -> Started {
                 resume,
                 table_closed: false,
                 confirm_exit: None,
-                ui: render::LobbyUi::new(settings),
+                ui: {
+                    let mut ui = render::LobbyUi::new(settings);
+                    ui.home = home_view();
+                    ui
+                },
                 table_ui: Default::default(),
                 windows_shown: Default::default(),
                 sound: p2p_poker::sound::Player::new(),
@@ -2693,6 +2829,12 @@ impl eframe::App for Client {
                 // has been open, and the record from the profile.
                 view.session_s = self.started.elapsed().as_secs();
                 view.record = Some(self.results.summary());
+                // `D-073`: installing restarts the client, and nothing restarts
+                // a client over a game or a search.
+                let busy = !self.state.slots().is_empty() || self.state.search.is_some();
+                if let Some(home) = self.ui.home.as_mut() {
+                    home.busy = busy;
+                }
                 match render::lobby(ui, &view, &mut self.ui) {
                     render::LobbyAction::Select(key) => self.state.selected = Some(key),
                     render::LobbyAction::None => {}
@@ -2830,6 +2972,28 @@ impl eframe::App for Client {
                             if opened { "was opened in the browser" } else { "could not be opened; it is at" },
                             render::BUG_REPORT_URL
                         ));
+                    }
+                    render::LobbyAction::ShowProgramFolder => {
+                        if let Ok(exe) = std::env::current_exe() {
+                            #[cfg(windows)]
+                            p2p_poker::install::shell::show_in_explorer(&exe);
+                            #[cfg(not(windows))]
+                            let _ = exe;
+                        }
+                    }
+                    // `D-073`: this client ends and starts itself again as the
+                    // installer, which never opens a profile -- so the one this
+                    // client holds is free by the time the player presses
+                    // Install, and if it is not, the move says so and waits.
+                    render::LobbyAction::InstallOnThisComputer => {
+                        if !busy {
+                            let started = std::env::current_exe()
+                                .and_then(|exe| std::process::Command::new(exe).arg("--install").spawn());
+                            match started {
+                                Ok(_) => ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close),
+                                Err(e) => self.state.log.push_back(format!("the installer could not be started: {e}")),
+                            }
+                        }
                     }
                     render::LobbyAction::OpenAlbum => self.album_open = true,
                     render::LobbyAction::RewardsSeen => self.rewards.rewards.mark_summary_seen(),

@@ -14,6 +14,7 @@
 
 pub mod app;
 pub mod gui;
+pub mod install;
 pub mod mental_poker;
 pub mod music;
 pub mod net;

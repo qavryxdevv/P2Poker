@@ -122,6 +122,11 @@ pub enum LobbyAction {
     OpenDonationPage,
     /// `D-072`: open the bug reports page, `BUG_REPORT_URL`, in the browser.
     OpenBugReports,
+    /// `D-073`: show the folder this program runs from.
+    ShowProgramFolder,
+    /// `D-073`: a portable copy asks to be installed: this client closes and
+    /// starts itself again as the installer.
+    InstallOnThisComputer,
 }
 
 /// `D-071`: the page the strip's *Support the project* button opens: the
@@ -149,6 +154,23 @@ pub const BUG_REPORT_URL: &str = "https://github.com/qavryxdevv/P2Poker/issues/n
 /// `Cargo.toml` and the word from here, so a release that is no longer a beta is
 /// one line, not a search.
 pub const RELEASE_STAGE: &str = "beta";
+
+/// `D-073`: where this copy of the client lives, as the About page says it.
+///
+/// Worked out once at start-up -- it asks the system where this user's folders
+/// are -- and only `busy` changes while the client runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeView {
+    /// The folder the program runs from.
+    pub folder: std::path::PathBuf,
+    /// It is the installed copy, in the user's programs folder.
+    pub installed: bool,
+    /// This build can install itself (Windows).
+    pub can_install: bool,
+    /// A table is open or a search is running: installing restarts the client,
+    /// and nothing restarts a client over a game.
+    pub busy: bool,
+}
 
 /// `D-068`: the settings' Profile page: what is being typed, and what the
 /// client answered. The work itself -- a second of key stretching, and a file
@@ -293,6 +315,9 @@ pub struct LobbyUi {
     /// `D-067`: on a one-column window, the people and the player's card in
     /// place of the tables.
     pub side_open: bool,
+    /// `D-073`: where this copy lives. `None` until `main` has worked it out,
+    /// and in a preview, where there is no copy to speak of.
+    pub home: Option<HomeView>,
 }
 
 /// The settings dialog's pages, one at a time: all of them on one page no longer
@@ -350,6 +375,7 @@ impl LobbyUi {
             diagnostics_open: false,
             fair_open: false,
             side_open: false,
+            home: None,
             settings,
             settings_tab: SettingsTab::default(),
             backup: BackupUi::default(),
@@ -1077,7 +1103,7 @@ fn found_toast(ctx: &egui::Context, f: &super::lobby::FoundView) {
 /// **It sends nothing**: no log, no profile, no address -- a report is what the
 /// player types, and a client that posted its own state somewhere would be
 /// making that decision for them.
-fn about_page(ui: &mut egui::Ui) -> Option<LobbyAction> {
+fn about_page(ui: &mut egui::Ui, home: Option<&HomeView>) -> Option<LobbyAction> {
     let mut action = None;
     ui.label(
         RichText::new(format!("P2Poker {} {}", env!("CARGO_PKG_VERSION"), RELEASE_STAGE))
@@ -1124,6 +1150,56 @@ fn about_page(ui: &mut egui::Ui) -> Option<LobbyAction> {
     {
         action = Some(LobbyAction::OpenBugReports);
     }
+    if let Some(home) = home {
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        if let Some(a) = home_section(ui, home) {
+            action = Some(a);
+        }
+    }
+    action
+}
+
+/// `D-073`: what the About page says about where this copy lives.
+pub fn home_words(home: &HomeView) -> String {
+    if home.installed {
+        format!(
+            "Installed in {}. To remove P2Poker, delete that folder and the shortcuts. Your player profile is in \
+             that folder too, so make a backup first (the Profile tab) if you want to stay the same player.",
+            home.folder.display()
+        )
+    } else {
+        format!(
+            "This copy is portable: it runs from {}, and your player profile is kept beside it. Copy the whole \
+             folder to another computer and you are the same player there.",
+            home.folder.display()
+        )
+    }
+}
+
+fn home_section(ui: &mut egui::Ui, home: &HomeView) -> Option<LobbyAction> {
+    let mut action = None;
+    ui.label(RichText::new("Where this program is").color(theme::TEXT).size(15.0).strong());
+    ui.add_space(4.0);
+    ui.label(RichText::new(home_words(home)).color(theme::TEXT_DIM).size(14.0));
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Show in folder").clicked() {
+            action = Some(LobbyAction::ShowProgramFolder);
+        }
+        if !home.installed && home.can_install {
+            let install = ui
+                .add_enabled(!home.busy, egui::Button::new("Install on this computer\u{2026}"))
+                .on_hover_text(
+                    "Copies the program to your user folder and puts a shortcut on the desktop. P2Poker restarts to do it.",
+                )
+                .on_disabled_hover_text("Leave your tables and stop the search first: installing restarts P2Poker.");
+            if install.clicked() {
+                action = Some(LobbyAction::InstallOnThisComputer);
+            }
+        }
+    });
     action
 }
 
@@ -1637,7 +1713,7 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                                 }
                             }
                             SettingsTab::About => {
-                                if let Some(a) = about_page(ui) {
+                                if let Some(a) = about_page(ui, state.home.as_ref()) {
                                     action = Some(a);
                                 }
                             }
@@ -1957,7 +2033,7 @@ fn fair_window(ctx: &egui::Context, state: &mut LobbyUi) {
 
 /// The one large gold button: the table's gold, lit from the top, the ink
 /// dark on it. Everything else on the screen is quieter than this on purpose.
-fn gold_button(ui: &mut egui::Ui, label: &str, size: egui::Vec2) -> egui::Response {
+pub(crate) fn gold_button(ui: &mut egui::Ui, label: &str, size: egui::Vec2) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let p = ui.painter();
     let lift = if resp.hovered() { 0.12 } else { 0.0 };

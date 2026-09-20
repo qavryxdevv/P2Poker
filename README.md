@@ -108,6 +108,8 @@ Both print `TABLE FORMED session=…` with the same session identity.
 | `--table` | open on the table rather than the lobby |
 | `--for N` | stop after `N` seconds |
 | `--renderer gl` \| `software` | pin the renderer instead of letting it choose |
+| `--install` | offer to install on this computer, from wherever this copy is |
+| `--portable` | never offer: run from the folder it is in |
 | `--no-mdns` | do not look for players by multicast — how the DHT path gets tested |
 
 ### On a machine with no graphics driver
@@ -140,7 +142,7 @@ that ran and found nothing.
 
 ## It is portable, and that is checked
 
-One executable, around 26 MB, statically linked against the C runtime. Five of
+One executable, around 45 MB, statically linked against the C runtime. Five of
 those megabytes are the second renderer, which is what makes it start on a
 machine with no graphics driver at all. Copy it
 into an empty folder and it runs, creating exactly `profile/identity.key` and
@@ -150,6 +152,29 @@ network identity and the player identity apart. Two folders are two players.
 `tools/check-portable.ps1` verifies all of that by measurement, including that
 the binary imports no C runtime and that the two identities really are two
 different secrets.
+
+### And on a first run it offers itself a home
+
+Double-click a fresh download — no arguments, no profile beside it — and the
+client asks one question before it does anything else: **Install**, **Run
+without installing**, or **Quit**. Install copies the program to your user
+folder (`%LOCALAPPDATA%\Programs\P2Poker`), puts a shortcut on the desktop and
+in the Start menu, tells you where both are, and hands over to the installed
+copy as it closes — so there are never two clients running.
+
+It is still the same portable folder, program and profile side by side, and it
+needs no administrator rights. **Nothing goes into the registry, nothing starts
+by itself, and nothing is deleted**: the copy is hashed as it is written and
+hashed again from the disk before it takes the program's name; a shortcut of
+your own is never overwritten; a newer installed version is never replaced by
+an older download; and a program that is running is not replaced under a game.
+To remove it, delete that folder and the shortcuts — your player profile is in
+that folder, so make a backup first (Settings, Profile).
+
+Anything started with arguments — a script, a relay, a test bed — is never
+asked, and neither is a folder that already has a player in it. The About tab
+says where this copy lives, and offers to install a portable one with its
+profile moved along, so you stay the same player. `D-073` has the reasoning.
 
 ## Testing
 

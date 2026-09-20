@@ -1,8 +1,13 @@
 //! The portable profile beside the executable.
 //!
 //! `SPEC_CS.md` §22: the whole directory can be copied to another machine and
-//! the client is that client again. Nothing goes to the registry, nothing goes
-//! outside this folder, and there is no installer.
+//! the client is that client again. Nothing goes to the registry and nothing of
+//! the profile goes outside this folder.
+//!
+//! §22 also says *no installer*, and `D-073` amends that on the owner's word: a
+//! first run is offered a home (`crate::install`). What it installs is still
+//! this -- the program with its profile beside it, one folder that can be
+//! copied whole -- and the only things it writes outside are two shortcuts.
 //!
 //! # Why the identity is persisted at all
 //!

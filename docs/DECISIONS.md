@@ -6482,3 +6482,162 @@ and §13 forbids a rated table a password at all. Making a private Sit-and-Go re
 have to carry `password_required`, the preset would have to fall back to `CUSTOM` the moment a password is typed,
 and the joiner's proof path would have to be reached from a game that has never used it. That is the owner's to ask
 for, and `S1-IQ` is where it waits.
+
+## D-073 — the client gives itself a home: a first run offers to install, and says afterwards what it did
+
+**Decided 2026-09-20 by the project owner:** *add to the binary an intelligent portable installer: on a first run on
+another machine it copies itself into a folder of the user's profile and makes a shortcut on the desktop; it tells
+the user that the shortcut is on the desktop and where the copy is kept; after OK the application closes, so that
+two instances do not run. The aim is to automate that cycle suitably and safely and make it comfortable -- plus
+whatever my own knowledge of the field adds.*
+
+**This amends `SPEC_CS.md` §22 on one point and keeps the rest of it whole.** §22 says *one portable folder, no
+installer, no registry, nothing outside its own directory, the profile beside the program so that the whole folder
+can be copied to another machine*. `SPEC_CS.md` stays unamended, as always; this decision is where the amendment
+lives. What changes is one thing: **with the player's agreement, two shortcuts are written outside the folder.**
+Everything else §22 asks is still true of the installed copy -- it is the same single file, in a folder with its
+profile beside it, copyable to another machine as one directory, with nothing in the registry -- and a player who
+declines gets exactly §22, untouched.
+
+**Why at all.** A player who has never seen this client double-clicks a download. Left alone, *the portable folder
+is `Downloads`*: the profile -- the player's identity, album and results -- is made beside a file that will be tidied
+away next month, nothing on the desktop says how to start it again, and the firewall's question is asked about a
+path that will not be the program's for long. The installer exists to make the first five minutes not cost the
+player their identity in the sixth week.
+
+1. **Who is asked, and who is never interrupted** (`install::decide`, a pure function of `Facts`, so the table is a
+   test). `--portable` answers no. `--install` asks by name. **Any other argument starts the client where it
+   stands** -- a bed seat, a relay, a preview, a test: a script is never shown a window nobody is there to answer
+   (`--renderer` alone does not count, because it is what the client passes to itself when it starts again in
+   software). The installed copy is not asked. **A folder with a player in it is not asked** -- an established
+   portable copy, which is the owner's two clients on one machine and every folder from before this decision. What
+   is left is a first run with no arguments and nothing beside it, and that one is offered a home. `main` asks in
+   two steps, so a scripted start costs a look at its own arguments and the system is asked nothing.
+2. **Asked first, and before the profile is touched.** The owner's words describe the copy being made and the
+   player being told; this build asks one question before it writes anything -- *Install*, *Run without
+   installing*, *Quit* -- and names both folders in full. A program that copies itself into a user's profile
+   without a word is what unwanted software does, and the consent costs one click. The question is asked **before
+   the profile lock, the identity and the node**: a profile made beside the download is the thing the offer exists
+   to prevent, and a process that never held a profile is one that can hand over without two clients ever having
+   run -- which is the owner's *so that two instances do not run*, held by construction rather than by timing.
+3. **Where.** The user's own programs folder as the system names it (`FOLDERID_UserProgramFiles`, which is
+   `%LOCALAPPDATA%\Programs`), in `P2Poker\`; the desktop and the Start menu as the system names them. **Never a
+   path glued together from `%USERPROFILE%`**: a desktop kept in OneDrive, a redirected profile and a Windows in
+   another language are ordinary, and all three break the glued path. The programs folder is asked for without
+   creating it, so nothing is written before the player agrees. No administrator rights are needed anywhere.
+4. **Nothing is installed that was not verified** (`copy::install_file`). The program is written beside its target
+   under another name, hashed as it is written and synced; **read back from the disk and hashed again**; and only
+   then renamed over the target, which the file system does in one step. The first hash says what was handed to the
+   system and only the second says what it kept. A crash leaves a `.partial` and never half a program under the
+   program's name; a partial younger than two minutes is another installer's and is respected, an older one is a
+   crash's and is cleared. The last page shows the byte count and the first sixteen digits of the SHA-256.
+5. **Never a downgrade, never over a running game, never twice.** The installed program's version is read **out of
+   its bytes without running it**: every build carries `BUILD_MARK`, its version between two marks, because a
+   sidecar file goes stale the first time a program is replaced by hand -- which this project's own deploy script
+   does -- and the bytes of a program cannot disagree with the program. The same bytes installed: nothing is copied,
+   *Start P2Poker*. An older build, or another build of the same number: *Update* -- a beta is rebuilt many times
+   under one number, and the player has just started **this** file on purpose. A newer one: nothing is replaced,
+   and that is `shell::install`'s own rule and not a button's, because a profile a newer client has written may be
+   one an older client cannot read. A program that is running refuses the rename, and the player is told to close
+   it (`CopyError::InUse`) rather than a hand being cut off -- seen for real: *Přístup byl odepřen (os error 5)*, the
+   running program's hash unchanged, no partial left.
+6. **Nobody's shortcut is taken, and every shortcut is read back** (`shell::place_shortcut`). A `P2Poker.lnk` that
+   points somewhere else is the player's own -- to a portable copy, most likely -- and stays as it is; ours becomes
+   `P2Poker (2).lnk`, and the last page says the name actually taken. What is written is then **read back through
+   the system** and must name the program, or it is removed again: a shortcut is the one thing the player will ever
+   click, and a desktop guarded by Windows' *Controlled folder access* fails in ways only reading back shows. A
+   refused shortcut is said to have been refused, with the likeliest reason, and the program is still installed.
+7. **The player's profile goes with them, and is never in two runnable places or in none**
+   (`copy::move_profile`). From an established portable copy -- `--install`, or *Install on this computer* on the
+   About page, which is disabled while a table is open or a search runs -- the profile can move with the program.
+   The lock a client holds (`S1-FV`) is taken and let go first, so a running client's profile stays where it is. On
+   one disk the move is a single rename. Across two it is copied under a name nothing reads, **every file hashed
+   against its original**, given the name `profile`, and only then is the original renamed aside to
+   `profile.moved-<time>` -- **not deleted**: the installer deletes nothing of the player's, ever. A profile is never
+   merged into or put over another: two profiles are two players. The move comes *before* the shortcuts, because a
+   failed move must end the installation before there is anything to click -- a client started at the new place then
+   would make a new player, and the move could never be made after.
+8. **What it says at the end is what happened.** The last page is `done_lines`, one line per step in that step's own
+   outcome: the owner's two sentences first -- *the shortcut "P2Poker" is on your desktop*, and the program's full
+   path with *Show in folder* -- then the verification, the profile, the Start menu, and that the file the player
+   started is no longer needed on this computer. *Start P2Poker now* is ticked (`START_NOW_BY_DEFAULT`, one constant:
+   the owner's to flip). **OK closes the window; the installed copy is started only as this process ends.**
+9. **A folder that cannot keep a profile is not offered as a home.** *Run without installing* is disabled, with the
+   reason, when the file runs from the system's temporary folder -- started from inside an archive, most often, where
+   the profile would be deleted with the folder -- or from somewhere that cannot be written.
+10. **The installer's window is the client's own** -- the felt band, the gold button, the lobby's fonts -- and takes the
+    client's own second attempt: no OpenGL 2.0 is a virtual machine, and it starts again on the software renderer
+    with `--install` kept.
+11. **Removing it** is deleting that folder and the shortcuts, which the first page, the About page and the README
+    all say, with the warning that the profile is in that folder and the Profile tab makes a backup (`D-068`). **There
+    is deliberately no uninstaller**: one would mean a registry entry to be found by and a program that deletes
+    itself, which on Windows is a helper process or a command-line trick -- the second of which is exactly what
+    security tools watch unsigned programs for. One folder and two shortcuts need neither.
+
+**What this never does**, stated as the discipline the code follows and not as an absence to be trusted: no
+registry, no administrator rights, no autorun, no service, no scheduled task, no file association, no `PATH`; nothing
+deleted and nothing of the player's overwritten; nothing sent anywhere -- the installer has no network code and never
+starts the node.
+
+**The mark of the web, said rather than left to be found.** The installed program is a *new file* holding this
+file's bytes, not a system copy of it, so the mark a browser puts on a download stays on the download. That is what
+every installer's output is, and it is the honest behaviour: the question that mark asks -- *do you want to run
+this?* -- was answered when the player started the file, and the installed copy is proven byte for byte to be the
+same program. **What would actually answer it is a code-signing certificate**, which is money and the owner's call;
+until then SmartScreen's warning on the first start is real and nothing here hides it.
+
+**One dependency edge, no new crate.** The shell's two conversations -- where this user's folders are, a shortcut
+written and read back -- are COM, which `windows-sys` deliberately does not model. `windows 0.62.2` was in the tree
+already (`gpu-allocator`, `if-watch`, `sysinfo`) with every needed feature on; measured after the change: **444
+compiled, 647 locked**, both unchanged, and `Cargo.lock` gained one line.
+
+**`P2P_POKER_INSTALL_ROOT=DIR`** installs under `DIR` instead -- `DIR\Programs`, `DIR\Desktop`, `DIR\StartMenu` -- in
+every build, on purpose: it is how **the shipped binary's own flow** was photographed and measured without putting
+a shortcut on anybody's real desktop. It crosses no boundary: whoever sets this process's environment already runs
+as this user.
+
+**Measured**, on the production build, under that root, outside the temporary folder:
+
+* *A first run*: the offer; *Install*; exactly three files written -- the program and two shortcuts, no partial; the
+  two SHA-256 equal and beginning with the sixteen digits the window showed; both shortcuts read by **an independent
+  reader** (`WScript.Shell`, none of this code) as pointing at the installed program, started in its folder, wearing
+  its icon; the real desktop untouched. OK: **one** process afterwards, running from the installed place; the
+  profile made beside the installed program and **none beside the download**.
+* *The same download again*: *already installed*, nothing copied. *An earlier build installed*: *Update*; the
+  program replaced, the identity key's hash unchanged, no second shortcut. *A program marked 9.9.9 installed*:
+  *newer*, read from its bytes, nothing replaced, its hash unchanged after the visit. *An update while the installed
+  copy runs*: refused in Windows' own words, the running program untouched, no partial left.
+* *An established portable copy*: started with arguments -- no window; started with none -- **the client itself, not
+  the installer**, because a player lives beside the file; `--install` -- the offer, with *Move my player profile*;
+  after it both key files' hashes unchanged, the `profile` folder gone from beside the portable file, and the
+  installed copy started as **the same player** -- the key's printed prefix the same before and after.
+* Twenty-eight tests, among them a real shortcut written and read back in a folder with a space and Czech accents in
+  its name, a held file standing in for a running program, and one that only *reads* this machine's real folders.
+  Fourteen breaks fail them, each made and unmade by a script: an established folder asked to move, a script
+  interrupted, the renderer's value read as the player's argument, two installers racing into one file, a profile
+  put over another's, a profile moved from under a running client, a changed byte in a copied profile unnoticed, a
+  newer program replaced -- in `install` and again at the button -- a second shortcut made, the player's own
+  shortcut overwritten, a refused shortcut not said to be one, a player left behind by the gold button, and a
+  folder merely spelled like the temporary one refused as a home.
+
+**Seen and corrected on the way, by photographing and not by reading.** The first offer page carried both paths
+inside one sentence, where a user's long path wraps mid-name and buries the sentence; each has a well of its own
+now. *Start the installed P2Poker* ran over the edges of a button sized for *Install*; the button is as wide as its
+words. And the very first photograph showed the right thing by accident: the scratch folder is under `%TEMP%`, so
+the page had disabled *Run without installing* with the archive warning -- the rule working before it was tested.
+
+**Two found by thinking the states through, and by a break that was not caught.** *A failed profile move* leaves
+the program in place and the player beside the old file; the next look read that as *already installed*, and its
+gold button would have **started the installed copy as a new player**, after which the move could never be made. A
+profile still to be moved is work now, whatever else is settled, and the page says *Finish installing*. And the
+thirteenth break -- matching the temporary folder by spelling instead of by path components -- **passed its own
+test**. The test made a look-alike folder beside the real `...\Local\Temp`, and a process started from inside a
+packaged application has writes there quietly redirected into the package's own store, so the folder it made was
+somewhere else entirely and proved nothing. `portable_given` takes the temporary folder as an argument, the test
+names one, and the break is caught. A test that passes under the break it was written for is the most expensive kind
+of green, and only making the break shows it.
+
+**What is NOT done.** No code signing (above). No automatic update -- a client that fetches and runs programs is a
+different trust question from one that installs the file a player started. No uninstaller (point 11). Nothing for
+Linux or macOS: `install::decide` answers *run here* wherever `supported` is false, and the copy and profile code
+is plain files that would serve them, but there is no shell half and nobody has asked for one.

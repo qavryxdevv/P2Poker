@@ -121,6 +121,12 @@ windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "
 # Named here rather than left to eframe because eframe's `wgpu` feature turns on
 # all of wgpu's backends, which is several megabytes we would never call.
 wgpu = { version = "30.0", default-features = false, features = ["std", "wgsl", "dx12"] }
+# `D-073`: the installer's two conversations with the shell -- where this
+# user's folders are, and a shortcut written and read back -- are COM, which
+# `windows-sys` deliberately does not model. Already in the tree at this version
+# (`gpu-allocator`, `if-watch`, `sysinfo`) with every one of these features on,
+# so this adds the edge and nothing to the lockfile or the build.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
 
 # --- dev-only: the arkworks types the vendored ziffle is built on --------
 # Present so tests/deck_constants.rs (ZIFFLE_VERDICT.md C-7) can recompute

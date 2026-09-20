@@ -20,7 +20,12 @@
          profile, user name, computer name or repository path in its bytes.
 
     Run it after any change to .cargo/config.toml, to the dependencies, or to
-    anything under src/storage/.
+    anything under src/storage/ or src/install/.
+
+    D-073 gave the client an installer, which a first run with NO arguments is
+    offered. Every start below passes arguments, and a start with arguments is
+    never offered it -- so this still measures section 22's portable folder,
+    which is also exactly what declining the offer leaves.
 #>
 
 [CmdletBinding()]

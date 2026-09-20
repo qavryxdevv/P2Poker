@@ -78,6 +78,8 @@ corrected in place and the correction is recorded in §9.7.
 | Locked but never compiled | **203** | the difference |
 
 **Re-measured 2026-09-19, after `D-069`'s music** (`lewton` and `ogg`, both compiled): 444 / 647 / 203.
+**Re-measured 2026-09-20, after `D-073`'s installer**: 444 / 647 / 203, unchanged -- `windows 0.62.2` became a direct
+edge and was in the tree already (§5.12); `Cargo.lock` gained the one line that says so.
 **Re-measured 2026-09-14, after `libp2p` 0.57** (`S1-FF`): 442 / 645 / 203, where the
 2026-08-31 figures were 461 / 659 / 198. **Re-measured 2026-08-31** before that: the
 compiled figure was right; the other two were not, and had been 646 / 185. `tests/corpus_dependencies.rs` now measures all three on
@@ -879,6 +881,11 @@ compiled in with `include_bytes!`, so `lewton 0.10.2` (`github.com/RustAudio/lew
 `ogg 0.8.0` (`github.com/RustAudio/ogg`, BSD-3-Clause) -- a Vorbis decoder and its container, Rust and nothing
 else, no advisory open against either by `cargo audit` on 2026-09-19 -- only ever decode this client's own file.
 Both are direct or one step from direct, and both would move into §5.7 the day a track came from anywhere else.
+**And for `D-073`'s installer:** `windows 0.62.2` (`github.com/microsoft/windows-rs`, MIT OR Apache-2.0) is a direct
+edge now -- it was compiled already, for `gpu-allocator`, `if-watch` and `sysinfo`, with every feature the installer
+uses switched on by them. It carries the shell's two COM conversations, which `windows-sys` does not model: where
+this user's folders are, and a shortcut written and read back. **No byte from a peer reaches it**: every path it is
+given is the system's own answer or a constant of this build, and the installer has no network code at all.
 The count moved from 339 with them, and with `serde_json`, which `D-068` took into §5.7. The same holds for the renderer: `naga` compiles shaders, and the
 only shaders it ever sees are `egui`'s own, compiled in. **This assumption fails the moment anything peer-supplied is
 rendered** — an avatar, a table skin, a chat message with an image, a downloaded
