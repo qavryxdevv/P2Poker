@@ -139,6 +139,21 @@ pub fn fill(dest: &mut [u8]) -> Result<(), getrandom::Error> {
     SysRng.try_fill_bytes(dest)
 }
 
+/// `N` fresh bytes from the operating system CSPRNG, **as a value**.
+///
+/// For a salt or a nonce. `let mut salt = [0u8; 16]; fill(&mut salt)?;` is
+/// correct and one deleted line away from a salt of zeros that still compiles,
+/// still round-trips and still passes every test of what a backup holds; here
+/// there is no moment at which the zeros have the salt's name. (`S1-IU`: what
+/// GitHub's code scanning flagged in `storage::backup` was exactly that
+/// initialiser -- a false alarm about the code as it stood, and a fair one
+/// about how little stood between it and being true.)
+pub fn array<const N: usize>() -> Result<[u8; N], getrandom::Error> {
+    let mut out = [0u8; N];
+    fill(&mut out)?;
+    Ok(out)
+}
+
 /// A fresh 32-byte secret from the operating system CSPRNG.
 pub fn secret_32() -> Result<[u8; 32], getrandom::Error> {
     let mut out = [0u8; 32];

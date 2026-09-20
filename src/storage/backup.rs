@@ -156,9 +156,13 @@ fn seal(password: &str, packed: &Packed, m_cost: u32, t_cost: u32) -> Result<Vec
     if password.chars().count() < PASSWORD_MIN {
         return Err(BackupError::PasswordTooShort);
     }
-    let (mut salt, mut nonce) = ([0u8; 16], [0u8; 12]);
-    crate::security::rng::fill(&mut salt).map_err(|e| BackupError::Io(io::Error::other(e.to_string())))?;
-    crate::security::rng::fill(&mut nonce).map_err(|e| BackupError::Io(io::Error::other(e.to_string())))?;
+    // Fresh for every backup, from the system's generator, or no backup at all.
+    // The key is stretched from the password and THIS salt, and the cipher's one
+    // rule is that a nonce is never used twice under a key -- so two backups
+    // under one password share neither (`S1-IU`, and the test that holds it).
+    let no_randomness = |e: getrandom::Error| BackupError::Io(io::Error::other(e.to_string()));
+    let salt: [u8; 16] = crate::security::rng::array().map_err(no_randomness)?;
+    let nonce: [u8; 12] = crate::security::rng::array().map_err(no_randomness)?;
     let mut out = Vec::with_capacity(HEADER_LEN);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
@@ -350,6 +354,34 @@ mod tests {
 
     fn quick(dir: &Path, password: &str) -> Result<PathBuf, BackupError> {
         create_with(dir, password, 1_789_820_701_000, 120, 8 * 1024, 1)
+    }
+
+    /// **`S1-IU`: two backups under one password share neither salt nor nonce.**
+    ///
+    /// The salt is what makes one password stretch to a different key in every
+    /// backup, and ChaCha20-Poly1305's one rule is that a nonce is never used
+    /// twice under a key: a salt that stood still would make the key stand still,
+    /// and a nonce that stood still under it would hand whoever holds two backups
+    /// the XOR of two profiles -- two player keys. Nothing had pinned this. A
+    /// backup with a constant salt round-trips, restores and passes every other
+    /// test here.
+    #[test]
+    fn two_backups_under_one_password_share_neither_salt_nor_nonce() {
+        let packed = Packed {
+            format: 1,
+            created_unix_ms: 1_789_820_701_000,
+            files: vec![PackedFile { name: "player.key".into(), bytes: vec![3u8; 32] }],
+        };
+        let a = seal("correct horse", &packed, 8 * 1024, 1).unwrap();
+        let b = seal("correct horse", &packed, 8 * 1024, 1).unwrap();
+        let (salt_a, nonce_a) = (&a[25..41], &a[41..53]);
+        let (salt_b, nonce_b) = (&b[25..41], &b[41..53]);
+        assert_ne!(salt_a, salt_b, "one password, one profile, one second: and still another salt");
+        assert_ne!(nonce_a, nonce_b);
+        assert!(salt_a.iter().any(|x| *x != 0) && nonce_a.iter().any(|x| *x != 0), "and neither is the array it started as");
+        assert_ne!(a[HEADER_LEN..], b[HEADER_LEN..], "so the same profile seals to other bytes");
+        // Both still open, to the same contents: fresh is not the same as broken.
+        assert_eq!(open(&a, "correct horse").unwrap().names(), open(&b, "correct horse").unwrap().names());
     }
 
     /// The whole road: a backup made here, restored into a fresh profile on
