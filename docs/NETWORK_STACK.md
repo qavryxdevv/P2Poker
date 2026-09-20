@@ -847,7 +847,10 @@ Three rules that make the trait the boundary rather than a formality:
   (§1.2 prohibition 3, §8.4, §10.4).
 * `ListenerClosed` exists because a relay reservation denial closes a circuit
   listener with no automatic retry (§9.6); the layer above must be able to see it
-  and re-issue `listen_on` with backoff.
+  and re-issue `listen_on` with backoff. **It must see it whatever the reason
+  says** (`S1-IT`): `libp2p-relay` closes the listener with `Ok(())` when the
+  connection to the relay closes, which is the ordinary way a reservation dies,
+  and a layer that reads only `Err(_)` goes on believing in a way in it has lost.
 
 #### 1.3.2 `InMemoryTransport` (`SPEC_CS.md` §24), specified
 
@@ -2707,8 +2710,10 @@ one, because we have a better source that costs nothing and is self-healing:
    [MEASURED `NAT_AND_DISCOVERY.md` §2.1].
 2. `get_providers` on the relay key (§3.2) — the `/libp2p/relay` namespace that
    go-libp2p's own AutoRelay advertises under, where public relays and D-002
-   volunteers both appear, asked every discovery cycle while this client holds no
-   reservation and dialled by the same bridge as §4; a peer whose `identify`
+   volunteers both appear, asked every discovery cycle while this client holds
+   fewer reservations than it keeps -- **two** (`S1-IT`, `net::waysin`): a public
+   relay can keep a reservation and take no new connection, which its holder
+   cannot see -- and dialled by the same bridge as §4; a peer whose `identify`
    shows the hop protocol is asked for a reservation. Emergent, self-healing,
    nothing compiled in, nobody structurally privileged. Until 2026-09-15 this item
    named `get_peers(RELAY_INFOHASH)`, a Mainline infohash for volunteers alone,
@@ -2746,7 +2751,9 @@ disconnect and stays seated.
 
 A reservation is a **lease, not a state**: expect periodic
 `ReservationReqAccepted { renewal: true, .. }` and treat its absence as loss of
-reachability.
+reachability. Its end is mostly silent -- the circuit listener closes with
+`Ok(())` (§1.3.1) -- and when it comes the client forgets that way in, takes its
+circuit addresses out of what it announces, and asks another relay (`S1-IT`).
 
 Multiaddr forms (byte-exact, `Protocol::P2pCircuit` is multicodec 290, string
 `p2p-circuit`):

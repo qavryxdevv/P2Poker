@@ -483,6 +483,36 @@ fn says_every_answer() -> bool {
     cfg!(feature = "fault-harness")
 }
 
+/// `S1-IT`: how often *could not reach <peer>* is said of one peer in a player's
+/// client. The founder being asked for a seat is said every time.
+const UNREACHED_SAID_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `S1-IT`: the most peers let through this client's own connection limit for a
+/// dial's sake at once; past it the oldest is under the limit again.
+const LET_THROUGH_MAX: usize = 512;
+
+/// `S1-IT`'s controls, each from the same binary and in no other than one built
+/// to be measured: `P2P_POKER_ONE_WAY_IN=1` keeps one relay as before that row,
+/// and `P2P_POKER_CAP_FOR_ALL=1` lets no dial through the connection limit.
+fn ways_in_wanted() -> usize {
+    if cfg!(feature = "fault-harness") && std::env::var_os("P2P_POKER_ONE_WAY_IN").is_some_and(|v| v == "1") {
+        1
+    } else {
+        super::waysin::WAYS_IN_WANTED
+    }
+}
+
+fn cap_applies_to_all() -> bool {
+    cfg!(feature = "fault-harness") && std::env::var_os("P2P_POKER_CAP_FOR_ALL").is_some_and(|v| v == "1")
+}
+
+/// `S1-IT`: whether this binary was built to be measured -- the same rule, for
+/// the lines that are only worth their volume on the bed: the failed dial of
+/// every relay a record named, and what this client's own limit refused.
+fn built_to_be_measured() -> bool {
+    cfg!(feature = "fault-harness")
+}
+
 /// `D-070`: how far into every hour **this** client announces under the new
 /// hour's key: a moment of the first `HOUR_TURN_SPREAD_S` fixed by its peer id.
 ///
@@ -2129,6 +2159,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // setter and no getter, so the only way to know the current value is to be
     // the one who set it.
     let mut budget: u32 = MAX_CONNECTIONS;
+    // `S1-IT`: connections this client's own limit refused at its ceiling, said
+    // once a discovery tick where a run is measured. Below the ceiling a refusal
+    // raises the budget and says so; at it, nothing did.
+    let mut refused_by_own_limit: u32 = 0;
+    // When *could not reach <peer>* was last said of each peer.
+    let mut unreached_said: std::collections::HashMap<PeerId, std::time::Instant> = std::collections::HashMap::new();
+    // And of the connections that came IN: all of them, and those that came
+    // through this client's own relay -- which is how somebody who looked this
+    // client up in the lobby arrives, a joiner at a founder's door among them.
+    let mut refused_coming_in: u32 = 0;
+    let mut refused_coming_in_by_relay: u32 = 0;
     // Connections held, counted here rather than asked of the swarm: there is
     // no accessor for it, and the two events that change it are already handled.
     let mut state_peers: u32 = 0;
@@ -2220,6 +2261,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_lobby_shout: Option<tokio::time::Instant> = None;
 
     let mut have_reservation = false;
+    // `S1-IT`: the relays that hold a reservation for this client -- two, not
+    // one, and a listener that closed is one fewer WHATEVER reason it closed
+    // with (`waysin`). `have_reservation` is `ways_in.any()`, kept for its readers.
+    let mut ways_in = super::waysin::WaysIn::new(ways_in_wanted());
+    // `S1-IT`: what is done to the addresses offered for a dial, and the book of
+    // relays that goes with it; told here which dials matter.
+    let offered = swarm.behaviour().offered().clone();
+    // The peers let through this client's own connection limit for a dial's
+    // sake, oldest first, so that the list is bounded. A poker client, once it
+    // is known for one, is let through for good and not by this list.
+    let mut let_through: std::collections::VecDeque<PeerId> = std::collections::VecDeque::new();
+    let cap_for_all = cap_applies_to_all();
     // **Whether the reservation this client holds can carry a hand, and which
     // poker peers are reachable only through it.**
     //
@@ -4210,7 +4263,44 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
+    // `S1-IT`: a dial of this peer matters -- the founder being asked for a seat,
+    // a player the lobby named. It is let through this client's own connection
+    // limit, and the relays the records route it through are noted for the same
+    // (`swarm::Offered`), because a circuit is given up when its relay is not
+    // reached.
+    macro_rules! let_through {
+        ($peer:expr) => {{
+            let peer: PeerId = $peer;
+            if !cap_for_all {
+                if !swarm.behaviour().conn_limits.is_bypassed(&peer) {
+                    swarm.behaviour_mut().conn_limits.bypass_peer_id(&peer);
+                    let_through.push_back(peer);
+                }
+                offered.matters(peer);
+            }
+        }};
+    }
+
     loop {
+        // `S1-IT`: the relays a dial that matters goes through are let through
+        // the limit before the connection to them can be refused -- read here,
+        // once a turn of the loop, because the dial that named them may have
+        // been a behaviour's own.
+        if !cap_for_all {
+            for relay in offered.take_relays_that_matter() {
+                if !swarm.behaviour().conn_limits.is_bypassed(&relay) {
+                    swarm.behaviour_mut().conn_limits.bypass_peer_id(&relay);
+                    let_through.push_back(relay);
+                }
+            }
+            while let_through.len() > LET_THROUGH_MAX {
+                if let Some(old) = let_through.pop_front() {
+                    if !poker_peers.contains(&old) {
+                        swarm.behaviour_mut().conn_limits.remove_peer_id(&old);
+                    }
+                }
+            }
+        }
         // `D-043`: the earliest own clock and the earliest deal among the
         // tables, read before the select so the timers own their instants
         // and borrow no table while the group's messages are awaited.
@@ -4471,6 +4561,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             ..
                         },
                     )) => {
+                        // `S1-IT`: a NEW way in is one the lobby's record does not
+                        // name yet, so the record is walked again; a renewal is not.
+                        if ways_in.accepted(relay_peer_id) && have_reservation {
+                            announce = LobbyAnnounce::default();
+                        }
                         have_reservation = true;
                         let bytes = limit.as_ref().and_then(|l| l.data_in_bytes());
                         let seconds = limit
@@ -5743,21 +5838,66 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // public `bootstrap.libp2p.io` nodes, all four advertise it
                     // and all four refuse, and a client that hid that would look
                     // identical to one whose request never went out.
-                    SwarmEvent::ListenerClosed { reason: Err(e), addresses, .. } => {
+                    SwarmEvent::ListenerClosed { reason, addresses, .. } => {
                         // A circuit listener that closes is a reservation that
                         // is gone - refused now, or expired later. Either way
                         // the flag has to come back down, or one bad minute
                         // leaves this client believing it has a way in for the
                         // rest of the process and never looking for another.
-                        if addresses.iter().any(|a| {
+                        //
+                        // `S1-IT`: **and it closes with `Ok(())` when the
+                        // connection to the relay closes**, which is the ordinary
+                        // way a reservation dies (`libp2p-relay`, the listener's
+                        // sender dropped with its connection). This arm matched
+                        // `reason: Err(_)` only, so that death was never seen: the
+                        // flag stayed up, no other relay was asked, and every
+                        // circuit address of the dead reservation stayed confirmed
+                        // and went on being announced -- *the relay holds no
+                        // reservation for it*, twenty-one times in one run, from
+                        // the relay a seat believed it was listening through.
+                        let circuit = addresses.iter().any(|a| {
                             a.iter()
                                 .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-                        }) {
-                            have_reservation = false;
+                        });
+                        if circuit {
+                            for gone in ways_in.closed(addresses.iter()) {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "the way in through relay ..{} is gone ({}); {} left",
+                                        super::dialfail::short(&gone),
+                                        if reason.is_ok() { "its connection closed" } else { "the relay ended it" },
+                                        ways_in.len()
+                                    )))
+                                    .await;
+                            }
+                            // What is announced must stop naming it.
+                            for a in &addresses {
+                                swarm.remove_external_address(a);
+                            }
+                            have_reservation = ways_in.any();
                         }
-                        let _ = events
-                            .send(NodeEvent::Warning(format!("relay said no: {e}")))
-                            .await;
+                        if let Err(e) = reason {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("relay said no: {e}")))
+                                .await;
+                        }
+                    }
+                    // `S1-IT`: a connection that came in and was refused by this
+                    // client's own limit. Nothing said so: the far end sees a
+                    // connection that was made and then cut, and this end saw
+                    // nothing at all.
+                    SwarmEvent::IncomingConnectionError {
+                        error: libp2p::swarm::ListenError::Denied { .. },
+                        send_back_addr,
+                        ..
+                    } => {
+                        refused_coming_in = refused_coming_in.saturating_add(1);
+                        if send_back_addr
+                            .iter()
+                            .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                        {
+                            refused_coming_in_by_relay = refused_coming_in_by_relay.saturating_add(1);
+                        }
                     }
                     // A dial refused by this client's own limit, rather than
                     // by the far end. That is the cap being too tight for what
@@ -5784,7 +5924,59 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
-                    SwarmEvent::OutgoingConnectionError { error, connection_id, .. } => {
+                    SwarmEvent::OutgoingConnectionError { error, connection_id, peer_id } => {
+                        // `S1-IT`: **the failed dial of a peer that matters is said
+                        // every time**, folded to a line (`dialfail`). The full
+                        // words of a failed dial are kept for the first twelve of
+                        // a run and counted after that, which is right for the
+                        // strangers of an open DHT and left `split190546-9` blind:
+                        // a seat and its founder dialled each other for seven
+                        // minutes and nothing past 13 s said how any of it ended.
+                        if let Some(peer) = peer_id {
+                            let founder = t
+                                .table
+                                .as_ref()
+                                .is_some_and(|f| !f.is_founder() && f.founder_peer_id() == peer.to_bytes().as_slice());
+                            // Not a peer that IS on the line: a hole punch that
+                            // failed towards a poker client already connected is a
+                            // failed dial and no unreached peer -- a hundred lines a
+                            // seat in the bed's first run with this, and *stays
+                            // relayed* says it already. And in a player's client one
+                            // peer is said once in `UNREACHED_SAID_EVERY`, the founder
+                            // being asked excepted: a lobby names players who left
+                            // within the hour, and each is dialled every minute.
+                            let matters = founder || poker_peers.contains(&peer) || named_this_hour.contains(&peer);
+                            let lately = unreached_said
+                                .get(&peer)
+                                .is_some_and(|at: &std::time::Instant| at.elapsed() < UNREACHED_SAID_EVERY);
+                            if matters && !swarm.is_connected(&peer) && (founder || built_to_be_measured() || !lately) {
+                                if unreached_said.len() >= 512 {
+                                    unreached_said.clear();
+                                }
+                                unreached_said.insert(peer, std::time::Instant::now());
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "could not reach {}{peer}: {}",
+                                        if founder { "the founder " } else { "" },
+                                        super::dialfail::fold(&error)
+                                    )))
+                                    .await;
+                            } else if built_to_be_measured() && swarm.behaviour().offered().knows_relay(&peer) {
+                                // Where a run is measured, the relays' own dials too:
+                                // a circuit is given up when its relay is not reached,
+                                // and this is the line that says why it was not.
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "could not reach relay ..{}: {}",
+                                        super::dialfail::short(&peer),
+                                        super::dialfail::fold(&error)
+                                    )))
+                                    .await;
+                            }
+                        }
+                        if matches!(error, libp2p::swarm::DialError::Denied { .. }) {
+                            refused_by_own_limit = refused_by_own_limit.saturating_add(1);
+                        }
                         // **A second look, for this site's own dial and for a
                         // failure that is the far end's.** `Denied` never
                         // reaches here while the budget is below its ceiling —
@@ -5976,7 +6168,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let relays = info.protocols.contains(&libp2p::relay::HOP_PROTOCOL_NAME);
                         seen_a_relay |= relays;
                         if relays
-                            && !have_reservation
+                            && ways_in.wants(&peer_id, std::time::Instant::now())
                             && !asked_hops
                                 .get(&peer_id)
                                 .is_some_and(|at| at.elapsed() < REDIAL_AFTER)
@@ -5998,6 +6190,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // later.
                             if let Some(addr) = info.listen_addrs.iter().find(|a| reachable(a)) {
                                 asked_hops.insert(peer_id, std::time::Instant::now());
+                                ways_in.asked(peer_id, std::time::Instant::now());
                                 let circuit = addr
                                     .clone()
                                     .with(libp2p::multiaddr::Protocol::P2p(peer_id))
@@ -6315,6 +6508,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     if dialled_lobby.len() > 512 {
                                         dialled_lobby.retain(|p, _| swarm.is_connected(p));
                                     }
+                                }
+                                // `S1-IT`: a player the lobby named is a dial that
+                                // matters -- it and the relay it goes through are
+                                // let through this client's own connection limit,
+                                // which sits at its ceiling from the seventh second
+                                // of a run and refused 364 relays in one.
+                                if charge.is_some() {
+                                    let_through!(peer);
                                 }
                                 // By peer id: the addresses came with the query
                                 // and live in the routing table, and asking for
@@ -6651,6 +6852,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = discover_timer.tick() => {
+                if built_to_be_measured() && (refused_by_own_limit > 0 || refused_coming_in > 0) {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "this client's own connection limit refused {refused_by_own_limit} connection(s) since the last tick, and {refused_coming_in} that came in, {refused_coming_in_by_relay} of them through its relay ({} established, the ceiling is {CONNECTION_CEILING})",
+                            swarm.network_info().connection_counters().num_established()
+                        )))
+                        .await;
+                }
+                refused_by_own_limit = 0;
+                refused_coming_in = 0;
+                refused_coming_in_by_relay = 0;
                 // The cap, downwards. Raising it is an event; lowering it is a
                 // habit, and it needs patience: a client that trimmed its budget
                 // the moment it was under would spend every cycle refusing and
@@ -6809,7 +7021,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // before a packet leaves, and reports the refusal as an empty
                 // string. That path never worked, and it is gone rather than
                 // repaired.
-                if !have_reservation {
+                if ways_in.short_of() {
                     relay_searches += 1;
                     let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(relay_namespace());
                     lookups.asked(lookup, super::lookups::Asked::Relays);
@@ -7613,6 +7825,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .behaviour_mut()
                                         .ipfs_kad
                                         .get_closest_peers(founder);
+                                    let_through!(founder);
+                                    // `S1-IT`: **the dial this ask rides on, made
+                                    // here so that its refusal is SAID.** The join
+                                    // behaviour dials by itself, and the three
+                                    // refusals `Swarm::dial` returns by value reach
+                                    // nobody: the ask ends *Failed to dial the
+                                    // requested peer* within a millisecond and the
+                                    // log cannot tell *no address is held for the
+                                    // founder* -- 20 of the 33 asks of
+                                    // `split190546-9`'s seat -- from a dial that went
+                                    // out and failed. The behaviour's own dial then
+                                    // finds this one under way and waits for it.
+                                    let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(founder)
+                                        .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                        .build();
+                                    if let Err(e) = swarm.dial(opts) {
+                                        if !matches!(e, libp2p::swarm::DialError::DialPeerConditionFalse(_)) {
+                                            let _ = events
+                                                .send(NodeEvent::Warning(format!(
+                                                    "the ask cannot reach the founder: {}",
+                                                    super::dialfail::fold(&e)
+                                                )))
+                                                .await;
+                                        }
+                                    }
                                 }
                                 let asked = swarm.behaviour_mut().join.send_request(&founder, request);
                                 join_pending.insert(asked, t.slot);
@@ -13791,7 +14028,7 @@ async fn handle_gossip(
 /// few per peer: a public node advertises nine or more and this client can dial
 /// two of those forms.
 fn harvest(
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
 ) -> Vec<(libp2p::PeerId, Vec<Multiaddr>)> {
     use super::peerbook::{worth_keeping, MAX_ADDRS_PER_PEER, MAX_PEERS};
 
@@ -13830,7 +14067,7 @@ fn harvest(
 /// a table that is bandwidth taken from the game. Client mode keeps every query
 /// this client makes and stops every query it answers. It is one field, and it
 /// goes back up the moment the player stands.
-fn dht_effort(swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>, at_a_table: bool) {
+fn dht_effort(swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>, at_a_table: bool) {
     let kad = &mut swarm.behaviour_mut().ipfs_kad;
     if at_a_table {
         kad.set_mode(Some(libp2p::kad::Mode::Client));
@@ -13855,7 +14092,7 @@ async fn begin_hand(
     app_key: &ed25519_dalek::SigningKey,
     hand: &mut Option<crate::table::hand::Hand>,
     said: &mut Vec<Vec<u8>>,
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     events: &Events,
     tox: &super::toxsink::TableSink,
 ) {
@@ -14547,7 +14784,7 @@ async fn reopen_hand(
     mut opening: crate::table::hand::Opening,
     hand: &mut Option<crate::table::hand::Hand>,
     said: &mut Vec<Vec<u8>>,
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     events: &Events,
     tox: &super::toxsink::TableSink,
     app_key: &ed25519_dalek::SigningKey,
@@ -14664,7 +14901,7 @@ async fn begin_hand_with(
     app_key: &ed25519_dalek::SigningKey,
     hand: &mut Option<crate::table::hand::Hand>,
     said: &mut Vec<Vec<u8>>,
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     events: &Events,
     tox: &super::toxsink::TableSink,
 ) {
@@ -14825,7 +15062,7 @@ fn old_reannounce() -> bool {
 /// subscribed is a peer it will not graft. The answer is what it *knows*, which
 /// is a claim that arrives in a subscription message and can be missed.
 fn peer_has_our_topics(
-    swarm: &libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &libp2p::Swarm<super::swarm::ShapedBehaviour>,
     peer: &libp2p::PeerId,
     topics: &super::swarm::Topics,
     table: Option<&gossipsub::IdentTopic>,
@@ -14907,7 +15144,7 @@ fn forced_depth() -> Option<u8> {
 /// **Subscribed before unsubscribed**, so the list never goes blank across the
 /// change.
 async fn weigh_lobby(
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     state: &mut NodeState,
     events: &Events,
     walked: &mut tokio::time::Instant,
@@ -15005,7 +15242,7 @@ async fn weigh_lobby(
 /// decides whether the table is out there at all, and every caller here was
 /// written to read it.
 fn publish_advert(
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     table_key: &[u8; 32],
     bytes: &[u8],
 ) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
@@ -15029,7 +15266,7 @@ fn publish_advert(
 /// only one this project keeps -- would be zero for exactly the traffic it was
 /// turned on for. See `swarm::peer_score`.
 fn subscribe_scored(
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     topic: &gossipsub::IdentTopic,
 ) -> Result<bool, gossipsub::SubscriptionError> {
     let g = &mut swarm.behaviour_mut().gossipsub;
@@ -15038,7 +15275,7 @@ fn subscribe_scored(
 }
 
 fn announce_topics(
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     which: &[&gossipsub::IdentTopic],
 ) {
     for t in which {
@@ -15330,7 +15567,7 @@ fn nothing_leaves() -> bool {
 /// that fails at the deal and blames the opponent.
 fn publish_hand(
     sends: Vec<crate::table::hand::Send>,
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     said: &mut Vec<Vec<u8>>,
     tox: &super::toxsink::TableSink,
 ) {
@@ -15767,7 +16004,7 @@ async fn publish_and_hear(
     // No topic, for the reason given on `publish_hand`: the way a hand stays
     // off libp2p is that nothing on the hand path is given the means to put it
     // there.
-    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     said: &mut Vec<Vec<u8>>,
     tox: &super::toxsink::TableSink,
 ) {
@@ -19543,5 +19780,39 @@ mod back_at_the_table {
             Some("cfg!(feature = \"fault-harness\")"),
             "only a binary built to be measured says every answer"
         );
+    }
+    /// `S1-IT`: the four places in this loop the row stands on, read as they are
+    /// written -- because each was a line somebody could put back without a test
+    /// noticing, and the first of them was the fault itself.
+    ///
+    /// The breaks that must make this fail: match `ListenerClosed` with
+    /// `reason: Err(e)` again; ask a relay while `!have_reservation`; dial a
+    /// player the lobby named without `let_through!`; ask the founder without it.
+    #[test]
+    fn a_way_in_that_closed_is_seen_and_a_dial_that_matters_is_let_through() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        // A circuit listener that closed is a way in gone WHATEVER it closed with.
+        assert_eq!(code.matches("SwarmEvent::ListenerClosed {").count(), 1, "one arm");
+        assert!(code.contains("SwarmEvent::ListenerClosed { reason, addresses, .. } => {"), "and it takes every reason");
+        let arm = code.find("SwarmEvent::ListenerClosed { reason, addresses, .. } => {").expect("the arm");
+        let body = &code[arm..arm + 3_000];
+        assert!(body.contains("ways_in.closed(addresses.iter())"), "the way in is forgotten");
+        assert!(body.contains("swarm.remove_external_address(a)"), "and no longer announced");
+        assert!(body.contains("have_reservation = ways_in.any();"), "and the flag follows the ways in");
+        // A relay is asked while this client is short of ways in, not while it has none.
+        assert!(code.contains("&& ways_in.wants(&peer_id, std::time::Instant::now())"));
+        assert!(!code.contains("&& !have_reservation"), "one way in is not enough to stop asking");
+        assert!(code.contains("if ways_in.short_of() {"), "and the relays' key is looked up for as long");
+        // The two dials that matter, and the relays they go through.
+        assert_eq!(code.matches("let_through!(").count(), 2, "the lobby's dial and the ask");
+        assert!(code.contains("if charge.is_some() {\n                                    let_through!(peer);"));
+        assert!(code.contains("let_through!(founder);"));
+        assert!(code.contains("for relay in offered.take_relays_that_matter() {"), "their relays, once a turn of the loop");
+        // And the controls are the build's: no player's client can be switched back.
+        for rule in ["fn ways_in_wanted() -> usize {", "fn cap_applies_to_all() -> bool {"] {
+            let at = code.find(rule).expect("the rule");
+            assert!(code[at..at + 200].contains("cfg!(feature = \"fault-harness\") &&"), "{rule}");
+        }
     }
 }

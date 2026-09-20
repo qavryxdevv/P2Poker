@@ -112,6 +112,20 @@ param(
     # client asked for the seat's own table topic. The control for that row, from
     # the same binary. Needs the fault harness at both ends.
     [switch]$OldReannounce,
+    # `-OfferEveryAddress` runs every seat handing the swarm every address the DHT
+    # offers for a peer (`P2P_POKER_OFFER_EVERY_ADDRESS`), as before `S1-IT`: the
+    # relay legs this client has no transport for are dialled like any other, and
+    # a relay is dialled at the one address of the first circuit request. The
+    # control for that row, from the same binary. Needs the fault harness at both
+    # ends.
+    [switch]$OfferEveryAddress,
+    # `-OneWayIn` keeps ONE relay reservation at every seat, as before `S1-IT`
+    # (`P2P_POKER_ONE_WAY_IN`); `-CapForAll` lets no dial through a seat's own
+    # connection limit, as before it (`P2P_POKER_CAP_FOR_ALL`). With
+    # `-OfferEveryAddress` the three are that row's control, from the same binary.
+    # They need the fault harness at both ends.
+    [switch]$OneWayIn,
+    [switch]$CapForAll,
     # `-Stall <seconds> -StallSeat <n>` starves one far seat's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -389,6 +403,9 @@ if (-not $faultHarness) {
     if ($DelayCerts -gt 0)  { $needy += '-DelayCerts' }
     if ($DeafFor -gt 0)     { $needy += '-DeafFor' }
     if ($DeafBothWays)      { $needy += '-DeafBothWays' }
+    if ($OfferEveryAddress) { $needy += '-OfferEveryAddress' }
+    if ($OneWayIn)          { $needy += '-OneWayIn' }
+    if ($CapForAll)         { $needy += '-CapForAll' }
     if ($needy.Count -gt 0) {
         throw ("$($needy -join ', ') need the fault harness and $Exe was built " +
                "without it: the environment variables behind those knobs are read " +
@@ -440,6 +457,8 @@ $header = @(
     "far    $(if ($FarDelay -gt 0) { "the far seat(s) start $FarDelay s after the rest - a late relay-only arrival, S1-AA's join-phase shape" } else { 'started with the rest' })"
     "0040   $(if ($NoPatch0040) { 'OFF at every seat - the control (fault-harness)' } else { 'as built' })"
     "topics $(if ($OldReannounce) { 'said again by the rule BEFORE S1-IS at every seat - the control (fault-harness)' } else { 'said again as built (S1-IS)' })"
+    "dials  $(if ($OfferEveryAddress) { 'every address the DHT offers is dialled, as BEFORE S1-IT, at every seat - the control (fault-harness)' } else { 'only addresses this client has a transport for; a relay at every address the records gave it (S1-IT)' })"
+    "waysin $(if ($OneWayIn) { 'ONE relay reservation a seat, as BEFORE S1-IT - the control (fault-harness)' } else { 'two relay reservations a seat (S1-IT)' }); $(if ($CapForAll) { 'no dial is let through a seat''s own connection limit, as BEFORE S1-IT - the control (fault-harness)' } else { 'a dial that matters and its relay are let through the connection limit (S1-IT)' })"
     "relay  $(if ($DeadAnnouncedRelay) { 'the relay a relay-only member is announced by is one no seat can connect to, at both ends (fault-harness; patch 0040)' } else { 'announced relays as they come' })"
     "tox    $(if ($faultHarness) { 'log on - the BINARY carries the fault harness' } else { 'log OFF - the binary has no fault harness; toxcore writes nothing, so do not read a zero as an absence' })"
     "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
@@ -665,6 +684,9 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($(if ($DeadAnnouncedRelay) { '$true' } else { '$false' })) { `$env:P2P_POKER_DEAD_ANNOUNCED_RELAY = '1' }
         if ($(if ($NoPatch0040) { '$true' } else { '$false' })) { `$env:P2P_POKER_NO_0040 = '1' }
         if ($(if ($OldReannounce) { '$true' } else { '$false' })) { `$env:P2P_POKER_OLD_REANNOUNCE = '1' }
+        if ($(if ($OfferEveryAddress) { '$true' } else { '$false' })) { `$env:P2P_POKER_OFFER_EVERY_ADDRESS = '1' }
+        if ($(if ($OneWayIn) { '$true' } else { '$false' })) { `$env:P2P_POKER_ONE_WAY_IN = '1' }
+        if ($(if ($CapForAll) { '$true' } else { '$false' })) { `$env:P2P_POKER_CAP_FOR_ALL = '1' }
         if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_MS = '$DelayCerts' }
         if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and $DelayCertsUntil -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_UNTIL_S = '$DelayCertsUntil' }
         `$start = Get-Date
@@ -765,6 +787,15 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         }
         if ($OldReannounce) {
             $knobs['P2P_POKER_OLD_REANNOUNCE'] = '1'
+        }
+        if ($OfferEveryAddress) {
+            $knobs['P2P_POKER_OFFER_EVERY_ADDRESS'] = '1'
+        }
+        if ($OneWayIn) {
+            $knobs['P2P_POKER_ONE_WAY_IN'] = '1'
+        }
+        if ($CapForAll) {
+            $knobs['P2P_POKER_CAP_FOR_ALL'] = '1'
         }
         if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"

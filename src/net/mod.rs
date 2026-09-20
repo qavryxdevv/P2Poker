@@ -3,6 +3,10 @@
 
 pub mod advert;
 pub mod chained;
+/// `S1-IT`: which addresses of a DHT record this client can dial, and the relays the records name.
+pub mod dialable;
+/// `S1-IT`: a failed dial, said in a line a person can read.
+pub mod dialfail;
 pub mod formation;
 pub mod joinrpc;
 pub mod joinwire;
@@ -28,3 +32,5 @@ pub mod swarm;
 /// the same shape when this build has no Tox. The cfg lives there so that
 /// `run.rs` reads identically in both.
 pub mod toxsink;
+/// `S1-IT`: the relays this client can be reached through, and how it learns one is gone.
+pub mod waysin;

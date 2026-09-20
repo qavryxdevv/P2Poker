@@ -292,6 +292,143 @@ pub struct Bogonless<B> {
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// `S1-IT`: what becomes of the addresses a behaviour offers for a dial, after
+/// whatever filter of its own it has: nothing this client has no transport for,
+/// and a relay at every address any record gave it (`dialable`).
+///
+/// **Around the whole behaviour, because every part of it offers addresses.**
+/// The first cut shaped only the public DHT's offers, and the bed's next run
+/// still held *no transport for the address* in 812 of 969 failed dials of peers
+/// that matter; the second added `identify`'s cache and the private DHT, and the
+/// run after it held 855 of 1 359. `identify` hands every address a peer lists to
+/// the swarm (`NewExternalAddrOfPeer`), the swarm hands it to every behaviour,
+/// and each request-response behaviour offers it back for a dial -- a poker
+/// client met once comes with every leg of its relay, WebTransport and
+/// WebSocket among them, from six behaviours at once. So the shaping is done
+/// once, on what all of them offer together ([`OnlyDialable`]).
+#[derive(Clone)]
+pub struct Offered {
+    undialable: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    relays: std::sync::Arc<std::sync::Mutex<super::dialable::RelayBook>>,
+    /// The peers a dial of which matters, as `net::run` tells it: the founder
+    /// being asked for a seat, a player the lobby named.
+    matters: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PeerId>>>,
+    /// And the relays the records route those peers through, for `net::run` to
+    /// take: a circuit is given up when its relay is not reached, and this
+    /// client's own connection limit was what refused 364 relays in one run.
+    relays_that_matter: std::sync::Arc<std::sync::Mutex<Vec<PeerId>>>,
+    /// The control, from the same binary (`offers_every_address`).
+    offer_every_address: bool,
+}
+
+impl Default for Offered {
+    fn default() -> Self {
+        Self {
+            undialable: Default::default(),
+            relays: Default::default(),
+            matters: Default::default(),
+            relays_that_matter: Default::default(),
+            offer_every_address: offers_every_address(),
+        }
+    }
+}
+
+impl Offered {
+    /// How many addresses were not offered for want of a transport.
+    pub fn undialable(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.undialable)
+    }
+
+    /// Whether a record has named this peer as somebody's relay.
+    pub fn knows_relay(&self, peer: &PeerId) -> bool {
+        self.relays.lock().unwrap_or_else(|held| held.into_inner()).knows(peer)
+    }
+
+    /// A dial of this peer matters. Bounded: the set is forgotten whole when it
+    /// is full, and whoever still matters is said again at its next dial.
+    pub fn matters(&self, peer: PeerId) {
+        let mut matters = self.matters.lock().unwrap_or_else(|held| held.into_inner());
+        if matters.len() >= PEERS_THAT_MATTER_MAX {
+            matters.clear();
+        }
+        matters.insert(peer);
+    }
+
+    /// The relays that peers that matter were offered through since this was
+    /// last asked, each once.
+    pub fn take_relays_that_matter(&self) -> Vec<PeerId> {
+        std::mem::take(&mut *self.relays_that_matter.lock().unwrap_or_else(|held| held.into_inner()))
+    }
+
+    /// Notes the relays a peer that matters is offered through.
+    fn note_relays(&self, maybe_peer: Option<PeerId>, offered: &[libp2p::Multiaddr]) {
+        let Some(peer) = maybe_peer else { return };
+        if !self.matters.lock().unwrap_or_else(|held| held.into_inner()).contains(&peer) {
+            return;
+        }
+        let mut wanted = self.relays_that_matter.lock().unwrap_or_else(|held| held.into_inner());
+        for (relay, _) in offered.iter().filter_map(super::dialable::relay_of) {
+            if wanted.len() < RELAYS_THAT_MATTER_MAX && !wanted.contains(&relay) {
+                wanted.push(relay);
+            }
+        }
+    }
+
+    /// `already` is what the dial was given; `offered` what the behaviour adds.
+    fn shape(&self, maybe_peer: Option<PeerId>, already: &[libp2p::Multiaddr], offered: Vec<libp2p::Multiaddr>) -> Vec<libp2p::Multiaddr> {
+        let shaped = self.shape_addresses(maybe_peer, already, offered);
+        self.note_relays(maybe_peer, already);
+        self.note_relays(maybe_peer, &shaped);
+        shaped
+    }
+
+    fn shape_addresses(&self, maybe_peer: Option<PeerId>, already: &[libp2p::Multiaddr], offered: Vec<libp2p::Multiaddr>) -> Vec<libp2p::Multiaddr> {
+        let mut relays = self.relays.lock().unwrap_or_else(|held| held.into_inner());
+        if self.offer_every_address {
+            // The control still LEARNS, so that the lines about relays are said
+            // in both kinds of run; it filters nothing and adds nothing.
+            relays.learn(offered.iter().filter(|a| !super::dialable::lacks_transport(a)));
+            return offered;
+        }
+        let before = offered.len();
+        let mut kept: Vec<libp2p::Multiaddr> =
+            offered.into_iter().filter(|a| !super::dialable::lacks_transport(a)).collect();
+        let undialable = before - kept.len();
+        if undialable > 0 {
+            self.undialable
+                .fetch_add(undialable as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        // **And the relay is dialled at every address the records gave it.**
+        // What they say of a relay is read out of the circuits that go through
+        // it, and offered when the relay itself is the peer being dialled --
+        // which is the relay client's own dial, made with the one address of
+        // one request and *extended through the behaviours*, that is, by this.
+        relays.learn(kept.iter());
+        if let Some(peer) = maybe_peer {
+            for known in relays.addresses_of(&peer) {
+                if !kept.contains(known) && !already.contains(known) {
+                    kept.push(known.clone());
+                }
+            }
+        }
+        kept
+    }
+}
+
+/// The most peers a dial of which is held to matter at once.
+pub const PEERS_THAT_MATTER_MAX: usize = 1024;
+
+/// The most relays waiting for `net::run` to take them.
+pub const RELAYS_THAT_MATTER_MAX: usize = 256;
+
+/// `S1-IT`'s control: `P2P_POKER_OFFER_EVERY_ADDRESS=1`, **in a binary built to
+/// be measured and in no other**, switches off the row's two changes -- nothing
+/// is dropped for want of a transport and no relay's addresses are added -- so
+/// that a run with them and a run without differ in nothing else.
+fn offers_every_address() -> bool {
+    cfg!(feature = "fault-harness") && std::env::var_os("P2P_POKER_OFFER_EVERY_ADDRESS").is_some_and(|v| v == "1")
+}
+
 impl<B> Bogonless<B> {
     pub fn new(inner: B) -> Self {
         Self {
@@ -398,6 +535,115 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Bog
             FromSwarm::ExpiredListenAddr(e) if !not_a_bogon(e.addr) => {}
             other => self.inner.on_swarm_event(other),
         }
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        peer: PeerId,
+        id: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        self.inner.on_connection_handler_event(peer, id, event)
+    }
+
+    fn poll(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
+        self.inner.poll(cx)
+    }
+}
+
+/// `S1-IT`: a behaviour whose offered addresses pass through [`Offered`] --
+/// worn by the WHOLE of this client's behaviour, so that what any part of it
+/// offers for a dial is shaped once and alike.
+pub struct OnlyDialable<B> {
+    inner: B,
+    offered: Offered,
+}
+
+/// The behaviour this client's swarm runs: all of [`PokerBehaviour`], offering
+/// for a dial only what this client can dial.
+pub type ShapedBehaviour = OnlyDialable<PokerBehaviour>;
+
+impl<B> OnlyDialable<B> {
+    pub fn new(inner: B) -> Self {
+        Self { inner, offered: Offered::default() }
+    }
+
+    /// What is done to offered addresses, and the book of relays: for
+    /// `net::run`, which reads it and tells it which dials matter.
+    pub fn offered(&self) -> &Offered {
+        &self.offered
+    }
+}
+
+impl<B> std::ops::Deref for OnlyDialable<B> {
+    type Target = B;
+    fn deref(&self) -> &B {
+        &self.inner
+    }
+}
+
+impl<B> std::ops::DerefMut for OnlyDialable<B> {
+    fn deref_mut(&mut self) -> &mut B {
+        &mut self.inner
+    }
+}
+
+impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for OnlyDialable<B> {
+    type ConnectionHandler = B::ConnectionHandler;
+    type ToSwarm = B::ToSwarm;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        local: &libp2p::Multiaddr,
+        remote: &libp2p::Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        self.inner.handle_pending_inbound_connection(id, local, remote)
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        local: &libp2p::Multiaddr,
+        remote: &libp2p::Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.inner
+            .handle_established_inbound_connection(id, peer, local, remote)
+    }
+
+    /// The one method that is not a delegation.
+    fn handle_pending_outbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        maybe_peer: Option<PeerId>,
+        addresses: &[libp2p::Multiaddr],
+        role: libp2p::core::Endpoint,
+    ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+        let offered = self
+            .inner
+            .handle_pending_outbound_connection(id, maybe_peer, addresses, role)?;
+        Ok(self.offered.shape(maybe_peer, addresses, offered))
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        addr: &libp2p::Multiaddr,
+        role: libp2p::core::Endpoint,
+        port_use: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.inner
+            .handle_established_outbound_connection(id, peer, addr, role, port_use)
+    }
+
+    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
+        self.inner.on_swarm_event(event)
     }
 
     fn on_connection_handler_event(
@@ -612,7 +858,7 @@ pub struct NodeConfig {
 /// identity → runtime → TCP → QUIC → DNS → relay client → behaviour → config.
 /// Note that `with_relay_client` gives the behaviour closure a **second
 /// argument**; that is not optional and is why the closure below takes two.
-pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::error::Error>> {
+pub fn build(config: NodeConfig) -> Result<Swarm<ShapedBehaviour>, Box<dyn std::error::Error>> {
     let local_discovery = config.local_discovery;
     let local_peer_id = PeerId::from(config.identity.public());
     let relay_role = config.relay_role;
@@ -694,7 +940,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                     .with_push_listen_addr_updates(true),
             );
 
-            Ok(PokerBehaviour {
+            Ok(OnlyDialable::new(PokerBehaviour {
                 gossipsub,
                 kademlia,
                 ipfs_kad: Bogonless::new(ipfs_kad),
@@ -749,7 +995,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 } else {
                     None
                 }),
-            })
+            }))
         })?
         .with_swarm_config(|c| {
             c.with_idle_connection_timeout(Duration::from_millis(IDLE_CONNECTION_TIMEOUT_MS))
@@ -1115,6 +1361,100 @@ mod tests {
         // Same allocation, not a copy: the point of handing out an Arc.
         b.dropped().fetch_add(3, Ordering::Relaxed);
         assert_eq!(handle.load(Ordering::Relaxed), 3);
+    }
+
+    /// `S1-IT`: of what a record offers for a player behind a relay, this client
+    /// is handed only what it can dial -- and when the relay client then dials
+    /// the relay with the ONE address its first request named, the dial is
+    /// extended with every address the records gave that relay.
+    ///
+    /// Measured, `split190546-9`: a relay named at fifteen addresses, its
+    /// WebTransport one first, the relay dialled there -- *Unsupported resolved
+    /// address* -- and fifteen circuit attempts *canceled*, in five seats' logs.
+    ///
+    /// The breaks that must make this fail: offer the WebTransport circuit;
+    /// offer the relay's dial nothing of what was learned.
+    #[test]
+    fn a_player_behind_a_relay_is_dialled_only_where_this_client_can_speak() {
+        use libp2p::swarm::{FromSwarm, NetworkBehaviour};
+        use std::sync::atomic::Ordering;
+
+        /// Offers the same addresses for whoever is dialled, as a DHT record does.
+        struct Offers(Vec<libp2p::Multiaddr>);
+        impl NetworkBehaviour for Offers {
+            type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+            type ToSwarm = std::convert::Infallible;
+            fn handle_pending_outbound_connection(
+                &mut self,
+                _: libp2p::swarm::ConnectionId,
+                _: Option<PeerId>,
+                _: &[libp2p::Multiaddr],
+                _: libp2p::core::Endpoint,
+            ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+                Ok(self.0.clone())
+            }
+            fn handle_established_inbound_connection(
+                &mut self,
+                _: libp2p::swarm::ConnectionId,
+                _: PeerId,
+                _: &libp2p::Multiaddr,
+                _: &libp2p::Multiaddr,
+            ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+                Ok(libp2p::swarm::dummy::ConnectionHandler)
+            }
+            fn handle_established_outbound_connection(
+                &mut self,
+                _: libp2p::swarm::ConnectionId,
+                _: PeerId,
+                _: &libp2p::Multiaddr,
+                _: libp2p::core::Endpoint,
+                _: libp2p::core::transport::PortUse,
+            ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+                Ok(libp2p::swarm::dummy::ConnectionHandler)
+            }
+            fn on_swarm_event(&mut self, _: FromSwarm) {}
+            fn on_connection_handler_event(&mut self, _: PeerId, _: libp2p::swarm::ConnectionId, e: libp2p::swarm::THandlerOutEvent<Self>) {
+                match e {}
+            }
+            fn poll(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        let a = |s: &str| s.parse::<libp2p::Multiaddr>().expect("a literal");
+        let relay: PeerId = "12D3KooWLZ18MNzm9xu7GZRQ16c6k3CZLN529CbUqrYaWNqyYko9".parse().unwrap();
+        let player = PeerId::random();
+        let through = |leg: &str| a(&format!("{leg}/p2p/{relay}/p2p-circuit/p2p/{player}"));
+        // The record as a node gave it: the relay's WebTransport address first.
+        let record = vec![
+            through("/ip4/147.75.87.27/udp/4001/quic-v1/webtransport"),
+            through("/ip4/147.75.87.27/tcp/4001"),
+            through("/dns4/relay.example.org/tcp/443/wss"),
+            through("/ip4/147.75.87.27/udp/4001/quic-v1"),
+            through("/ip4/192.168.1.5/tcp/4001"),
+        ];
+        let mut b = super::OnlyDialable::new(super::Bogonless::new(Offers(record)));
+        let id = libp2p::swarm::ConnectionId::new_unchecked(1);
+        let dialer = libp2p::core::Endpoint::Dialer;
+
+        let offered = b.handle_pending_outbound_connection(id, Some(player), &[], dialer).expect("not denied");
+        assert_eq!(offered, [through("/ip4/147.75.87.27/tcp/4001"), through("/ip4/147.75.87.27/udp/4001/quic-v1")]);
+        assert_eq!(b.offered().undialable().load(Ordering::Relaxed), 2, "WebTransport and secure WebSocket");
+        assert_eq!(b.dropped().load(Ordering::Relaxed), 1, "and the home network's address is the other filter's");
+        assert!(b.offered().knows_relay(&relay) && !b.offered().knows_relay(&player));
+
+        // The relay client's dial of the relay: one address, that of its first
+        // request. It leaves here with the other one the records gave.
+        b.inner.inner.0.clear();
+        let given = [a("/ip4/147.75.87.27/tcp/4001")];
+        let offered = b.handle_pending_outbound_connection(id, Some(relay), &given, dialer).expect("not denied");
+        assert_eq!(offered, [a("/ip4/147.75.87.27/udp/4001/quic-v1")], "every address but the one the dial already has");
+        // And nobody else's dial gains an address from the book.
+        let offered = b.handle_pending_outbound_connection(id, Some(PeerId::random()), &[], dialer).expect("not denied");
+        assert!(offered.is_empty(), "{offered:?}");
     }
 
     use super::*;

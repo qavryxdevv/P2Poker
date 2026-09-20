@@ -37,19 +37,19 @@ use libp2p::futures::StreamExt;
 use libp2p::{identity, multiaddr::Protocol, relay, swarm::SwarmEvent, Multiaddr, PeerId, Swarm};
 
 use p2p_poker::net::relay::{adequate, Adequacy};
-use p2p_poker::net::swarm::{self, NodeConfig, PokerBehaviour, PokerBehaviourEvent, RelayAdmits, RelayRole};
+use p2p_poker::net::swarm::{self, NodeConfig, ShapedBehaviour, PokerBehaviourEvent, RelayAdmits, RelayRole};
 use p2p_poker::protocol::constants::{HAND_DEADLINE_CAP_MS, MAX_SEATS};
 
 const PATIENCE: Duration = Duration::from_secs(60);
 
-fn node(role: RelayRole) -> Swarm<PokerBehaviour> {
+fn node(role: RelayRole) -> Swarm<ShapedBehaviour> {
     node_admitting(role, RelayAdmits::default())
 }
 
 /// A node whose relay reserves slots for the peers in `admits` (`S1-FK`): the
 /// node loop fills that set from `identify`, and a test with no loop names the
 /// peer itself.
-fn node_admitting(role: RelayRole, admits: RelayAdmits) -> Swarm<PokerBehaviour> {
+fn node_admitting(role: RelayRole, admits: RelayAdmits) -> Swarm<ShapedBehaviour> {
     swarm::build(NodeConfig {
         identity: identity::Keypair::generate_ed25519(),
         // Off. These dial a loopback address and then assert two peers met;

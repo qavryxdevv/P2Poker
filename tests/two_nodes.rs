@@ -29,7 +29,7 @@ use libp2p::{gossipsub, identity, swarm::SwarmEvent, Multiaddr, Swarm};
 
 use p2p_poker::net::advert::{publish, receive};
 use p2p_poker::net::lobby::{BlindSchedule, LobbyStore, Mode, RateLimiter, TableAd, DECK_SUITE_V1};
-use p2p_poker::net::swarm::{self, NodeConfig, PokerBehaviour, PokerBehaviourEvent, RelayRole, Topics};
+use p2p_poker::net::swarm::{self, NodeConfig, ShapedBehaviour, PokerBehaviourEvent, RelayRole, Topics};
 use p2p_poker::protocol::constants::hand_deadline_min_ms;
 
 const NOW: u64 = 1_700_000_000_000;
@@ -37,7 +37,7 @@ const NOW: u64 = 1_700_000_000_000;
 /// The whole test must finish inside this, or it has hung rather than failed.
 const PATIENCE: Duration = Duration::from_secs(30);
 
-fn node() -> Swarm<PokerBehaviour> {
+fn node() -> Swarm<ShapedBehaviour> {
     swarm::build(NodeConfig {
         identity: identity::Keypair::generate_ed25519(),
         // The relay server is irrelevant here and its capacity costs nothing.
