@@ -1811,6 +1811,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // **fault-harness only.** `P2P_POKER_LAST_ADDRESS_VERDICT=1` restores what
+    // `S1-IL` found: the client's verdict about its own reachability follows the
+    // answer about whichever address AutoNAT tested last, rather than the set of
+    // addresses it has confirmed. The control run of the fix, out of the same
+    // binary as the treatment.
+    let last_address_verdict = cfg!(feature = "fault-harness")
+        && std::env::var("P2P_POKER_LAST_ADDRESS_VERDICT").is_ok_and(|v| v.trim() == "1");
     // ... and only until this many seconds after the loop started, so a run
     // can park one hand's votes and copies and let the later ones through.
     let delay_certs_until: Option<std::time::Duration> = if cfg!(feature = "fault-harness") {
@@ -5615,7 +5622,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // both would conclude they are publicly reachable, both
                         // would volunteer as relays, and both would advertise a
                         // port that nobody outside the house can open.
-                        let public = ev.result.is_ok() && reachable(&ev.tested_addr);
+                        let confirmed = ev.result.is_ok() && reachable(&ev.tested_addr);
 
                         // A confirmed address is an **external** address, and
                         // saying so is not bookkeeping.
@@ -5630,7 +5637,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `tests/relay_circuit.rs` found on the first run it was
                         // ever given, and it had been true since the relay was
                         // configured.
-                        if public {
+                        if confirmed {
                             swarm.add_external_address(ev.tested_addr.clone());
                             // `D-070`: an address the hour's record may not name
                             // -- by the address, not by the verdict turning to
@@ -5641,9 +5648,44 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             swarm.remove_external_address(&ev.tested_addr);
                         }
 
+                        // **`S1-IL`: the verdict is about this CLIENT, and it is
+                        // read from every address AutoNAT has confirmed.**
+                        //
+                        // It used to be `confirmed` itself -- the answer about
+                        // whichever address was tested last. AutoNAT v2 tests one
+                        // address per answer and a client offers several: a LAN
+                        // address, an IPv6 ULA, a circuit, and the one the rest of
+                        // the world can dial. So the answer about the LAN address
+                        // took the verdict down while the public one stood
+                        // confirmed, and the next answer put it back. Measured in
+                        // the corpus before the fix: 49 turns in 26 logs of seven
+                        // runs, every one of them beginning *public* and turning
+                        // *behind NAT*, five of them within five seconds and one
+                        // within one -- a second in which nothing about the
+                        // network changed.
+                        //
+                        // **A circuit does not count.** A relayed address holds
+                        // the relay's public IP, so `reachable` says yes to it,
+                        // and it is added above and by the circuit arm because a
+                        // provider record needs it. But this flag answers *can the
+                        // rest of the world reach this client without a relay* --
+                        // it is what volunteers this client as a relay (`D-002`)
+                        // -- and through a circuit the answer is no.
+                        let public = publicly_reachable(swarm.external_addresses(), last_address_verdict.then_some(confirmed));
                         if public != state.is_public() {
                             state.set_public(public);
-                            let _ = events.send(NodeEvent::Reachability { public }).await;
+                            let _ = events
+                                .send(NodeEvent::Reachability {
+                                    public,
+                                    // Both numbers, because a circuit is a confirmed
+                                    // address and is not a way in: without the first
+                                    // a reader cannot tell a truthful *behind NAT*
+                                    // at a client holding three circuits from the
+                                    // defect this row is about.
+                                    ways_in: swarm.external_addresses().filter(|a| dialable_without_a_relay(a)).count(),
+                                    confirmed: swarm.external_addresses().count(),
+                                })
+                                .await;
                         }
                     }
                     // A relay that advertises the hop protocol and then says no.
@@ -6689,15 +6731,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // already looks in, rather than a swarm of our own: a relay is
                 // not a poker thing, and a volunteer who is only findable by
                 // poker clients helps nobody else and is found no sooner.
-                if state.is_public()
-                    && !volunteering
-                    && swarm
-                        .behaviour_mut()
-                        .ipfs_kad
-                        .start_providing(relay_namespace())
-                        .is_ok()
-                {
-                    volunteering = true;
+                match relay_advert(state.is_public(), volunteering) {
+                    RelayAdvert::Start => {
+                        if swarm.behaviour_mut().ipfs_kad.start_providing(relay_namespace()).is_ok() {
+                            volunteering = true;
+                        }
+                    }
+                    // `S1-IL`: and the offer is withdrawn when the way in goes.
+                    // This was a one-way latch, so a client that volunteered and
+                    // then lost its public address went on republishing itself in
+                    // `/libp2p/relay` for the life of the process, and the
+                    // strangers who found it there dialled a client nobody can
+                    // reach. Withdrawing on a verdict is safe only because the
+                    // verdict is read from the confirmed set now: under the rule
+                    // this row replaced it followed whichever address AutoNAT
+                    // tested last, and this would have taken the record out and
+                    // put it back eight times in a seven-minute run.
+                    RelayAdvert::Stop => {
+                        swarm.behaviour_mut().ipfs_kad.stop_providing(&relay_namespace());
+                        volunteering = false;
+                    }
+                    RelayAdvert::Leave => {}
                 }
             }
 
@@ -17234,6 +17288,46 @@ fn peer_bytes(from: &libp2p::PeerId) -> [u8; 32] {
 /// address and is what other players will dial. Loopback and the private ranges
 /// are somebody's own network; `0.0.0.0` is a wildcard bind and not an address
 /// at all.
+/// `S1-IL`: whether the rest of the world could dial this address **without a
+/// relay** -- `reachable`, and not through a circuit.
+///
+/// A circuit address carries the relay's own IP, which is public, so `reachable`
+/// alone says yes to an address that is a relay's and not this client's.
+fn dialable_without_a_relay(addr: &libp2p::Multiaddr) -> bool {
+    reachable(addr) && !addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+/// `S1-IL`: what this cycle does about offering this client's line as a relay.
+///
+/// A pure function because it was a one-way latch -- `start_providing` on the
+/// first *public* verdict and nothing ever after -- and a latch is the half of a
+/// rule nobody notices is missing. `D-002`: the offer stands while AutoNAT says
+/// this client can be reached, and not a cycle longer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayAdvert {
+    Start,
+    Stop,
+    Leave,
+}
+
+fn relay_advert(public: bool, volunteering: bool) -> RelayAdvert {
+    match (public, volunteering) {
+        (true, false) => RelayAdvert::Start,
+        (false, true) => RelayAdvert::Stop,
+        _ => RelayAdvert::Leave,
+    }
+}
+
+/// `S1-IL`: the verdict about this client, from every address AutoNAT has
+/// confirmed. `last` is the fault-harness knob's answer about the address just
+/// tested, which is what this used to be and what a control run restores.
+fn publicly_reachable<'a>(confirmed: impl Iterator<Item = &'a libp2p::Multiaddr>, last: Option<bool>) -> bool {
+    match last {
+        Some(answer) => answer,
+        None => confirmed.into_iter().any(dialable_without_a_relay),
+    }
+}
+
 fn reachable(addr: &libp2p::Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     addr.iter().any(|p| match p {
@@ -17731,6 +17825,60 @@ mod tests {
         // which is why its tests use it as a good address — two filters, two
         // jobs, and this one is stricter.
         assert!(yes("/ip4/1.1.1.1/tcp/1"));
+    }
+
+    /// **`S1-IL`: the verdict is about the client, and one answer about one
+    /// address does not carry it.**
+    ///
+    /// AutoNAT v2 tests a single address per answer, and a client offers
+    /// several: a LAN address, an IPv6 ULA, a circuit and the one the world can
+    /// dial. The flag used to be the answer about whichever was tested last, so
+    /// the answer about the LAN address said *behind NAT* while the public one
+    /// stood confirmed. Measured in the corpus before this: 49 turns of the
+    /// verdict in 26 logs of seven runs, every one of them from *public* to
+    /// *behind NAT*, one of them one second after the other.
+    ///
+    /// The break that must make this fail: read the answer about the last
+    /// address instead of the set, which is what the harness knob restores.
+    #[test]
+    fn the_reachability_verdict_is_read_from_every_confirmed_address() {
+        let a = |s: &str| s.parse::<Multiaddr>().expect("a literal");
+        let public = a("/ip4/1.1.1.1/tcp/4001");
+        let lan = a("/ip4/192.168.1.20/tcp/4001");
+        let ula = a("/ip6/fd12:3456:789a:1::1/tcp/4001");
+        // A circuit carries the RELAY's address, which is public, and the whole
+        // point of the flag is that this client is not.
+        // Written without the relay's peer id: a real one is a stranger's
+        // identity and this repository carries none, and the guard reads the
+        // `p2p-circuit` component alone.
+        let circuit = a("/ip4/1.1.1.1/tcp/4001/p2p-circuit");
+        let holds = |set: &[&Multiaddr]| publicly_reachable(set.iter().copied(), None);
+
+        assert!(!holds(&[]), "nothing confirmed: no way in");
+        assert!(holds(&[&public]), "one address the world can dial");
+        // The bug, stated as the case it got wrong: the client holds its public
+        // address and AutoNAT has just said no about the LAN one.
+        assert!(holds(&[&public, &lan, &ula]), "the LAN answer does not take the way in away");
+        assert!(!holds(&[&lan, &ula]), "LAN addresses alone are not a way in");
+        assert!(!holds(&[&circuit]), "a relay's address is the relay's, not this client's");
+        assert!(!holds(&[&circuit, &lan]), "nor with a LAN address beside it");
+        assert!(holds(&[&circuit, &public]), "and a circuit does not hide a real one");
+
+        // The knob is the old behaviour exactly: the answer about the last
+        // address tested, whatever the client holds.
+        assert!(!publicly_reachable([&public].into_iter(), Some(false)), "the control run's verdict");
+        assert!(publicly_reachable([].into_iter(), Some(true)), "in both directions");
+    }
+
+    /// `S1-IL`: the offer of this client's line as a relay follows the verdict
+    /// **both ways**. `D-002` gates it on being reachable, and until this row
+    /// the gate was a latch: set once and never cleared.
+    #[test]
+    fn the_relay_advertisement_follows_the_verdict_both_ways() {
+        assert_eq!(relay_advert(true, false), RelayAdvert::Start, "reachable and not offered yet");
+        assert_eq!(relay_advert(false, true), RelayAdvert::Stop, "the way in went: take the offer back");
+        assert_eq!(relay_advert(true, true), RelayAdvert::Leave, "offered already");
+        assert_eq!(relay_advert(false, false), RelayAdvert::Leave, "nothing to take back");
     }
 
     /// **One hand behind is what an ordinary table looks like, and it used to be

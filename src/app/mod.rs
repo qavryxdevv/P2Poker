@@ -1104,13 +1104,20 @@ impl AppState {
                     }
                 }
             }
-            NodeEvent::Reachability { public } => {
+            NodeEvent::Reachability { public, ways_in, confirmed } => {
                 self.status.public = Some(public);
-                self.note(if public {
-                    "this client is reachable from the internet".into()
-                } else {
-                    "this client is behind NAT".into()
-                });
+                // `S1-IL`: the two counts, because the verdict used to follow the
+                // last address AutoNAT tested and turned over while the client's
+                // way in stood confirmed. Counts and no reading of them: under the
+                // harness knob that restores the old rule the verdict and the
+                // addresses disagree on purpose, and a line that explained the
+                // verdict would be the one thing in the log that was false. The
+                // addresses themselves are never written: this file is read aloud
+                // and pasted, and they are the player's own.
+                self.note(format!(
+                    "this client is {} ({ways_in} of {confirmed} confirmed address(es) can be dialled without a relay)",
+                    if public { "reachable from the internet" } else { "behind NAT" }
+                ));
             }
             NodeEvent::Reserved {
                 relay,
@@ -4100,9 +4107,23 @@ mod tests {
     fn reachability_reaches_the_status() {
         let mut s = AppState::new();
         assert_eq!(s.status.public, None, "unknown until AutoNAT answers");
-        s.apply(NodeEvent::Reachability { public: false });
+        s.apply(NodeEvent::Reachability { public: false, ways_in: 0, confirmed: 3 });
         assert_eq!(s.status.public, Some(false));
         assert!(s.view().status.summary().contains("no relay"));
+        // `S1-IL`: the log says how many of the confirmed addresses are a way in,
+        // so a truthful *behind NAT* at a client holding three circuits is told
+        // from the defect -- a verdict taken while a way in stood confirmed.
+        assert!(
+            s.log.back().is_some_and(|l| l.contains("behind NAT") && l.contains("0 of 3 confirmed")),
+            "{:?}",
+            s.log.back()
+        );
+        s.apply(NodeEvent::Reachability { public: true, ways_in: 1, confirmed: 4 });
+        assert!(
+            s.log.back().is_some_and(|l| l.contains("reachable from the internet") && l.contains("1 of 4 confirmed")),
+            "{:?}",
+            s.log.back()
+        );
     }
 
     /// The whole struct is a local view. Nothing in it enters a hash, which is

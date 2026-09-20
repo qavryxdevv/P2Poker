@@ -254,6 +254,12 @@ param(
     [ValidateRange(0, 32)][int]$StrangerNode = 1,
     [switch]$StrangerFlood,
     [ValidateSet('', 'copy')][string]$StrangerName = '',
+    # `S1-IL`'s control run: every seat decides whether it is reachable from the
+    # internet by the answer about the **last address AutoNAT tested**, which is
+    # what the client did until this row. Without it a seat reads the verdict off
+    # every address it has confirmed, which is the fix. Read by
+    # `tools/read-reachability.py`; needs `--features fault-harness`.
+    [switch]$LastAddressVerdict,
     # `-StallJoin <seconds> -StallJoinNode <n>` starves one joiner's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -430,6 +436,18 @@ if ($StaggerSeconds -gt 0) {
     Write-Host ("join   over {0} s, one every {1:F1} s" -f $StaggerSeconds, ($StaggerSeconds / [Math]::Max(1, $Seats - 1)))
 }
 Write-Host "work   $work"
+# `S1-IL`: the control run's own line in the header, so a run tells which rule it
+# was under without anybody remembering. Set on this process, which every job
+# below inherits -- the argument list is thirty-six long already, and a knob that
+# is the same for every seat has no business in it.
+if ($LastAddressVerdict) {
+    $env:P2P_POKER_LAST_ADDRESS_VERDICT = '1'
+    Write-Host "verdict the old rule: reachability follows the LAST address AutoNAT tested (S1-IL control)"
+    Write-Host "        (needs a binary built with --features fault-harness)"
+} else {
+    Remove-Item Env:P2P_POKER_LAST_ADDRESS_VERDICT -ErrorAction SilentlyContinue
+    Write-Host "verdict reachability read from every confirmed address (S1-IL)"
+}
 Write-Host ''
 
 # --- start them ------------------------------------------------------------

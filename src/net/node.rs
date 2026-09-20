@@ -187,8 +187,13 @@ pub enum NodeEvent {
     /// A table this client listed is gone before its advert expired: its
     /// founder answered a lobby question (§7.5, D-040) without it.
     TableGone { key: [u8; 32], why: String },
-    /// AutoNAT decided.
-    Reachability { public: bool },
+    /// AutoNAT decided. `S1-IL`: `public` is read from every address AutoNAT
+    /// has confirmed and not from the one it tested last. `ways_in` is how many
+    /// of those addresses the internet can dial **without a relay** and
+    /// `confirmed` how many there are in all -- a circuit is confirmed and is
+    /// not a way in -- so a verdict of *behind NAT* can be told from a client
+    /// that has lost its way in and one that was asked about the wrong address.
+    Reachability { public: bool, ways_in: usize, confirmed: usize },
     /// `S1-EH`: this client's own line to the Tox network, the table's
     /// carrier -- `udp`, `tcp` or `offline` -- said on change, so the window
     /// can say over the felt which network is gone and take it down when
@@ -993,7 +998,7 @@ mod wake_tests {
             // Another poker client is a change to the header. A stranger on
             // the DHT is not, and there are several hundred of those.
             NodeEvent::PokerPeer { peer, gone: false },
-            NodeEvent::Reachability { public: true },
+            NodeEvent::Reachability { public: true, ways_in: 1, confirmed: 1 },
         ];
         for e in now {
             assert!(e.changes_more_than_the_log(), "{e:?} must not be held back");

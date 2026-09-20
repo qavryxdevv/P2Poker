@@ -2545,6 +2545,16 @@ We use **v2 only**:
   address as external. Filtering is ours (§5.6). This is mandatory, not advisory:
   publishing a private address to the DHT poisons the lobby for everyone.
 
+**The verdict is about the client, and it is read from the confirmed SET (`S1-IL`).** v2 answers about **one
+address at a time** (`tested_addr`), and a client offers several at once -- a LAN address, an IPv6
+unique-local one, a circuit, and the one the world can dial. So an answer is `add_external_address` or
+`remove_external_address` for that address and nothing more; *is this client publicly reachable* is then
+`swarm.external_addresses().any(dialable_without_a_relay)`. Reading the last answer instead is what the
+client did until 2026-09-20, and it turned the verdict over 49 times in the 26 seat logs of seven runs, once
+one second after the answer before it. **A circuit is not a way in**: its address carries the relay's IP, so
+the private-address filter says yes to it, and it is an external address (it must be, for the provider
+record) without being this client's own reachability.
+
 Configuration used: `Config::default().with_probe_interval(30 s).with_max_candidates(8)`.
 Both the client and the server behaviour are enabled — a publicly reachable client
 answering AutoNAT probes for others costs almost nothing and the network needs
@@ -2786,6 +2796,14 @@ together, §16.1 — and to stay open for up to an hour, and up to 64 peers hold
 reservation through you.*
 Slot and bandwidth ceilings are user-visible and user-settable, and the network
 status panel shows how many peers are currently being relayed.
+
+**The advertisement follows the verdict both ways (`S1-IL`).** This client provides `/libp2p/relay` while
+AutoNAT says it is publicly reachable and **stops providing it when that stops being true**. It used to be a
+one-way latch, so a client that volunteered and then lost its way in went on republishing itself for the life
+of the process, and strangers who found it there dialled a client nobody can reach. Withdrawing on a change
+of verdict is only safe because the verdict is now read from the confirmed set: under the old rule it
+followed whichever address was tested last and would have taken the record out and put it back eight times
+in a seven-minute run.
 
 > **The client is this section, with the owner's default (`S1-FK`, checked
 > 2026-09-15, built 2026-09-18).** Admission: `swarm::relay_config` pushes a
