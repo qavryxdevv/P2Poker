@@ -1,0 +1,150 @@
+# 0041 - a list's bytes are counted where they cannot wrap, and a list whose bytes do not
+#        fit is refused; and Messenger's check of a save compares in 64 bits.
+#
+# S1-IU (2026-09-20). GitHub's code scanning read the vendored tree the evening the
+# repository became public and raised three alerts in toxcore proper, all of one kind --
+# "multiplication result may overflow 'unsigned int' before it is converted" to a wider type:
+# toxcore/list.c twice (the lengths of the memmoves in bs_list_add and bs_list_remove) and
+# toxcore/Messenger.c once (inside an assert of friends_list_save). They were first dismissed
+# as unreachable, which they are for this client: the overflow needs 4 GiB of list elements or
+# of saved friends, and this client holds tens of the first and none of the second. The owner
+# asked that they be mended anyway, to be sure. Read for that, the alerts turned out to point
+# at the harmless half of list.c:
+#
+#   * resize() allocated the element array with
+#         mem_brealloc(list->mem, list->data, new_size * list->element_size)
+#     -- two uint32_t multiplied in 32 bits, which is also all toxcore's allocator counts in.
+#     A capacity whose bytes pass 4 GiB wrapped, and the buffer came back SMALLER than the
+#     list believed: 4 elements of 1 GiB + 1 byte are 2^32 + 4 bytes, the product is 4, and
+#     bs_list_init returned success holding four bytes. The next bs_list_add would have moved
+#     and copied past the end of them. Widening only the memmove lengths the analyser named
+#     would have made that worse, not better: a full-width copy into a wrapped allocation.
+#
+# The change, in toxcore/list.c:
+#   * resize(): the elements are allocated with mem_vrealloc(mem, ptr, new_size,
+#     element_size), upstream's own overflow-safe call ("fails safely" when nmemb * size does
+#     not fit), which the ids array three lines below already used. A list whose bytes do not
+#     fit 32 bits is refused; bs_list_init returns 0 and bs_list_add returns false. From then
+#     on capacity * element_size fits 32 bits for as long as the list lives, and every other
+#     product in the file is of an index no greater than the capacity.
+#   * bs_list_add(): the grown capacity, n + n / 2 + 1, is refused when it wrapped (it comes
+#     back no greater than n past 2.8e9 elements, and resize() would have SHRUNK the arrays
+#     under the elements they hold).
+#   * find(), bs_list_add(), bs_list_remove(): offsets and lengths are computed in size_t, so
+#     that none of the above has to be reasoned out to be believed.
+# and in toxcore/Messenger.c:
+#   * friends_list_save(): assert((uint64_t)(cur_data - data) == (uint64_t)num * friend_size())
+#     -- both sides in 64 bits. build.rs does not define NDEBUG, so the assert is live in a
+#     release build: past 4 GiB of saved friends it would have failed a save that was right.
+#     (The save format's own section length is 32 bits, upstream's; that is not touched.)
+#
+# Held by two tests that call the C directly, src/tox/vendored.rs: a list of 4 elements of
+# 1 GiB + 1 byte is REFUSED (the break that fails it: mem_brealloc with the 32-bit product
+# again -- bs_list_init then returns 1 with a 4-byte buffer), and a list of 600 keys that does
+# fit still finds every key under its id through every growth and shrinking of the arrays.
+# Three breaks of the C fail them, each by a test's own assertion: the 32-bit product again
+# (measured: bs_list_init then returns 1, holding four bytes), an add that moves nothing out
+# of the way, a remove that leaves the element where it was. The grown capacity's guard and
+# Messenger's assert are NOT held by a test: they need 2.8e9 elements and 4 GiB of friends.
+#
+# Local; the wire is untouched, and nothing this client does reaches any of it today.
+# Upstream has the same lines; no pull request is opened from here (the owner's rule).
+#
+# Vendored tree patched in place. Re-apply on a toxcore bump with
+#   git apply patches/0041-*.patch
+# and check tools/build-tox.ps1's markers for 0041 in list.c and Messenger.c.
+diff --git a/vendor/c-toxcore/toxcore/Messenger.c b/vendor/c-toxcore/toxcore/Messenger.c
+index 0687653..16cafcd 100644
+--- a/vendor/c-toxcore/toxcore/Messenger.c
++++ b/vendor/c-toxcore/toxcore/Messenger.c
+@@ -2988,7 +2988,10 @@ static uint8_t *_Nonnull friends_list_save(const Messenger *_Nonnull m, uint8_t
+         }
+     }
+ 
+-    assert(cur_data - data == num * friend_size());
++    // p2p-poker (patch 0041): both sides in 64 bits. The product was two
++    // uint32_t multiplied in 32 bits and then widened to be compared: past
++    // 4 GiB of saved friends the check would have failed a save that was right.
++    assert((uint64_t)(cur_data - data) == (uint64_t)num * friend_size());
+     data += len;
+ 
+     return data;
+diff --git a/vendor/c-toxcore/toxcore/list.c b/vendor/c-toxcore/toxcore/list.c
+index 182b34a..047f792 100644
+--- a/vendor/c-toxcore/toxcore/list.c
++++ b/vendor/c-toxcore/toxcore/list.c
+@@ -59,7 +59,7 @@ static int find(const BS_List *_Nonnull list, const uint8_t *_Nonnull data)
+     // closest match is found if we move back to where we have already been
+ 
+     while (true) {
+-        const int r = list->cmp_callback(data, list->data + list->element_size * i, list->element_size);
++        const int r = list->cmp_callback(data, list->data + (size_t)list->element_size * i, list->element_size);
+ 
+         if (r == 0) {
+             return i;
+@@ -113,7 +113,22 @@ static bool resize(BS_List *_Nonnull list, uint32_t new_size)
+         return true;
+     }
+ 
+-    uint8_t *data = (uint8_t *)mem_brealloc(list->mem, list->data, new_size * list->element_size);
++    /* p2p-poker (patch 0041): the elements are allocated the way the ids below are.
++     *
++     * This was mem_brealloc(..., new_size * list->element_size): two uint32_t
++     * multiplied in 32 bits, which is also all the allocator counts in. A
++     * capacity whose bytes pass 4 GiB wrapped, the buffer came back SMALLER
++     * than the list believed -- of no bytes at all for 4 elements of 1 GiB --
++     * and the next bs_list_add moved and copied past its end. mem_vrealloc is
++     * upstream's own answer to that (it "fails safely" when nmemb * size does
++     * not fit), already used for the ids three lines down; with it a list whose
++     * bytes do not fit is refused, the add that asked for it fails, and
++     * capacity * element_size fits 32 bits for as long as the list lives.
++     * Every other product in this file is of an index no greater than the
++     * capacity, so none of them can wrap either; they are widened to size_t
++     * below so that this does not have to be reasoned out to be believed.
++     */
++    uint8_t *data = (uint8_t *)mem_vrealloc(list->mem, list->data, new_size, list->element_size);
+ 
+     if (data == nullptr) {
+         return false;
+@@ -199,6 +214,13 @@ bool bs_list_add(BS_List *list, const uint8_t *data, int id)
+         // 1.5 * n + 1
+         const uint32_t new_capacity = list->n + list->n / 2 + 1;
+ 
++        // p2p-poker (patch 0041): and a capacity that wrapped is no capacity.
++        // Past 2.8e9 elements the sum above comes back SMALLER than n, and
++        // resize() would shrink the arrays under the elements they hold.
++        if (new_capacity <= list->n) {
++            return false;
++        }
++
+         if (!resize(list, new_capacity)) {
+             return false;
+         }
+@@ -208,9 +230,11 @@ bool bs_list_add(BS_List *list, const uint8_t *data, int id)
+ 
+     // insert data to element array
+     assert(list->data != nullptr);
+-    memmove(list->data + (i + 1) * list->element_size, list->data + i * list->element_size,
+-            (list->n - i) * list->element_size);
+-    memcpy(list->data + i * list->element_size, data, list->element_size);
++    // p2p-poker (patch 0041): offsets and lengths in size_t, see resize().
++    const size_t element_size = list->element_size;
++    memmove(list->data + (i + 1) * element_size, list->data + i * element_size,
++            (list->n - i) * element_size);
++    memcpy(list->data + i * element_size, data, element_size);
+ 
+     // insert id to id array
+     memmove(&list->ids[i + 1], &list->ids[i], (list->n - i) * sizeof(int));
+@@ -246,8 +270,10 @@ bool bs_list_remove(BS_List *list, const uint8_t *data, int id)
+ 
+     --list->n;
+ 
+-    memmove(list->data + i * list->element_size, list->data + (i + 1) * list->element_size,
+-            (list->n - i) * list->element_size);
++    // p2p-poker (patch 0041): offsets and lengths in size_t, see resize().
++    const size_t element_size = list->element_size;
++    memmove(list->data + i * element_size, list->data + (i + 1) * element_size,
++            (list->n - i) * element_size);
+     memmove(&list->ids[i], &list->ids[i + 1], (list->n - i) * sizeof(int));
+ 
+     return true;

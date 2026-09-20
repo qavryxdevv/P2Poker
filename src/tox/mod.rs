@@ -31,6 +31,9 @@
 pub mod nodes;
 pub mod sys;
 pub mod table;
+/// Patches to the vendored C that a test can hold, held from the C's own entry points.
+#[cfg(test)]
+mod vendored;
 
 use std::ffi::{c_int, c_void, CString};
 

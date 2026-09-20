@@ -59,7 +59,7 @@ static int find(const BS_List *_Nonnull list, const uint8_t *_Nonnull data)
     // closest match is found if we move back to where we have already been
 
     while (true) {
-        const int r = list->cmp_callback(data, list->data + list->element_size * i, list->element_size);
+        const int r = list->cmp_callback(data, list->data + (size_t)list->element_size * i, list->element_size);
 
         if (r == 0) {
             return i;
@@ -113,7 +113,22 @@ static bool resize(BS_List *_Nonnull list, uint32_t new_size)
         return true;
     }
 
-    uint8_t *data = (uint8_t *)mem_brealloc(list->mem, list->data, new_size * list->element_size);
+    /* p2p-poker (patch 0041): the elements are allocated the way the ids below are.
+     *
+     * This was mem_brealloc(..., new_size * list->element_size): two uint32_t
+     * multiplied in 32 bits, which is also all the allocator counts in. A
+     * capacity whose bytes pass 4 GiB wrapped, the buffer came back SMALLER
+     * than the list believed -- of no bytes at all for 4 elements of 1 GiB --
+     * and the next bs_list_add moved and copied past its end. mem_vrealloc is
+     * upstream's own answer to that (it "fails safely" when nmemb * size does
+     * not fit), already used for the ids three lines down; with it a list whose
+     * bytes do not fit is refused, the add that asked for it fails, and
+     * capacity * element_size fits 32 bits for as long as the list lives.
+     * Every other product in this file is of an index no greater than the
+     * capacity, so none of them can wrap either; they are widened to size_t
+     * below so that this does not have to be reasoned out to be believed.
+     */
+    uint8_t *data = (uint8_t *)mem_vrealloc(list->mem, list->data, new_size, list->element_size);
 
     if (data == nullptr) {
         return false;
@@ -199,6 +214,13 @@ bool bs_list_add(BS_List *list, const uint8_t *data, int id)
         // 1.5 * n + 1
         const uint32_t new_capacity = list->n + list->n / 2 + 1;
 
+        // p2p-poker (patch 0041): and a capacity that wrapped is no capacity.
+        // Past 2.8e9 elements the sum above comes back SMALLER than n, and
+        // resize() would shrink the arrays under the elements they hold.
+        if (new_capacity <= list->n) {
+            return false;
+        }
+
         if (!resize(list, new_capacity)) {
             return false;
         }
@@ -208,9 +230,11 @@ bool bs_list_add(BS_List *list, const uint8_t *data, int id)
 
     // insert data to element array
     assert(list->data != nullptr);
-    memmove(list->data + (i + 1) * list->element_size, list->data + i * list->element_size,
-            (list->n - i) * list->element_size);
-    memcpy(list->data + i * list->element_size, data, list->element_size);
+    // p2p-poker (patch 0041): offsets and lengths in size_t, see resize().
+    const size_t element_size = list->element_size;
+    memmove(list->data + (i + 1) * element_size, list->data + i * element_size,
+            (list->n - i) * element_size);
+    memcpy(list->data + i * element_size, data, element_size);
 
     // insert id to id array
     memmove(&list->ids[i + 1], &list->ids[i], (list->n - i) * sizeof(int));
@@ -246,8 +270,10 @@ bool bs_list_remove(BS_List *list, const uint8_t *data, int id)
 
     --list->n;
 
-    memmove(list->data + i * list->element_size, list->data + (i + 1) * list->element_size,
-            (list->n - i) * list->element_size);
+    // p2p-poker (patch 0041): offsets and lengths in size_t, see resize().
+    const size_t element_size = list->element_size;
+    memmove(list->data + i * element_size, list->data + (i + 1) * element_size,
+            (list->n - i) * element_size);
     memmove(&list->ids[i], &list->ids[i + 1], (list->n - i) * sizeof(int));
 
     return true;

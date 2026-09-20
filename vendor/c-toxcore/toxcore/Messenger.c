@@ -2988,7 +2988,10 @@ static uint8_t *_Nonnull friends_list_save(const Messenger *_Nonnull m, uint8_t 
         }
     }
 
-    assert(cur_data - data == num * friend_size());
+    // p2p-poker (patch 0041): both sides in 64 bits. The product was two
+    // uint32_t multiplied in 32 bits and then widened to be compared: past
+    // 4 GiB of saved friends the check would have failed a save that was right.
+    assert((uint64_t)(cur_data - data) == (uint64_t)num * friend_size());
     data += len;
 
     return data;

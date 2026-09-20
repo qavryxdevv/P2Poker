@@ -276,7 +276,16 @@ $patched = @(
        Why    = '0040b: S1-AA. A member learned from a sync is known by ONE relay, drawn at random by whoever answered (the announce has room for one, and that is the wire''s); a seat that cannot connect to it had no road to that member for the thirty seconds its entry lives, reaped it, and the founder gave the seat away (runs/split201156-9; on demand, runs/split214815-9). A peer that has not shaken hands by the second attempt is registered on up to four of this client''s own connected relays' }
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker (patch 0040, the fault harness): P2P_POKER_DEAD_ANNOUNCED_RELAY=1'
-       Why    = '0040c: S1-AA''s instrument. The knob that makes the one announced relay of a relay-only member unreachable, and P2P_POKER_NO_0040, which switches the patch off so a control and its treatment are one binary (tools/table-run-split.ps1 -DeadAnnouncedRelay, -NoPatch0040). Entirely inside #ifdef P2P_POKER_FAULT_HARNESS' }
+       Why    = '0040c: S1-AA''s instrument. The knob that makes the one announced relay of a relay-only member unreachable, and P2P_POKER_NO_0040, which switches the patch off so a control and its treatment are one binary (tools/table-run-split.ps1 -DeadAnnouncedRelay, -NoPatch0040). Entirely inside #ifdef P2P_POKER_FAULT_HARNESS' },
+    @{ File   = 'toxcore/list.c'
+       Marker = 'p2p-poker (patch 0041): the elements are allocated the way the ids below are.'
+       Why    = '0041a: S1-IU. resize() allocated the element array by new_size * element_size multiplied in 32 bits, so a list whose bytes pass 4 GiB came back with a SMALLER buffer than it believed (4 elements of 1 GiB + 1 byte: four bytes) and the next bs_list_add copied past its end. mem_vrealloc, upstream''s own overflow-safe call, refuses such a list; src/tox/vendored.rs holds it from the C''s own entry points. Unreachable for this client today; mended on the owner''s word after code scanning named the file.' },
+    @{ File   = 'toxcore/list.c'
+       Marker = 'p2p-poker (patch 0041): and a capacity that wrapped is no capacity.'
+       Why    = '0041b: S1-IU. The grown capacity n + n / 2 + 1 wraps past 2.8e9 elements and comes back no greater than n, and resize() would shrink the arrays under the elements they hold. Refused. Not held by a test: it needs 2.8e9 elements.' },
+    @{ File   = 'toxcore/Messenger.c'
+       Marker = 'p2p-poker (patch 0041): both sides in 64 bits.'
+       Why    = '0041c: S1-IU. friends_list_save''s assert compared a pointer difference with two uint32_t multiplied in 32 bits; build.rs defines no NDEBUG, so the assert is live in a release build and would have failed a save that was right past 4 GiB of friends. Not held by a test: it needs 4 GiB of friends.' }
 )
 
 Step 'checking the patches are in the vendored source'
