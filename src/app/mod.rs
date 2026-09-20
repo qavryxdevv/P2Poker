@@ -206,6 +206,15 @@ fn short(key: &[u8; 32]) -> String {
 /// memory bug with an external trigger like any other.
 pub const MAX_LOG_LINES: usize = 500;
 
+/// `S1-IM`: how many lobby peers this client remembers having named.
+///
+/// A bound rather than a set that grows with what an open DHT returns. Past it
+/// the client says a peer again, which is the old behaviour and harmless: the
+/// measured population of the lobby key is in the hundreds (`S1-AI`: 598 in one
+/// answer, 778 this project's own dead test nodes), so a session reaches this
+/// only if the lobby grows by an order of magnitude.
+pub const LOBBY_SAID_MAX: usize = 4_096;
+
 /// How many lines of lobby chat to keep.
 ///
 /// A pane, not a history. Nothing is stored between runs and nothing is
@@ -395,6 +404,20 @@ pub struct AppState {
     /// Monotonic, and the only sound way to ask "what is new since I last
     /// looked" once the log has reached its cap. See `AppState::note`.
     pub emitted: u64,
+    /// `S1-IM`: the lobby peers this session has already named, so each is
+    /// named **once**.
+    ///
+    /// The DHT hands back the same provider record cycle after cycle, and the
+    /// line was written for every provider in every answer: measured over the
+    /// seven runs kept for `S1-AA`, 221 702 lines naming 2 186 peers -- each one
+    /// a hundred times over, 3 462 lines a seat in seven minutes against 34
+    /// peers. The log is 500 lines, so it could not hold a minute.
+    ///
+    /// Bounded by `LOBBY_SAID_MAX`: this is a set of strangers' ids from an open
+    /// DHT, and nothing that grows with what strangers send may be unbounded.
+    /// Full, it stops taking new ones -- the line is a nicety and the count on
+    /// the strip is the measurement.
+    said_in_lobby: std::collections::HashSet<String>,
     /// The table the user has selected in the list.
     pub selected: Option<[u8; 32]>,
     /// The table this client is at or forming, if any.
@@ -1263,7 +1286,19 @@ impl AppState {
                 self.note(format!("the unfinished game is gone: {why}"));
             }
             NodeEvent::LocalPeer(p) => self.note(format!("found {p} on this network")),
-            NodeEvent::LobbyPeer(p) => self.note(format!("found {p} in the public lobby")),
+            // `S1-IM`: once per peer per session. The recurrence is what the
+            // count line beside it says -- *N player(s) in the public lobby*,
+            // every cycle -- and repeating the name of every provider in every
+            // answer emptied the log of everything else.
+            NodeEvent::LobbyPeer(p) => {
+                let name = p.to_string();
+                if !self.said_in_lobby.contains(&name) {
+                    if self.said_in_lobby.len() < LOBBY_SAID_MAX {
+                        self.said_in_lobby.insert(name);
+                    }
+                    self.note(format!("found {p} in the public lobby"));
+                }
+            }
             NodeEvent::LobbyHere { who, nickname } => {
                 // Noted when somebody arrives, not every time they say they are
                 // still here: presence repeats every thirty seconds and a line
@@ -4101,6 +4136,38 @@ mod tests {
             seat(&s).playing(later),
             "a client that can hear the table again is playing at it again"
         );
+    }
+
+    /// **`S1-IM`: a lobby peer is named once a session, not once an answer.**
+    ///
+    /// The DHT returns the same provider record every cycle, and the client
+    /// wrote a line for every provider in every answer. Measured over the seven
+    /// runs kept for `S1-AA`: **221 702 lines naming 2 186 peers**, a hundred
+    /// times each; a median seat wrote **3 462** of them in seven minutes about
+    /// **34** peers. The log the player reads holds `MAX_LOG_LINES` = 500, so it
+    /// could not hold one minute, and whatever went wrong had scrolled out
+    /// before they clicked *Network details*.
+    ///
+    /// The break that must make this fail: note the line unconditionally.
+    #[test]
+    fn a_lobby_peer_is_named_once_a_session() {
+        let mut s = AppState::new();
+        let peers: Vec<libp2p::PeerId> = (0..3).map(|_| libp2p::PeerId::random()).collect();
+        for _ in 0..100 {
+            for p in &peers {
+                s.apply(NodeEvent::LobbyPeer(*p));
+            }
+        }
+        let said = s.log.iter().filter(|l| l.contains("in the public lobby")).count();
+        // The count and not the log: a failure here used to print three hundred
+        // lines of the same sentence, which is the defect itself in a test's
+        // clothing.
+        assert_eq!(said, peers.len(), "three peers, three hundred answers, {said} line(s)");
+        for p in &peers {
+            assert!(s.log.iter().any(|l| l.contains(&p.to_string())), "each one is named once");
+        }
+        // And the memory of it is bounded, because the ids come from an open DHT.
+        assert!(s.said_in_lobby.len() <= LOBBY_SAID_MAX);
     }
 
     #[test]
