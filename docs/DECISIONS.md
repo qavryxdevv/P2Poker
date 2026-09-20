@@ -6757,6 +6757,15 @@ the latest (`/releases/latest/download/p2p-poker.exe` is the stable address, in 
 command for whoever wants to check for themselves. That the client is a beta is said in the title and on its own About
 page, not by hiding the download. `D-075`'s check counts pre-releases and full releases alike, so it did not move.
 
+**The second release, 2026-09-21 -- `v0.1.1`, on the owner's word the night `S1-IT` closed.** What a player gets that
+`v0.1.0` did not have: a client behind a router that **notices when its way in is gone and keeps two of them** (`S1-IT`
+-- on the bed every seat was seated within 24 s where it had taken up to two minutes, and one table never set); a log
+that says what a lookup found once, instead of a line for every answer (`S1-IV`); a backup whose salt and nonce cannot
+start as zeros, held by a test (`S1-IU`); a client that no longer drops and retakes its topics at nine meetings in ten
+(`S1-IS`); and toxcore's sorted list counting its bytes where they cannot wrap (patch 0041). The number is the crate's:
+`Cargo.toml` says 0.1.1, the workflow refuses a tag that does not match it, and `D-075`'s button in a 0.1.0 client now
+says *a newer version is out*.
+
 ## D-075 — *Check for a new version*: asked by the player, never by the client
 
 **Decided 2026-09-20 by the project owner:** *add to the application, in the settings' About tab, a button that
