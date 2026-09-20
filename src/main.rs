@@ -549,6 +549,9 @@ fn main() {
     }
 }
 
+/// `D-075`: what the version check's thread sends back.
+type UpdateAnswer = Result<p2p_poker::app::update::Verdict, String>;
+
 /// `D-073`: the installer's turn, if this start is one. `None`: start the
 /// client as always. `Some(code)`: the installer ran, and this process ends.
 ///
@@ -1572,6 +1575,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 reveal_clock: std::time::Instant::now(),
                 preview_rewards,
                 backup_done: std::sync::mpsc::channel(),
+                update_done: std::sync::mpsc::channel(),
                 backup_opened: None,
                 backups_listed: None,
                 profile_dir,
@@ -2118,6 +2122,8 @@ struct Client {
     /// (a restore stages exactly what was looked at), and when the folder was
     /// last read.
     backup_done: (std::sync::mpsc::Sender<BackupDone>, std::sync::mpsc::Receiver<BackupDone>),
+    /// `D-075`: what the version check came back with.
+    update_done: (std::sync::mpsc::Sender<UpdateAnswer>, std::sync::mpsc::Receiver<UpdateAnswer>),
     backup_opened: Option<p2p_poker::storage::backup::Contents>,
     backups_listed: Option<std::time::Instant>,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
@@ -2251,6 +2257,32 @@ impl Client {
             self.sound.play(p2p_poker::sound::Cue::LobbyChatNotify, switches.volume);
         }
         Some(shown.view)
+    }
+
+    /// `D-075`: one question to GitHub, on a thread of its own -- it is a
+    /// stranger's server and takes as long as it takes. Started by the button
+    /// and by nothing else.
+    fn check_for_update(&mut self, ctx: &eframe::egui::Context) {
+        if self.ui.update == render::UpdateUi::Checking {
+            return;
+        }
+        self.ui.update = render::UpdateUi::Checking;
+        self.state.log.push_back("asked GitHub whether a newer version is out (the About page's button)".into());
+        let (tx, ctx) = (self.update_done.0.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(p2p_poker::app::update::check());
+            ctx.request_repaint();
+        });
+    }
+
+    fn update_answers(&mut self) {
+        while let Ok(answer) = self.update_done.1.try_recv() {
+            self.state.log.push_back(match &answer {
+                Ok(v) => format!("the version check: {v:?}"),
+                Err(e) => format!("the version check failed: {e}"),
+            });
+            self.ui.update = render::UpdateUi::Done(answer);
+        }
     }
 
     /// `D-068`: a backup is a second of key stretching and a file: made on a
@@ -2721,6 +2753,7 @@ impl eframe::App for Client {
         // `D-068`: what the rewards earned from those words.
         self.reward_notices();
         self.backup_answers();
+        self.update_answers();
 
         // `S1-CS`: a join nobody answers is called failed on the clock.
         self.state.tick_join();
@@ -2971,6 +3004,15 @@ impl eframe::App for Client {
                             "the bug report page {}: {}",
                             if opened { "was opened in the browser" } else { "could not be opened; it is at" },
                             render::BUG_REPORT_URL
+                        ));
+                    }
+                    render::LobbyAction::CheckForUpdate => self.check_for_update(&ctx),
+                    render::LobbyAction::OpenReleases => {
+                        let opened = open_in_browser(render::RELEASES_URL);
+                        self.state.log.push_back(format!(
+                            "the releases page {}: {}",
+                            if opened { "was opened in the browser" } else { "could not be opened; it is at" },
+                            render::RELEASES_URL
                         ));
                     }
                     render::LobbyAction::ShowProgramFolder => {

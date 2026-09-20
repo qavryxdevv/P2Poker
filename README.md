@@ -194,6 +194,11 @@ the source is good, which is what reading it is for. It is also **not** a
 Windows code-signing certificate, so SmartScreen still asks before the first
 start. `D-074` has the reasoning.
 
+The client itself will tell you when a newer release is out -- **when you ask
+it to**: Settings, About, *Check for a new version*. It asks GitHub for the list
+of releases once, sends nothing about you, downloads nothing, and never asks by
+itself (`D-075`).
+
 ## Testing
 
 ```bash

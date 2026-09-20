@@ -6732,3 +6732,53 @@ pushed, not by a red run.
 not shown to be reproducible bit for bit, and the attestation does not need it to be. The generated API
 documentation (`cargo doc`) is not published: its source is every `///` in `src/`, which is in the repository, and
 GitHub Pages from a workflow is the way if it is wanted.
+
+## D-075 — *Check for a new version*: asked by the player, never by the client
+
+**Decided 2026-09-20 by the project owner:** *add to the application, in the settings' About tab, a button that
+checks for a new version.*
+
+1. **The player asks; the client never does.** Not at start, not on a timer, not after a game, and there is no
+   setting that turns it on, because there is nothing to turn on. This client has no house and no server and phones
+   nobody, and the About page goes on saying so truthfully: the one request this feature makes is made by a finger on
+   a button.
+2. **One question, to where the releases are.** A `GET` of this repository's public list of releases on GitHub's API
+   (`app::update::RELEASES_API`), over TLS with the system's own trust store, through the HTTPS client the tree
+   already carries for the Tox node list -- no new dependency. **What goes with it:** a `User-Agent` of the product's
+   name, because GitHub refuses a request without one -- not the version, not the system, not a key -- and the address
+   the request comes from, which is what opening the releases page in a browser shows. The About page says that in a
+   sentence, under the button.
+3. **It never downloads and never installs.** A client that fetches a program and runs it is a different question of
+   trust from one that says *there is a newer one*. The player downloads the release, can check it against this
+   source (`D-074`), and starts it; `D-073`'s installer then offers to update the installed copy and keeps the
+   profile. The words on the page say so, including that the profile stays -- an update must never read as becoming a
+   new player.
+4. **It opens no address the network chose.** The answer is read for one thing, version numbers. The page a player
+   is sent to is `RELEASES_URL`, a constant of the build like the donation and bug pages (`D-071`, `D-072`); nothing
+   GitHub answers can change where that button goes.
+5. **The answer is not trusted further than it has to be.** Bounded before it is parsed (`RELEASES_ANSWER_MAX`, read through
+   a limit and not measured afterwards); redirects not followed, because *somewhere else* is not a place this client
+   follows anybody to; and **a tag is believed only if it is a plain version** (`plain_version`: an optional `v`, one
+   to three numbers, a short suffix) -- the tag is text from the network that ends on the player's screen, and *digits
+   and dots* can be checked where *whatever was sent* cannot. A tag that is not one is passed over: it cannot make
+   itself the newest and cannot put words on the page.
+6. **Newer is a higher number of a real release.** The highest by number, not the first listed -- GitHub lists by date,
+   and a fix for an older line released later is first and not newest; ordered as numbers, so `0.10.0` is above
+   `0.9.0`; a draft is nobody's release, and a pre-release is one, because every release of a beta is. A build AHEAD
+   of every release -- the owner's own -- is told it is the newest and not nagged.
+7. **A broken answer is never good news.** Anything that is not a list of releases -- an error page, a rate limit,
+   nothing at all -- is said as what it is, in the warning colour, with the releases page one click away. *You have
+   the newest version* is only ever said of an answer that was read and understood.
+8. **The tag is the version the client says it is** -- the release workflow now refuses a tag `vX` when `Cargo.toml`
+   says another version. The check compares the About page's number with the tags, so a release whose tag and binary
+   disagree would make this button lie. **It follows that a release needs the version raised**: two builds under one
+   number are one version to this check, as they are to `D-073`'s installer.
+
+**Measured.** On the built client against GitHub itself, before any release existed: *No release has been published
+yet* -- true. Four tests in `app::update` and one in `gui::render`; five breaks fail them: the first release listed
+taken for the newest, a draft counted, any text GitHub sends believed and shown, GitHub's error page read as *no
+release yet*, and a failed check painted as good news. After the first release: see `D-074`'s first tag.
+
+**What is NOT done.** No automatic check, by decision and not by omission. No download, no self-update. No check in a
+build without the HTTPS client (`--no-default-features`): it says it cannot ask, and the page is a click away. The
+headless client has no such command: a relay's operator reads the releases page.

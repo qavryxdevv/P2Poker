@@ -50,6 +50,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: The tag is the version the client will say it is
+        # D-075's version check compares the About page's number with the release tags, so a release whose tag and
+        # binary disagree would make that button lie.
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ('${{ github.ref_name }}' -ne "v$version") { throw "the tag ${{ github.ref_name }} is not v$version, which is what Cargo.toml and the About page say" }
+          "tag and Cargo.toml agree: $version"
+
       - name: Rust, stable, as the runner ships it
         shell: pwsh
         run: |

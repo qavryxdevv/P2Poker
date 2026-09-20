@@ -24,6 +24,8 @@ use crate::net::node::{NodeCommand, NodeEvent};
 
 /// `D-068`: rewards, quests and the one penalty, folded from the node's words.
 pub mod rewards;
+/// `D-075`: is there a newer version -- asked by the player, never by the client.
+pub mod update;
 /// `S1-CS`: the table window's view, derived here so it can be tested.
 mod table;
 mod tablelog;

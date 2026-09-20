@@ -122,6 +122,11 @@ pub enum LobbyAction {
     OpenDonationPage,
     /// `D-072`: open the bug reports page, `BUG_REPORT_URL`, in the browser.
     OpenBugReports,
+    /// `D-075`: ask GitHub whether a newer version is out. Only ever from the
+    /// button: the client never asks by itself.
+    CheckForUpdate,
+    /// `D-075`: open the releases page, `RELEASES_URL`, in the browser.
+    OpenReleases,
     /// `D-073`: show the folder this program runs from.
     ShowProgramFolder,
     /// `D-073`: a portable copy asks to be installed: this client closes and
@@ -149,6 +154,23 @@ pub const DONATION_URL: &str = "https://github.com/qavryxdevv/P2Poker/blob/maste
 /// no query beyond the template, so nothing of this machine or this player goes
 /// out in it; what goes in the report is what the player types.
 pub const BUG_REPORT_URL: &str = "https://github.com/qavryxdevv/P2Poker/issues/new";
+
+/// `D-075`: where a newer version is downloaded from -- the repository's
+/// releases, newest on top. A constant of the build like the two above, and for
+/// the same reason: **what GitHub answers to the version check is read for
+/// numbers and never for an address**, so the page a player is sent to cannot
+/// be chosen by whoever answers.
+pub const RELEASES_URL: &str = "https://github.com/qavryxdevv/P2Poker/releases";
+
+/// `D-075`: the version check, as the About page holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UpdateUi {
+    /// Not asked yet in this session.
+    #[default]
+    Idle,
+    Checking,
+    Done(Result<crate::app::update::Verdict, String>),
+}
 
 /// `D-072`: what the About page calls this build. The number comes from
 /// `Cargo.toml` and the word from here, so a release that is no longer a beta is
@@ -318,6 +340,8 @@ pub struct LobbyUi {
     /// `D-073`: where this copy lives. `None` until `main` has worked it out,
     /// and in a preview, where there is no copy to speak of.
     pub home: Option<HomeView>,
+    /// `D-075`: what the version check said, if it was asked.
+    pub update: UpdateUi,
 }
 
 /// The settings dialog's pages, one at a time: all of them on one page no longer
@@ -376,6 +400,7 @@ impl LobbyUi {
             fair_open: false,
             side_open: false,
             home: None,
+            update: UpdateUi::default(),
             settings,
             settings_tab: SettingsTab::default(),
             backup: BackupUi::default(),
@@ -1103,7 +1128,7 @@ fn found_toast(ctx: &egui::Context, f: &super::lobby::FoundView) {
 /// **It sends nothing**: no log, no profile, no address -- a report is what the
 /// player types, and a client that posted its own state somewhere would be
 /// making that decision for them.
-fn about_page(ui: &mut egui::Ui, home: Option<&HomeView>) -> Option<LobbyAction> {
+fn about_page(ui: &mut egui::Ui, home: Option<&HomeView>, update: &UpdateUi) -> Option<LobbyAction> {
     let mut action = None;
     ui.label(
         RichText::new(format!("P2Poker {} {}", env!("CARGO_PKG_VERSION"), RELEASE_STAGE))
@@ -1127,6 +1152,10 @@ fn about_page(ui: &mut egui::Ui, home: Option<&HomeView>) -> Option<LobbyAction>
             .color(theme::TEXT_DIM)
             .size(14.0),
     );
+    ui.add_space(12.0);
+    if let Some(a) = update_section(ui, update) {
+        action = Some(a);
+    }
     ui.add_space(14.0);
     ui.label(RichText::new("Found something wrong?").color(theme::TEXT).size(15.0).strong());
     ui.add_space(4.0);
@@ -1158,6 +1187,59 @@ fn about_page(ui: &mut egui::Ui, home: Option<&HomeView>) -> Option<LobbyAction>
             action = Some(a);
         }
     }
+    action
+}
+
+/// `D-075`: what the About page says after the version check, and in which
+/// tone. `None` while nothing was asked.
+pub fn update_words(update: &UpdateUi) -> Option<(String, Color32)> {
+    use crate::app::update::Verdict;
+    Some(match update {
+        UpdateUi::Idle => return None,
+        UpdateUi::Checking => ("Asking GitHub\u{2026}".to_owned(), theme::TEXT_DIM),
+        UpdateUi::Done(Ok(Verdict::Newest { latest })) => {
+            (format!("This is the newest version. The newest release is {latest}."), theme::OK)
+        }
+        UpdateUi::Done(Ok(Verdict::Newer { latest })) => (
+            format!(
+                "Version {latest} is out. Download it from the releases page and start it: it offers to update \
+                 this installation, and your player profile stays as it is."
+            ),
+            theme::GOLD_ACTION,
+        ),
+        UpdateUi::Done(Ok(Verdict::NoRelease)) => ("No release has been published yet.".to_owned(), theme::TEXT_DIM),
+        UpdateUi::Done(Err(why)) => (format!("{why}. The releases page says what the newest version is."), theme::WARN),
+    })
+}
+
+/// `D-075`: the version check. One button, what it said, and what it costs in
+/// privacy -- in a sentence, where the player presses it.
+fn update_section(ui: &mut egui::Ui, update: &UpdateUi) -> Option<LobbyAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        let asking = *update == UpdateUi::Checking;
+        if ui.add_enabled(!asking, egui::Button::new("Check for a new version")).clicked() {
+            action = Some(LobbyAction::CheckForUpdate);
+        }
+        let offer_page = matches!(update, UpdateUi::Done(Ok(crate::app::update::Verdict::Newer { .. })) | UpdateUi::Done(Err(_)));
+        if offer_page && ui.button("Open the releases page").clicked() {
+            action = Some(LobbyAction::OpenReleases);
+        }
+    });
+    if let Some((words, colour)) = update_words(update) {
+        ui.add_space(4.0);
+        ui.label(RichText::new(words).color(colour).size(14.0));
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Asks GitHub for its list of releases when you press the button, and never by itself. GitHub sees the \
+             address the question comes from, as it would if you opened the page; nothing about you or this client \
+             is sent, and nothing is downloaded.",
+        )
+        .color(style::mix(theme::TEXT_DIM, theme::PANEL, 0.3))
+        .size(13.0),
+    );
     action
 }
 
@@ -1713,7 +1795,7 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                                 }
                             }
                             SettingsTab::About => {
-                                if let Some(a) = about_page(ui, state.home.as_ref()) {
+                                if let Some(a) = about_page(ui, state.home.as_ref(), &state.update) {
                                     action = Some(a);
                                 }
                             }
@@ -3520,6 +3602,36 @@ mod tests {
                 "a colour drawn on a panel is not legible on it"
             );
         }
+    }
+
+    /// **`D-075`: the version check says what it found in words a player can
+    /// act on, never sends them to an address the network chose, and a failure
+    /// is never read as good news.**
+    #[test]
+    fn the_version_check_says_what_it_found_and_opens_only_its_own_page() {
+        use crate::app::update::Verdict;
+        assert_eq!(update_words(&UpdateUi::Idle), None, "nothing is said before it is asked");
+        let words = |u: UpdateUi| update_words(&u).expect("said").0;
+        assert!(words(UpdateUi::Checking).contains("Asking GitHub"));
+        let newest = words(UpdateUi::Done(Ok(Verdict::Newest { latest: "0.1.0".into() })));
+        assert!(newest.contains("newest version") && newest.contains("0.1.0"), "{newest}");
+        let newer = words(UpdateUi::Done(Ok(Verdict::Newer { latest: "0.2.0".into() })));
+        assert!(newer.contains("Version 0.2.0 is out") && newer.contains("releases page"), "{newer}");
+        assert!(newer.contains("player profile stays"), "an update must not read as a new player: {newer}");
+        assert!(words(UpdateUi::Done(Ok(Verdict::NoRelease))).contains("No release"));
+        // A failure is a warning with a way on, not a verdict.
+        let (failed, tone) = update_words(&UpdateUi::Done(Err("GitHub could not be reached: timed out".into()))).unwrap();
+        assert!(failed.contains("could not be reached") && failed.contains("releases page"), "{failed}");
+        assert_eq!(tone, theme::WARN);
+        assert_ne!(update_words(&UpdateUi::Done(Ok(Verdict::Newest { latest: "1".into() }))).unwrap().1, theme::WARN);
+
+        // The page it opens is a constant of the build, in this project's own repository.
+        assert_eq!(RELEASES_URL, "https://github.com/qavryxdevv/P2Poker/releases");
+        assert!(!RELEASES_URL.contains('?'));
+        let repo = |u: &str| u.split('/').take(5).collect::<Vec<_>>().join("/");
+        assert_eq!(repo(RELEASES_URL), repo(DONATION_URL));
+        assert_eq!(repo(RELEASES_URL), repo(BUG_REPORT_URL));
+        assert!(crate::app::update::RELEASES_API.contains("/repos/qavryxdevv/P2Poker/"), "and the question goes to the same one");
     }
 
     /// **`D-072`: the About page says what this build is, and where a bug
