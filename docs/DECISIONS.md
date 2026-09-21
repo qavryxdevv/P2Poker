@@ -7043,3 +7043,8 @@ said it was silent no longer holds.
 desktop's do, but no one has listened on a Linux machine, and PipeWire's own ALSA plugin, the default on the newest
 distributions, is not in the test. Each sound opens a stream of its own, which costs a few milliseconds before it is
 heard.
+
+**Measured 2026-09-21**, the release workflow's dry run on commit `3f8cd4b` (Ubuntu 22.04, PulseAudio 15.99): the
+Linux code compiled without a warning, and the recording held 11.77 s of the sounds heard -- the fifteen files hold
+11.66 s by the same measure -- and 2.75 s of the music, with a peak of 32768; the whole check cost the client 0.34 s of
+processor time.

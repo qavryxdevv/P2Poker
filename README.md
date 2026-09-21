@@ -15,7 +15,8 @@ Written in Rust. One portable executable.
 > **Linux** — x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later): an **AppImage** for
 > any distribution, a **.deb** for Ubuntu, Debian and Mint, and an **.rpm** for Fedora and openSUSE, on the
 > [release page](https://github.com/qavryxdevv/P2Poker/releases/latest). The player profile is kept in
-> `~/.local/share/p2poker/profile`. No sound on Linux yet.
+> `~/.local/share/p2poker/profile`. Since 0.1.4 the sounds play on Linux too, through ALSA, which PipeWire and
+> PulseAudio both serve.
 >
 > Every release is built by GitHub from this source and GitHub signs a statement of it:
 > [how to check a download](#and-a-download-can-be-checked-against-this-source). It is not signed with a Windows

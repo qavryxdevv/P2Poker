@@ -54,7 +54,8 @@ is then in `~/.local/share/p2poker/profile`.
 **Linux, yes** — since version 0.1.3, for x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and
 later). The [release page](https://github.com/qavryxdevv/P2Poker/releases/latest) has an **AppImage** for any
 distribution, a **.deb** for Ubuntu, Debian and Mint, an **.rpm** for Fedora and openSUSE, and a **.tar.gz**. The
-Linux client plays no sounds yet. **Mac: not yet.**
+Linux client plays its sounds since 0.1.4, through ALSA, which PipeWire and PulseAudio both serve;
+`p2p-poker --sound-check` plays every sound once, to hear whether they work on your machine. **Mac: not yet.**
 
 ## Why does it ask me to update?
 
