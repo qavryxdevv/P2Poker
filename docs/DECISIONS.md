@@ -6992,3 +6992,16 @@ and a Linux client plays the silence it always had. No test suite on Linux: the 
 starts the program there, and the tests run on Windows. No macOS. No snap, no Flatpak, no AUR. The software renderer
 (`--renderer software`) is Windows' WARP; on Linux the window draws with OpenGL, which Mesa provides even without a
 graphics driver.
+
+**Measured**, on GitHub's runners, 2026-09-21. The Linux job built the client in 7 min 39 s; `check-build-paths`
+found nothing of the runner in it; the program started, made its profile and refused `--cash`; and the four packages
+came out -- the AppImage 19.9 MB, the `.deb` 15.7 MB, the `.rpm` 20.7 MB, the `.tar.gz` 20.8 MB -- and were attested.
+The first test of the window found the runner without `libxkbcommon-x11`, which the window loads at run time and
+panicked without -- the reason the `.deb` and the `.rpm` name it. The test now installs the `.deb` with apt, as a
+player would: apt brought that library, the installed program kept its profile in `~/.local/share/p2poker/profile`
+and none in `/usr/bin`, and its table preview was still open on a virtual display after twenty seconds, with
+something drawn (the screen's average colour `#27281D`, where an empty one is black). On Windows, the Linux paths
+that are plain functions -- where the profile lives, the offset `date` prints, the gate's words and page, the About
+page -- are held by four tests, and six breaks of them fail by their own assertions. **Not measured:** a real Linux
+desktop -- nobody has played a hand on one yet; the window has run on a virtual display with Mesa's software OpenGL
+only.
