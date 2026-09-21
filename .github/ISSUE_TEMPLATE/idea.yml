@@ -1,0 +1,11 @@
+name: Idea
+description: Something P2Poker could do, or do better.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What would you like, and what would it change for you when you play?
+    validations:
+      required: true

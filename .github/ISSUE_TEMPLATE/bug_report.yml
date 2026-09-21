@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in P2Poker does not work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time. Only *What happened?* is required — a short answer is fine.
+        Questions such as *is it real money?* or *why does Windows warn me?* are answered in the [FAQ](https://github.com/qavryxdevv/P2Poker/blob/master/FAQ.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Settings → About shows it.
+      placeholder: "0.1.2"
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it happen?
+      options:
+        - Installing or starting
+        - The lobby, or finding a game
+        - At the table, during a hand
+        - Connecting to other players
+        - Somewhere else
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log lines (optional)
+      description: >
+        P2Poker keeps a log, client.log, in its profile folder. Lines from around the time it went wrong help a lot.
+        The log can contain network addresses of you and of other players: remove them, or leave this empty.
+      render: text
+  - type: input
+    id: system
+    attributes:
+      label: Windows version (optional)
+      placeholder: Windows 11

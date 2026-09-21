@@ -15,6 +15,9 @@ Written in Rust. One portable executable.
 > Every release is built by GitHub from this source and GitHub signs a statement of it:
 > [how to check a download](#and-a-download-can-be-checked-against-this-source). It is not signed with a Windows
 > certificate, so SmartScreen asks before the first start (*More info*, then *Run anyway*).
+>
+> Questions — real money, fairness without a server, the Windows warning, Mac and Linux — are answered in the
+> **[FAQ](FAQ.md)**.
 
 ![The table window with all ten seats taken, in PokerTH's Green Casino style](docs/images/table-ten-seats.png)
 
@@ -261,7 +264,8 @@ around them.
 
 ## Documentation
 
-The design is written down before it is built, and the documents are normative:
+For players, [`FAQ.md`](FAQ.md) answers the questions people ask first. The design is written down before it is
+built, and the documents are normative:
 
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the wire protocol, message by message
 - [`docs/STATE_MACHINE.md`](docs/STATE_MACHINE.md) — the hand, as a state machine
