@@ -2,7 +2,7 @@
 name = "p2p-poker"
 version = "0.1.2"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Decentralised No-Limit Texas Hold'em: the lobby over libp2p and its public Kademlia DHT, the tables over Tox groups"
 # **GPL-3.0-or-later, and it is not a preference.** D-019 puts a table's game
 # traffic on a Tox group; `c-toxcore` declares `GPL-3.0-or-later` in every
@@ -127,6 +127,12 @@ wgpu = { version = "30.0", default-features = false, features = ["std", "wgsl", 
 # (`gpu-allocator`, `if-watch`, `sysinfo`) with every one of these features on,
 # so this adds the edge and nothing to the lockfile or the build.
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
+
+# `D-078`: the window on Linux. eframe leaves the display servers to features,
+# and with its defaults off neither X11 nor Wayland is compiled -- winit would
+# then have nothing to open a window on. The same eframe, two more features.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.36.1", default-features = false, features = ["x11", "wayland"] }
 
 # --- dev-only: the arkworks types the vendored ziffle is built on --------
 # Present so tests/deck_constants.rs (ZIFFLE_VERDICT.md C-7) can recompute

@@ -20,18 +20,24 @@ param([string]$Exe = '')
 $ErrorActionPreference = 'Stop'
 
 $root = if ($PSScriptRoot) { Split-Path $PSScriptRoot -Parent } else { (Get-Location).Path }
-if (-not $Exe) { $Exe = Join-Path $root 'target\release\p2p-poker.exe' }
+# D-078: the Linux build's program has no .exe.
+if (-not $Exe) { $Exe = Join-Path $root $(if ($IsLinux) { 'target/release/p2p-poker' } else { 'target\release\p2p-poker.exe' }) }
 if (-not (Test-Path $Exe)) { Write-Host "no binary at $Exe" -ForegroundColor Red; exit 1 }
 $Exe = (Resolve-Path $Exe).Path
 
-$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+# D-078: the same names on Linux, where the profile is HOME, the user USER and the machine its host name.
+$userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+$userName = if ($env:USERNAME) { $env:USERNAME } elseif ($env:USER) { $env:USER } else { [Environment]::UserName }
+$machine = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $userHome '.cargo' }
 $names = New-Object System.Collections.Generic.List[string]
-foreach ($n in @($env:USERPROFILE, $cargoHome, $root, "\Users\$env:USERNAME\", $env:COMPUTERNAME)) {
+foreach ($n in @($userHome, $cargoHome, $root, "\Users\$userName\", "/home/$userName/", $machine)) {
     if ($n -and $n.Length -ge 6) { $names.Add($n.Replace('/', '\')) }
 }
-$profileRoot = if ($env:USERPROFILE) { $env:USERPROFILE.TrimEnd('\') + '\' } else { $null }
-if ($profileRoot -and $root.StartsWith($profileRoot, [StringComparison]::OrdinalIgnoreCase)) {
-    $names.Add($root.Substring($profileRoot.Length))
+$profileRoot = if ($userHome) { $userHome.Replace('/', '\').TrimEnd('\') + '\' } else { $null }
+$rootSeen = $root.Replace('/', '\')
+if ($profileRoot -and $rootSeen.StartsWith($profileRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    $names.Add($rootSeen.Substring($profileRoot.Length))
 }
 
 $bytes = [IO.File]::ReadAllBytes($Exe)

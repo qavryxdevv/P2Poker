@@ -197,6 +197,9 @@ pub const RELEASE_STAGE: &str = "beta";
 pub struct HomeView {
     /// The folder the program runs from.
     pub folder: std::path::PathBuf,
+    /// `D-078`: the folder the player's profile is in -- beside the program on
+    /// Windows and in a portable copy, the user's data folder in a Linux package.
+    pub profile: std::path::PathBuf,
     /// It is the installed copy, in the user's programs folder.
     pub installed: bool,
     /// This build can install itself (Windows).
@@ -1308,8 +1311,12 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
                     super::table::paint_again(ctx, std::time::Duration::from_millis(250));
                 }
                 Gate::Closed { latest, tag } => {
-                    let words =
-                        super::lobby::closed_words(latest, &crate::app::update::compared_version(), state.home.as_ref());
+                    let words = super::lobby::closed_words(
+                        latest,
+                        &crate::app::update::compared_version(),
+                        state.home.as_ref(),
+                        super::lobby::System::THIS,
+                    );
                     let body_height = (room.height() - 160.0).max(140.0);
                     scroller(egui::ScrollArea::vertical())
                         .id_salt("update-gate-body")
@@ -1334,7 +1341,7 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
                             if let Some(handed) = state.download_handed {
                                 ui.add_space(6.0);
                                 let tone = if handed { theme::OK } else { theme::WARN };
-                                ui.label(RichText::new(super::lobby::handed_words(handed)).color(tone).size(14.5));
+                                ui.label(RichText::new(super::lobby::handed_words(handed, super::lobby::System::THIS)).color(tone).size(14.5));
                             }
                             ui.add_space(10.0);
                             ui.add(egui::Label::new(RichText::new(&words.next).color(theme::TEXT_DIM).size(14.5)).wrap());
@@ -1360,7 +1367,7 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
                                         ui.add(egui::Label::new(path.monospace()).wrap());
                                     });
                             }
-                            if let Some(url) = crate::app::update::download_url(tag) {
+                            if let Some(url) = crate::app::update::download_for(tag, super::lobby::System::THIS) {
                                 ui.add_space(8.0);
                                 let quiet = style::mix(theme::TEXT_DIM, theme::PANEL, 0.2);
                                 ui.add(egui::Label::new(RichText::new(url).color(quiet).size(12.5).monospace()).wrap().selectable(true));
@@ -1381,8 +1388,18 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
     action
 }
 
-/// `D-073`: what the About page says about where this copy lives.
-pub fn home_words(home: &HomeView) -> String {
+/// `D-073`: what the About page says about where this copy lives. `D-078`: a
+/// Linux package keeps the program where it was installed and the profile in
+/// the user's data folder, and says both.
+pub fn home_words(home: &HomeView, system: super::lobby::System) -> String {
+    if system == super::lobby::System::Linux && !home.profile.starts_with(&home.folder) {
+        return format!(
+            "P2Poker runs from {}, and your player profile is in {}. To be the same player on another computer, \
+             make a backup (the Profile tab) and restore it there.",
+            home.folder.display(),
+            home.profile.display()
+        );
+    }
     if home.installed {
         format!(
             "Installed in {}. To remove P2Poker, delete that folder and the shortcuts. Your player profile is in \
@@ -1402,7 +1419,7 @@ fn home_section(ui: &mut egui::Ui, home: &HomeView) -> Option<LobbyAction> {
     let mut action = None;
     ui.label(RichText::new("Where this program is").color(theme::TEXT).size(15.0).strong());
     ui.add_space(4.0);
-    ui.label(RichText::new(home_words(home)).color(theme::TEXT_DIM).size(14.0));
+    ui.label(RichText::new(home_words(home, super::lobby::System::THIS)).color(theme::TEXT_DIM).size(14.0));
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button("Show in folder").clicked() {

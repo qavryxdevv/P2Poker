@@ -209,10 +209,19 @@ mod tox {
             "the build script is not running in the package directory, so the C sources cannot be named relative to it"
         );
 
+        // `D-078`: libsodium's headers. With MSVC they are the vendored tree's,
+        // where the MSVC build puts its `version.h`; elsewhere they are the copy
+        // `tools/build-sodium.sh` configured, which holds the `version.h` its
+        // `configure` wrote -- the vendored git tree has only the template.
+        let sodium_include = if cfg!(target_env = "msvc") {
+            sodium_here.join("src/libsodium/include")
+        } else {
+            Path::new("target/libsodium/src/libsodium/include").to_path_buf()
+        };
         let mut cc = cc::Build::new();
         cc.include(tox_here.join("toxcore"))
             .include(tox_here)
-            .include(sodium_here.join("src/libsodium/include"))
+            .include(&sodium_include)
             .warnings(false);
 
         // **The library's own diagnostics, at DEBUG, in the harness build only.**
@@ -277,14 +286,25 @@ mod tox {
         // libsodium, built from the vendored source by `tools/build-tox.ps1`.
         // Not built here: it has its own MSVC solution and driving MSBuild from
         // a build script would be a second build system inside this one, run on
-        // every `cargo check`.
-        let lib = sodium.join("bin/x64/Release/v143/static");
-        assert!(
-            lib.join("libsodium.lib").exists() || !cfg!(target_env = "msvc"),
-            "libsodium.lib is missing - run tools/build-tox.ps1 once before building with --features tox"
-        );
-        println!("cargo:rustc-link-search=native={}", lib.display());
-        println!("cargo:rustc-link-lib=static=libsodium");
+        // every `cargo check`. `D-078`: and elsewhere by `tools/build-sodium.sh`,
+        // with the system's autotools, for the same reason.
+        if cfg!(target_env = "msvc") {
+            let lib = sodium.join("bin/x64/Release/v143/static");
+            assert!(
+                lib.join("libsodium.lib").exists(),
+                "libsodium.lib is missing - run tools/build-tox.ps1 once before building with --features tox"
+            );
+            println!("cargo:rustc-link-search=native={}", lib.display());
+            println!("cargo:rustc-link-lib=static=libsodium");
+        } else {
+            let lib = root.join("target/libsodium/src/libsodium/.libs");
+            assert!(
+                lib.join("libsodium.a").exists(),
+                "libsodium.a is missing - run tools/build-sodium.sh once before building with --features tox"
+            );
+            println!("cargo:rustc-link-search=native={}", lib.display());
+            println!("cargo:rustc-link-lib=static=sodium");
+        }
 
         if cfg!(windows) {
             for l in ["ws2_32", "iphlpapi", "advapi32", "bcrypt"] {

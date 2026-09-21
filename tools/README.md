@@ -61,6 +61,9 @@ this register has fallen into three times (`S1-AA`'s `no relay carried`, its
 | tool | the question |
 | --- | --- |
 | `build-tox.ps1` | Build what `--features tox` needs from the vendored source, and **verify every patch marker is still in the tree** — one or more for every file under `patches/`, checked case-sensitively (the count is the script's own, and a number written here went stale at thirty). A tree that was reverted, half-merged or restored from an unpatched copy would otherwise build and run and be wrong. |
+| `build-sodium.sh` | `D-078`: libsodium for a Linux build — static, from the vendored source, set up under `target/` with the system's autotools and nothing fetched from the network. The Linux counterpart of `build-tox.ps1`'s MSVC build; `build.rs` links what it makes. |
+| `package-linux.sh` | `D-078`: the Linux packages of a built client — an AppImage, a `.deb`, an `.rpm` and a `.tar.gz` — into `dist/`. The AppImage's tool and runtime are fetched at pinned versions and refused unless their SHA-256 is the one in the script. |
+| `check-build-paths.ps1` | `S1-EN`: does a built program name the machine it was built on — the profile, the user, the computer, the cargo home, the repository? Read from the file itself; on Windows and, since `D-078`, on Linux. |
 | `check-portable.ps1` | Is the built client actually portable? By measurement, not by reading the build configuration. |
 | `deploy.ps1` | Build and put the client where it is played from, without copying the profile. |
 | `clean.ps1` | Sweep `target/` of what cargo never deletes. |

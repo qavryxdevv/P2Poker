@@ -163,6 +163,16 @@ pub fn notes_url(tag: &str) -> Option<String> {
     Some(format!("{}/tag/{tag}", crate::gui::render::RELEASES_URL))
 }
 
+/// `D-078`: what the gate's gold button hands to the browser on `system` --
+/// the program itself on Windows, and on Linux the release's page, which holds
+/// the AppImage, the `.deb` and the `.rpm` for the player to choose from.
+pub fn download_for(tag: &str, system: crate::gui::lobby::System) -> Option<String> {
+    match system {
+        crate::gui::lobby::System::Windows => download_url(tag),
+        crate::gui::lobby::System::Linux => notes_url(tag),
+    }
+}
+
 /// `D-077`: the tag the releases page's `latest` redirect names, if it names
 /// one of this repository's releases and nothing else.
 ///
@@ -365,6 +375,11 @@ mod tests {
             Some("https://github.com/qavryxdevv/P2Poker/releases/download/v0.1.2/p2p-poker.exe")
         );
         assert_eq!(notes_url("v0.1.2").as_deref(), Some("https://github.com/qavryxdevv/P2Poker/releases/tag/v0.1.2"));
+        // `D-078`: Windows gets the program, Linux the page with its three packages.
+        use crate::gui::lobby::System;
+        assert_eq!(download_for("v0.1.2", System::Windows), download_url("v0.1.2"));
+        assert_eq!(download_for("v0.1.2", System::Linux), notes_url("v0.1.2"));
+        assert_eq!(download_for("../x", System::Linux), None);
         for bad in ["../../../evil", "v0.1.2/../../x", "v0.1.2?download=elsewhere", "v0.1.2#x", "https://evil.example/", ""] {
             assert_eq!(download_url(bad), None, "{bad:?}");
             assert_eq!(notes_url(bad), None, "{bad:?}");

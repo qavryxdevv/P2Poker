@@ -1152,6 +1152,18 @@ pub fn player_names(roster: &Roster) -> Vec<String> {
         .collect()
 }
 
+/// `D-078`: the system this client runs on, where the words for it differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum System {
+    Windows,
+    /// Linux -- and whatever else is not Windows: the packages are Linux's.
+    Linux,
+}
+
+impl System {
+    pub const THIS: System = if cfg!(windows) { System::Windows } else { System::Linux };
+}
+
 /// `D-077`: whether the lobby is open to this version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gate {
@@ -1213,16 +1225,40 @@ pub struct ClosedWords {
 }
 
 /// `D-077`: the window's words for release `latest`, to a client of version
-/// `this` that lives at `home`.
+/// `this` that lives at `home`, on `system`.
 ///
 /// **What to do next depends on where this copy lives, and getting it wrong
 /// makes a new player.** An installed copy is updated by the new file's own
 /// installer (`D-073`), which keeps the profile. A portable copy keeps its
 /// profile beside the program, so the new program goes where the old one is:
 /// started from the downloads folder, it would find no player beside it and
-/// offer to install a new one.
-pub fn closed_words(latest: &str, this: &str, home: Option<&super::render::HomeView>) -> ClosedWords {
+/// offer to install a new one. `D-078`: a Linux package keeps the profile in
+/// the user's data folder, so the new package is installed as this one was --
+/// and the button opens the release page, which has the three packages, where
+/// on Windows it hands over the one program.
+pub fn closed_words(
+    latest: &str,
+    this: &str,
+    home: Option<&super::render::HomeView>,
+    system: System,
+) -> ClosedWords {
+    let packaged = system == System::Linux && home.is_none_or(|h| !h.profile.starts_with(&h.folder));
     let (next, folder, by_hand) = match home {
+        _ if packaged => (
+            "Choose the package for your system on the release page -- the AppImage, the .deb or the .rpm -- then \
+             close P2Poker and install it the way you installed this one. Your player profile stays as it is, in \
+             your home folder."
+                .to_owned(),
+            None,
+            false,
+        ),
+        Some(h) if system == System::Linux => (
+            "When it has downloaded, close P2Poker, put the new program in place of this one, in the folder below, \
+             and start it there: your player profile is kept beside it and stays as it is."
+                .to_owned(),
+            Some(h.folder.clone()),
+            true,
+        ),
         Some(h) if h.installed => (
             "When it has downloaded, close P2Poker and start the new p2p-poker.exe: it offers to update the \
              installed copy, in the folder below, and your player profile stays as it is."
@@ -1259,12 +1295,13 @@ pub fn closed_words(latest: &str, this: &str, home: Option<&super::render::HomeV
 }
 
 /// `D-077`: what the window says once the gold button was pressed: whether the
-/// system took the address.
-pub fn handed_words(handed: bool) -> &'static str {
-    if handed {
-        "The download was handed to your browser."
-    } else {
-        "Your browser could not be started. Copy the address below into it."
+/// system took the address -- on Windows the program itself, on Linux the
+/// release page with the packages (`D-078`).
+pub fn handed_words(handed: bool, system: System) -> &'static str {
+    match (handed, system) {
+        (true, System::Windows) => "The download was handed to your browser.",
+        (true, System::Linux) => "The release page was opened in your browser.",
+        (false, _) => "Your browser could not be started. Copy the address below into it.",
     }
 }
 
@@ -2093,13 +2130,15 @@ mod tests {
     fn the_next_step_is_said_for_where_this_copy_lives() {
         use super::super::render::HomeView;
         use std::path::PathBuf;
+        let folder = PathBuf::from(r"C:\Users\someone\AppData\Local\Programs\P2Poker");
         let home = |installed| HomeView {
-            folder: PathBuf::from(r"C:\Users\someone\AppData\Local\Programs\P2Poker"),
+            folder: folder.clone(),
+            profile: folder.join("profile"),
             installed,
             can_install: true,
             busy: false,
         };
-        let installed = closed_words("0.2.0", "0.1.1", Some(&home(true)));
+        let installed = closed_words("0.2.0", "0.1.1", Some(&home(true)), System::Windows);
         assert_eq!(installed.heading, "P2Poker 0.2.0 is out");
         assert!(installed.body.contains("0.1.1") && installed.body.contains("0.2.0"), "{}", installed.body);
         assert!(installed.body.contains("protocol"), "why it is required: {}", installed.body);
@@ -2108,7 +2147,7 @@ mod tests {
         assert!(installed.next.contains("profile stays"), "an update must not read as a new player");
         assert!(!installed.by_hand);
 
-        let portable = closed_words("0.2.0", "0.1.1", Some(&home(false)));
+        let portable = closed_words("0.2.0", "0.1.1", Some(&home(false)), System::Windows);
         assert!(portable.next.contains("in place of this one"), "{}", portable.next);
         assert!(portable.next.contains("new player"), "and what the other way costs: {}", portable.next);
         assert!(portable.by_hand);
@@ -2117,9 +2156,49 @@ mod tests {
             assert_eq!(w.folder.as_deref(), Some(home(true).folder.as_path()));
             assert!(![&w.heading, &w.body, &w.next].iter().any(|s| s.contains(r"C:\")), "a path inside a sentence");
         }
-        let nowhere = closed_words("0.2.0", "0.1.1", None);
+        let nowhere = closed_words("0.2.0", "0.1.1", None, System::Windows);
         assert_eq!(nowhere.folder, None);
         assert!(nowhere.next.contains("profile stays"));
-        assert_ne!(handed_words(true), handed_words(false));
+        assert_ne!(handed_words(true, System::Windows), handed_words(false, System::Windows));
+    }
+
+    /// **`D-078`: on Linux the next step is the package, or the portable
+    /// folder.** A package keeps the profile in the user's data folder, so the
+    /// new version is installed as this one was and no folder is shown; a copy
+    /// whose profile stands beside it is replaced in place, as on Windows. The
+    /// words never name the Windows program, and the button opens a page.
+    #[test]
+    fn on_linux_the_next_step_is_the_package_or_the_portable_folder() {
+        use super::super::render::HomeView;
+        use std::path::PathBuf;
+        let packaged = HomeView {
+            folder: PathBuf::from("/usr/lib/p2poker"),
+            profile: PathBuf::from("/home/someone/.local/share/p2poker/profile"),
+            installed: false,
+            can_install: false,
+            busy: false,
+        };
+        let words = closed_words("0.2.0", "0.1.1", Some(&packaged), System::Linux);
+        assert!(words.next.contains("AppImage") && words.next.contains(".deb") && words.next.contains(".rpm"), "{}", words.next);
+        assert!(words.next.contains("profile stays"), "{}", words.next);
+        assert_eq!(words.folder, None, "nothing to replace by hand");
+        assert!(!words.by_hand);
+        assert_eq!(closed_words("0.2.0", "0.1.1", None, System::Linux).next, words.next, "no home known: the package");
+
+        let portable = HomeView { folder: PathBuf::from("/home/someone/p2poker"), profile: PathBuf::from("/home/someone/p2poker/profile"), ..packaged.clone() };
+        let words = closed_words("0.2.0", "0.1.1", Some(&portable), System::Linux);
+        assert!(words.next.contains("in place of this one"), "{}", words.next);
+        assert_eq!(words.folder.as_deref(), Some(portable.folder.as_path()));
+        assert!(words.by_hand);
+
+        for w in [closed_words("0.2.0", "0.1.1", Some(&packaged), System::Linux), words] {
+            assert!(![&w.heading, &w.body, &w.next].iter().any(|s| s.contains(".exe")), "no Windows program on Linux");
+        }
+        assert!(handed_words(true, System::Linux).contains("release page"));
+        assert!(!handed_words(true, System::Windows).contains("release page"));
+        let about = super::super::render::home_words(&packaged, System::Linux);
+        assert!(about.contains("/usr/lib/p2poker") && about.contains(".local/share/p2poker/profile"), "{about}");
+        let beside = super::super::render::home_words(&portable, System::Linux);
+        assert!(beside.contains("portable"), "{beside}");
     }
 }

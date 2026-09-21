@@ -74,9 +74,13 @@ corrected in place and the correction is recorded in §9.7.
 | Figure | Value | How |
 |---|---|---|
 | Crates **compiled into the client** | **444** | `cargo tree --edges normal --target x86_64-pc-windows-msvc`, unique name+version, minus `p2p-poker` itself |
-| Crates **recorded in `Cargo.lock`** | **647** | `[[package]]` entries, minus `p2p-poker` itself |
-| Locked but never compiled | **203** | the difference |
+| Crates **recorded in `Cargo.lock`** | **653** | `[[package]]` entries, minus `p2p-poker` itself |
+| Locked but never compiled | **209** | the difference |
 
+**Re-measured 2026-09-21, after `D-078`'s Linux client**: 444 / 653 / 209. The Windows client compiles what it
+did; `Cargo.lock` gained the six crates eframe's `x11` and `wayland` features bring to a Linux build --
+`x11-dl`, `as-raw-xcb-connection`, `glutin_glx_sys`, `smithay-client-toolkit` 0.19.2, `calloop-wayland-source`
+and `wayland-protocols-plasma` -- which a Windows build locks and never compiles.
 **Re-measured 2026-09-19, after `D-069`'s music** (`lewton` and `ogg`, both compiled): 444 / 647 / 203.
 **Re-measured 2026-09-20, after `D-073`'s installer**: 444 / 647 / 203, unchanged -- `windows 0.62.2` became a direct
 edge and was in the tree already (§5.12); `Cargo.lock` gained the one line that says so.

@@ -6940,3 +6940,50 @@ opens. **Not photographed:** the window that says the lobby is waiting -- the an
 button. No check in the headless client. No download, no self-update, and no list of processes. A client that
 cannot reach GitHub is not stopped, by decision -- so the gate stops the window client from sitting down with an old
 protocol, and not a person who cuts the network from running what they have.
+
+## D-078 — P2Poker on Linux: one source, a Linux build beside the Windows one, four packages
+
+**Decided 2026-09-21 by the project owner:** *have GitHub build it for Linux too -- a snap, or a package for Ubuntu,
+and so on, for the distributions used most* -- and, asked the same evening: *can the code be made to work on Windows
+and on Linux at once?*
+
+It is one source. Rust compiles it for each system, and where the systems differ the code says so in `#[cfg]`
+branches -- one program for Windows and one for Linux, from the same commit, by the same workflow, into the same
+release. One file that runs on both cannot be made: the two systems do not run the same kind of executable.
+
+1. **Four packages, built and attested by the release workflow** on a Linux runner with glibc 2.35 -- so Ubuntu
+   22.04, Debian 12, Fedora 36 and every distribution after them: an **AppImage**, one file for any distribution; a
+   **.deb** for Ubuntu, Debian, Mint and Pop!_OS; an **.rpm** for Fedora and openSUSE; and a **.tar.gz** with the
+   program in a folder. `tools/package-linux.sh` makes them, `gh attestation verify` checks each as it checks the
+   Windows program, and the release is published by a third job once both systems are built, so a release never
+   holds one system's files alone.
+2. **Not a snap and not a Flatpak, yet.** Both are stores: a snap needs a Snapcraft account and its name registered,
+   a Flatpak a submission to Flathub and its review. Opening either is the owner's; the AppImage and the two packages
+   reach the same distributions without an account anywhere.
+3. **The profile.** A package puts the program where a user cannot write -- `/usr/bin`, or the read-only mount of an
+   AppImage -- so on Linux the profile lives in the user's data folder, `~/.local/share/p2poker/profile`
+   (`$XDG_DATA_HOME` when it is set), **unless a `profile` folder stands beside the program**, which keeps a portable
+   copy portable, as it is on Windows (`storage::profile::profile_dir_for`). Windows is unchanged.
+4. **One client to a profile, on Linux too.** `S1-FV`'s lock held on Windows only; on Linux it is `File::try_lock`,
+   and that is why the crate's `rust-version` is now 1.89.
+5. **`D-077` on Linux.** The gate's gold button opens the release's page, where the packages are, instead of handing
+   over the Windows program, and its words tell a package from a portable copy. The About page says where the program
+   is and where the profile is.
+6. **A day's quests turn over at the player's midnight** on Linux as well: the offset is what `date +%z` says, read
+   once, where it had been UTC.
+7. **libsodium from the vendored source**, as on Windows: `tools/build-sodium.sh` copies libsodium's git tree under
+   `target/`, generates its `configure` with the system's autotools (`autogen.sh -s -b`, nothing fetched) and builds
+   the static library `build.rs` links.
+8. **The window.** eframe's `x11` and `wayland` features, on Linux only: six crates more in `Cargo.lock`, compiled by
+   the Linux build alone (`DEPENDENCIES.md` section 1).
+9. **Nothing of the machine** (`S1-EN`) on Linux: the Linux job maps the runner's paths away -- `--remap-path-prefix`
+   for Rust, `-ffile-prefix-map` for C -- and `tools/check-build-paths.ps1`, which now knows a Linux home, user and
+   host name, reads the built program for them.
+10. **The AppImage's tools are pinned**: appimagetool 1.9.1 and its runtime 20251108, each refused unless its SHA-256
+    is the one written in `tools/package-linux.sh` -- the rule every action of the workflow already follows.
+
+**What is NOT done.** **No sound on Linux**: the table's sounds and the search music go through Windows' `waveOut`,
+and a Linux client plays the silence it always had. No test suite on Linux: the workflow builds, checks the paths and
+starts the program there, and the tests run on Windows. No macOS. No snap, no Flatpak, no AUR. The software renderer
+(`--renderer software`) is Windows' WARP; on Linux the window draws with OpenGL, which Mesa provides even without a
+graphics driver.

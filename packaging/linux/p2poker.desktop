@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=P2Poker
+GenericName=Poker
+Comment=Decentralised poker: no house, no server, every card proven
+Exec=p2p-poker
+Icon=p2poker
+Terminal=false
+Categories=Game;CardGame;
+Keywords=poker;holdem;texas;sit and go;
+StartupWMClass=p2p-poker

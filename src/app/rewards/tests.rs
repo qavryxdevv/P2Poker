@@ -695,3 +695,16 @@ fn two_thirds_of_the_experience_is_for_effort() {
     }
     assert!(effort * 3 >= (effort + result) * 2, "effort {effort}, result {result}");
 }
+
+/// `D-078`: Linux says its offset through `date +%z`, and only that shape is
+/// believed -- anything else is UTC, never a day that turns over at noon.
+#[test]
+fn an_offset_is_read_as_date_prints_it_and_nothing_else() {
+    assert_eq!(parse_utc_offset("+0200"), Some(120));
+    assert_eq!(parse_utc_offset("-0530"), Some(-330));
+    assert_eq!(parse_utc_offset("+0000"), Some(0));
+    assert_eq!(parse_utc_offset("+1400"), Some(840));
+    for bad in ["", "0200", "+02:00", "+200", "+02000", "+2400", "+0260", "UTC", "-", "+ab12"] {
+        assert_eq!(parse_utc_offset(bad), None, "{bad:?}");
+    }
+}

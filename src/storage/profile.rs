@@ -32,18 +32,49 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The profile directory, beside the executable.
+/// The profile directory: beside the executable on Windows; on Linux, in the
+/// user's data folder unless a profile already stands beside the program.
 ///
 /// Falls back to the working directory if the executable's location cannot be
 /// determined — which happens on some sandboxes — because a client that refuses
 /// to start over a path lookup is worse than one that keeps its profile
 /// somewhere slightly unexpected and says so.
 pub fn profile_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("profile")
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    profile_dir_for(cfg!(windows), exe_dir.as_deref(), data_home, home, |p| p.is_dir())
+}
+
+/// `D-078`: where the profile lives, from what the system says.
+///
+/// **Windows: beside the program, always** -- `SPEC_CS.md` §22's portable
+/// folder, and `D-073`'s installed copy is that same folder in the user's
+/// programs folder.
+///
+/// **Linux: in the user's data folder** (`$XDG_DATA_HOME/p2poker/profile`, or
+/// `~/.local/share/p2poker/profile`). A package puts the program where a user
+/// cannot write -- `/usr/lib` for the `.deb` and the `.rpm`, a read-only mount
+/// for the AppImage -- so *beside the program* is nowhere there. **Unless a
+/// profile already stands beside the program**: then that one, which is how a
+/// Linux player keeps a portable copy, as on Windows -- make a `profile` folder
+/// beside the program, and it is used. `exists` is the test for that folder,
+/// so the rule is a table.
+pub fn profile_dir_for(
+    windows: bool,
+    exe_dir: Option<&Path>,
+    data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let beside = exe_dir.unwrap_or_else(|| Path::new(".")).join("profile");
+    if windows || exists(&beside) {
+        return beside;
+    }
+    match data_home.or_else(|| home.map(|h| h.join(".local").join("share"))) {
+        Some(data) => data.join("p2poker").join("profile"),
+        None => beside,
+    }
 }
 
 /// Where the libp2p identity lives.
@@ -216,10 +247,10 @@ pub fn lock_path(dir: &Path) -> PathBuf {
 /// operating system when the process ends, however it ends, so a client that
 /// was killed leaves nothing behind to clear.
 ///
-/// Enforced on Windows, the platform the portable client is built for: the
-/// lock file is opened with no sharing, which no other open can pass while it
-/// is held. Elsewhere nothing is held (`File::try_lock` is newer than this
-/// crate's `rust-version`).
+/// On Windows the lock file is opened with no sharing, which no other open can
+/// pass while it is held. `D-078`: elsewhere it is locked with `File::try_lock`
+/// -- an advisory lock every copy of this client asks for, and the reason this
+/// crate's `rust-version` is 1.89.
 pub struct ProfileLock {
     _file: Option<fs::File>,
 }
@@ -261,17 +292,56 @@ fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
 }
 
 #[cfg(not(windows))]
-fn open_exclusive(_path: &Path) -> Result<Option<fs::File>, LockError> {
-    Ok(None)
+fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(LockError::Unavailable)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Err(LockError::InUse),
+        Err(fs::TryLockError::Error(e)) => Err(LockError::Unavailable(e)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// **`D-078`: where the profile lives.** Windows keeps it beside the
+    /// program, whatever stands where; Linux keeps it in the user's data folder
+    /// -- a package's program sits where nobody can write -- unless a profile
+    /// already stands beside the program, which is a portable copy.
+    #[test]
+    fn the_profile_is_beside_the_program_on_windows_and_in_the_data_folder_on_linux() {
+        let exe = Path::new("/usr/lib/p2poker");
+        let beside = exe.join("profile");
+        let none = |_: &Path| false;
+        let there = |p: &Path| p == Path::new("/usr/lib/p2poker/profile");
+        let data = || Some(PathBuf::from("/home/someone/.data"));
+        let home = || Some(PathBuf::from("/home/someone"));
+
+        assert_eq!(profile_dir_for(true, Some(exe), data(), home(), none), beside, "Windows: beside, always");
+        assert_eq!(
+            profile_dir_for(false, Some(exe), data(), home(), none),
+            Path::new("/home/someone/.data/p2poker/profile"),
+            "Linux: the XDG data folder"
+        );
+        assert_eq!(
+            profile_dir_for(false, Some(exe), None, home(), none),
+            Path::new("/home/someone/.local/share/p2poker/profile"),
+            "and its default under the home folder"
+        );
+        assert_eq!(profile_dir_for(false, Some(exe), data(), home(), there), beside, "a portable copy keeps its own");
+        assert_eq!(profile_dir_for(false, Some(exe), None, None, none), beside, "no home at all: beside, as before");
+    }
+
     /// `S1-FV`: a profile one client holds is refused to a second, and is
-    /// free again the moment the first lets it go.
-    #[cfg(windows)]
+    /// free again the moment the first lets it go -- on Windows by the sharing
+    /// mode, elsewhere by `File::try_lock` (`D-078`).
     #[test]
     fn a_profile_is_held_by_one_client_at_a_time() {
         let dir = scratch("profile-lock");

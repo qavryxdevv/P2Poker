@@ -15,6 +15,10 @@
 #
 # Every action is pinned to a commit, not to a tag: a tag can be moved, and a moved tag in a signing workflow is a
 # way to sign somebody else's build under this repository's name. Only GitHub's own actions are used.
+#
+# D-078: and the Linux client, from the same commit on a Linux runner -- an AppImage, a .deb, an .rpm and a .tar.gz,
+# attested the same way (`gh attestation verify <file> --repo qavryxdevv/P2Poker`). The two builds run side by side;
+# the release is published by a third job once both are done, so a release never holds one system's files alone.
 
 name: release
 
@@ -36,10 +40,13 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 120
     permissions:
-      contents: write          # to publish the release
+      contents: read
       id-token: write          # to ask Sigstore for the short-lived certificate
       attestations: write      # to store the attestation
       artifact-metadata: write # what actions/attest asks for beside it
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+      attestation: ${{ steps.attest.outputs.attestation-url }}
     env:
       # .cargo/config.toml holds the owner's machine to 19 jobs; a hosted runner has four cores and 16 GB.
       CARGO_BUILD_JOBS: 4
@@ -137,45 +144,172 @@ jobs:
             target/release/p2p-poker.exe.sha256
             target/release/p2p-poker.exe.sigstore.json
 
-      - name: Publish the release
+  linux:
+    # D-078: built against glibc 2.35, so the program runs on Ubuntu 22.04, Debian 12, Fedora 36 and every
+    # distribution after them.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write          # to ask Sigstore for the short-lived certificate
+      attestations: write      # to store the attestation
+      artifact-metadata: write # what actions/attest asks for beside it
+    outputs:
+      attestation: ${{ steps.attest.outputs.attestation-url }}
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The tag is the version the client will say it is
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${{ github.ref_name }}" != "v$version" ]; then
+            echo "the tag ${{ github.ref_name }} is not v$version, which is what Cargo.toml and the About page say"
+            exit 1
+          fi
+          echo "tag and Cargo.toml agree: $version"
+
+      - name: Rust, stable, as the runner ships it
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: The tools the packages are made with
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends autoconf automake libtool rpm
+
+      - name: libsodium, static, from the vendored source
+        run: sh tools/build-sodium.sh
+
+      - name: Build the client (release, locked to Cargo.lock), naming nothing of the machine
+        # S1-EN on Linux: what tools/remap-build-paths.ps1 writes into the cargo home on Windows, given here --
+        # the runner's home, the cargo and rustup homes and the checkout, most general first, because rustc takes
+        # the last flag that matches -- and the same maps for the C a build script compiles, through CFLAGS.
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup --remap-path-prefix=$GITHUB_WORKSPACE=/p2p-poker"
+          export CFLAGS="-ffile-prefix-map=$HOME=~ -ffile-prefix-map=$GITHUB_WORKSPACE=/p2p-poker"
+          cargo build --release --locked
+
+      - name: And it does not
+        shell: pwsh
+        run: ./tools/check-build-paths.ps1
+
+      - name: It starts, and says which version it is
+        # As on Windows: `--cash` is refused (D-072) before a window or the node is started.
+        run: |
+          set +e
+          out=$(./target/release/p2p-poker --cash 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then echo "expected the refusal's exit code 2, got $code"; exit 1; fi
+          echo "$out" | grep -Eq 'p2p-poker [0-9]+[.][0-9]+[.][0-9]+' || { echo 'the client did not say its version'; exit 1; }
+
+      - name: The packages
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          sh tools/package-linux.sh "$version"
+          cd dist
+          sha256sum * > SHA256SUMS-linux.txt
+          { echo '### Linux'; echo; echo '```'; cat SHA256SUMS-linux.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the build's provenance
+        id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+
+      - name: Keep the attestation beside the files, for checking offline
+        if: ${{ steps.attest.outputs.bundle-path != '' }}
+        run: cp '${{ steps.attest.outputs.bundle-path }}' dist/p2poker-linux.sigstore.json
+
+      - name: Keep the build with the run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: p2p-poker-linux-x64
+          if-no-files-found: error
+          path: dist/*
+
+  release:
+    # Published once both systems are built: a release never holds one system's files alone.
+    needs: [windows, linux]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write          # to publish the release
+    steps:
+      - name: The two builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ github.ref_name }}'
-          $files = @('target/release/p2p-poker.exe', 'target/release/p2p-poker.exe.sha256')
-          if (Test-Path 'target/release/p2p-poker.exe.sigstore.json') { $files += 'target/release/p2p-poker.exe.sigstore.json' }
-          $attested = if ('${{ steps.attest.outputs.attestation-url }}') { "Build provenance: ${{ steps.attest.outputs.attestation-url }}" } else { 'Not attested: the repository was private when this was built.' }
+          $version = $tag.TrimStart('v')
+          $files = @(Get-ChildItem dist -File | ForEach-Object { $_.FullName })
+          $windowsAttested = if ('${{ needs.windows.outputs.attestation }}') { "Windows: ${{ needs.windows.outputs.attestation }}" } else { 'Windows: not attested (the repository was private when this was built).' }
+          $linuxAttested = if ('${{ needs.linux.outputs.attestation }}') { "Linux: ${{ needs.linux.outputs.attestation }}" } else { 'Linux: not attested (the repository was private when this was built).' }
           $fence = '```'
-          $size = [math]::Round((Get-Item 'target/release/p2p-poker.exe').Length / 1MB)
+          $size = [math]::Round((Get-Item 'dist/p2p-poker.exe').Length / 1MB)
           $base = 'https://github.com/${{ github.repository }}'
+          $get = "$base/releases/download/$tag"
           $notes = @(
             '## Download',
             '',
-            "**[p2p-poker.exe]($base/releases/download/$tag/p2p-poker.exe)** - Windows x64, one portable file, $size MB.",
+            "**[p2p-poker.exe]($get/p2p-poker.exe)** - Windows x64, one portable file, $size MB.",
             '',
             'Start it and it offers to install itself: a copy in your user folder, a shortcut on the desktop and in the Start menu, no administrator rights, nothing in the registry. Decline, and it runs from the folder it is in.',
             '',
             'A beta. Play money only. It is not signed with a Windows certificate, so SmartScreen asks before the first start (*More info*, then *Run anyway*).',
             '',
+            '**Linux** (x86_64, glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36 and later):',
+            '',
+            "- **[P2Poker-$version-x86_64.AppImage]($get/P2Poker-$version-x86_64.AppImage)** - one file for any distribution: make it executable and start it.",
+            "- **[p2poker_$($version)_amd64.deb]($get/p2poker_$($version)_amd64.deb)** - Ubuntu, Debian, Mint, Pop!_OS: ``sudo apt install ./p2poker_$($version)_amd64.deb``",
+            "- **[p2poker-$version-1.x86_64.rpm]($get/p2poker-$version-1.x86_64.rpm)** - Fedora, openSUSE: ``sudo dnf install ./p2poker-$version-1.x86_64.rpm``",
+            "- **[P2Poker-$version-linux-x86_64.tar.gz]($get/P2Poker-$version-linux-x86_64.tar.gz)** - the program in a folder, to run from where it is unpacked.",
+            '',
+            'On Linux the player profile is kept in `~/.local/share/p2poker/profile` (a `profile` folder beside the program makes a portable copy instead). Sounds are played on Windows only, for now.',
+            '',
             '## This build is verified',
             '',
-            'GitHub built this file on its own machines from exactly this tag, and **signed a statement that it did** (a build provenance attestation, through Sigstore). That is already done - nothing is pending.',
+            'GitHub built these files on its own machines from exactly this tag, and **signed a statement that it did** (a build provenance attestation, through Sigstore). That is already done - nothing is pending.',
             '',
             'SHA-256 of `p2p-poker.exe`:',
-            '`${{ steps.digest.outputs.sha256 }}`',
+            '`${{ needs.windows.outputs.sha256 }}`',
             '',
-            'Anyone who wants to check it for themselves can, with GitHub''s own tool:',
+            'The Linux files are listed with theirs in `SHA256SUMS-linux.txt`.',
+            '',
+            'Anyone who wants to check a file for themselves can, with GitHub''s own tool:',
             '',
             $fence,
             'gh attestation verify p2p-poker.exe --repo ${{ github.repository }}',
             $fence,
             '',
-            "It answers that the file was built by this repository's release.yml from refs/tags/$tag, and it refuses any other file. $attested"
+            "It answers that the file was built by this repository's release.yml from refs/tags/$tag, and it refuses any other file. $windowsAttested $linuxAttested"
           ) -join "`n"
           $notes | Out-File -Encoding utf8 'release-notes.md'
           # A full release, marked latest: the owner's word, 2026-09-20. A pre-release is never what GitHub calls
           # the latest, so the repository's front page showed no release and its files sat folded away; that the
           # client is a beta is said in the title and on its own About page, not by hiding the download.
-          gh release create $tag @files --repo '${{ github.repository }}' --title "P2Poker $($tag.TrimStart('v')) beta" --notes-file 'release-notes.md' --latest --verify-tag
+          gh release create $tag @files --repo '${{ github.repository }}' --title "P2Poker $version beta" --notes-file 'release-notes.md' --latest --verify-tag

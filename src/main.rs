@@ -659,15 +659,16 @@ fn installer_window(args: &[String], exe: std::path::PathBuf) -> i32 {
     }
 }
 
-/// `D-073`: where this copy lives, for the About page. Asked once.
-fn home_view() -> Option<render::HomeView> {
+/// `D-073`: where this copy lives, for the About page. Asked once. `D-078`:
+/// and where its profile is, which on Linux is not beside it.
+fn home_view(profile: &std::path::Path) -> Option<render::HomeView> {
     let exe = std::env::current_exe().ok()?;
     let folder = exe.parent()?.to_path_buf();
     #[cfg(windows)]
     let installed = p2p_poker::install::shell::places().is_some_and(|p| p2p_poker::install::same_place(&folder, &p.install_dir()));
     #[cfg(not(windows))]
     let installed = false;
-    Some(render::HomeView { folder, installed, can_install: cfg!(windows), busy: false })
+    Some(render::HomeView { folder, profile: profile.to_path_buf(), installed, can_install: cfg!(windows), busy: false })
 }
 
 /// `S1-FV`: a word to a player who started the client from its icon, where a
@@ -1559,7 +1560,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 confirm_exit: None,
                 ui: {
                     let mut ui = render::LobbyUi::new(settings);
-                    ui.home = home_view();
+                    ui.home = home_view(&profile_dir);
                     ui
                 },
                 table_ui: Default::default(),
@@ -2312,7 +2313,7 @@ impl Client {
             return;
         };
         let address = if download {
-            p2p_poker::app::update::download_url(&tag)
+            p2p_poker::app::update::download_for(&tag, p2p_poker::gui::lobby::System::THIS)
         } else {
             p2p_poker::app::update::notes_url(&tag)
         };
@@ -3069,8 +3070,9 @@ impl eframe::App for Client {
                         if let Ok(exe) = std::env::current_exe() {
                             #[cfg(windows)]
                             p2p_poker::install::shell::show_in_explorer(&exe);
+                            // `D-078`: the folder, in whatever the desktop opens folders with.
                             #[cfg(not(windows))]
-                            let _ = exe;
+                            let _ = exe.parent().map(|folder| std::process::Command::new("xdg-open").arg(folder).spawn());
                         }
                     }
                     // `D-073`: this client ends and starts itself again as the

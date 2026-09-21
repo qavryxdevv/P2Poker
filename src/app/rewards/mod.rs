@@ -65,9 +65,37 @@ pub fn local_offset_min() -> i32 {
     }
 }
 
+/// `D-078`: on Linux, what `date +%z` says, asked once -- `+0200` is 120 --
+/// rather than a time-zone database in this crate. A day's quests turn over at
+/// the player's midnight; a clock that changes to summer time while the client
+/// runs is an hour out until the next start, which a day's quest survives.
 #[cfg(not(windows))]
 pub fn local_offset_min() -> i32 {
-    0
+    static OFFSET: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| parse_utc_offset(s.trim()))
+            .unwrap_or(0)
+    })
+}
+
+/// An offset as `date +%z` prints it -- `+0200`, `-0530` -- in minutes east of
+/// UTC, or `None` for anything else.
+pub fn parse_utc_offset(s: &str) -> Option<i32> {
+    let (sign, digits) = match s.as_bytes().first()? {
+        b'+' => (1, &s[1..]),
+        b'-' => (-1, &s[1..]),
+        _ => return None,
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (hours, minutes): (i32, i32) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
+    (hours <= 14 && minutes <= 59).then_some(sign * (hours * 60 + minutes))
 }
 
 /// Days since 1970-01-01, local.
