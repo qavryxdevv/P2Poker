@@ -6771,6 +6771,13 @@ start as zeros, held by a test (`S1-IU`); a client that no longer drops and reta
 `Cargo.toml` says 0.1.1, the workflow refuses a tag that does not match it, and `D-075`'s button in a 0.1.0 client now
 says *a newer version is out*.
 
+**The third release, 2026-09-21 -- `v0.1.2`, on the owner's word the evening `D-076` and `D-077` were built.** The
+first release that **requires the next one**: a 0.1.2 client asks GitHub as its window opens and shuts its lobby to
+itself once a higher version is out (`D-077`) -- which no earlier client does, so 0.1.0 and 0.1.1 are told only by
+their About page's button, and the players who have them are the last ones who must update by hand. Also: *Players in
+the lobby* is a window of 512 that turns over as the tables' does (`D-076`, and `S1-IW`: it had no bound at all), and
+an installed copy that could not be replaced because it runs is a page of its own, *Close P2Poker first*.
+
 ## D-075 — *Check for a new version*: asked by the player, never by the client
 
 **Decided 2026-09-20 by the project owner:** *add to the application, in the settings' About tab, a button that

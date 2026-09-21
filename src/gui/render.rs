@@ -3800,7 +3800,7 @@ mod tests {
     #[test]
     fn the_about_page_says_the_build_and_where_a_bug_goes() {
         assert_eq!(RELEASE_STAGE, "beta", "this build is a beta and says so");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1", "the number comes from Cargo.toml");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.2", "the number comes from Cargo.toml");
         assert!(BUG_REPORT_URL.starts_with("https://github.com/"), "{BUG_REPORT_URL}");
         assert!(BUG_REPORT_URL.ends_with("/issues/new"), "the issue form, already open");
         assert!(!BUG_REPORT_URL.contains('?'), "no query: the client sends nothing with it");
