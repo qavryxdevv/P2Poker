@@ -1152,6 +1152,122 @@ pub fn player_names(roster: &Roster) -> Vec<String> {
         .collect()
 }
 
+/// `D-077`: whether the lobby is open to this version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    Open,
+    /// The window has just opened and is asking GitHub: nobody sits down
+    /// before the answer.
+    Asking,
+    /// A newer release is out, under `tag`, and this version does not sit down
+    /// again: this beta's protocol still changes from one version to the next.
+    Closed { latest: String, tag: String },
+}
+
+/// `D-077`: the gate, from what the version check has said.
+///
+/// **Only an answer that was read and understood closes the lobby.** Not
+/// asked, asked by the button and not yet answered, the newest, no release at
+/// all, and a check that could not be made are all open: a client that cannot
+/// reach GitHub plays, and its log says why. The one wait is the question the
+/// window asks as it opens, and that has a clock (`app::update`).
+pub fn gate(update: &super::render::UpdateUi) -> Gate {
+    use super::render::UpdateUi;
+    use crate::app::update::Verdict;
+    match update {
+        UpdateUi::Opening => Gate::Asking,
+        UpdateUi::Done(Ok(Verdict::Newer { latest, tag })) => Gate::Closed { latest: latest.clone(), tag: tag.clone() },
+        UpdateUi::Idle | UpdateUi::Checking | UpdateUi::Done(_) => Gate::Open,
+    }
+}
+
+/// `D-077`: what reaches the client from a frame of the lobby. With the gate
+/// open, whatever the lobby produced; with it shut, **the gate's own window's
+/// buttons and nothing else** -- not a click that reached a row before the
+/// window covered it, and not a line typed into a box that kept the keyboard.
+pub fn through_the_gate(
+    gate: &Gate,
+    lobby: super::render::LobbyAction,
+    from_gate: Option<super::render::LobbyAction>,
+) -> super::render::LobbyAction {
+    match gate {
+        Gate::Open => lobby,
+        Gate::Asking | Gate::Closed { .. } => from_gate.unwrap_or(super::render::LobbyAction::None),
+    }
+}
+
+/// `D-077`: the words of the window that closes the lobby.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedWords {
+    pub heading: String,
+    pub body: String,
+    /// The gold button's label.
+    pub download: String,
+    /// What to do once the download is done.
+    pub next: String,
+    /// The folder `next` speaks of, in a well of its own -- a path inside a
+    /// sentence buries the sentence (`D-073`'s first photograph).
+    pub folder: Option<std::path::PathBuf>,
+    /// This copy is portable: the player puts the new program in its place.
+    pub by_hand: bool,
+}
+
+/// `D-077`: the window's words for release `latest`, to a client of version
+/// `this` that lives at `home`.
+///
+/// **What to do next depends on where this copy lives, and getting it wrong
+/// makes a new player.** An installed copy is updated by the new file's own
+/// installer (`D-073`), which keeps the profile. A portable copy keeps its
+/// profile beside the program, so the new program goes where the old one is:
+/// started from the downloads folder, it would find no player beside it and
+/// offer to install a new one.
+pub fn closed_words(latest: &str, this: &str, home: Option<&super::render::HomeView>) -> ClosedWords {
+    let (next, folder, by_hand) = match home {
+        Some(h) if h.installed => (
+            "When it has downloaded, close P2Poker and start the new p2p-poker.exe: it offers to update the \
+             installed copy, in the folder below, and your player profile stays as it is."
+                .to_owned(),
+            Some(h.folder.clone()),
+            false,
+        ),
+        Some(h) => (
+            "When it has downloaded, close P2Poker, put the new p2p-poker.exe in place of this one, in the folder \
+             below, and start it there: your player profile is kept beside it and stays as it is. Started from \
+             anywhere else, it would be a new player."
+                .to_owned(),
+            Some(h.folder.clone()),
+            true,
+        ),
+        None => (
+            "When it has downloaded, close P2Poker and start the new p2p-poker.exe. Your player profile stays as it is."
+                .to_owned(),
+            None,
+            false,
+        ),
+    };
+    ClosedWords {
+        heading: format!("P2Poker {latest} is out"),
+        body: format!(
+            "This is a beta, and its protocol still changes from one version to the next, so version {this} can no \
+             longer play with the players who have {latest}. Download the new version to go on playing."
+        ),
+        download: format!("Download {latest}"),
+        next,
+        folder,
+        by_hand,
+    }
+}
+
+/// `D-077`: what the window says once the gold button was pressed: whether the
+/// system took the address.
+pub fn handed_words(handed: bool) -> &'static str {
+    if handed {
+        "The download was handed to your browser."
+    } else {
+        "Your browser could not be started. Copy the address below into it."
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1916,5 +2032,94 @@ mod tests {
         .unwrap();
 
         assert_eq!(player_names(&roster), vec!["seat 0", "Alice"]);
+    }
+
+    /// **`D-077`: only an answer that was read and understood closes the
+    /// lobby.** The breaks this must catch: a failed check read as *a newer one
+    /// is out* -- every player locked out whenever GitHub has a bad hour -- and
+    /// the button's own question, or no question at all, shutting the lobby.
+    #[test]
+    fn only_a_newer_release_closes_the_lobby_and_only_the_opening_question_holds_it() {
+        use super::super::render::UpdateUi;
+        use crate::app::update::Verdict;
+        assert_eq!(gate(&UpdateUi::Opening), Gate::Asking, "the question the window asks as it opens is waited for");
+        assert_eq!(
+            gate(&UpdateUi::Done(Ok(Verdict::Newer { latest: "0.2.0".into(), tag: "v0.2.0".into() }))),
+            Gate::Closed { latest: "0.2.0".into(), tag: "v0.2.0".into() }
+        );
+        for open in [
+            UpdateUi::Idle,
+            UpdateUi::Checking,
+            UpdateUi::Done(Ok(Verdict::Newest { latest: "0.1.1".into() })),
+            UpdateUi::Done(Ok(Verdict::NoRelease)),
+            UpdateUi::Done(Err("GitHub could not be reached: timed out".into())),
+            UpdateUi::Done(Err("GitHub is not answering this address right now".into())),
+        ] {
+            assert_eq!(gate(&open), Gate::Open, "{open:?}");
+        }
+    }
+
+    /// **`D-077`: with the gate shut, the window's own buttons and nothing
+    /// else.** A row clicked, a table joined, a search started or a line said
+    /// in the frame the window covered the lobby does not reach the client.
+    #[test]
+    fn a_shut_lobby_passes_nothing_but_the_gates_own_buttons() {
+        use super::super::render::LobbyAction;
+        let shut = Gate::Closed { latest: "0.2.0".into(), tag: "v0.2.0".into() };
+        for tried in [
+            LobbyAction::Sit { key: [1u8; 32], buyin: 1_000, password: None },
+            LobbyAction::Resume,
+            LobbyAction::Say("hello".into()),
+            LobbyAction::Select([1u8; 32]),
+            LobbyAction::CheckForUpdate,
+        ] {
+            for gate in [&shut, &Gate::Asking] {
+                assert_eq!(through_the_gate(gate, tried.clone(), None), LobbyAction::None, "{gate:?} let {tried:?} through");
+            }
+            assert_eq!(through_the_gate(&Gate::Open, tried.clone(), None), tried, "an open lobby passes it");
+        }
+        // The gate's own button beats whatever else the frame held.
+        assert_eq!(
+            through_the_gate(&shut, LobbyAction::Resume, Some(LobbyAction::DownloadUpdate)),
+            LobbyAction::DownloadUpdate
+        );
+    }
+
+    /// **`D-077`: the next step is said for where this copy lives**, because the
+    /// wrong one makes a new player: an installed copy is updated by the new
+    /// file's installer, a portable one by putting the new program in the old
+    /// one's place. The folder is a field, never inside the sentence.
+    #[test]
+    fn the_next_step_is_said_for_where_this_copy_lives() {
+        use super::super::render::HomeView;
+        use std::path::PathBuf;
+        let home = |installed| HomeView {
+            folder: PathBuf::from(r"C:\Users\someone\AppData\Local\Programs\P2Poker"),
+            installed,
+            can_install: true,
+            busy: false,
+        };
+        let installed = closed_words("0.2.0", "0.1.1", Some(&home(true)));
+        assert_eq!(installed.heading, "P2Poker 0.2.0 is out");
+        assert!(installed.body.contains("0.1.1") && installed.body.contains("0.2.0"), "{}", installed.body);
+        assert!(installed.body.contains("protocol"), "why it is required: {}", installed.body);
+        assert_eq!(installed.download, "Download 0.2.0");
+        assert!(installed.next.contains("update the installed copy"), "{}", installed.next);
+        assert!(installed.next.contains("profile stays"), "an update must not read as a new player");
+        assert!(!installed.by_hand);
+
+        let portable = closed_words("0.2.0", "0.1.1", Some(&home(false)));
+        assert!(portable.next.contains("in place of this one"), "{}", portable.next);
+        assert!(portable.next.contains("new player"), "and what the other way costs: {}", portable.next);
+        assert!(portable.by_hand);
+
+        for w in [&installed, &portable] {
+            assert_eq!(w.folder.as_deref(), Some(home(true).folder.as_path()));
+            assert!(![&w.heading, &w.body, &w.next].iter().any(|s| s.contains(r"C:\")), "a path inside a sentence");
+        }
+        let nowhere = closed_words("0.2.0", "0.1.1", None);
+        assert_eq!(nowhere.folder, None);
+        assert!(nowhere.next.contains("profile stays"));
+        assert_ne!(handed_words(true), handed_words(false));
     }
 }

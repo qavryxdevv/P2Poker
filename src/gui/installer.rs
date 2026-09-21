@@ -20,8 +20,8 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 
 use super::table::style;
 use super::theme;
-use crate::install::copy::{hex, Moved};
-use crate::install::shell::{self, Choices, ProfileStep, Report, Step};
+use crate::install::copy::{hex, CopyError, MoveError, Moved};
+use crate::install::shell::{self, Choices, InstallError, ProfileStep, Report, Step};
 use crate::install::{self, Installed, Offer, Portable, Relation};
 
 /// Whether *Start P2Poker now* is ticked when the last page opens. One
@@ -52,7 +52,7 @@ enum Page {
     Offer(Offer),
     Working,
     Done(Report),
-    Failed { words: String },
+    Failed(FailedWords),
 }
 
 pub struct InstallerApp {
@@ -61,7 +61,7 @@ pub struct InstallerApp {
     start_now: bool,
     source: PathBuf,
     surveyed: Receiver<Option<Offer>>,
-    finished: Option<Receiver<Result<Report, String>>>,
+    finished: Option<Receiver<Result<Report, FailedWords>>>,
     outcome: Arc<Mutex<Outcome>>,
 }
 
@@ -104,7 +104,8 @@ impl InstallerApp {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64);
-            let _ = tx.send(shell::install(&job, choices, now).map_err(|e| e.to_string()));
+            let done = shell::install(&job, choices, now).map_err(|e| failed_words(&e, &job.places.install_dir()));
+            let _ = tx.send(done);
             ctx.request_repaint();
         });
         self.finished = Some(rx);
@@ -129,7 +130,7 @@ impl eframe::App for InstallerApp {
             self.finished = None;
             self.page = match done {
                 Ok(report) => Page::Done(report),
-                Err(words) => Page::Failed { words },
+                Err(words) => Page::Failed(words),
             };
         }
 
@@ -154,7 +155,7 @@ impl eframe::App for InstallerApp {
                         Page::NoPlaces => no_places(ui),
                         Page::Offer(offer) => offer_page(ui, offer, &mut self.ticks),
                         Page::Done(report) => done_page(ui, report, &self.source, &mut self.start_now),
-                        Page::Failed { words } => failed_page(ui, words),
+                        Page::Failed(words) => failed_page(ui, words),
                     })
                     .inner
             })
@@ -317,6 +318,49 @@ pub fn portable_words(portable: Portable) -> Option<&'static str> {
         Portable::ReadOnly => {
             Some("The folder this file is in cannot be written to, so there is nowhere here to keep a player profile.")
         }
+    }
+}
+
+/// The page after work that did not go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedWords {
+    pub heading: &'static str,
+    pub body: String,
+    /// What the system itself said, under the words and smaller.
+    pub system: Option<String>,
+    /// A P2Poker holds what was to be replaced: the player is told to close it,
+    /// and the folder it runs from is shown.
+    pub running: Option<PathBuf>,
+}
+
+/// **`D-077`, the owner's word (2026-09-21): a program that is running where
+/// the update goes is a warning to close it, on a page of its own** -- not a
+/// sentence inside *P2Poker was not installed*. For now it is found the one way
+/// it always was, by the copy failing: Windows will not let a running program
+/// be replaced (`copy::install_file`), and a profile a client holds will not
+/// move (`copy::move_profile`). No list of processes is read.
+pub fn failed_words(e: &InstallError, install_dir: &Path) -> FailedWords {
+    const CLOSE: &str = "Close P2Poker first";
+    match e {
+        InstallError::Copy(CopyError::InUse(system)) => FailedWords {
+            heading: CLOSE,
+            body: "The installed P2Poker could not be replaced, and the likeliest reason is that it is running: \
+                   Windows does not let a program be replaced while it runs. Close it \u{2014} the lobby and every \
+                   table window \u{2014} and press Try again. Nothing was changed."
+                .into(),
+            system: Some(system.to_string()),
+            running: Some(install_dir.to_path_buf()),
+        },
+        InstallError::Profile(MoveError::InUse) => FailedWords {
+            heading: CLOSE,
+            body: "A P2Poker is running with your player profile, so the profile cannot move. Close it \u{2014} the \
+                   lobby and every table window \u{2014} and press Try again. Nothing of yours was changed, and the \
+                   installed copy has not been started."
+                .into(),
+            system: None,
+            running: None,
+        },
+        other => FailedWords { heading: "P2Poker was not installed", body: other.to_string(), system: None, running: None },
     }
 }
 
@@ -589,10 +633,20 @@ fn done_page(ui: &mut egui::Ui, report: &Report, source: &Path, start_now: &mut 
     action
 }
 
-fn failed_page(ui: &mut egui::Ui, words: &str) -> Action {
+fn failed_page(ui: &mut egui::Ui, words: &FailedWords) -> Action {
     let mut action = Action::None;
-    heading(ui, "P2Poker was not installed", theme::WARN);
-    para(ui, words, theme::TEXT);
+    heading(ui, words.heading, theme::WARN);
+    para(ui, &words.body, theme::TEXT);
+    if let Some(folder) = words.running.as_ref() {
+        ui.add_space(10.0);
+        if place(ui, "The installed copy is in", folder) {
+            action = Action::Show(folder.clone());
+        }
+    }
+    if let Some(system) = words.system.as_ref() {
+        ui.add_space(6.0);
+        para(ui, &format!("Windows said: {system}"), style::mix(theme::TEXT_DIM, theme::WINDOW, 0.25));
+    }
     ui.add_space(16.0);
     ui.horizontal(|ui| {
         if super::render::gold_button(ui, "Try again", egui::vec2(180.0, 44.0)).clicked() {
@@ -769,6 +823,38 @@ mod tests {
         r.profile = ProfileStep::Moved(Moved::Copied { kept_as: r"E:\stick\profile".into() });
         let lines = done_lines(&r, source);
         assert!(lines.iter().any(|(t, w)| *t == Tone::Warn && w.contains("two places")), "{lines:?}");
+    }
+
+    /// **`D-077`, the owner's word: a running program where the update goes is a
+    /// page that says to close it** -- its own heading, the folder, and *Try
+    /// again* -- and every other failure keeps the plain one. The break this
+    /// must catch is the sentence buried under *P2Poker was not installed*,
+    /// which is what a program that could not be replaced used to get.
+    #[test]
+    fn a_running_program_where_the_update_goes_is_a_warning_to_close_it() {
+        let home = Path::new(r"C:\R\Programs\P2Poker");
+        let held = std::io::Error::from_raw_os_error(32);
+        let w = failed_words(&InstallError::Copy(CopyError::InUse(held)), home);
+        assert_eq!(w.heading, "Close P2Poker first");
+        assert!(w.body.contains("running") && w.body.contains("Close it") && w.body.contains("Try again"), "{}", w.body);
+        assert!(w.body.contains("Nothing was changed"), "{}", w.body);
+        assert_eq!(w.running.as_deref(), Some(home), "and where it is");
+        assert!(w.system.is_some(), "what Windows said stays, under the words");
+
+        let profile = failed_words(&InstallError::Profile(MoveError::InUse), home);
+        assert_eq!(profile.heading, "Close P2Poker first");
+        assert!(profile.body.contains("profile") && profile.body.contains("Close it"), "{}", profile.body);
+
+        for other in [
+            InstallError::Copy(CopyError::Mismatch),
+            InstallError::Copy(CopyError::Busy),
+            InstallError::Profile(MoveError::Occupied),
+        ] {
+            let w = failed_words(&other, home);
+            assert_eq!(w.heading, "P2Poker was not installed", "{other:?}");
+            assert_eq!(w.running, None, "{other:?}");
+            assert_eq!(w.body, other.to_string());
+        }
     }
 
     #[test]

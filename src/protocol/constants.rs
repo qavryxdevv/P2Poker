@@ -284,7 +284,13 @@ pub const SNAPSHOT_PEER_COUNT: usize = 4;
 /// design can fill -- an honest-looking number that hid where the real ceiling
 /// was.
 pub const MAX_TRACKED_TABLES: usize = 512;
-pub const MAX_TRACKED_PRESENCE: usize = 8_192;
+/// `D-076`: how many players one client's lobby shows at once -- the tables'
+/// bound, and turned over the way the tables' window is (`app::players`).
+///
+/// It stood at 8 192 "in an LRU" in `PROTOCOL.md` and was read by nothing: the
+/// list of players was a map of every key heard in the last two minutes, with
+/// no bound at all, and one signature from a fresh key was one more row.
+pub const MAX_TRACKED_PRESENCE: usize = 512;
 pub const MAX_ADS_PER_TABLE_KEY_PER_MIN: u32 = 4;
 /// `D-055`: how many adverts one **forwarding neighbour** may deliver a minute.
 ///

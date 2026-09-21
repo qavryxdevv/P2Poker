@@ -22,9 +22,12 @@ use crate::gui::lobby::{LobbyView, NetworkStatus, RelayStatus};
 use crate::net::lobby::LobbyStore;
 use crate::net::node::{NodeCommand, NodeEvent};
 
+/// `D-076`: who is in the lobby, in a window turned over as the tables' is.
+pub mod players;
 /// `D-068`: rewards, quests and the one penalty, folded from the node's words.
 pub mod rewards;
-/// `D-075`: is there a newer version -- asked by the player, never by the client.
+/// `D-075`, `D-077`: is there a newer version -- asked as the window opens and
+/// by the player's button; a newer release closes the lobby to this one.
 pub mod update;
 /// `S1-CS`: the table window's view, derived here so it can be tested.
 mod table;
@@ -440,11 +443,8 @@ pub struct AppState {
     /// identifier — §4.3 says that of a name received from the network, and it
     /// is no less true of one's own.
     pub me: String,
-    /// Who is in the lobby: player key to name and when they last said so.
-    ///
-    /// Keyed on the **key**, never the name: two players may choose one name,
-    /// and a list keyed on names would let either of them evict the other.
-    pub players: std::collections::BTreeMap<[u8; 32], (String, u64)>,
+    /// Who is in the lobby, by key: `D-076`'s window of them.
+    pub players: players::Players,
     /// What has been said in the lobby, newest last.
     pub chat: VecDeque<crate::gui::lobby::ChatLine>,
     /// The hand this client believes is in progress.
@@ -1315,16 +1315,14 @@ impl AppState {
             }
             NodeEvent::LobbyHere { who, nickname } => {
                 // Noted when somebody arrives, not every time they say they are
-                // still here: presence repeats every thirty seconds and a line
-                // each time would bury everything else.
-                let arrived = !self.players.contains_key(&who);
-                if arrived {
-                    self.note(format!(
-                        "{nickname} ({}) is in the lobby",
-                        crate::storage::profile::short_name(&who)
-                    ));
+                // still here: presence repeats every forty seconds and a line
+                // each time would bury everything else. `D-076`: *arrives* is
+                // into the window, which a full one takes only so many of a
+                // minute; the rest are heard at their next heartbeat.
+                let short = crate::storage::profile::short_name(&who);
+                if self.players.heard(who, nickname.clone(), self.last_sweep_ms) == players::Heard::Arrived {
+                    self.note(format!("{nickname} ({short}) is in the lobby"));
                 }
-                self.players.insert(who, (nickname, self.last_sweep_ms));
             }
             NodeEvent::LobbySaid {
                 who,
@@ -1333,8 +1331,9 @@ impl AppState {
             } => {
                 // Somebody who speaks is somebody who is here, so a client that
                 // joined between two presence messages still sees them in the
-                // list rather than only in the chat.
-                self.players.insert(who, (nickname.clone(), self.last_sweep_ms));
+                // list rather than only in the chat -- through the same window
+                // as a presence (`D-076`), so a chat line is no way past it.
+                let _ = self.players.heard(who, nickname.clone(), self.last_sweep_ms);
                 // PokerTH's *lobby chat notification*: somebody else named this
                 // player.
                 if !self.me.is_empty()
@@ -1906,9 +1905,7 @@ impl AppState {
                 // A player who has stopped saying they are here stops being
                 // here. There is no goodbye message, because a client that is
                 // switched off does not send one.
-                self.players.retain(|_, (_, at)| {
-                    now_ms.saturating_sub(*at) < crate::protocol::constants::PRESENCE_TTL_MS
-                });
+                self.players.expire(now_ms);
                 let gone = self.lobby.expire(now_ms);
                 if gone > 0 {
                     // Said only when something went. A line every half minute
@@ -3519,6 +3516,13 @@ impl AppState {
         ));
     }
 
+    /// `D-077`: what the version check asked and found, in the log **and its
+    /// file** -- a player told that this version can no longer play is one whose
+    /// file must say why, and a check that failed must say it too.
+    pub fn note_update(&mut self, line: String) {
+        self.note(line);
+    }
+
     /// `S1-CS`: the decision clock runs for the seat to act, from the moment
     /// this client learned it was that seat's turn; a seat that was already
     /// on the clock keeps its start.
@@ -3656,9 +3660,7 @@ impl AppState {
             let mut who: Vec<String> = self
                 .players
                 .iter()
-                .map(|(k, (name, _))| {
-                    format!("{name} ({})", crate::storage::profile::short_name(k))
-                })
+                .map(|(k, name)| format!("{name} ({})", crate::storage::profile::short_name(k)))
                 .collect();
             who.sort();
             who
@@ -3728,6 +3730,39 @@ mod tests {
         let id = s.search.as_ref().expect("a search").request.id;
         s.apply(NodeEvent::SearchEnded { id, why: "cancelled".into(), started: Vec::new() });
         assert!(s.view().found.is_none());
+    }
+
+    /// **`D-076`: the lobby's list of players is the window, not everybody
+    /// heard.** Six hundred players in one minute: the window's 512, and the
+    /// minute's share of newcomers turned in over them -- and a line in the chat
+    /// from somebody the full window has no room for this minute is in the chat
+    /// and is no way into the list.
+    #[test]
+    fn the_players_in_the_lobby_are_a_window_and_not_everybody_heard() {
+        use crate::protocol::constants::MAX_TRACKED_PRESENCE;
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Swept { now_ms: 1_700_000_000_000 });
+        let key = |n: u64| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&n.to_be_bytes());
+            k
+        };
+        for n in 0..600u64 {
+            s.apply(NodeEvent::LobbyHere { who: key(n), nickname: format!("p{n}") });
+        }
+        assert_eq!(s.view().seated.len(), MAX_TRACKED_PRESENCE, "at most the window");
+        assert_eq!(s.players.len(), MAX_TRACKED_PRESENCE);
+        let turned = MAX_TRACKED_PRESENCE as u64 + u64::from(crate::net::lobby::ROWS_ROTATED_PER_MIN);
+        assert!(!s.players.contains(&key(0)), "the first heard made way for the minute's newcomers");
+        assert!(s.players.contains(&key(turned - 1)), "the last of the minute's share is shown");
+        assert!(!s.players.contains(&key(turned)), "and the one after it waits for its next heartbeat");
+
+        // The minute's share is spent: a stranger's chat line is said, and the
+        // list is what it was.
+        s.apply(NodeEvent::LobbySaid { who: key(9_999), nickname: "stranger".into(), text: "hello".into() });
+        assert!(s.view().chat.iter().any(|l| l.said == "hello"), "the line is in the chat");
+        assert!(!s.players.contains(&key(9_999)), "and the full window took nobody for it");
+        assert_eq!(s.view().seated.len(), MAX_TRACKED_PRESENCE);
     }
 
     fn peer() -> PeerId {

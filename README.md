@@ -212,10 +212,13 @@ the source is good, which is what reading it is for. It is also **not** a
 Windows code-signing certificate, so SmartScreen still asks before the first
 start. `D-074` has the reasoning.
 
-The client itself will tell you when a newer release is out -- **when you ask
-it to**: Settings, About, *Check for a new version*. It asks GitHub for the list
-of releases once, sends nothing about you, downloads nothing, and never asks by
-itself (`D-075`).
+The client asks GitHub for the list of releases **when its window opens**, and
+again when you press Settings, About, *Check for a new version*. It sends
+nothing about you and downloads nothing itself. While P2Poker is a beta its
+protocol changes from one version to the next, so **a newer release is
+required**: an older client says which version is out, hands its download to
+your browser, and does not sit down at a table until the new one is started. A
+client that cannot reach GitHub plays (`D-075`, `D-077`).
 
 ## Testing
 

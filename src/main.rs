@@ -1550,7 +1550,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 let _ = commands.try_send(cmd);
             }
             cc.egui_ctx.set_zoom_factor(settings.zoom());
-            Ok(Box::new(Client {
+            let mut client = Client {
                 state,
                 screen,
                 join,
@@ -1585,7 +1585,11 @@ fn windowed(player: Player, run: Run) -> Started {
                 bounded,
                 started,
                 _rt: rt,
-            }))
+            };
+            // `D-077`: the window's one question of its own, as it opens -- the
+            // lobby waits for the answer, and a newer release closes it.
+            client.check_for_update(&cc.egui_ctx, true);
+            Ok(Box::new(client))
         }),
     );
     match result {
@@ -2259,15 +2263,23 @@ impl Client {
         Some(shown.view)
     }
 
-    /// `D-075`: one question to GitHub, on a thread of its own -- it is a
-    /// stranger's server and takes as long as it takes. Started by the button
-    /// and by nothing else.
-    fn check_for_update(&mut self, ctx: &eframe::egui::Context) {
-        if self.ui.update == render::UpdateUi::Checking {
+    /// `D-075`, `D-077`: one question to GitHub, on a thread of its own -- it is
+    /// a stranger's server and takes as long as it takes, within the check's
+    /// own clock. Asked as the window opens (`opening`), when the lobby waits
+    /// for the answer, and by the About page's button, when it does not.
+    fn check_for_update(&mut self, ctx: &eframe::egui::Context, opening: bool) {
+        if matches!(self.ui.update, render::UpdateUi::Checking | render::UpdateUi::Opening) {
             return;
         }
-        self.ui.update = render::UpdateUi::Checking;
-        self.state.log.push_back("asked GitHub whether a newer version is out (the About page's button)".into());
+        self.ui.update = if opening { render::UpdateUi::Opening } else { render::UpdateUi::Checking };
+        self.state.note_update(
+            if opening {
+                "asked GitHub whether a newer version is out (as the window opens, D-077)"
+            } else {
+                "asked GitHub whether a newer version is out (the About page's button)"
+            }
+            .into(),
+        );
         let (tx, ctx) = (self.update_done.0.clone(), ctx.clone());
         std::thread::spawn(move || {
             let _ = tx.send(p2p_poker::app::update::check());
@@ -2277,12 +2289,45 @@ impl Client {
 
     fn update_answers(&mut self) {
         while let Ok(answer) = self.update_done.1.try_recv() {
-            self.state.log.push_back(match &answer {
+            self.state.note_update(match &answer {
                 Ok(v) => format!("the version check: {v:?}"),
-                Err(e) => format!("the version check failed: {e}"),
+                Err(e) => format!("the version check failed, and nothing is closed for it: {e}"),
             });
+            if let Ok(p2p_poker::app::update::Verdict::Newer { latest, .. }) = &answer {
+                self.state.note_update(format!(
+                    "version {} can no longer play: {latest} is out, and the lobby is closed to this one (D-077)",
+                    p2p_poker::app::update::compared_version()
+                ));
+            }
             self.ui.update = render::UpdateUi::Done(answer);
         }
+    }
+
+    /// `D-077`: the newer release's program, or its page, in the player's own
+    /// browser. Both addresses are this build's releases page with the tag the
+    /// check believed; the one opened is said in the log either way, so a
+    /// player whose system opened nothing can still read where it is.
+    fn open_the_newer_release(&mut self, download: bool) {
+        let p2p_poker::gui::lobby::Gate::Closed { tag, .. } = p2p_poker::gui::lobby::gate(&self.ui.update) else {
+            return;
+        };
+        let address = if download {
+            p2p_poker::app::update::download_url(&tag)
+        } else {
+            p2p_poker::app::update::notes_url(&tag)
+        };
+        let Some(url) = address else {
+            return;
+        };
+        let opened = open_in_browser(&url);
+        if download {
+            self.ui.download_handed = Some(opened);
+        }
+        self.state.note_update(format!(
+            "the new version's {} {}: {url}",
+            if download { "download" } else { "page" },
+            if opened { "was handed to the browser" } else { "could not be opened; it is at" },
+        ));
     }
 
     /// `D-068`: a backup is a second of key stretching and a file: made on a
@@ -3006,7 +3051,12 @@ impl eframe::App for Client {
                             render::BUG_REPORT_URL
                         ));
                     }
-                    render::LobbyAction::CheckForUpdate => self.check_for_update(&ctx),
+                    render::LobbyAction::CheckForUpdate => self.check_for_update(&ctx, false),
+                    render::LobbyAction::DownloadUpdate => self.open_the_newer_release(true),
+                    render::LobbyAction::UpdateNotes => self.open_the_newer_release(false),
+                    // `D-077`: closed to start the new version. The window's own
+                    // close, as the title bar's is.
+                    render::LobbyAction::QuitForUpdate => ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close),
                     render::LobbyAction::OpenReleases => {
                         let opened = open_in_browser(render::RELEASES_URL);
                         self.state.log.push_back(format!(
@@ -3082,6 +3132,23 @@ mod tests {
     fn our_own_faults_do_not_earn_a_second_attempt() {
         let mine = eframe::Error::AppCreation(Box::new(std::io::Error::other("my fault")));
         assert!(!is_a_driver_problem(&mine));
+    }
+
+    /// **`D-077`: the window asks as it opens, and the button is the other way
+    /// in.** Read from the source: the question is asked where the window's
+    /// client is made -- after it exists and before its first frame -- and the
+    /// About page's button asks without holding the lobby.
+    #[test]
+    fn the_window_asks_as_it_opens_and_the_button_asks_without_holding_the_lobby() {
+        let whole = include_str!("main.rs").replace("\r\n", "\n");
+        // The program only: this test's own words would otherwise be found.
+        let code = &whole[..whole.find("\n#[cfg(test)]\nmod tests").expect("the tests")];
+        let made = code.find("let mut client = Client {").expect("where the window's client is made");
+        let asked = code.find("client.check_for_update(&cc.egui_ctx, true);").expect("the opening question");
+        let handed = code.find("Ok(Box::new(client))").expect("and handed to the window");
+        assert!(made < asked && asked < handed, "asked once the client exists, before the window has it");
+        assert!(code.contains("render::LobbyAction::CheckForUpdate => self.check_for_update(&ctx, false),"));
+        assert_eq!(code.matches("check_for_update(&cc.egui_ctx, true)").count(), 1, "one opening question");
     }
 
     #[test]

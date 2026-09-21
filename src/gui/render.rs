@@ -122,11 +122,17 @@ pub enum LobbyAction {
     OpenDonationPage,
     /// `D-072`: open the bug reports page, `BUG_REPORT_URL`, in the browser.
     OpenBugReports,
-    /// `D-075`: ask GitHub whether a newer version is out. Only ever from the
-    /// button: the client never asks by itself.
+    /// `D-075`: ask GitHub whether a newer version is out -- the About page's
+    /// button. The one other question is the window's own as it opens (`D-077`).
     CheckForUpdate,
     /// `D-075`: open the releases page, `RELEASES_URL`, in the browser.
     OpenReleases,
+    /// `D-077`: hand the newer release's program to the browser to download.
+    DownloadUpdate,
+    /// `D-077`: open the newer release's own page: what is new in it.
+    UpdateNotes,
+    /// `D-077`: close the client, to start the new version.
+    QuitForUpdate,
     /// `D-073`: show the folder this program runs from.
     ShowProgramFolder,
     /// `D-073`: a portable copy asks to be installed: this client closes and
@@ -159,7 +165,9 @@ pub const BUG_REPORT_URL: &str = "https://github.com/qavryxdevv/P2Poker/issues/n
 /// releases, newest on top. A constant of the build like the two above, and for
 /// the same reason: **what GitHub answers to the version check is read for
 /// numbers and never for an address**, so the page a player is sent to cannot
-/// be chosen by whoever answers.
+/// be chosen by whoever answers. `D-077`: a release's own page and its program
+/// are this address with the release's tag in the path, and nothing else of
+/// the answer (`app::update::download_url`).
 pub const RELEASES_URL: &str = "https://github.com/qavryxdevv/P2Poker/releases";
 
 /// `D-075`: the version check, as the About page holds it.
@@ -168,6 +176,10 @@ pub enum UpdateUi {
     /// Not asked yet in this session.
     #[default]
     Idle,
+    /// `D-077`: the question the window asks as it opens. The lobby waits for
+    /// its answer (`lobby::gate`).
+    Opening,
+    /// The About page's button was pressed and GitHub has not answered.
     Checking,
     Done(Result<crate::app::update::Verdict, String>),
 }
@@ -342,6 +354,9 @@ pub struct LobbyUi {
     pub home: Option<HomeView>,
     /// `D-075`: what the version check said, if it was asked.
     pub update: UpdateUi,
+    /// `D-077`: the download of a newer release was asked for, and whether the
+    /// system's browser took the address.
+    pub download_handed: Option<bool>,
 }
 
 /// The settings dialog's pages, one at a time: all of them on one page no longer
@@ -401,6 +416,7 @@ impl LobbyUi {
             side_open: false,
             home: None,
             update: UpdateUi::default(),
+            download_handed: None,
             settings,
             settings_tab: SettingsTab::default(),
             backup: BackupUi::default(),
@@ -723,6 +739,15 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     // columns; nothing else can have been pressed in the same pass.
     if let Some(what) = asked {
         action = what;
+    }
+
+    // `D-077`: the lobby shut to this version, or waiting for the answer that
+    // says whether it is -- the gate's own window over everything, and its
+    // buttons the only thing that reaches the client.
+    let gate = super::lobby::gate(&state.update);
+    if gate != super::lobby::Gate::Open {
+        let from_gate = gate_modal(ui.ctx(), &gate, state);
+        action = super::lobby::through_the_gate(&gate, action, from_gate);
     }
 
     action
@@ -1196,14 +1221,14 @@ pub fn update_words(update: &UpdateUi) -> Option<(String, Color32)> {
     use crate::app::update::Verdict;
     Some(match update {
         UpdateUi::Idle => return None,
-        UpdateUi::Checking => ("Asking GitHub\u{2026}".to_owned(), theme::TEXT_DIM),
+        UpdateUi::Opening | UpdateUi::Checking => ("Asking GitHub\u{2026}".to_owned(), theme::TEXT_DIM),
         UpdateUi::Done(Ok(Verdict::Newest { latest })) => {
             (format!("This is the newest version. The newest release is {latest}."), theme::OK)
         }
-        UpdateUi::Done(Ok(Verdict::Newer { latest })) => (
+        UpdateUi::Done(Ok(Verdict::Newer { latest, .. })) => (
             format!(
-                "Version {latest} is out. Download it from the releases page and start it: it offers to update \
-                 this installation, and your player profile stays as it is."
+                "Version {latest} is out, and this one can no longer play. Download it from the releases page and \
+                 start it: it offers to update this installation, and your player profile stays as it is."
             ),
             theme::GOLD_ACTION,
         ),
@@ -1217,7 +1242,7 @@ pub fn update_words(update: &UpdateUi) -> Option<(String, Color32)> {
 fn update_section(ui: &mut egui::Ui, update: &UpdateUi) -> Option<LobbyAction> {
     let mut action = None;
     ui.horizontal(|ui| {
-        let asking = *update == UpdateUi::Checking;
+        let asking = matches!(update, UpdateUi::Checking | UpdateUi::Opening);
         if ui.add_enabled(!asking, egui::Button::new("Check for a new version")).clicked() {
             action = Some(LobbyAction::CheckForUpdate);
         }
@@ -1233,13 +1258,126 @@ fn update_section(ui: &mut egui::Ui, update: &UpdateUi) -> Option<LobbyAction> {
     ui.add_space(4.0);
     ui.label(
         RichText::new(
-            "Asks GitHub for its list of releases when you press the button, and never by itself. GitHub sees the \
+            "Asks GitHub for its list of releases when P2Poker opens and when you press the button. GitHub sees the \
              address the question comes from, as it would if you opened the page; nothing about you or this client \
-             is sent, and nothing is downloaded.",
+             is sent. P2Poker downloads nothing itself: a new version is downloaded by your browser.",
         )
         .color(style::mix(theme::TEXT_DIM, theme::PANEL, 0.3))
         .size(13.0),
     );
+    action
+}
+
+/// `D-077`: why the lobby waits a moment as the window opens.
+const GATE_ASKING: &str = "P2Poker asks GitHub once, as it opens, whether a newer version is out: this beta's \
+                           protocol still changes from one version to the next, and an older client cannot play \
+                           with a newer one.";
+
+/// `D-077`: the window over a lobby that is not open to this version. While the
+/// window's opening question is out, a spinner and why it is asked; once a
+/// newer release is known, which one it is, its download, and what to do next,
+/// for where this copy lives.
+///
+/// A modal and not a dialog: nothing under it can be clicked, and it has no
+/// close box -- Escape and a click beside it are not read. What leaves it is
+/// its own buttons, and closing the client.
+fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -> Option<LobbyAction> {
+    use super::lobby::Gate;
+    let mut action = None;
+    egui::Modal::new(egui::Id::new("update-gate"))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::GOLD_EDGE))
+                .corner_radius(12.0)
+                .inner_margin(22.0),
+        )
+        .show(ctx, |ui| {
+            let room = ctx.content_rect();
+            ui.set_width((room.width() - 60.0).clamp(260.0, 520.0));
+            match gate {
+                Gate::Open => {}
+                Gate::Asking => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(26.0).color(theme::GOLD_ACTION));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Checking for a new version").color(theme::TEXT).size(21.0).strong());
+                    });
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(RichText::new(GATE_ASKING).color(theme::TEXT_DIM).size(15.0)).wrap());
+                    super::table::paint_again(ctx, std::time::Duration::from_millis(250));
+                }
+                Gate::Closed { latest, tag } => {
+                    let words =
+                        super::lobby::closed_words(latest, &crate::app::update::compared_version(), state.home.as_ref());
+                    let body_height = (room.height() - 160.0).max(140.0);
+                    scroller(egui::ScrollArea::vertical())
+                        .id_salt("update-gate-body")
+                        .max_height(body_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&words.heading).color(theme::GOLD_ACTION).size(22.0).strong());
+                            ui.add_space(6.0);
+                            ui.add(egui::Label::new(RichText::new(&words.body).color(theme::TEXT).size(15.5)).wrap());
+                            ui.add_space(12.0);
+                            ui.horizontal_wrapped(|ui| {
+                                let wide = style::text_width(ui.painter(), &words.download, 18.0, style::Weight::Bold) + 56.0;
+                                if gold_button(ui, &words.download, egui::vec2(wide.max(200.0), 44.0)).clicked() {
+                                    action = Some(LobbyAction::DownloadUpdate);
+                                }
+                                let notes = egui::Button::new(RichText::new("What is new").size(15.0))
+                                    .min_size(egui::vec2(0.0, 40.0));
+                                if ui.add(notes).clicked() {
+                                    action = Some(LobbyAction::UpdateNotes);
+                                }
+                            });
+                            if let Some(handed) = state.download_handed {
+                                ui.add_space(6.0);
+                                let tone = if handed { theme::OK } else { theme::WARN };
+                                ui.label(RichText::new(super::lobby::handed_words(handed)).color(tone).size(14.5));
+                            }
+                            ui.add_space(10.0);
+                            ui.add(egui::Label::new(RichText::new(&words.next).color(theme::TEXT_DIM).size(14.5)).wrap());
+                            if let Some(folder) = words.folder.as_ref() {
+                                ui.add_space(6.0);
+                                egui::Frame::new()
+                                    .fill(theme::FIELD)
+                                    .stroke(Stroke::new(1.0, theme::LINE))
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin::symmetric(12, 8))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            let label = if words.by_hand { "This copy is in" } else { "Installed in" };
+                                            ui.label(RichText::new(label).color(theme::TEXT_DIM).size(13.0));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("Show in folder").clicked() {
+                                                    action = Some(LobbyAction::ShowProgramFolder);
+                                                }
+                                            });
+                                        });
+                                        let path = RichText::new(folder.display().to_string()).color(theme::TEXT).size(14.0);
+                                        ui.add(egui::Label::new(path.monospace()).wrap());
+                                    });
+                            }
+                            if let Some(url) = crate::app::update::download_url(tag) {
+                                ui.add_space(8.0);
+                                let quiet = style::mix(theme::TEXT_DIM, theme::PANEL, 0.2);
+                                ui.add(egui::Label::new(RichText::new(url).color(quiet).size(12.5).monospace()).wrap().selectable(true));
+                            }
+                        });
+                    ui.add_space(14.0);
+                    ui.vertical_centered(|ui| {
+                        let close = egui::Button::new(RichText::new("Close P2Poker").color(theme::TEXT))
+                            .fill(theme::PANEL_LIGHT)
+                            .min_size(egui::vec2(200.0, 40.0));
+                        if ui.add(close).clicked() {
+                            action = Some(LobbyAction::QuitForUpdate);
+                        }
+                    });
+                }
+            }
+        });
     action
 }
 
@@ -3615,7 +3753,8 @@ mod tests {
         assert!(words(UpdateUi::Checking).contains("Asking GitHub"));
         let newest = words(UpdateUi::Done(Ok(Verdict::Newest { latest: "0.1.0".into() })));
         assert!(newest.contains("newest version") && newest.contains("0.1.0"), "{newest}");
-        let newer = words(UpdateUi::Done(Ok(Verdict::Newer { latest: "0.2.0".into() })));
+        assert!(words(UpdateUi::Opening).contains("Asking GitHub"), "the window's own question reads the same");
+        let newer = words(UpdateUi::Done(Ok(Verdict::Newer { latest: "0.2.0".into(), tag: "v0.2.0".into() })));
         assert!(newer.contains("Version 0.2.0 is out") && newer.contains("releases page"), "{newer}");
         assert!(newer.contains("player profile stays"), "an update must not read as a new player: {newer}");
         assert!(words(UpdateUi::Done(Ok(Verdict::NoRelease))).contains("No release"));
@@ -3632,6 +3771,22 @@ mod tests {
         assert_eq!(repo(RELEASES_URL), repo(DONATION_URL));
         assert_eq!(repo(RELEASES_URL), repo(BUG_REPORT_URL));
         assert!(crate::app::update::RELEASES_API.contains("/repos/qavryxdevv/P2Poker/"), "and the question goes to the same one");
+    }
+
+    /// **`D-077`: the lobby's last word is the gate's.** Whatever the columns,
+    /// the dialogs and the small windows produced in a frame, it passes through
+    /// `lobby::through_the_gate` last -- read from the source, because it is a
+    /// frame's wiring and not a decision: the decisions are tested next door.
+    #[test]
+    fn the_lobby_ends_at_the_gate() {
+        let code = include_str!("render.rs").replace("\r\n", "\n");
+        let start = code.find("pub fn lobby(ui: &mut egui::Ui").expect("the lobby");
+        let body = &code[start..start + code[start..].find("\n}\n").expect("its end")];
+        let gate = body.find("let gate = super::lobby::gate(&state.update);").expect("the gate is asked");
+        let through = body.find("action = super::lobby::through_the_gate(&gate, action, from_gate);").expect("and passed");
+        let asked = body.rfind("if let Some(what) = asked {").expect("the small windows");
+        assert!(asked < gate && gate < through, "the gate after everything else that sets the action");
+        assert!(body[through..].trim_end().ends_with("}\n\n    action"), "and nothing after it but the answer");
     }
 
     /// **`D-072`: the About page says what this build is, and where a bug

@@ -941,6 +941,10 @@ pub struct RateLimiter {
 ///
 /// It governs **displacement, not arrival**: a window with room takes every
 /// table at once, so an empty lobby fills in seconds rather than in ten minutes.
+///
+/// `D-076`: and the lobby's list of **players** turns over at this same pace,
+/// by the same counter (`app::players`) -- the owner's word, *the way the
+/// tables are*.
 pub const ROWS_ROTATED_PER_MIN: u32 = 50;
 
 /// `D-054`: how many lines one key may say in the lobby a minute.
@@ -968,14 +972,17 @@ fn prune(map: &mut BTreeMap<[u8; 32], Window>, now_ms: u64) {
     map.retain(|_, w| now_ms.saturating_sub(w.started_ms) < 60_000);
 }
 
+/// A count over one minute: `cap` admissions, then none until the minute is
+/// over. `pub(crate)` for `D-076`: the lobby's list of players turns over at
+/// the tables' pace by this same counter, so the two cannot drift apart.
 #[derive(Debug, Clone, Copy, Default)]
-struct Window {
+pub(crate) struct Window {
     started_ms: u64,
     count: u32,
 }
 
 impl Window {
-    fn admit(&mut self, now_ms: u64, cap: u32) -> bool {
+    pub(crate) fn admit(&mut self, now_ms: u64, cap: u32) -> bool {
         if now_ms.saturating_sub(self.started_ms) >= 60_000 {
             self.started_ms = now_ms;
             self.count = 0;

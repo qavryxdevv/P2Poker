@@ -5846,8 +5846,10 @@ class into a single map has pre-committed the version-2 defect.
   11 and reads only envelope fields. The one thing it opens is a memory bound, and
   it is bounded in the paragraph above, in the section that already owns that
   discipline.
-* The lobby keeps at most `MAX_TRACKED_TABLES = 512` `(table_id, last_timestamp)`
-  pairs in an LRU, and at most `MAX_TRACKED_PRESENCE = 8192` peers.
+* The lobby keeps at most `MAX_TRACKED_TABLES = 512` tables and at most
+  `MAX_TRACKED_PRESENCE = 512` players. A full window of either makes room by
+  letting the entry shown longest go, at most `ROWS_ROTATED_PER_MIN` = 50 a
+  minute (`DECISIONS.md` D-055, D-076).
 
 ---
 
@@ -6733,8 +6735,9 @@ The layers, cheapest first:
    Exceeding a limit gets
    `MessageAcceptance::Reject`, which applies the GossipSub P₄ score penalty to the
    forwarder as well.
-3. **Bounded caches** — `MAX_TRACKED_TABLES = 512`, `MAX_TRACKED_PRESENCE = 8192`,
-   both LRU. A full cache evicts; it never grows.
+3. **Bounded caches** — `MAX_TRACKED_TABLES = 512`, `MAX_TRACKED_PRESENCE = 512`.
+   A full cache lets the entry shown longest go, at a bounded pace (D-055,
+   D-076); it never grows.
 4. **Content deduplication** through the overridden `message_id_fn` (§7.1),
    without which republication of identical bytes is free.
 5. **Subscription filtering** — `MaxCountSubscriptionFilter` so a peer cannot
@@ -8160,7 +8163,7 @@ processed.
 | `ledger_delta` in `HAND_INIT` | `MAX_SEATS` | ascending by seat, unique |
 | `MAX_STAGES_PER_HAND` | 2 048 | exceeding it aborts the hand |
 | `MAX_TRACKED_TABLES` | 512 | the row shown longest makes way, D-055; never the table this client is at |
-| `MAX_TRACKED_PRESENCE` | 8 192 | LRU |
+| `MAX_TRACKED_PRESENCE` | 512 | the player shown longest makes way, at the tables' pace, D-076 |
 | `MAX_CBOR_NESTING_DEPTH` | 8 | our own limit, well above the 3 levels we use |
 
 String fields: `display_name` ≤ 32 B, `table_name` ≤ 64 B, `client_name` ≤ 64 B,
@@ -8715,7 +8718,7 @@ IDLE_CONNECTION_TIMEOUT_MS      = 60 000
 MDNS_QUERY_INTERVAL_MS          = 15 000
 SNAPSHOT_PEER_COUNT             = 4
 MAX_TRACKED_TABLES              = 512           (local)
-MAX_TRACKED_PRESENCE            = 8 192         (local)
+MAX_TRACKED_PRESENCE            = 512           (local)
 MAX_ADS_PER_TABLE_KEY_PER_MIN   = 4             (local)
 MAX_ADS_PER_PEER_PER_MIN        = 90            (local)
 MAX_PRESENCE_PER_PEER_PER_MIN   = 4             (local; and the same figure for
