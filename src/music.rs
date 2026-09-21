@@ -23,8 +23,10 @@
 //! never moved. A client that never searches never opens the device and never
 //! starts the thread.
 //!
-//! The sounds are Windows' `waveOut`, as `sound::Player`'s are; elsewhere the
-//! music is silent and everything here but the device still runs and is tested.
+//! The device is Windows' `waveOut`, as `sound::Player`'s is, and since `D-079`
+//! on Linux ALSA's `default` device (`crate::alsa`), where a write waits while
+//! the device plays, so the device itself sets the pace; elsewhere the music is
+//! silent and everything here but the device still runs and is tested.
 
 use std::io::Cursor;
 
@@ -341,10 +343,115 @@ mod device {
     }
 }
 
+/// `D-079`: the music on Linux -- the same track, envelope and commands, into
+/// a stream on ALSA's `default` device. A write waits while the device holds
+/// a fifth of a second, so the device sets the pace, and a command is looked
+/// for between two twentieths of a second: a fade is heard as soon as on
+/// Windows.
+#[cfg(target_os = "linux")]
+mod device {
+    use super::{shape, Envelope, Track};
+    use std::sync::mpsc::{Receiver, TryRecvError};
+
+    pub enum Cmd {
+        /// Play at this gain, from the beginning if nothing is playing.
+        Play(f32),
+        /// Fade away and stop.
+        Fade,
+    }
+
+    /// A twentieth of a second at a time, into a device holding a fifth.
+    const CHUNK_MS: u32 = 50;
+    const LATENCY_MS: u32 = 200;
+
+    struct Voice {
+        pcm: crate::alsa::Pcm,
+        track: Track,
+        envelope: Envelope,
+        gain: f32,
+        channels: usize,
+        samples: Vec<i16>,
+        bytes: Vec<u8>,
+    }
+
+    impl Voice {
+        fn open() -> Option<Voice> {
+            let track = Track::open()?;
+            let (rate, channels) = (track.rate(), track.channels());
+            if rate == 0 || !(1..=2).contains(&channels) {
+                return None;
+            }
+            let pcm = crate::alsa::Pcm::open(channels, rate, LATENCY_MS)?;
+            let samples = (rate * CHUNK_MS / 1_000) as usize * usize::from(channels);
+            Some(Voice {
+                pcm,
+                track,
+                envelope: Envelope::new(rate),
+                gain: 0.0,
+                channels: usize::from(channels),
+                samples: vec![0; samples],
+                bytes: vec![0; samples * 2],
+            })
+        }
+
+        /// The next twentieth of a second, written -- once the device has room
+        /// for it. `false` when the device gave up.
+        fn pump(&mut self) -> bool {
+            self.track.fill(&mut self.samples);
+            shape(&self.samples, self.channels, self.gain, &mut self.envelope, &mut self.bytes);
+            self.pcm.write(&self.bytes)
+        }
+    }
+
+    /// The music's thread: until the window lets go of its end of the channel.
+    pub fn run(rx: Receiver<Cmd>) {
+        let mut voice: Option<Voice> = None;
+        loop {
+            // Playing, the device sets the pace and a command is looked for
+            // between two chunks; with nothing playing, the thread sleeps until
+            // it is told something.
+            let cmd = if voice.is_some() {
+                match rx.try_recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => break,
+                }
+            };
+            match cmd {
+                Some(Cmd::Play(gain)) => {
+                    if voice.is_none() {
+                        voice = Voice::open();
+                    }
+                    if let Some(v) = voice.as_mut() {
+                        v.gain = gain;
+                        v.envelope.aim(true);
+                    }
+                }
+                Some(Cmd::Fade) => {
+                    if let Some(v) = voice.as_mut() {
+                        v.envelope.aim(false);
+                    }
+                }
+                None => {}
+            }
+            // Faded out -- or a device that gave up -- the stream is closed,
+            // and the next search hears the track from its beginning.
+            if voice.as_mut().is_some_and(|v| v.envelope.silent() || !v.pump()) {
+                voice = None;
+            }
+        }
+    }
+}
+
 /// What the window owns: it says what should be, the thread does it.
 #[derive(Default)]
 pub struct Music {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     tx: Option<std::sync::mpsc::Sender<device::Cmd>>,
     on: bool,
     volume: u8,
@@ -368,7 +475,7 @@ impl Music {
         }
         self.on = on;
         self.volume = volume;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             if on {
                 let tx = self.tx.get_or_insert_with(|| {

@@ -890,6 +890,10 @@ edge now -- it was compiled already, for `gpu-allocator`, `if-watch` and `sysinf
 uses switched on by them. It carries the shell's two COM conversations, which `windows-sys` does not model: where
 this user's folders are, and a shortcut written and read back. **No byte from a peer reaches it**: every path it is
 given is the system's own answer or a constant of this build, and the installer has no network code at all.
+**And for `D-079`'s sound on Linux:** `libloading 0.8.9` (`github.com/nagisa/rust_libloading`, ISC) is a direct edge
+on Linux only -- it was in the tree already for the window's OpenGL (`glutin`), so the lockfile gained the line that
+says so and no crate. It opens ALSA's `libasound.so.2` by that constant name; **no byte from a peer reaches it**, and
+what is played through it is this client's own compiled-in sounds and music.
 The count moved from 339 with them, and with `serde_json`, which `D-068` took into §5.7. The same holds for the renderer: `naga` compiles shaders, and the
 only shaders it ever sees are `egui`'s own, compiled in. **This assumption fails the moment anything peer-supplied is
 rendered** — an avatar, a table skin, a chat message with an image, a downloaded

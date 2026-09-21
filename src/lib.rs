@@ -12,6 +12,9 @@
 //!              `-> security       keys, randomness, validation, limits
 //! ```
 
+/// `D-079`: sound on Linux, through ALSA's library opened at run time.
+#[cfg(target_os = "linux")]
+pub mod alsa;
 pub mod app;
 pub mod gui;
 pub mod install;

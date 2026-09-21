@@ -6783,6 +6783,10 @@ an installed copy that could not be replaced because it runs is a page of its ow
 program, built from the same commit and attested the same way. For a Windows player nothing changes but the number;
 a 0.1.2 client is told to update all the same, as `D-077` tells it for every release while this is a beta.
 
+**The fifth release, 2026-09-21 -- `v0.1.4`, on the owner's word that the Linux build should sound** (`D-079`). The
+Linux client plays the table's sounds and the search music through ALSA; `--sound-check` plays them all, on either
+system. For a Windows player nothing changes but the number, and 0.1.3 is told to update as every client is.
+
 ## D-075 — *Check for a new version*: asked by the player, never by the client
 
 **Decided 2026-09-20 by the project owner:** *add to the application, in the settings' About tab, a button that
@@ -7005,3 +7009,37 @@ that are plain functions -- where the profile lives, the offset `date` prints, t
 page -- are held by four tests, and six breaks of them fail by their own assertions. **Not measured:** a real Linux
 desktop -- nobody has played a hand on one yet; the window has run on a virtual display with Mesa's software OpenGL
 only.
+
+**`D-079`, the same day:** the Linux client plays the sounds and the search music through ALSA; the point above that
+said it was silent no longer holds.
+
+## D-079 — Sound on Linux: ALSA's library, opened at run time
+
+**Decided 2026-09-21 by the project owner:** *make the sounds work on the Linux build.*
+
+1. **Through ALSA's `libasound.so.2`**, which every desktop distribution carries and which PipeWire and PulseAudio both
+   serve through their ALSA plugins: the one API reaches whatever the desktop runs (`src/alsa.rs`).
+2. **Opened with `dlopen`, not linked** -- through `libloading`, in the tree already for the window's OpenGL: a machine
+   without the library starts and is silent, as a Windows machine without an audio device is, and the build needs no
+   ALSA headers. The `.deb` recommends `libasound2` (or `libasound2t64`, Ubuntu 24.04's name for it) and the `.rpm`
+   `libasound.so.2` -- recommended and not required, because without it the client is silent, not broken.
+3. **The sounds** (`sound::Player`): each on a stream of its own, on a thread of its own -- an ALSA write waits while the
+   device plays, where `waveOut` returns at once, so the window's thread never writes one -- and at most four at once,
+   the size of the Windows pool. A fifth, which a table does not make, is not played; Windows cuts the oldest for it.
+4. **The search music** (`music.rs`'s Linux device): the same track, envelope and commands as on Windows. A write waits
+   while the device holds a fifth of a second, so the device sets the pace, and a command is looked for between two
+   twentieths of a second: a fade is heard as soon as on Windows.
+5. **`--sound-check`** plays every sound once and three seconds of the music with its fade, and stops -- *is the sound
+   working here?* answered without a table, on either system. On Linux it says so, and exits 1, where ALSA's library
+   or its default device cannot be opened.
+6. **Tested where there is no speaker.** The release workflow's Linux job starts PulseAudio with a sink that plays to
+   nothing, points ALSA's default device at it through ALSA's PulseAudio plugin -- the way a desktop's sound reaches
+   its sound server -- runs `--sound-check` from the installed `.deb` and records the sink, in windows of 10 ms, a
+   window heard when a sample in it is over 300. Of the fifteen sounds 11.7 s are heard so: at least 9 s must be,
+   before the line that says the music starts, and at least 2 s of the music after it; and the client must have used
+   under 2.5 s of processor time, which it would not have if it wrote ahead of the device instead of waiting for it.
+
+**What is NOT done.** Heard by nobody yet: the test proves that the sounds reach a sound server through ALSA as a
+desktop's do, but no one has listened on a Linux machine, and PipeWire's own ALSA plugin, the default on the newest
+distributions, is not in the test. Each sound opens a stream of its own, which costs a few milliseconds before it is
+heard.

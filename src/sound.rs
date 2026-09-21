@@ -30,7 +30,11 @@
 //! turn warning overlap instead of cutting each other off; the volume scales
 //! the samples. The fourteen files are 16-bit stereo PCM at 44.1 kHz, embedded
 //! in the binary so a copied client still sounds; their provenance is
-//! `assets/pokerth/PROVENANCE.md`. Anywhere but Windows the player is silent.
+//! `assets/pokerth/PROVENANCE.md`.
+//!
+//! `D-079`: on Linux each sound is a stream of its own on ALSA's `default`
+//! device (`crate::alsa`), played on a thread of its own, at most four at once
+//! as on Windows. Anywhere else the player is silent.
 
 /// One of PokerTH's sounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -355,11 +359,68 @@ mod player {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod player {
+    use super::{parse_wav, scaled, Cue};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// How many sounds may overlap: the Windows pool's four.
+    const POOL: usize = 4;
+    /// What ALSA queues ahead of a sound: short, because a sound is short and
+    /// is heard the moment its action is taken.
+    const LATENCY_MS: u32 = 80;
+
+    /// `D-079`: the sounds, each played through a stream of its own on a
+    /// thread of its own. ALSA's writes wait while the device plays -- where
+    /// `waveOut` returns at once -- so the window's thread never writes one.
+    #[derive(Default)]
+    pub struct Player {
+        playing: Arc<AtomicUsize>,
+    }
+
+    impl Player {
+        pub fn new() -> Player {
+            Player::default()
+        }
+
+        /// Play `cue` at `volume` tenths (1..=10). Returns at once; a thread
+        /// plays it. With four already sounding, it is not played: the next
+        /// action is heard, where a queue of them would be heard late.
+        pub fn play(&mut self, cue: Cue, volume: u8) {
+            let Some(pcm) = parse_wav(cue.wav()) else {
+                return;
+            };
+            if pcm.channels != 2 || pcm.rate != 44_100 {
+                return;
+            }
+            if self.playing.fetch_add(1, Ordering::SeqCst) >= POOL {
+                self.playing.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            let bytes = scaled(pcm.data, volume.clamp(1, 10));
+            let playing = Arc::clone(&self.playing);
+            let started = std::thread::Builder::new().name("sound".into()).spawn(move || {
+                if let Some(mut out) = crate::alsa::Pcm::open(2, 44_100, LATENCY_MS) {
+                    if out.write(&bytes) {
+                        out.drain();
+                    }
+                }
+                playing.fetch_sub(1, Ordering::SeqCst);
+            });
+            if started.is_err() {
+                self.playing.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod player {
     use super::Cue;
 
-    /// Silent: this client plays sounds through Windows' `waveOut` only.
+    /// Silent: this client plays sounds through Windows' `waveOut` and
+    /// Linux's ALSA only.
     #[derive(Default)]
     pub struct Player;
 

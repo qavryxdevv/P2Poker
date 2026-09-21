@@ -1,6 +1,6 @@
 [package]
 name = "p2p-poker"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.89"
 description = "Decentralised No-Limit Texas Hold'em: the lobby over libp2p and its public Kademlia DHT, the tables over Tox groups"
@@ -133,6 +133,10 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Co
 # then have nothing to open a window on. The same eframe, two more features.
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.36.1", default-features = false, features = ["x11", "wayland"] }
+# `D-079`: ALSA's library, opened at run time for the sounds and the music.
+# Already in the tree for the window's OpenGL (`glutin`), so this adds the edge
+# and nothing to the lockfile; and no ALSA headers are needed to build.
+libloading = "0.8"
 
 # --- dev-only: the arkworks types the vendored ziffle is built on --------
 # Present so tests/deck_constants.rs (ZIFFLE_VERDICT.md C-7) can recompute

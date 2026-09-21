@@ -16,6 +16,8 @@
 //! p2p-poker --host N --seats 6   a six-handed Sit-and-Go
 //! p2p-poker --host N --seats 2   a two-seat Sit-and-Go: it deals when both sit
 //! p2p-poker --renderer software  draw without a graphics driver
+//! p2p-poker --sound-check        play every sound once and the search music,
+//!                                then stop: is the sound working here?
 //! p2p-poker --install            offer to install on this computer (`D-073`);
 //!                                with no argument at all and no profile beside
 //!                                it, a first run offers that by itself
@@ -213,6 +215,12 @@ fn main() {
     if has("--table-preview") {
         preview_table(&args);
         return;
+    }
+    // `D-079`: *is the sound working here?* -- every sound once, then the
+    // search music for a moment with its fades, and nothing of the network,
+    // the profile or the window.
+    if has("--sound-check") {
+        std::process::exit(sound_check());
     }
     // `--album-preview`: the album drawn from a sample of progress, with no
     // node and no profile -- for looking at the cards. `--preview-all` earns
@@ -657,6 +665,44 @@ fn installer_window(args: &[String], exe: std::path::PathBuf) -> i32 {
             }
         },
     }
+}
+
+/// `D-079`: every sound at full volume, one after another, then three seconds
+/// of the search music and its fade. Exit code 1 where this client can be
+/// seen to be silent -- on Linux, ALSA's library or its default device not to
+/// be opened -- and 0 otherwise.
+fn sound_check() -> i32 {
+    use p2p_poker::sound::{parse_wav, Cue, Player};
+    #[cfg(target_os = "linux")]
+    {
+        if !p2p_poker::alsa::available() {
+            eprintln!("sound check: ALSA's library (libasound.so.2) could not be opened, so this client is silent here");
+            return 1;
+        }
+        if p2p_poker::alsa::Pcm::open(2, 44_100, 80).is_none() {
+            eprintln!("sound check: ALSA's default device could not be opened, so this client is silent here");
+            return 1;
+        }
+    }
+    let mut player = Player::new();
+    for cue in Cue::ALL {
+        let Some(pcm) = parse_wav(cue.wav()) else {
+            continue;
+        };
+        let bytes_a_second = u64::from(pcm.rate) * u64::from(pcm.channels) * 2;
+        let ms = pcm.data.len() as u64 * 1_000 / bytes_a_second.max(1);
+        println!("sound check: {} ({ms} ms)", cue.name());
+        player.play(cue, 10);
+        std::thread::sleep(Duration::from_millis(ms + 150));
+    }
+    println!("sound check: the search music, three seconds and its fade");
+    let mut music = p2p_poker::music::Music::new();
+    music.set(true, 10);
+    std::thread::sleep(Duration::from_secs(3));
+    music.set(false, 10);
+    std::thread::sleep(Duration::from_millis(u64::from(p2p_poker::music::MUSIC_FADE_OUT_MS) + 700));
+    println!("sound check: done");
+    0
 }
 
 /// `D-073`: where this copy lives, for the About page. Asked once. `D-078`:

@@ -253,6 +253,67 @@ jobs:
           xwd -root -silent | convert xwd:- -resize 1x1 txt:- | tail -n 1
           kill "$pid"
 
+      - name: Its sounds are heard, through ALSA, by a sound server (PulseAudio, a sink with no speaker, recorded)
+        # D-079: the sounds and the search music go to ALSA's default device, which on a desktop is its sound server
+        # behind ALSA's own plugin for it. A runner has no speaker: PulseAudio is started with a sink that plays to
+        # nothing, ALSA's default device is pointed at it, and what reaches the sink is recorded and read, in 10 ms
+        # windows, a window heard when a sample in it is over 300. Of the fifteen sounds 11.7 s are heard so: at least
+        # 9 s of them must be, before the line that says the music starts, and at least 2 s of the music's 3 s and fade
+        # after it; the client must have waited for the device, not run ahead of it, which would cost it seconds of
+        # processor time.
+        run: |
+          sudo apt-get install -y -q --no-install-recommends pulseaudio pulseaudio-utils libasound2-plugins
+          if [ ! -d "${XDG_RUNTIME_DIR:-/nonexistent}" ]; then
+            export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
+            mkdir -m 700 -p "$XDG_RUNTIME_DIR"
+          fi
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=cap
+          pactl set-default-sink cap
+          printf 'pcm.!default { type pulse }\nctl.!default { type pulse }\n' > "$HOME/.asoundrc"
+          python3 - <<'EOF'
+          import array, resource, signal, subprocess, time
+          raw = "/tmp/p2poker-sound.raw"
+          rec = subprocess.Popen(["parecord", "--raw", "--latency-msec=50", "--format=s16le", "--rate=44100",
+                                  "--channels=2", "--device=cap.monitor", raw])
+          time.sleep(1)
+          start = time.monotonic()
+          client = subprocess.Popen(["/usr/bin/p2p-poker", "--sound-check"], stdout=subprocess.PIPE, text=True)
+          marks = []
+          for line in client.stdout:
+              print(line, end="", flush=True)
+              marks.append((time.monotonic() - start, line))
+          if client.wait() != 0:
+              raise SystemExit("--sound-check failed")
+          used = resource.getrusage(resource.RUSAGE_CHILDREN)
+          cpu = used.ru_utime + used.ru_stime
+          time.sleep(1)
+          rec.send_signal(signal.SIGINT)
+          rec.wait(timeout=10)
+          data = open(raw, "rb").read()
+          samples = array.array("h")
+          samples.frombytes(data[: len(data) // 4 * 4])
+          loud = [max(max(w), -min(w)) for w in (samples[at : at + 882] for at in range(0, len(samples) - 881, 882))]
+          heard = [x > 300 for x in loud]
+          if True not in heard:
+              raise SystemExit("nothing was heard")
+          # The recording's clock is set by the first sound, heard when the client's first line says it starts.
+          first = heard.index(True)
+          music_line = next(t for t, line in marks if "search music" in line)
+          def window(t):
+              return max(0, first + round((t - marks[0][0]) * 100))
+          sounds = sum(heard[: window(music_line)]) / 100
+          music = sum(heard[window(music_line + 0.4) : window(music_line + 4.0)]) / 100
+          print("recorded %.1f s; heard: the sounds %.2f s, the music %.2f s, in all %.2f s; peak %d;"
+                " the client's processor time %.2f s" % (len(loud) / 100, sounds, music, sum(heard) / 100, max(loud), cpu))
+          if sounds < 9 or music < 2 or sum(heard) > 2400:
+              raise SystemExit("the sounds and the music were not heard as they are")
+          if cpu > 2.5:
+              raise SystemExit("the client did not wait for the device")
+          EOF
+          rm -f "$HOME/.asoundrc"
+          pulseaudio --kill
+
       - name: Attest the build's provenance
         id: attest
         if: ${{ !github.event.repository.private }}

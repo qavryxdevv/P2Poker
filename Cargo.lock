@@ -4184,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "p2p-poker"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "argon2",
  "ark-ec",
@@ -4206,6 +4206,7 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "lewton",
+ "libloading",
  "libp2p",
  "libp2p-stream",
  "minicbor",

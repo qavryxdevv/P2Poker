@@ -48,7 +48,9 @@ install -Dm644 "$root/LICENSE" "$stage/usr/share/doc/p2poker/copyright"
 summary="Decentralised poker: no house, no server, every card proven"
 description="P2Poker is a No-Limit Texas Hold'em client with no server. Players find each other peer-to-peer and deal the cards themselves, with cryptographic shuffle proofs. Sit & Go tournaments for 2 to 10 players; play money only."
 
-# .deb -- the libraries the window opens at run time, which no linker sees, are named by hand.
+# .deb -- the libraries the window opens at run time, which no linker sees, are named by hand; ALSA's, which
+# the sounds open the same way, is recommended rather than required: without it the client is silent, not broken
+# (D-079). Ubuntu 24.04 renamed it libasound2t64, so either name will do.
 deb="$work/deb"
 cp -a "$stage" "$deb"
 mkdir -p "$deb/DEBIAN"
@@ -60,6 +62,7 @@ Architecture: amd64
 Maintainer: P2Poker <270192017+qavryxdev@users.noreply.github.com>
 Installed-Size: $size
 Depends: libc6 (>= 2.35), libgl1, libegl1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libwayland-client0
+Recommends: libasound2 | libasound2t64
 Section: games
 Priority: optional
 Homepage: https://github.com/qavryxdevv/P2Poker
@@ -80,6 +83,7 @@ License: GPL-3.0-or-later
 URL: https://github.com/qavryxdevv/P2Poker
 BuildArch: x86_64
 Requires: libGL.so.1()(64bit), libEGL.so.1()(64bit), libxkbcommon.so.0()(64bit), libxkbcommon-x11.so.0()(64bit), libX11.so.6()(64bit), libX11-xcb.so.1()(64bit), libXcursor.so.1()(64bit), libXrandr.so.2()(64bit), libXi.so.6()(64bit), libwayland-client.so.0()(64bit)
+Recommends: libasound.so.2()(64bit)
 %define debug_package %{nil}
 %define __strip /bin/true
 %define _build_id_links none
