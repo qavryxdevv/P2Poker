@@ -1,6 +1,6 @@
 [package]
 name = "p2p-poker"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.89"
 description = "Decentralised No-Limit Texas Hold'em: the lobby over libp2p and its public Kademlia DHT, the tables over Tox groups"

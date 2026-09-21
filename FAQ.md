@@ -45,10 +45,16 @@ the Start menu. No administrator rights, nothing in the registry, nothing that s
 from the folder it is in. To remove it, delete its folder and the shortcuts — your player profile is in that
 folder, so back it up first (Settings → Profile) if you want to stay the same player.
 
+On Linux, the `.deb` and the `.rpm` install it as any program is installed (`sudo apt install ./p2poker_….deb`, or
+`sudo dnf install ./p2poker-….rpm`), and the AppImage is one file you make executable and start. Your player profile
+is then in `~/.local/share/p2poker/profile`.
+
 ## Mac or Linux?
 
-Not yet: the releases are for Windows (x64). The client is written in Rust, and nothing in its design is
-Windows-only, but builds for other systems are not made or tested yet.
+**Linux, yes** — since version 0.1.3, for x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and
+later). The [release page](https://github.com/qavryxdevv/P2Poker/releases/latest) has an **AppImage** for any
+distribution, a **.deb** for Ubuntu, Debian and Mint, an **.rpm** for Fedora and openSUSE, and a **.tar.gz**. The
+Linux client plays no sounds yet. **Mac: not yet.**
 
 ## Why does it ask me to update?
 
@@ -78,8 +84,9 @@ Not yet. Every table is public for now.
 
 ## Where are my results, album and settings?
 
-In the profile folder beside the program. Settings → Profile makes a backup protected by a password, and restores it
-on another computer: you are the same player there.
+In the profile folder: beside the program on Windows, `~/.local/share/p2poker/profile` on Linux. Settings → Profile
+makes a backup protected by a password, and restores it on another computer — Windows or Linux: you are the same
+player there.
 
 ## How do I report a bug?
 

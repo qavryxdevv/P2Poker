@@ -6,11 +6,16 @@ rather than promised.
 
 Written in Rust. One portable executable.
 
-> ## [Download P2Poker for Windows](https://github.com/qavryxdevv/P2Poker/releases/latest)
+> ## [Download P2Poker](https://github.com/qavryxdevv/P2Poker/releases/latest)
 >
-> One file, 45 MB: **[p2p-poker.exe](https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe)**.
+> **Windows** — one file, 45 MB: **[p2p-poker.exe](https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe)**.
 > Start it and it offers to install itself — a copy in your user folder and a shortcut on the desktop, no
 > administrator rights, nothing in the registry — or runs from the folder it is in. A beta; **play money only**.
+>
+> **Linux** — x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later): an **AppImage** for
+> any distribution, a **.deb** for Ubuntu, Debian and Mint, and an **.rpm** for Fedora and openSUSE, on the
+> [release page](https://github.com/qavryxdevv/P2Poker/releases/latest). The player profile is kept in
+> `~/.local/share/p2poker/profile`. No sound on Linux yet.
 >
 > Every release is built by GitHub from this source and GitHub signs a statement of it:
 > [how to check a download](#and-a-download-can-be-checked-against-this-source). It is not signed with a Windows

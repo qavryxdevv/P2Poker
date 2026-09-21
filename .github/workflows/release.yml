@@ -214,6 +214,26 @@ jobs:
           if [ "$code" -ne 2 ]; then echo "expected the refusal's exit code 2, got $code"; exit 1; fi
           echo "$out" | grep -Eq 'p2p-poker [0-9]+[.][0-9]+[.][0-9]+' || { echo 'the client did not say its version'; exit 1; }
 
+      - name: Its window opens on a display (Xvfb, with Mesa's software OpenGL)
+        # D-078: the table preview draws the table from its sample hand with no node, no network and no profile.
+        # A window that cannot open returns at once, so one still alive after twenty seconds opened; and the average
+        # colour of the screen says whether anything was drawn on it -- the table's felt is green.
+        run: |
+          sudo apt-get install -y -q --no-install-recommends xvfb x11-apps imagemagick libgl1-mesa-dri
+          Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
+          export DISPLAY=:99
+          sleep 2
+          ./target/release/p2p-poker --table-preview &
+          pid=$!
+          sleep 20
+          if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid"
+            echo "the window closed by itself, exit $?: it did not open"
+            exit 1
+          fi
+          xwd -root -silent | convert xwd:- -resize 1x1 txt:- | tail -n 1
+          kill "$pid"
+
       - name: The packages
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)

@@ -6778,6 +6778,11 @@ their About page's button, and the players who have them are the last ones who m
 the lobby* is a window of 512 that turns over as the tables' does (`D-076`, and `S1-IW`: it had no bound at all), and
 an installed copy that could not be replaced because it runs is a page of its own, *Close P2Poker first*.
 
+**The fourth release, 2026-09-21 -- `v0.1.3`, on the owner's word that GitHub build the client for Linux too**
+(`D-078`). The first with **Linux packages** -- an AppImage, a `.deb`, an `.rpm` and a `.tar.gz` beside the Windows
+program, built from the same commit and attested the same way. For a Windows player nothing changes but the number;
+a 0.1.2 client is told to update all the same, as `D-077` tells it for every release while this is a beta.
+
 ## D-075 — *Check for a new version*: asked by the player, never by the client
 
 **Decided 2026-09-20 by the project owner:** *add to the application, in the settings' About tab, a button that
