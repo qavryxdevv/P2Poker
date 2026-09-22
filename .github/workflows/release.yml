@@ -110,6 +110,48 @@ jobs:
           if ($out -notmatch 'p2p-poker [0-9]+[.][0-9]+[.][0-9]+') { throw 'the client did not say its version' }
           $global:LASTEXITCODE = 0
 
+      # The Authenticode signature, before the hash and the attestation so that everything the release page says is
+      # of the signed file. All three steps do nothing until SIGNPATH_ORGANIZATION_ID is set on the repository --
+      # the SignPath Foundation has the application and has not answered yet -- so a release, a dry run and a fork
+      # build exactly as they did, unsigned. The gate is on the variable rather than on the secret because a step's
+      # `if` cannot read `secrets`. docs/CODE_SIGNING.md is the policy the Foundation asks a project to publish.
+      - name: Hand the unsigned binary to the signing service
+        id: unsigned
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: p2p-poker-unsigned
+          if-no-files-found: error
+          path: target/release/p2p-poker.exe
+
+      - name: Authenticode signature (SignPath Foundation, free for open source)
+        # The key never reaches this runner: SignPath fetches the artifact of this run through its GitHub app, a
+        # person approves the request, and the signed file comes back into target/release in place of it. The three
+        # slugs are SignPath's own names for the project, the artifact and the signing policy, and are set as
+        # repository variables when the project is created there.
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: target/release
+
+      - name: And the file carries it
+        # A signature nobody reads back is a signature that can stop happening quietly. This fails the build on a
+        # file that is unsigned, broken, or signed by somebody else.
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        shell: pwsh
+        run: |
+          $s = Get-AuthenticodeSignature 'target/release/p2p-poker.exe'
+          Write-Host "$($s.Status): $($s.SignerCertificate.Subject)"
+          if ($s.Status -ne 'Valid') { throw "the signature is $($s.Status)" }
+          if ($s.SignerCertificate.Subject -notmatch 'SignPath Foundation') { throw 'signed by somebody else' }
+
       - name: SHA-256, as other tools print it
         id: digest
         shell: pwsh
