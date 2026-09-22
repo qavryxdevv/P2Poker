@@ -154,6 +154,32 @@ fn offline_window() -> Option<(Duration, Duration, Duration)> {
     })
 }
 
+/// Whether an outage `window` -- from `at`, for `dur`, again every `every`
+/// (zero: once) -- covers `since_start` of the client's life.
+#[cfg_attr(not(feature = "fault-harness"), allow(dead_code))]
+fn offline_in(window: Option<(Duration, Duration, Duration)>, since_start: Duration) -> bool {
+    window.is_some_and(|(at, dur, every)| match since_start.checked_sub(at) {
+        None => false,
+        Some(since) if every.is_zero() => since < dur,
+        Some(since) => since.as_secs() % every.as_secs() < dur.as_secs(),
+    })
+}
+
+/// fault-harness, `S1-IB`/`S1-ID`: whether the harness's outage covers the
+/// lobby's transport as well as the table's line, `since_start` of the
+/// client's life -- `P2P_POKER_OFFLINE_BOTH=1` beside the window above. The
+/// table's line is cut at the socket by this driver; `net::run` reads this
+/// and takes every libp2p connection down with it, so the founder of a
+/// search table goes dark on both lines, its advert going stale, as the
+/// owner's far client did on 2026-09-18.
+#[cfg(feature = "fault-harness")]
+pub fn both_lines_dark(since_start: Duration) -> bool {
+    use std::sync::OnceLock;
+    static BOTH: OnceLock<bool> = OnceLock::new();
+    *BOTH.get_or_init(|| std::env::var_os("P2P_POKER_OFFLINE_BOTH").is_some_and(|v| v == "1"))
+        && offline_in(offline_window(), since_start)
+}
+
 /// fault-harness, `D-051`: what a flooder sends.
 #[cfg(feature = "fault-harness")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2194,13 +2220,9 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
         #[cfg(feature = "fault-harness")]
         {
             let now = started.elapsed();
-            let scheduled = offline_window().map(|(at, dur, every)| match now.checked_sub(at) {
-                None => false,
-                Some(since) if every.is_zero() => since < dur,
-                Some(since) => since.as_secs() % every.as_secs() < dur.as_secs(),
-            });
+            let scheduled = offline_in(offline_window(), now);
             let asked = CUT_UNTIL.lock().ok().and_then(|u| *u).is_some_and(|u| Instant::now() < u);
-            let cut = scheduled.unwrap_or(false) || asked;
+            let cut = scheduled || asked;
             if cut != line_cut {
                 tox.cut_line(cut);
                 line_cut = cut;
@@ -3391,6 +3413,22 @@ fn millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The harness's outage window, which the table's line and -- since
+    /// `S1-IB`/`S1-ID`'s re-test -- the lobby's transport are both cut by: from
+    /// its start, for its length, once or again every so often, and never
+    /// without a window.
+    #[test]
+    fn the_outage_window_covers_its_span_once_or_every_period() {
+        let s = Duration::from_secs;
+        let once = Some((s(100), s(30), s(0)));
+        assert!(!offline_in(once, s(99)), "before it");
+        assert!(offline_in(once, s(100)) && offline_in(once, s(129)), "through it");
+        assert!(!offline_in(once, s(130)) && !offline_in(once, s(500)), "and once only");
+        let every = Some((s(100), s(30), s(200)));
+        assert!(offline_in(every, s(310)) && !offline_in(every, s(340)), "again every period, for as long");
+        assert!(!offline_in(None, s(110)), "no window, no outage");
+    }
 
     /// `S1-FR`: the founder offers the group always; the founder back after a
     /// restart once it is in a copy that has confirmed a member; a member never

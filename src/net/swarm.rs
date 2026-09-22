@@ -555,9 +555,30 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Bog
     }
 }
 
+/// fault-harness, `S1-IB`/`S1-ID`: set by `net::run` while the harness's
+/// outage covers both lines (`tox::table::both_lines_dark`). Every connection
+/// is refused while it is, inbound and outbound -- the lobby's transport as
+/// dark as a machine whose internet has gone: its advert goes stale, its
+/// search queue falls silent, and nobody reaches it.
+#[cfg(feature = "fault-harness")]
+pub static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// No connection while the harness keeps this client dark; `Ok` in every other
+/// build and at every other time.
+fn dark_gate() -> Result<(), libp2p::swarm::ConnectionDenied> {
+    #[cfg(feature = "fault-harness")]
+    if DARK.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(libp2p::swarm::ConnectionDenied::new(std::io::Error::other(
+            "fault-harness: this client's internet is gone",
+        )));
+    }
+    Ok(())
+}
+
 /// `S1-IT`: a behaviour whose offered addresses pass through [`Offered`] --
 /// worn by the WHOLE of this client's behaviour, so that what any part of it
-/// offers for a dial is shaped once and alike.
+/// offers for a dial is shaped once and alike. It is also where the harness's
+/// dark outage refuses every connection ([`dark_gate`]), for the same reason.
 pub struct OnlyDialable<B> {
     inner: B,
     offered: Offered,
@@ -602,6 +623,7 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Onl
         local: &libp2p::Multiaddr,
         remote: &libp2p::Multiaddr,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        dark_gate()?;
         self.inner.handle_pending_inbound_connection(id, local, remote)
     }
 
@@ -612,6 +634,7 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Onl
         local: &libp2p::Multiaddr,
         remote: &libp2p::Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        dark_gate()?;
         self.inner
             .handle_established_inbound_connection(id, peer, local, remote)
     }
@@ -624,6 +647,7 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Onl
         addresses: &[libp2p::Multiaddr],
         role: libp2p::core::Endpoint,
     ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+        dark_gate()?;
         let offered = self
             .inner
             .handle_pending_outbound_connection(id, maybe_peer, addresses, role)?;
@@ -638,6 +662,7 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Onl
         role: libp2p::core::Endpoint,
         port_use: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        dark_gate()?;
         self.inner
             .handle_established_outbound_connection(id, peer, addr, role, port_use)
     }

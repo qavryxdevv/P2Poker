@@ -63,6 +63,12 @@ param(
     [string]$CutNodes = '',
     [ValidateRange(0, 3000)][int]$CutAt = 0,
     [ValidateRange(0, 600)][int]$CutFor = 0,
+    # Every cut darkens BOTH lines (S1-IB..ID's owed re-test): the table's line at the
+    # socket, as every cut does, and the lobby's libp2p transport with it -- every
+    # connection closed and refused -- so a cut founder's advert goes stale and its
+    # search queue falls silent, as the owner's far client's did. Without it only the
+    # table's line goes.
+    [switch]$CutBoth,
     # Every seat's stack at a table founded here: 300 against blinds of 50/100
     # ends a tournament in a few hands.
     [ValidateRange(0, 100000)][int]$StartStack = 300,
@@ -180,7 +186,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 [pscustomobject]@{
     table = $table; nodes = $Nodes; seconds = $Seconds; seed = $Seed; churn_until = $ChurnUntil
     far = $far; roles = $roles; lives = $lives; formats = $formatList; tables = $tableList
-    start_stack = $StartStack; again = [bool]$Again
+    start_stack = $StartStack; again = [bool]$Again; cut_both = [bool]$CutBoth
 } | ConvertTo-Json -Depth 5 | Out-File (Join-Path $work 'plan.json') -Encoding utf8
 
 $header = @(
@@ -194,7 +200,7 @@ $header | ForEach-Object { Write-Host $_ }
 $header | Out-File (Join-Path $work 'run.txt') -Encoding utf8
 foreach ($l in ($lives | Sort-Object Start)) {
     $what = switch ($l.End) { 'kill' { "killed at $($l.Stop) s" } default { 'to the end' } }
-    $cut = if ($l.OfflineFor -gt 0) { ", line cut $($l.Start + $l.OfflineAt)-$($l.Start + $l.OfflineAt + $l.OfflineFor) s" } else { '' }
+    $cut = if ($l.OfflineFor -gt 0) { ", $(if ($CutBoth) { 'both lines' } else { 'line' }) cut $($l.Start + $l.OfflineAt)-$($l.Start + $l.OfflineAt + $l.OfflineFor) s" } else { '' }
     $can = if ($l.CancelAt -gt 0) { ", cancels at $($l.Start + $l.CancelAt) s and searches again at $($l.Start + $l.AgainAt) s" } else { '' }
     Write-Host ("  n{0}.{1} {2,-5} {3,-4} x{4} from {5,4} s, {6}{7}{8}" -f $l.Node, $l.Life, $(if ($l.Far) { 'far' } else { 'here' }), $l.Format, $l.Tables, $l.Start, $what, $cut, $can)
 }
@@ -245,6 +251,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'p2p-poker.exe'" |
     $t0 = (Get-Date).ToUniversalTime().AddSeconds(8)
     $t0Ticks = $t0.Ticks
     $againFlag = if ($Again) { '1' } else { '0' }
+    $bothFlag = if ($CutBoth) { '1' } else { '0' }
 
     if ($farLives.Count -gt 0) {
         $plan = ($farLives | ConvertTo-Json -Depth 3 -AsArray) -replace "'", "''"
@@ -293,6 +300,7 @@ foreach (`$e in (`$events | Sort-Object At)) {
     if (`$l.Resume) { `$a += '--resume' }
     `$knobs = @{ P2P_POKER_STAYS = '1'; P2P_POKER_START_STACK = '$StartStack' }
     if (`$l.OfflineFor -gt 0) { `$knobs['P2P_POKER_OFFLINE_AT'] = "`$(`$l.OfflineAt)"; `$knobs['P2P_POKER_OFFLINE_FOR'] = "`$(`$l.OfflineFor)" }
+    if (`$l.OfflineFor -gt 0 -and '$bothFlag' -eq '1') { `$knobs['P2P_POKER_OFFLINE_BOTH'] = '1' }
     if (`$l.CancelAt -gt 0) { `$knobs['P2P_POKER_CANCEL_SEARCH_AT'] = "`$(`$l.CancelAt)"; `$knobs['P2P_POKER_SEARCH_AGAIN_AT'] = "`$(`$l.AgainAt)" }
     `$jobs += Start-Job -ArgumentList `$exe, `$a, `$log, `$knobs, `$t0 -ScriptBlock {
         param(`$exe, `$a, `$log, `$knobs, `$t0)
@@ -365,6 +373,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'p2p-poker.exe'" |
         if ($l.Resume) { $a += '--resume' }
         $knobs = @{ P2P_POKER_STAYS = '1'; P2P_POKER_START_STACK = "$StartStack" }
         if ($l.OfflineFor -gt 0) { $knobs['P2P_POKER_OFFLINE_AT'] = "$($l.OfflineAt)"; $knobs['P2P_POKER_OFFLINE_FOR'] = "$($l.OfflineFor)" }
+        if ($l.OfflineFor -gt 0 -and $CutBoth) { $knobs['P2P_POKER_OFFLINE_BOTH'] = '1' }
         if ($l.CancelAt -gt 0) { $knobs['P2P_POKER_CANCEL_SEARCH_AT'] = "$($l.CancelAt)"; $knobs['P2P_POKER_SEARCH_AGAIN_AT'] = "$($l.AgainAt)" }
         $jobs += Start-Job -ArgumentList $Exe, $a, $log, $knobs, $t0 -ScriptBlock {
             param($exe, $a, $log, $knobs, $t0)

@@ -47,6 +47,9 @@ PATTERNS = [
     ("won", re.compile(r"^you won the tournament|^out of chips: finished")),
     ("cut", re.compile(r"^fault-harness: the internet goes away")),
     ("back", re.compile(r"^fault-harness: the internet is back")),
+    # `-CutBoth`: the lobby's libp2p transport dark with the table's line.
+    ("dark", re.compile(r"^fault-harness: libp2p goes dark")),
+    ("light", re.compile(r"^fault-harness: libp2p is back")),
     ("cancel", re.compile(r"^fault-harness: cancelling the search")),
     ("again", re.compile(r"^fault-harness: searching again|^searching again, as --search-again asked")),
     ("formed", re.compile(r"^TABLE FORMED session=([0-9a-f]+) seats=(\d+)(?: slot=(\d+))?")),

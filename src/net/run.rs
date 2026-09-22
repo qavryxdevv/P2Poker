@@ -9066,6 +9066,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // is read here; whether the seat is on the line stays the stall
             // tick's, and a seat off the line is never said to sit out.
             _ = away_tick.tick() => {
+                // fault-harness, `S1-IB`/`S1-ID`: the harness's outage over
+                // both lines -- the lobby's transport dark with the table's
+                // line (`tox::table::both_lines_dark`): every connection closed
+                // at its start and refused through it (`swarm::DARK`).
+                #[cfg(feature = "fault-harness")]
+                {
+                    let dark = crate::tox::table::both_lines_dark(started.elapsed());
+                    if dark != super::swarm::DARK.load(std::sync::atomic::Ordering::Relaxed) {
+                        super::swarm::DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+                        let mut closed = 0usize;
+                        if dark {
+                            let peers: Vec<libp2p::PeerId> = swarm.connected_peers().copied().collect();
+                            for p in peers {
+                                closed += usize::from(swarm.disconnect_peer_id(p).is_ok());
+                            }
+                        }
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "fault-harness: libp2p {} at {} s, as P2P_POKER_OFFLINE_BOTH asked",
+                                if dark {
+                                    format!("goes dark: {closed} connection(s) closed, every other refused")
+                                } else {
+                                    "is back".to_string()
+                                },
+                                started.elapsed().as_secs()
+                            )))
+                            .await;
+                    }
+                }
                 // `D-055`, **the owner's rule**: a lobby row is held only while
                 // it is actively true that this client plays at that table. So
                 // the held set is **derived** from the live tables rather than
