@@ -199,6 +199,13 @@ impl AppState {
             out_flooded: self.out_flooded,
             lost: self.lost.clone(),
             unsafe_note: self.unsafe_note.clone(),
+            // `S1-IX`: the seats by the names the window shows.
+            stopped: self.stopped.as_ref().map(|(s, serial)| crate::gui::table::StoppedView {
+                hand_id: s.hand_id,
+                seats: s.seats.iter().map(|x| self.seat_name(*x)).collect(),
+                ended: s.ended.clone(),
+                serial: *serial,
+            }),
             // `S1-EL`: and the group's softer *the line may be down* yields to the
             // question when that stands, which says the same with the choice.
             line: match self.line_message() {
@@ -1053,6 +1060,44 @@ mod tests {
         s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for flooding".into(), flooded: true });
         let v = s.table_view();
         assert!(v.out_for_good.is_some() && v.out_flooded);
+    }
+
+    /// `S1-IX`, section 6.4: a table stopped on a disagreement about a hand's
+    /// result reaches the window by the names of the seats that differed, with
+    /// a serial the window's *Wait* closes; the game ended on it is said as
+    /// that, plainly and blaming nobody; and a table that deals again takes the
+    /// word down. A table left takes it with it.
+    #[test]
+    fn a_table_stopped_on_a_disagreement_and_the_game_ended_on_it_reach_the_window() {
+        use crate::net::node::TableStop;
+        let stop = |ended: Option<&str>| NodeEvent::TableStopped {
+            stop: Some(TableStop { hand_id: 7, seats: vec![1, 2], ended: ended.map(str::to_string) }),
+        };
+        let mut s = seated(0);
+        assert_eq!(s.table_view().stopped, None);
+        s.apply(stop(None));
+        let v = s.table_view().stopped.expect("said");
+        assert_eq!((v.hand_id, v.seats.clone(), v.ended.clone()), (7, vec!["Bob".to_string(), "Carol".to_string()], None));
+        assert!(
+            s.table_view().log.iter().any(|l| l.text.contains("Bob, Carol's client finished hand #7 with a different result")),
+            "the table's log says why no further hand is dealt"
+        );
+        s.apply(NodeEvent::TableStopped { stop: None });
+        assert_eq!(s.table_view().stopped, None, "the table deals again");
+        assert!(s.table_view().log.iter().any(|l| l.text == "The table deals again."));
+
+        s.apply(stop(None));
+        let first = s.table_view().stopped.expect("stopped again").serial;
+        s.apply(stop(Some("the seats compared their results again and they still differ")));
+        let v = s.table_view().stopped.expect("ended");
+        assert!(v.serial > first, "the end is a new word, not the question the player waited through");
+        assert_eq!(v.ended.as_deref(), Some("the seats compared their results again and they still differ"));
+        let line = s.table_view().log.last().expect("logged").text.clone();
+        assert!(line.contains("could not agree on how hand #7 ended") && line.contains("No winner is named"), "{line}");
+        assert!(!line.contains("Bob") && !line.contains("Carol"), "the end names nobody: {line}");
+
+        s.apply(NodeEvent::LeftTable { why: "left the table".into() });
+        assert!(s.stopped.is_none(), "nothing of it outlives the table");
     }
 
     #[test]

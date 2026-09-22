@@ -288,6 +288,9 @@ pub struct TableView {
     /// `D-051`: why this table is not safe, with the serial the window is
     /// closed by -- the question comes back when the node says it again.
     pub unsafe_note: Option<(String, u64)>,
+    /// `S1-IX`: the table stopped on a disagreement about a hand's result, or
+    /// the game ended on it.
+    pub stopped: Option<StoppedView>,
     /// `S1-EH`: a word over the felt about this client's own line, while it
     /// is gone: which network is unavailable.
     pub line: Option<String>,
@@ -368,6 +371,22 @@ pub enum StepState {
     Done,
     Now,
     Later,
+}
+
+/// `S1-IX`, `PROTOCOL.md` §6.4: a table stopped because other seats finished
+/// a hand with a different result from this client's -- *"the UI must say
+/// plainly that the game ended because the participants could not agree, and
+/// must not guess at fault"*.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoppedView {
+    pub hand_id: u64,
+    /// The names of the seats whose result differed.
+    pub seats: Vec<String>,
+    /// Why the game here is over on it, once it is.
+    pub ended: Option<String>,
+    /// The serial the window's *Wait* is closed by, until the node says it
+    /// again.
+    pub serial: u64,
 }
 
 /// `D-057`: the way back, as the felt shows it.
@@ -654,6 +673,9 @@ pub struct TableUi {
     /// `D-051`: the serial of the *not safe* question the player chose to
     /// stay through.
     pub unsafe_closed: u64,
+    /// `S1-IX`: the serial of the *table stopped* word the player chose to
+    /// wait through.
+    pub stopped_closed: u64,
 }
 
 /// The raise the control offers this frame.
@@ -1797,6 +1819,63 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
             });
     }
 
+    // `S1-IX`, `PROTOCOL.md` §6.4: *"the UI must say plainly that the game
+    // ended because the participants could not agree, and must not guess at
+    // fault."* A table stopped on it asks, and *Wait* closes the question until
+    // the node says it again; a game ended on it is closed by its player.
+    if let Some(stop) = view
+        .stopped
+        .as_ref()
+        .filter(|s| (s.ended.is_some() || s.serial != state.stopped_closed) && view.out_for_good.is_none() && view.lost.is_none())
+    {
+        let ended = stop.ended.is_some();
+        egui::Window::new(if ended { "Game ended" } else { "Table stopped" })
+            .id(egui::Id::new("table-stopped"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(window_frame(&ctx))
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(&ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
+                let hand = stop.hand_id;
+                match stop.ended.as_ref() {
+                    Some(why) => {
+                        window_heading(ui, "The game has ended", false);
+                        ui.label(format!(
+                            "The players' clients could not agree on how hand #{hand} ended, so this table deals no further hand."
+                        ));
+                        ui.label(RichText::new("No winner is named, and nobody is blamed.").strong());
+                        ui.label(RichText::new(why.as_str()).color(style::PANEL_MUTED).small());
+                        if ui.add(egui::Button::new(RichText::new("Close the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                            action = Some(TableAction::CloseOut);
+                        }
+                    }
+                    None => {
+                        window_heading(ui, "The table has stopped", false);
+                        let who = if stop.seats.is_empty() {
+                            "Another player's client".to_string()
+                        } else {
+                            format!("{}'s client", stop.seats.join(", "))
+                        };
+                        ui.label(format!(
+                            "{who} finished hand #{hand} with a different result from yours, so no further hand is dealt while the results are compared again."
+                        ));
+                        ui.label("If the others play on, your client rejoins them. You can wait, or leave the table.");
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(RichText::new("Wait").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
+                                state.stopped_closed = stop.serial;
+                            }
+                            if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                                action = Some(TableAction::LeaveTable);
+                            }
+                        });
+                    }
+                }
+            });
+    }
+
     // The owner, 2026-09-13: the tournament over for this player -- out of
     // chips, the place, and leave or, while others still play, watch; or the
     // winner, congratulated. Ten seconds after the deciding hand, so it can be
@@ -2131,6 +2210,7 @@ impl TableView {
             out_flooded: false,
             lost: None,
             unsafe_note: None,
+            stopped: None,
             line: None,
             absent: Vec::new(),
             rejoin: None,

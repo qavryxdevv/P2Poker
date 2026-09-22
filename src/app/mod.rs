@@ -392,6 +392,7 @@ pub struct TableApp {
     pub show_choice: Option<(u64, std::time::Instant)>,
     pub out_flooded: bool,
     pub unsafe_note: Option<(String, u64)>,
+    pub stopped: Option<(crate::net::node::TableStop, u64)>,
     pub rejoin: Option<Rejoin>,
     pub waits: std::collections::BTreeMap<u8, SeatWait>,
     pub lost: Option<String>,
@@ -556,6 +557,10 @@ pub struct AppState {
     /// serial the window closes by -- the question comes back when the node
     /// says it again.
     pub unsafe_note: Option<(String, u64)>,
+    /// `S1-IX`: the table stopped on a disagreement about a hand's result, or
+    /// the game ended on it, as the node last said it -- with a serial the
+    /// window's *Wait* closes the question by, until the node says it again.
+    pub stopped: Option<(crate::net::node::TableStop, u64)>,
     /// `D-057`: this client's own way back to the table, while it is under way.
     pub rejoin: Option<Rejoin>,
     /// `D-058`: the other seats this table waits on, or waited on and is taking
@@ -951,6 +956,14 @@ impl AppState {
                 self.search_again_due = true;
             }
         }
+        // `S1-IX`: and a game that ended on a disagreement about a hand's result
+        // is over for this player as surely as one played to its end.
+        if matches!(&event, NodeEvent::TableStopped { stop: Some(s) } if s.ended.is_some())
+            && self.search_again_slots.remove(&self.current_slot)
+            && self.search_again.is_some()
+        {
+            self.search_again_due = true;
+        }
         match &event {
             NodeEvent::YourTurn { .. } => {
                 self.turn_at.insert(self.current_slot);
@@ -1023,6 +1036,7 @@ impl AppState {
         std::mem::swap(&mut self.show_choice, &mut other.show_choice);
         std::mem::swap(&mut self.out_flooded, &mut other.out_flooded);
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
+        std::mem::swap(&mut self.stopped, &mut other.stopped);
         std::mem::swap(&mut self.rejoin, &mut other.rejoin);
         std::mem::swap(&mut self.waits, &mut other.waits);
         std::mem::swap(&mut self.lost, &mut other.lost);
@@ -2244,6 +2258,36 @@ impl AppState {
                     self.note(line);
                 }
             }
+            // `S1-IX`, section 6.4: the table stopped on a disagreement about a
+            // hand's result, the game ended on it, or the table deals again.
+            // Said plainly, and without guessing at whose fault it is.
+            NodeEvent::TableStopped { stop } => match stop {
+                Some(stop) => {
+                    let serial = self.stopped.as_ref().map_or(1, |(_, n)| n + 1);
+                    let names: Vec<String> = stop.seats.iter().map(|s| self.seat_name(*s)).collect();
+                    let line = match stop.ended.as_ref() {
+                        Some(why) => format!(
+                            "The game has ended: the players' clients could not agree on how hand #{} ended ({why}). No winner is named.",
+                            stop.hand_id
+                        ),
+                        None => format!(
+                            "The table has stopped: {} finished hand #{} with a different result from yours, and no further hand is dealt while the results are compared.",
+                            if names.is_empty() { "another player's client".to_string() } else { format!("{}'s client", names.join(", ")) },
+                            stop.hand_id
+                        ),
+                    };
+                    self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
+                    self.note(line);
+                    self.stopped = Some((stop, serial));
+                }
+                None => {
+                    if self.stopped.take().is_some() {
+                        let line = "The table deals again.".to_string();
+                        self.log_table(crate::gui::table::LogKind::Normal, line.clone());
+                        self.note(line);
+                    }
+                }
+            },
             NodeEvent::LeftTable { why } => {
                 self.forget_the_table();
                 self.seated = None;
@@ -2441,6 +2485,7 @@ impl AppState {
         self.show_choice = None;
         self.out_flooded = false;
         self.unsafe_note = None;
+        self.stopped = None;
         self.rejoin = None;
         self.waits.clear();
         self.lost = None;

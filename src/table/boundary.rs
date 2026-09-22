@@ -326,11 +326,17 @@ impl Boundary {
     /// disputed checkpoint at a new `sequence`, chained from that checkpoint's
     /// `stage_hash`, in the reconciliation stage §4.9 defines"*.
     ///
-    /// **The value is this peer's own, re-derived.** With no transcript exchange
-    /// built (`S1-Q`) there is nothing new to derive it from, so it is the same
-    /// value — which is honest: a round that carries two values says the
-    /// divergence is a fork this peer cannot fill, and that is exactly what a
-    /// peer with nothing to reconcile from should be saying.
+    /// **The value is this peer's own, re-derived -- and at this checkpoint a
+    /// re-derivation can only give the value it gave (`S1-CI`).** §4.9's parent
+    /// rule admits into the comparison only copies chained from this peer's own
+    /// `TERMINAL(k)`, and `TERMINAL(k)` is a `stage_hash` over every seat's
+    /// settlement event, each chained from every stage before it: a seat whose
+    /// value differs here holds the same transcript as this peer. §6.3 step 3's
+    /// exchange has nothing to carry, and a derivation over the same events is
+    /// the same derivation. So two values here are §6.3 case (c) -- an engine
+    /// at fault, or a seat not telling the truth about its own derivation --
+    /// and a round that carries them says exactly that. This used to be read
+    /// as waiting on `S1-Q`'s transcript exchange; it never was.
     pub fn round_hash_event(
         &self,
         round: u16,
@@ -958,6 +964,16 @@ impl Boundaries {
             .unwrap_or_default()
     }
 
+    /// `S1-IX`: whether a reconciliation round of hand `k`'s boundary has
+    /// completed carrying two values -- §6.3 case (c), and §6.4's faulted
+    /// table. Read by the loop that decides whether a further hand is dealt,
+    /// which is where the window is told the game has ended.
+    pub fn faulted(&self, hand_id: u64) -> bool {
+        self.open
+            .get(&hand_id)
+            .is_some_and(|b| b.rounds.values().any(|r| r.stage.complete() && r.values.len() > 1))
+    }
+
     /// One `STATE_HASH` of a reconciliation round.
     pub fn on_round_hash(
         &mut self,
@@ -1253,15 +1269,34 @@ mod tests {
             RoundTook::Resolved,
             "the re-derivation agrees, so the divergence was a gap this peer could fill"
         );
+        assert!(!b.faulted(4), "S1-IX: a round that resolved faults nothing");
 
         // And the other way, in a second round.
         b.open_round(4, 2, &[0, 1]).expect("the floor is still met");
         assert_eq!(b.on_round_hash(4, 2, 0, ev(30), STATE), RoundTook::Counted);
+        assert!(!b.faulted(4), "S1-IX: nor does one that has not completed");
         assert_eq!(
             b.on_round_hash(4, 2, 1, ev(31), [2u8; 32]),
             RoundTook::Unresolved,
             "two values, and section 6.3's case (c) faults the table"
         );
+        assert!(b.faulted(4), "S1-IX: and the loop that deals reads the fault back");
+        assert!(!b.faulted(5), "of that hand's boundary alone");
+
+        // `S1-IX`: two values in a round still waiting for a seat are not the
+        // fault yet -- section 6.3 reads it off the completed stage, and a
+        // seat that never speaks is the silent branch, ended by the deadline.
+        let mut c = Boundaries::new();
+        c.open(4, TABLE, TERMINAL, STATE, &[0, 1, 2], &[0, 1, 2]).expect("opens");
+        c.on_state_hash(4, 0, ev(40), STATE);
+        c.on_state_hash(4, 1, ev(41), [1u8; 32]);
+        c.on_state_hash(4, 2, ev(42), STATE);
+        c.open_round(4, 1, &[0, 1, 2]).expect("the floor is met");
+        assert_eq!(c.on_round_hash(4, 1, 0, ev(50), STATE), RoundTook::Counted);
+        assert_eq!(c.on_round_hash(4, 1, 1, ev(51), [1u8; 32]), RoundTook::Counted, "seat 2 has not spoken");
+        assert!(!c.faulted(4), "two values heard, and the stage not complete");
+        assert_eq!(c.on_round_hash(4, 1, 2, ev(52), STATE), RoundTook::Unresolved);
+        assert!(c.faulted(4), "the completed stage is the fault");
     }
 
     /// **A round driven by the real emitter cannot resolve, and that makes
@@ -1277,25 +1312,27 @@ mod tests {
     /// Here both sides emit through [`Boundary::round_hash_event`] and the
     /// value is read back off the **sealed frame**, so the loop closes through
     /// the real emitter and the real wire format. The emitter republishes
-    /// `self.own`, because with no transcript exchange built (`S1-Q`) there is
-    /// nothing else to derive it from — so the round carries the same two
-    /// values the checkpoint did and `RoundTook::Unresolved` is the only
-    /// outcome available.
+    /// `self.own`, because the two peers hold one transcript at this checkpoint
+    /// and a re-derivation over it can only give what it gave (`S1-CI`) — so
+    /// the round carries the same two values the checkpoint did and
+    /// `RoundTook::Unresolved` is the only outcome available.
     ///
     /// **What that means beyond this file** (`S1-R`): §6.3's division of labour
     /// is *"checkpoint 8 is the route that heals a table where the two peers
     /// agree; the freeze is the route that stops one where they do not"* — and
-    /// the healing route cannot run. A genuine divergence therefore reaches
-    /// §6.4 and the table deals no further hand; a contradictor that stays
-    /// silent never closes the stage at all. **Every freeze is terminal, so any
-    /// NEW freeze trigger is a table-killer**, which is the ground the aborted
-    /// path's checkpoint designs died on. The corpus has never exercised it:
-    /// zero freeze lines in 108 run directories.
+    /// the healing route has nothing to heal here. A divergence therefore
+    /// reaches §6.4 and the table deals no further hand; a contradictor that
+    /// stays silent never closes the stage, which `S1-IX` bounds by the table's
+    /// hand deadline. **Every freeze is terminal, so any NEW freeze trigger is a
+    /// table-killer**, which is the ground the aborted path's checkpoint designs
+    /// died on. The corpus has never exercised it: zero freeze lines in 108 run
+    /// directories, and none in the owner's own logs.
     ///
-    /// **To make this fail**: give `round_hash_event` something to re-derive
-    /// from — which is what `S1-Q`'s transcript exchange would be — and the
-    /// values stop being equal to the published ones. That is the intended
-    /// future, and this test is what will notice it arriving.
+    /// **To make this fail**: have `round_hash_event` publish anything but
+    /// `self.own` -- a value the two sides share -- and it reddens on *A
+    /// republishes its own value*. It is not a future waiting to arrive
+    /// (`S1-CI`): at this checkpoint the peers hold one transcript, so there is
+    /// nothing a re-derivation could learn from a transcript exchange.
     #[test]
     fn a_round_driven_by_the_real_emitter_cannot_resolve() {
         use ed25519_dalek::SigningKey;
@@ -1379,6 +1416,7 @@ mod tests {
             RoundTook::Unresolved,
             "and neither can B, so the fault is symmetric and terminal"
         );
+        assert!(a.faulted(4) && b.faulted(4), "S1-IX: both sides hold the fault the window is told of");
     }
 
     /// The three things §6.4's divergence report reads off a faulted boundary

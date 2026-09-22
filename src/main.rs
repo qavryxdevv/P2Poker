@@ -211,7 +211,8 @@ fn main() {
     // shows the way back half done and `--preview-rejoin-back` over (D-057);
     // `--preview-waits` the table waiting on a seat, `--preview-waits-gap` the
     // table going on without it and `--preview-waits-back` that seat on its way
-    // back (D-058).
+    // back (D-058); `--preview-stopped` the table stopped on a disagreement
+    // about a hand's result and `--preview-ended` the game ended on it (S1-IX).
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1900,6 +1901,16 @@ fn preview_table(args: &[String]) {
             "2 of the 4 players flooded the table's connection with junk traffic. They are cut off here, but too few other players are left to put them out of the game.".into(),
             1,
         ));
+    }
+    // `S1-IX`: the table stopped on a disagreement about a hand's result, and
+    // the game ended on it.
+    if has("--preview-stopped") || has("--preview-ended") {
+        view.stopped = Some(table::StoppedView {
+            hand_id: 128,
+            seats: vec!["Carol".into()],
+            ended: has("--preview-ended").then(|| "the seats compared their results again and they still differ".into()),
+            serial: 1,
+        });
     }
     if has("--preview-line") {
         view.line = Some("This client has heard nobody at the table for 12 s. Your seat keeps its cards; the hand goes on when the line is back".into());

@@ -175,6 +175,8 @@ struct Slot {
     unsafe_ever: bool,
     out_for_good: bool,
     lost: bool,
+    /// `S1-IX`: the table stopped on a disagreement about a hand's result.
+    stopped: bool,
     sitting_out: bool,
     off_line: BTreeSet<u8>,
     finished: BTreeSet<u8>,
@@ -833,6 +835,9 @@ impl Rewards {
         if s.lost {
             return Some("the table was lost");
         }
+        if s.stopped {
+            return Some("the table stopped: the players' clients did not agree on a hand's result");
+        }
         if self.line_down {
             return Some("your own connection was down");
         }
@@ -920,6 +925,7 @@ impl Rewards {
                 | NodeEvent::TableUnsafe { .. }
                 | NodeEvent::OutForGood { .. }
                 | NodeEvent::TableLost { .. }
+                | NodeEvent::TableStopped { .. }
                 | NodeEvent::LeftTable { .. }
         ) {
             return;
@@ -1007,6 +1013,11 @@ impl Rewards {
             }
             NodeEvent::OutForGood { .. } => self.slot().out_for_good = true,
             NodeEvent::TableLost { .. } => self.slot().lost = true,
+            NodeEvent::TableStopped { stop } => {
+                if stop.is_some() {
+                    self.slot().stopped = true;
+                }
+            }
             NodeEvent::Finished { seat, place, players_left, .. } => {
                 let line_down = self.line_down;
                 let s = self.slot();

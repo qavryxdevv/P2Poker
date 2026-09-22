@@ -138,6 +138,19 @@ pub struct PotEnd {
     pub winners: Vec<u8>,
 }
 
+/// `S1-IX`: why a table stopped dealing -- see [`NodeEvent::TableStopped`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableStop {
+    /// The hand whose result the seats hold differently.
+    pub hand_id: u64,
+    /// The seats whose result differed from this client's own (section 4.9's
+    /// contradiction set `W`).
+    pub seats: Vec<u8>,
+    /// Why the game at this table is over on it, once it is: no further hand
+    /// is dealt here and no winner is named.
+    pub ended: Option<String>,
+}
+
 /// What the loop reports upwards, for the GUI and the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
@@ -524,6 +537,15 @@ pub enum NodeEvent {
     /// out, or strangers let in again and again -- or `None` once it is safe
     /// again. The window recommends leaving.
     TableUnsafe { why: Option<String> },
+    /// `S1-IX`, `PROTOCOL.md` §6.3 and §6.4: this table has stopped at a
+    /// hand's boundary, because other seats finished that hand with a
+    /// different result from this client's own -- and, once it has, the game
+    /// here has ended on it -- or `None`, once the table deals again. §6.4:
+    /// *"The UI must say plainly that the game ended because the participants
+    /// could not agree, and must not guess at fault."* It used to be said in
+    /// the log alone, and a table that deals no further hand looked like one
+    /// waiting for a slow seat.
+    TableStopped { stop: Option<TableStop> },
     /// A peer was found in the public lobby, through the DHT.
     ///
     /// Separate from [`LocalPeer`](NodeEvent::LocalPeer) on purpose. The two
@@ -732,6 +754,8 @@ impl NodeEvent {
             | Self::OutForGood { .. }
             | Self::SeatFlooded { .. }
             | Self::TableUnsafe { .. }
+            // `S1-IX`: the table stopped, or the game ended, over the felt.
+            | Self::TableStopped { .. }
             // The lobby list and the counters above it.
             | Self::TableSeen { .. }
             | Self::TableGone { .. }

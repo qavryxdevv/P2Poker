@@ -6288,6 +6288,14 @@ holds another seat's signature against its own account of a hand it believed it
 played alone — and it is what §3.2's *"a table that stops is the price"* costs
 when the contradiction cannot be reconciled.
 
+**How this client reaches that terminus (`S1-IX`).** A checkpoint-8 divergence is
+met at the boundary, after the hand it is about has settled, and a frozen peer
+deals no further hand — so there is no stalled hand for the deadline to dispose
+of. The table's own `hand_deadline_ms` is counted from the freeze instead, and the
+game ends there, unless a seat is heard two hands on: that table went on without
+this peer, which rejoins it from the copies (`D-038`). Either end, and case (c)
+below, is said to the player in §6.4's words.
+
 **The two completing branches are unchanged.** One value: the divergence was a
 gap, the peer resumes at the phase it held, and the latch clears with it. Two
 values: case (c) below, `cause = 4`, the table is faulted — at which point the

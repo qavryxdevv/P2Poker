@@ -989,6 +989,10 @@ struct TableRun {
     roster_seats: Vec<u8>,
     /// Said once: why the table has stopped. Cleared when the freeze is.
     frozen_said: bool,
+    /// `S1-IX`: what the window was last told of the freeze -- since when this
+    /// client has held it, and whether the game was said to have ended on it.
+    /// `None` while the table deals.
+    stopped: Option<(tokio::time::Instant, bool)>,
     /// When a vote was last reported as owed and not cast (`vote_state`).
     vote_state_said: u64,
     /// `D-058`: the seats a hand's cryptographic stage was last said to stand
@@ -1481,6 +1485,7 @@ impl TableRun {
             frozen: None,
             roster_seats: Vec::new(),
             frozen_said: false,
+            stopped: None,
             vote_state_said: 0,
             stands_said: (0, Vec::new()),
             patience: crate::table::hand::Waits::default(),
@@ -3597,6 +3602,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.ahead.clear();
             $t.adrift = None;
             $t.frozen = None;
+            // `S1-IX`: the window was told the table stopped, and the table
+            // goes on: this client rejoins it.
+            if $t.stopped.take().is_some() {
+                let _ = events.send(NodeEvent::TableStopped { stop: None }).await;
+            }
             $t.genesis_wait_said = None;
             $t.late_cert_said = None;
             $t.late_banked_for = None;
@@ -3693,6 +3703,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // freeze would be silent — the one state that stops a client
             // dealing, with nothing said about why.
             $t.frozen_said = false;
+            $t.stopped = None;
             // Both hang off the freeze and the reconciliation round, which are
             // per table: `no_round_said` reports why no round could be opened,
             // and `disputes_seen` is counted so that "none arrived" and
@@ -11510,6 +11521,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // knowing what this loop has said out loud.
                 if t.frozen.is_none() {
                     t.frozen_said = false;
+                    // `S1-IX`: the window was told the table stopped, and it
+                    // deals again.
+                    if t.stopped.take().is_some() {
+                        let _ = events.send(NodeEvent::TableStopped { stop: None }).await;
+                    }
                 }
                 if let Some((k, _)) = t.frozen {
                     // **Re-armed, not consumed.** The line above cleared the
@@ -11537,6 +11553,54 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 t.disputes_seen,
                                 t.boundaries.contradicted(k)
                             )))
+                            .await;
+                    }
+                    // `S1-IX`, §6.4: *"the UI must say plainly that the game
+                    // ended because the participants could not agree"*. The
+                    // window is told the table stopped the first time this is
+                    // reached, and told again once, when the game has ended
+                    // on it -- the one place both are decided, on the cadence
+                    // the freeze already re-checks on.
+                    let now = tokio::time::Instant::now();
+                    let since = t.stopped.map_or(now, |(at, _)| at);
+                    let deadline = Duration::from_millis(
+                        t.table
+                            .as_ref()
+                            .map_or(crate::protocol::constants::HAND_DEADLINE_CAP_MS, |f| {
+                                u64::from(f.advert().hand_deadline_ms)
+                            }),
+                    );
+                    let moving_on = t.ahead.values().any(|x| *x >= k.saturating_add(ADRIFT_MARGIN));
+                    let ended = stop_ended(
+                        t.boundaries.faulted(k),
+                        now.saturating_duration_since(since),
+                        deadline,
+                        moving_on,
+                    );
+                    let told_ended = t.stopped.is_some_and(|(_, e)| e);
+                    if t.stopped.is_none() || (ended.is_some() && !told_ended) {
+                        t.stopped = Some((since, ended.is_some()));
+                        if let Some(why) = ended {
+                            // The game here is over, and the search counts it
+                            // so. The table's group is not left here, as a
+                            // finished tournament's is (`D-042`): the table is
+                            // left when its player closes it, the one road a
+                            // table's window closes by (`S1-FY`).
+                            t.done_here = true;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the game at this table has ended on hand {k}: {why}. No further hand is dealt and no winner is named (section 6.4, S1-IX)"
+                                )))
+                                .await;
+                        }
+                        let _ = events
+                            .send(NodeEvent::TableStopped {
+                                stop: Some(super::node::TableStop {
+                                    hand_id: k,
+                                    seats: t.boundaries.contradicted(k),
+                                    ended: ended.map(str::to_string),
+                                }),
+                            })
                             .await;
                     }
                     continue;
@@ -15916,6 +15980,30 @@ fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>, others: &[u
     (saying.len() * 2 > others.len()).then_some((furthest, mine))
 }
 
+/// `S1-IX`: whether the game at a frozen table is over, and why -- the decision
+/// alone, so a test can reach it.
+///
+/// **Two ends, and each is the corpus's.** A reconciliation round that
+/// completed carrying two values is §6.3 case (c), and §6.4 faults the table
+/// (`faulted`). And §6.3's silent branch: a seat whose value differed never
+/// answers, so the round never completes, and the corpus closes the table once
+/// the hand deadline has disposed of the stalled hand. A frozen client deals no
+/// hand for a deadline to dispose of, so the table's own `hand_deadline_ms` is
+/// counted from the freeze (`held`). Before `S1-IX` that branch waited for ever.
+///
+/// **Not while the table plays on.** A seat heard two hands past the frozen one
+/// (`moving_on`) is `D-038`'s road: the table went on without this client, which
+/// rejoins it from the copies, and ending the game here would throw that away.
+fn stop_ended(faulted: bool, held: Duration, deadline: Duration, moving_on: bool) -> Option<&'static str> {
+    if faulted {
+        return Some("the seats compared their results again and they still differ");
+    }
+    if !moving_on && held >= deadline {
+        return Some("a seat whose result differed did not answer within the table's hand deadline");
+    }
+    None
+}
+
 /// How many hands ahead the table must be before this client calls itself out.
 ///
 /// # This was one, and one is what an ordinary table looks like
@@ -18383,6 +18471,71 @@ mod tests {
 
         // And a table nobody is ahead of says nothing.
         assert_eq!(adrift_now(mine, &at(&[(1, mine), (2, mine - 1)]), &two), None);
+    }
+
+    /// `S1-IX`: a frozen table's game ends on either of the corpus's two ends
+    /// -- §6.3 case (c) at once, the silent branch at the table's hand
+    /// deadline -- and not while the table plays on, which is `D-038`'s road.
+    ///
+    /// The breaks that must make this fail: end on the deadline whatever the
+    /// table does (drop `!moving_on`), or never end on silence (drop the
+    /// deadline arm), or wait out the deadline on a faulted round.
+    #[test]
+    fn a_frozen_tables_game_ends_on_a_fault_or_on_silence_and_not_while_it_plays_on() {
+        let deadline = Duration::from_secs(300);
+        let short = Duration::from_secs(5);
+
+        assert_eq!(stop_ended(false, short, deadline, false), None, "a freeze a few seconds old is a stop, not an end");
+        assert!(
+            stop_ended(true, short, deadline, false).is_some_and(|w| w.contains("still differ")),
+            "section 6.3 case (c) ends the game at once: section 6.4's faulted table"
+        );
+        assert!(
+            stop_ended(true, short, deadline, true).is_some(),
+            "and a faulted round is terminal whatever the table seems to do"
+        );
+        assert!(
+            stop_ended(false, deadline, deadline, false).is_some_and(|w| w.contains("did not answer")),
+            "a seat that never answers ends the game at the table's hand deadline"
+        );
+        assert_eq!(
+            stop_ended(false, deadline * 4, deadline, true),
+            None,
+            "a table heard two hands on is going on without this client, which rejoins it"
+        );
+    }
+
+    /// `S1-IX`: every road out of a freeze the window was told of tells the
+    /// window it is over -- the loop that deals, when a reconciliation round
+    /// released it, and `rejoin_from_copies!`, when the table went on without
+    /// this client. The rejoin's road arms no timer, so the loop never sees the
+    /// release: the table would play on under a window saying it had stopped.
+    ///
+    /// The break that must make this fail: drop the window's word from
+    /// `rejoin_from_copies!`.
+    #[test]
+    fn every_road_out_of_a_freeze_tells_the_window() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let body = |name: &str| -> &str {
+            let from = code.find(&format!("macro_rules! {name} {{")).unwrap_or_else(|| panic!("{name}"));
+            let to = from + code[from..].find("\n    }\n").expect("its end");
+            &code[from..to]
+        };
+        let rejoin = body("rejoin_from_copies");
+        let released = rejoin.find("$t.frozen = None;").expect("the rejoin clears the freeze");
+        let told = rejoin.find("NodeEvent::TableStopped { stop: None }").expect("and tells the window");
+        assert!(released < told, "the rejoin tells the window after clearing the freeze");
+        let deals = code.find("if t.frozen.is_none() {\n                    t.frozen_said = false;").expect("the loop that deals");
+        assert!(
+            code[deals..deals + 400].contains("NodeEvent::TableStopped { stop: None }"),
+            "the loop that deals tells the window when the freeze has lifted"
+        );
+        assert_eq!(
+            code.matches("NodeEvent::TableStopped {").count(),
+            3,
+            "the table stopped or ended, said in one place; its end, in the two"
+        );
     }
 
     /// **`D-038`: two seats are not the table, a strict majority of the seats
