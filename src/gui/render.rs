@@ -202,7 +202,11 @@ pub struct HomeView {
     pub profile: std::path::PathBuf,
     /// It is the installed copy, in the user's programs folder.
     pub installed: bool,
-    /// This build can install itself (Windows).
+    /// `D-080`: this copy came from the Microsoft Store -- it runs from a
+    /// package, so the Store installs it, updates it and removes it, and this
+    /// client neither installs nor downloads anything.
+    pub store: bool,
+    /// This build can install itself (Windows, and not from the Store).
     pub can_install: bool,
     /// A table is open or a search is running: installing restarts the client,
     /// and nothing restarts a client over a game.
@@ -1311,6 +1315,9 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
                     super::table::paint_again(ctx, std::time::Duration::from_millis(250));
                 }
                 Gate::Closed { latest, tag } => {
+                    // `D-080`: a copy from the Store updates through the Store,
+                    // so no address is shown to copy into a browser.
+                    let store = state.home.as_ref().is_some_and(|h| h.store);
                     let words = super::lobby::closed_words(
                         latest,
                         &crate::app::update::compared_version(),
@@ -1341,7 +1348,8 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
                             if let Some(handed) = state.download_handed {
                                 ui.add_space(6.0);
                                 let tone = if handed { theme::OK } else { theme::WARN };
-                                ui.label(RichText::new(super::lobby::handed_words(handed, super::lobby::System::THIS)).color(tone).size(14.5));
+                                let words = super::lobby::handed_words(handed, super::lobby::System::THIS, store);
+                                ui.label(RichText::new(words).color(tone).size(14.5));
                             }
                             ui.add_space(10.0);
                             ui.add(egui::Label::new(RichText::new(&words.next).color(theme::TEXT_DIM).size(14.5)).wrap());
@@ -1367,7 +1375,9 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
                                         ui.add(egui::Label::new(path.monospace()).wrap());
                                     });
                             }
-                            if let Some(url) = crate::app::update::download_for(tag, super::lobby::System::THIS) {
+                            if let Some(url) =
+                                crate::app::update::download_for(tag, super::lobby::System::THIS).filter(|_| !store)
+                            {
                                 ui.add_space(8.0);
                                 let quiet = style::mix(theme::TEXT_DIM, theme::PANEL, 0.2);
                                 ui.add(egui::Label::new(RichText::new(url).color(quiet).size(12.5).monospace()).wrap().selectable(true));
@@ -1390,8 +1400,18 @@ fn gate_modal(ctx: &egui::Context, gate: &super::lobby::Gate, state: &LobbyUi) -
 
 /// `D-073`: what the About page says about where this copy lives. `D-078`: a
 /// Linux package keeps the program where it was installed and the profile in
-/// the user's data folder, and says both.
+/// the user's data folder, and says both. `D-080`: a copy from the Microsoft
+/// Store is installed, updated and removed by the Store, and says that first,
+/// because none of the three is this client's to offer.
 pub fn home_words(home: &HomeView, system: super::lobby::System) -> String {
+    if home.store {
+        return format!(
+            "P2Poker came from the Microsoft Store, which keeps it up to date and removes it if you uninstall it. \
+             Your player profile is in {}, and removing P2Poker takes it with them: to stay the same player, make a \
+             backup first (the Profile tab).",
+            home.profile.display()
+        );
+    }
     if system == super::lobby::System::Linux && !home.profile.starts_with(&home.folder) {
         return format!(
             "P2Poker runs from {}, and your player profile is in {}. To be the same player on another computer, \

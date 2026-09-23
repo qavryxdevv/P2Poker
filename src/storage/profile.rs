@@ -41,9 +41,20 @@ use std::path::{Path, PathBuf};
 /// somewhere slightly unexpected and says so.
 pub fn profile_dir() -> PathBuf {
     let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    // `D-080`: on Windows the system's own data folder is the packaged copy's;
+    // on Linux it is XDG's. One argument, filled by the system this is.
+    let data_home = std::env::var_os(if cfg!(windows) { "LOCALAPPDATA" } else { "XDG_DATA_HOME" })
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
     let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
-    profile_dir_for(cfg!(windows), exe_dir.as_deref(), data_home, home, |p| p.is_dir())
+    profile_dir_for(
+        cfg!(windows),
+        crate::install::packaged(),
+        exe_dir.as_deref(),
+        data_home,
+        home,
+        |p| p.is_dir(),
+    )
 }
 
 /// `D-078`: where the profile lives, from what the system says.
@@ -51,6 +62,13 @@ pub fn profile_dir() -> PathBuf {
 /// **Windows: beside the program, always** -- `SPEC_CS.md` §22's portable
 /// folder, and `D-073`'s installed copy is that same folder in the user's
 /// programs folder.
+///
+/// **`D-080`, the one exception: a copy from the Microsoft Store.** A packaged
+/// program's own folder is read-only and its install and removal are the
+/// Store's, so the profile goes to the user's local data folder, which Windows
+/// redirects into the package's own storage. It is the same portable folder in
+/// every other way, and the profile backup (`D-068`) is how it moves to
+/// another machine or to a copy from GitHub.
 ///
 /// **Linux: in the user's data folder** (`$XDG_DATA_HOME/p2poker/profile`, or
 /// `~/.local/share/p2poker/profile`). A package puts the program where a user
@@ -62,12 +80,20 @@ pub fn profile_dir() -> PathBuf {
 /// so the rule is a table.
 pub fn profile_dir_for(
     windows: bool,
+    packaged: bool,
     exe_dir: Option<&Path>,
     data_home: Option<PathBuf>,
     home: Option<PathBuf>,
     exists: impl Fn(&Path) -> bool,
 ) -> PathBuf {
     let beside = exe_dir.unwrap_or_else(|| Path::new(".")).join("profile");
+    // `D-080`: the Store's copy, which may not write beside itself.
+    if windows && packaged {
+        return match data_home {
+            Some(data) => data.join(crate::install::FOLDER_NAME).join("profile"),
+            None => beside,
+        };
+    }
     if windows || exists(&beside) {
         return beside;
     }
@@ -324,19 +350,43 @@ mod tests {
         let data = || Some(PathBuf::from("/home/someone/.data"));
         let home = || Some(PathBuf::from("/home/someone"));
 
-        assert_eq!(profile_dir_for(true, Some(exe), data(), home(), none), beside, "Windows: beside, always");
+        assert_eq!(profile_dir_for(true, false, Some(exe), data(), home(), none), beside, "Windows: beside, always");
         assert_eq!(
-            profile_dir_for(false, Some(exe), data(), home(), none),
+            profile_dir_for(false, false, Some(exe), data(), home(), none),
             Path::new("/home/someone/.data/p2poker/profile"),
             "Linux: the XDG data folder"
         );
         assert_eq!(
-            profile_dir_for(false, Some(exe), None, home(), none),
+            profile_dir_for(false, false, Some(exe), None, home(), none),
             Path::new("/home/someone/.local/share/p2poker/profile"),
             "and its default under the home folder"
         );
-        assert_eq!(profile_dir_for(false, Some(exe), data(), home(), there), beside, "a portable copy keeps its own");
-        assert_eq!(profile_dir_for(false, Some(exe), None, None, none), beside, "no home at all: beside, as before");
+        assert_eq!(profile_dir_for(false, false, Some(exe), data(), home(), there), beside, "a portable copy keeps its own");
+        assert_eq!(profile_dir_for(false, false, Some(exe), None, None, none), beside, "no home at all: beside, as before");
+
+        // `D-080`: the Store's copy may not write beside itself, so the
+        // profile goes to the user's local data folder -- and only for a
+        // packaged copy, so every Windows copy from GitHub is unmoved.
+        assert_eq!(
+            profile_dir_for(true, true, Some(exe), data(), home(), none),
+            Path::new("/home/someone/.data/P2Poker/profile"),
+            "packaged: the data folder Windows gives the package"
+        );
+        assert_eq!(
+            profile_dir_for(true, true, Some(exe), data(), home(), there),
+            Path::new("/home/someone/.data/P2Poker/profile"),
+            "and a folder beside a packaged program does not take it back"
+        );
+        assert_eq!(
+            profile_dir_for(true, true, Some(exe), None, home(), none),
+            beside,
+            "with no data folder at all, beside the program, as before"
+        );
+        assert_eq!(
+            profile_dir_for(false, true, Some(exe), data(), home(), none),
+            Path::new("/home/someone/.data/p2poker/profile"),
+            "there are no packages of this kind off Windows"
+        );
     }
 
     /// `S1-FV`: a profile one client holds is refused to a second, and is

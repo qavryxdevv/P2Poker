@@ -572,7 +572,10 @@ type UpdateAnswer = Result<p2p_poker::app::update::Verdict, String>;
 fn maybe_install(args: &[String]) -> Option<i32> {
     use p2p_poker::install::{self, Decision, Facts};
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
-    let by_arguments = Facts { args: rest.clone(), supported: true, at_home: false, player_here: false };
+    // `D-080`: a copy from the Store is installed by the Store; it never
+    // offers to install itself, wherever it was started from.
+    let supported = !install::packaged();
+    let by_arguments = Facts { args: rest.clone(), supported, at_home: false, player_here: false };
     if install::decide(&by_arguments) == Decision::RunHere {
         return None;
     }
@@ -580,7 +583,7 @@ fn maybe_install(args: &[String]) -> Option<i32> {
     let folder = exe.parent()?;
     let facts = Facts {
         args: rest,
-        supported: true,
+        supported,
         at_home: install::shell::places().is_some_and(|p| install::same_place(folder, &p.install_dir())),
         player_here: install::holds_a_player(&folder.join("profile")),
     };
@@ -707,15 +710,25 @@ fn sound_check() -> i32 {
 }
 
 /// `D-073`: where this copy lives, for the About page. Asked once. `D-078`:
-/// and where its profile is, which on Linux is not beside it.
+/// and where its profile is, which on Linux is not beside it. `D-080`: and
+/// whether it came from the Microsoft Store, which installs, updates and
+/// removes that copy -- so this client offers to do none of the three.
 fn home_view(profile: &std::path::Path) -> Option<render::HomeView> {
     let exe = std::env::current_exe().ok()?;
     let folder = exe.parent()?.to_path_buf();
+    let store = p2p_poker::install::packaged();
     #[cfg(windows)]
     let installed = p2p_poker::install::shell::places().is_some_and(|p| p2p_poker::install::same_place(&folder, &p.install_dir()));
     #[cfg(not(windows))]
     let installed = false;
-    Some(render::HomeView { folder, profile: profile.to_path_buf(), installed, can_install: cfg!(windows), busy: false })
+    Some(render::HomeView {
+        folder,
+        profile: profile.to_path_buf(),
+        installed,
+        store,
+        can_install: cfg!(windows) && !store,
+        busy: false,
+    })
 }
 
 /// `S1-FV`: a word to a player who started the client from its icon, where a
@@ -2365,12 +2378,19 @@ impl Client {
     /// browser. Both addresses are this build's releases page with the tag the
     /// check believed; the one opened is said in the log either way, so a
     /// player whose system opened nothing can still read where it is.
+    ///
+    /// **`D-080`: a copy from the Microsoft Store downloads nothing.** Its own
+    /// page in the Store is opened instead, by the package family name Windows
+    /// gave this process, and the Store is what installs the new version.
     fn open_the_newer_release(&mut self, download: bool) {
         let p2p_poker::gui::lobby::Gate::Closed { tag, .. } = p2p_poker::gui::lobby::gate(&self.ui.update) else {
             return;
         };
         let address = if download {
-            p2p_poker::app::update::download_for(&tag, p2p_poker::gui::lobby::System::THIS)
+            match p2p_poker::install::family_name() {
+                Some(family) => Some(format!("ms-windows-store://pdp/?PFN={family}")),
+                None => p2p_poker::app::update::download_for(&tag, p2p_poker::gui::lobby::System::THIS),
+            }
         } else {
             p2p_poker::app::update::notes_url(&tag)
         };

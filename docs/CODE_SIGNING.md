@@ -1,16 +1,24 @@
 # Code signing policy
 
-**Status, 2026-09-22: applied for, not yet granted.** No release of P2Poker is signed with a Windows code-signing
-certificate today, and until one is, Windows SmartScreen asks before the first start (*More info*, then *Run
-anyway*). The project has applied to the [SignPath Foundation](https://signpath.org/), which gives open-source
-projects free code signing; this page is the policy that applies the moment it is granted, and it is published now
-so that anybody -- the Foundation included -- can read what the project promises about it.
+**Status, 2026-09-23.** The `p2p-poker.exe` on the release page is **not** signed with a Windows code-signing
+certificate, so SmartScreen asks before the first start (*More info*, then *Run anyway*). Two things are being done
+about it, and this page says where each stands.
+
+* **The Microsoft Store** (`D-080`): the same program, wrapped in an MSIX package, which **Microsoft signs itself**
+  after certification -- a player who installs it from the Store is asked nothing. Being prepared; not published yet.
+* **A free certificate for the release page**: the project applied to the [SignPath Foundation](https://signpath.org/),
+  which signs open-source releases free of charge, and was **refused on 2026-09-22** for want of public visibility --
+  community adoption, outside references, that kind of signal -- with an invitation to apply again as the project
+  becomes better known. The policy below is what applies the day it is granted.
 
 ## What is signed, and by whom
 
-Once the Foundation has granted it: **free code signing provided by [SignPath.io](https://signpath.io/), certificate
-by [SignPath Foundation](https://signpath.org/)**. The certificate is the Foundation's, so the publisher Windows
-shows is the Foundation and not a person.
+**From the Microsoft Store:** Microsoft re-signs the package with its own certificate, and the publisher shown is the
+Store account. Nothing of this project's is signed by hand for it.
+
+**From the release page, once the Foundation has granted it:** free code signing provided by
+[SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). The certificate is
+the Foundation's, so the publisher Windows shows is the Foundation and not a person.
 
 Signed: the Windows program of every release, `p2p-poker.exe`, as built by GitHub Actions from this repository's
 tagged commit (`.github/workflows/release.yml`). The Linux packages carry no Authenticode signature -- Windows is

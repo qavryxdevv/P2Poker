@@ -186,6 +186,27 @@ jobs:
             target/release/p2p-poker.exe.sha256
             target/release/p2p-poker.exe.sigstore.json
 
+      # D-080: the package for the Microsoft Store, made from the very binary above and left with the run for the
+      # owner to submit in Partner Center. Unsigned on purpose: the Store signs it after certification, which is what
+      # spares a player the SmartScreen warning. It is not a release asset -- an unsigned MSIX installs for nobody --
+      # and it is not made at all until the three identity values of the Store account are set on the repository.
+      - name: The Microsoft Store's package
+        if: ${{ vars.MSIX_IDENTITY_NAME != '' }}
+        shell: pwsh
+        run: |
+          ./tools/package-msix.ps1 `
+            -IdentityName '${{ vars.MSIX_IDENTITY_NAME }}' `
+            -Publisher '${{ vars.MSIX_PUBLISHER }}' `
+            -PublisherDisplayName '${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}'
+
+      - name: Keep the Store's package with the run
+        if: ${{ vars.MSIX_IDENTITY_NAME != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: p2p-poker-msix
+          if-no-files-found: error
+          path: dist/*.msix
+
   linux:
     # D-078: built against glibc 2.35, so the program runs on Ubuntu 22.04, Debian 12, Fedora 36 and every
     # distribution after them.

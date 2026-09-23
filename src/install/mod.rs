@@ -49,6 +49,51 @@ pub mod copy;
 #[cfg(windows)]
 pub mod shell;
 
+/// `D-080`: whether this copy runs from an MSIX package -- the Microsoft
+/// Store's, which is the only place one comes from.
+///
+/// **Windows answers it, so one binary knows which of its two homes it is in.**
+/// `GetCurrentPackageFamilyName` gives a packaged process its package family
+/// name and every other process `APPMODEL_ERROR_NO_PACKAGE`; there is no build
+/// flavour, no feature and nothing to get wrong at packaging time. Three things
+/// hang off the answer: the update gate opens the Store instead of downloading
+/// a file (`D-077`), the installer is never offered because the Store installs
+/// and removes this copy (`D-073`), and the profile goes where a packaged app
+/// may write rather than beside the program.
+pub fn packaged() -> bool {
+    family_name().is_some()
+}
+
+/// The package family name of this copy, which is also how the Store's own
+/// page for it is addressed: `ms-windows-store://pdp/?PFN=<family name>`.
+/// `None` for a copy that is not packaged, and on every other system.
+#[cfg(windows)]
+pub fn family_name() -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFamilyName;
+
+    let mut len: u32 = 0;
+    // SAFETY: the documented way to ask for the length -- a null buffer and a
+    // length of zero, which the call fills in. Anything but "too small" here
+    // means this process has no package, which is the ordinary case.
+    if unsafe { GetCurrentPackageFamilyName(&mut len, std::ptr::null_mut()) } != ERROR_INSUFFICIENT_BUFFER {
+        return None;
+    }
+    let mut name = vec![0u16; len as usize];
+    // SAFETY: `name` holds the `len` units the call just asked for.
+    if unsafe { GetCurrentPackageFamilyName(&mut len, name.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // `len` counts the terminating NUL, which is not part of the name.
+    name.truncate(len.saturating_sub(1) as usize);
+    Some(String::from_utf16_lossy(&name))
+}
+
+#[cfg(not(windows))]
+pub fn family_name() -> Option<String> {
+    None
+}
+
 /// The folder under the user's programs folder.
 pub const FOLDER_NAME: &str = "P2Poker";
 /// The program's file name there. The same as the build's own: scripts, the
@@ -384,6 +429,18 @@ mod tests {
 
     fn facts(args: &[&str]) -> Facts {
         Facts { args: args.iter().map(|s| s.to_string()).collect(), supported: true, at_home: false, player_here: false }
+    }
+
+    /// `D-080`: the question Windows is asked about this copy -- *are you in a
+    /// package?* -- answered for a process that is not. This test's own is
+    /// not, so the answer is known, and asking is what shows the call works
+    /// at all: a wrong signature or a wrong error code would read *packaged*
+    /// here, and every copy from GitHub would then refuse to install itself
+    /// and look for its profile somewhere else.
+    #[test]
+    fn a_copy_that_is_not_in_a_package_says_so() {
+        assert_eq!(family_name(), None, "the test process runs from no package");
+        assert!(!packaged());
     }
 
     /// **`D-073`: who is asked, and who is never interrupted.** The table in

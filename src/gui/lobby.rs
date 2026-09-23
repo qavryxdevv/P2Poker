@@ -1242,8 +1242,21 @@ pub fn closed_words(
     home: Option<&super::render::HomeView>,
     system: System,
 ) -> ClosedWords {
+    // `D-080`: the Store's copy updates itself through the Store, and this
+    // client downloads nothing. The words say where the new version comes
+    // from, including the one case a player cannot act on -- a version that is
+    // out on GitHub and still being published to the Store.
+    let store = home.is_some_and(|h| h.store);
     let packaged = system == System::Linux && home.is_none_or(|h| !h.profile.starts_with(&h.folder));
     let (next, folder, by_hand) = match home {
+        _ if store => (
+            "The Microsoft Store installs the new version and P2Poker can be played again as soon as it has. Your \
+             player profile stays as it is. If the Store does not offer it yet, it is still being published there: \
+             it arrives on its own, and nothing else is needed."
+                .to_owned(),
+            None,
+            false,
+        ),
         _ if packaged => (
             "Choose the package for your system on the release page -- the AppImage, the .deb or the .rpm -- then \
              close P2Poker and install it the way you installed this one. Your player profile stays as it is, in \
@@ -1285,9 +1298,10 @@ pub fn closed_words(
         heading: format!("P2Poker {latest} is out"),
         body: format!(
             "This is a beta, and its protocol still changes from one version to the next, so version {this} can no \
-             longer play with the players who have {latest}. Download the new version to go on playing."
+             longer play with the players who have {latest}. {}",
+            if store { "Take the new version to go on playing." } else { "Download the new version to go on playing." }
         ),
-        download: format!("Download {latest}"),
+        download: if store { "Update in the Microsoft Store".to_owned() } else { format!("Download {latest}") },
         next,
         folder,
         by_hand,
@@ -1296,12 +1310,16 @@ pub fn closed_words(
 
 /// `D-077`: what the window says once the gold button was pressed: whether the
 /// system took the address -- on Windows the program itself, on Linux the
-/// release page with the packages (`D-078`).
-pub fn handed_words(handed: bool, system: System) -> &'static str {
-    match (handed, system) {
-        (true, System::Windows) => "The download was handed to your browser.",
-        (true, System::Linux) => "The release page was opened in your browser.",
-        (false, _) => "Your browser could not be started. Copy the address below into it.",
+/// release page with the packages (`D-078`), and from the Store its own page
+/// there (`D-080`), which is where that copy's update comes from.
+pub fn handed_words(handed: bool, system: System, store: bool) -> &'static str {
+    match (handed, system, store) {
+        (true, _, true) => "The Microsoft Store was opened.",
+        (false, _, true) => "The Microsoft Store could not be opened. Open it yourself and look for P2Poker: the \
+                             update is there, or on its way.",
+        (true, System::Windows, false) => "The download was handed to your browser.",
+        (true, System::Linux, false) => "The release page was opened in your browser.",
+        (false, _, false) => "Your browser could not be started. Copy the address below into it.",
     }
 }
 
@@ -2135,6 +2153,7 @@ mod tests {
             folder: folder.clone(),
             profile: folder.join("profile"),
             installed,
+            store: false,
             can_install: true,
             busy: false,
         };
@@ -2159,7 +2178,7 @@ mod tests {
         let nowhere = closed_words("0.2.0", "0.1.1", None, System::Windows);
         assert_eq!(nowhere.folder, None);
         assert!(nowhere.next.contains("profile stays"));
-        assert_ne!(handed_words(true, System::Windows), handed_words(false, System::Windows));
+        assert_ne!(handed_words(true, System::Windows, false), handed_words(false, System::Windows, false));
     }
 
     /// **`D-078`: on Linux the next step is the package, or the portable
@@ -2175,6 +2194,7 @@ mod tests {
             folder: PathBuf::from("/usr/lib/p2poker"),
             profile: PathBuf::from("/home/someone/.local/share/p2poker/profile"),
             installed: false,
+            store: false,
             can_install: false,
             busy: false,
         };
@@ -2194,11 +2214,50 @@ mod tests {
         for w in [closed_words("0.2.0", "0.1.1", Some(&packaged), System::Linux), words] {
             assert!(![&w.heading, &w.body, &w.next].iter().any(|s| s.contains(".exe")), "no Windows program on Linux");
         }
-        assert!(handed_words(true, System::Linux).contains("release page"));
-        assert!(!handed_words(true, System::Windows).contains("release page"));
+        assert!(handed_words(true, System::Linux, false).contains("release page"));
+        assert!(!handed_words(true, System::Windows, false).contains("release page"));
         let about = super::super::render::home_words(&packaged, System::Linux);
         assert!(about.contains("/usr/lib/p2poker") && about.contains(".local/share/p2poker/profile"), "{about}");
         let beside = super::super::render::home_words(&portable, System::Linux);
         assert!(beside.contains("portable"), "{beside}");
+    }
+
+    /// **`D-080`: a copy from the Microsoft Store updates through the Store**,
+    /// and this client hands it no file to download and no folder to replace.
+    /// The words say the one thing a player cannot act on as well: a version
+    /// that is out and not yet published there.
+    ///
+    /// The break that must make this fail: take `store` out of `closed_words`,
+    /// and the Store's copy is told to download a program it cannot install.
+    #[test]
+    fn a_copy_from_the_store_is_updated_by_the_store() {
+        use super::super::render::HomeView;
+        use std::path::PathBuf;
+        let store = HomeView {
+            folder: PathBuf::from(r"C:\Program Files\WindowsApps\P2Poker_0.1.4.0_x64__abcdefg"),
+            profile: PathBuf::from(r"C:\Users\someone\AppData\Local\P2Poker\profile"),
+            installed: false,
+            store: true,
+            can_install: false,
+            busy: false,
+        };
+        let words = closed_words("0.2.0", "0.1.4", Some(&store), System::Windows);
+        assert_eq!(words.download, "Update in the Microsoft Store");
+        assert!(words.next.contains("Microsoft Store installs"), "{}", words.next);
+        assert!(words.next.contains("still being published"), "the one wait a player cannot shorten: {}", words.next);
+        assert!(words.next.contains("profile stays"), "{}", words.next);
+        assert_eq!(words.folder, None, "nothing to replace by hand");
+        assert!(!words.by_hand);
+        assert!(
+            ![&words.heading, &words.body, &words.next].iter().any(|s| s.contains(".exe") || s.contains("ownload")),
+            "a packaged copy downloads nothing"
+        );
+        assert!(handed_words(true, System::Windows, true).contains("Microsoft Store"));
+        assert!(!handed_words(true, System::Windows, true).contains("browser"));
+        assert!(handed_words(false, System::Windows, true).contains("look for P2Poker"));
+
+        let about = super::super::render::home_words(&store, System::Windows);
+        assert!(about.contains("Microsoft Store") && about.contains("backup"), "{about}");
+        assert!(!about.contains("portable"), "the Store's copy is not the portable folder: {about}");
     }
 }

@@ -7049,3 +7049,56 @@ heard.
 Linux code compiled without a warning, and the recording held 11.77 s of the sounds heard -- the fifteen files hold
 11.66 s by the same measure -- and 2.75 s of the music, with a peak of 32768; the whole check cost the client 0.34 s of
 processor time.
+
+## D-080 — P2Poker in the Microsoft Store, and what a copy from there does differently
+
+**Decided 2026-09-22 by the project owner**, after the free certificate was refused: *make the Store version, and the
+update check in it has to be different.*
+
+**Why the Store at all.** Windows asks about every unsigned program, and `D-077` makes this client fetch a new one at
+every release, so the question comes round every time. The ways out were priced (`docs/CODE_SIGNING.md`): the
+SignPath Foundation signs open source free of charge and **refused this project on 2026-09-22** for want of public
+visibility -- *"community adoption, external articles, independent references ... your project doesn't yet show enough
+of these signals"* -- and invited a second application later; a certificate of the owner's own costs money every year,
+carries his name into every binary, and by Microsoft's own page (updated 2026-08-17) **removes no warning**: an
+Extended Validation certificate stopped bypassing SmartScreen in 2024, and a signed file builds reputation like any
+other. **One road ends the question instead of softening it:** an MSIX package published through the Store is
+re-signed by Microsoft, and a player who installs it from the Store is asked nothing at all. Registration for an
+individual developer became free in 2026, so the road costs nothing but the work.
+
+**One binary, two homes, and Windows says which.** There is no Store build and no feature: `install::packaged` asks
+`GetCurrentPackageFamilyName`, which names the package of a packaged process and refuses every other. Three things
+hang off that answer, and nothing else in the client changes:
+
+1. **The update gate keeps its rule and changes its remedy** (`D-077`). What decides remains the newest release on
+   GitHub, because that is what says the protocol moved and that is whom the other players are playing with. A copy
+   from the Store downloads nothing: the gold button opens its own page there
+   (`ms-windows-store://pdp/?PFN=<package family name>`), and the words say the Store installs it. They also say the
+   one thing a player cannot act on -- a version that is out on GitHub and **still being published to the Store**,
+   where certification takes hours or days. That wait is real and is stated rather than hidden; the table stays shut
+   through it, because the reason for shutting it is the protocol and not the channel.
+2. **The installer is never offered** (`D-073`). The Store installs the copy, updates it and removes it;
+   `Facts::supported` is false for a packaged copy, so the first-run offer never appears, and the About page's
+   *Install on this computer* is not drawn.
+3. **The profile goes where a packaged program may write**: the user's local data folder,
+   `%LOCALAPPDATA%\P2Poker\profile`, which Windows redirects into the package's own storage. Everywhere else the
+   rule is exactly what it was -- beside the program on Windows, the data folder on Linux. **The cost is stated**:
+   uninstalling the Store's copy takes that folder with it, so the About page and the update gate both say to make a
+   profile backup (`D-068`) before removing it.
+
+**What the Store gets and what GitHub keeps.** Both, and neither is the other's fallback. The release workflow builds
+the same Windows binary it always did, attests it and publishes it with the Linux packages; `tools/package-msix.ps1`
+then wraps that very file in an MSIX which is kept **with the run** and never put on the release page -- an unsigned
+package installs for nobody, and the signature it is waiting for is Microsoft's. The three identity values of the
+Store account (the reserved name, the publisher string, its display name) are repository variables, not lines in a
+public repository, and the packaging step does nothing until they are set.
+
+**The age rating is 18 and that is expected.** One IARC questionnaire produces every board's rating; a game that
+simulates gambling has been PEGI 18 since 2020 even with play money, and the table's chat adds *users interact*. What
+the questionnaire also records is what this client is not: no real money, no purchases, nothing of value to win.
+
+**What is NOT done.** Nobody has yet run a copy from a package: the packaged behaviour is decided by one call to
+Windows and covered by its unit tests, and certification will be the first real run. The Store's copy is Windows
+only. The *Support* button stays as it is in the packaged copy on the owner's word, to be removed only if
+certification objects to it. And the Store cannot be submitted from here: the account, the identity check and the
+submission are the owner's, and the listing, the answers and the package are prepared for him.
