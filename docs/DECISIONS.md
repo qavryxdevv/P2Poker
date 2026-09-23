@@ -7127,3 +7127,43 @@ submission are the owner's, and the listing, the answers and the package are pre
 preparation was carried through in his own signed-in browser -- properties, price, rating, package, listing and the
 `runFullTrust` justification are filled and saved, the package validated -- and what is left is the one thing that is
 his alone to do: sending it to certification.
+
+
+## D-081 -- a clock that is out, and the company it costs
+
+**Decided 2026-09-23 by the project owner**, from his own question: *can players in different time zones play together
+and see each other's tables?* They can, and nothing had to be changed for it -- but the question was worth following,
+and at the end of it stood a real way to be alone in a lobby that is not empty.
+
+**A time zone cannot separate two players.** Everything the clients say to each other is in seconds since the epoch
+(`net::node::now_unix_ms`), which is the same number in Prague and in Santiago; the lobby's topic is a constant
+(`/p2p-poker/lobby/1`) and its slices come from a table key's hash, not from geography. The one place in the whole
+program that asks what the local time is, is the rewards album -- the dates it prints and where a player's own day
+ends (`app::rewards::local_offset_min`) -- and that is each player's own business, not something two clients have to
+agree on.
+
+**A clock that is wrong can.** `D-070`'s key for *who is here now* is the hour of the clock, `unix_s / 3600`: two
+clients meet under it only while they agree on which hour it is. Ten minutes of every hour are read from the hour
+before as well, so a small difference costs nothing -- but a computer whose clock is out by more (a dead battery, a
+machine that boots Windows and Linux in turn and lets each set the hardware clock its own way, a virtual machine
+resumed from an old snapshot) announces itself into an hour nobody else is in. **It is not shut out of the game** --
+tables ride gossipsub and the queue of `D-064` does not depend on the clock at all -- it just fails to find company
+at the moment it is looking for some, and has no way of knowing why.
+
+**So the client says so, out of an answer it was already getting.** The version check (`D-077`) asks GitHub as the
+window opens, and every HTTP answer carries the server's own time. Reading that header costs no request, no service
+and nothing of the player: `http_date_unix_s` takes the one form the standard tells a server to send and refuses
+every other, because a guess about somebody's clock is worse than silence. Past `CLOCK_OUT_BY_S` (five minutes, below
+the ten the hour's overlap already forgives) the lobby shows one sentence in the same quiet band `D-068` uses, with an
+*OK* under it: what is wrong, what it costs, and the one thing to do about it. The difference is written into the
+client's log whatever it is, because a log that speaks only when something is wrong cannot be read for whether it was
+ever right.
+
+**What it does not do.** It does not set the clock, and it does not offer to: a game does not touch a system setting.
+It names no operating system's settings page, because this client runs on more than one. It treats GitHub's clock as
+a second opinion, not as the truth -- what is said is that the two disagree. And it never closes anything: a player
+with a wrong clock plays exactly as before, having been told why the lobby may look emptier than it is.
+
+`P2P_POKER_PRETEND_CLOCK_OUT` shows the sentence in a binary built to be measured, so it can be seen and
+photographed without setting this computer's clock wrong; a player's build has no such knob, exactly as `D-077`'s
+`P2P_POKER_PRETEND_VERSION` has none.

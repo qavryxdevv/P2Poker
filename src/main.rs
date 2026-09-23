@@ -558,8 +558,10 @@ fn main() {
     }
 }
 
-/// `D-075`: what the version check's thread sends back.
-type UpdateAnswer = Result<p2p_poker::app::update::Verdict, String>;
+/// `D-075`: what the version check's thread sends back -- the verdict, and
+/// (`D-081`) how far this computer's clock is from the one GitHub's answer
+/// carried.
+type UpdateAnswer = p2p_poker::app::update::Checked;
 
 /// `D-073`: the installer's turn, if this start is one. `None`: start the
 /// client as always. `Some(code)`: the installer ran, and this process ends.
@@ -2360,17 +2362,27 @@ impl Client {
 
     fn update_answers(&mut self) {
         while let Ok(answer) = self.update_done.1.try_recv() {
-            self.state.note_update(match &answer {
+            self.state.note_update(match &answer.verdict {
                 Ok(v) => format!("the version check: {v:?}"),
                 Err(e) => format!("the version check failed, and nothing is closed for it: {e}"),
             });
-            if let Ok(p2p_poker::app::update::Verdict::Newer { latest, .. }) = &answer {
+            if let Ok(p2p_poker::app::update::Verdict::Newer { latest, .. }) = &answer.verdict {
                 self.state.note_update(format!(
                     "version {} can no longer play: {latest} is out, and the lobby is closed to this one (D-077)",
                     p2p_poker::app::update::compared_version()
                 ));
             }
-            self.ui.update = render::UpdateUi::Done(answer);
+            // `D-081`: the difference is written down whatever it is -- a log
+            // that only speaks when something is wrong cannot be read for
+            // whether it was ever right -- and the player is told only when it
+            // is far enough out to cost him company.
+            if let Some(out) = p2p_poker::app::update::out_by(answer.clock_out_by_s) {
+                self.state.note_update(format!(
+                    "this computer's clock is {out} s from the time GitHub's answer carried (D-081)"
+                ));
+                self.ui.clock_notice = p2p_poker::app::update::clock_words(out);
+            }
+            self.ui.update = render::UpdateUi::Done(answer.verdict);
         }
     }
 
@@ -2981,6 +2993,9 @@ impl eframe::App for Client {
                     view.rewards_notice = self.rewards.notice.map(|n| n.words());
                     view.reveal = self.reveal_now();
                 }
+                // `D-081`: and the clock's, which is nothing to do with the
+                // rewards switch above it.
+                view.clock_notice = self.ui.clock_notice.clone();
                 // `D-067`: the card about the player -- how long this client
                 // has been open, and the record from the profile.
                 view.session_s = self.started.elapsed().as_secs();
@@ -3169,6 +3184,7 @@ impl eframe::App for Client {
                     render::LobbyAction::OpenAlbum => self.album_open = true,
                     render::LobbyAction::RewardsSeen => self.rewards.rewards.mark_summary_seen(),
                     render::LobbyAction::RewardsNoticeSeen => self.rewards.notice = None,
+                    render::LobbyAction::ClockNoticeSeen => self.ui.clock_notice = None,
                 }
             }
         }

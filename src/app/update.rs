@@ -61,6 +61,122 @@ pub const RELEASES_ANSWER_MAX: usize = 512 * 1024;
 /// what it is sent. A network that is simply not there answers at once.
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// `D-081`: how far out this computer's clock may be before the player is told.
+///
+/// **Why the clock is worth a word at all.** The lobby's key in the public DHT
+/// is the hour of the clock -- `unix_s / 3600` (`net::run::lobby_hour`, `D-070`)
+/// -- so two clients announce under the same key only while their clocks agree
+/// on which hour it is. A time zone cannot do that: every client works in
+/// seconds since the epoch, which is the same number everywhere on earth.
+/// A clock that is simply *wrong* can, and then a player looks in an hour that
+/// nobody else is in and finds an empty lobby that is not empty. Ten minutes of
+/// every hour are read from the hour before as well, so this is set below that.
+pub const CLOCK_OUT_BY_S: i64 = 300;
+
+/// What one question to GitHub came back with: the verdict, and how far this
+/// computer's clock is from GitHub's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub verdict: Result<Verdict, String>,
+    /// Positive: this computer is ahead. `None` when the answer carried no time
+    /// this client could read, which is not worth a word to anybody.
+    pub clock_out_by_s: Option<i64>,
+}
+
+/// The moment an HTTP `Date` header names, in seconds since the epoch.
+///
+/// **Only the one form the standard tells a server to send** is read -- `Sun, 06
+/// Nov 1994 08:49:37 GMT`. The two obsolete forms are not, and neither is a
+/// header with anything else in it: this is used to tell a player their clock is
+/// wrong, and a guess is worse than silence.
+pub fn http_date_unix_s(header: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let after_day_name = header.trim().split_once(", ")?.1;
+    let mut fields = after_day_name.split(' ');
+    let day: i64 = fields.next()?.parse().ok()?;
+    let month_name = fields.next()?;
+    let month = MONTHS.iter().position(|m| *m == month_name)? as i64 + 1;
+    let year: i64 = fields.next()?.parse().ok()?;
+    let clock = fields.next()?;
+    if fields.next()? != "GMT" || fields.next().is_some() {
+        return None;
+    }
+    let mut hms = clock.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next()?.parse().ok()?;
+    let second: i64 = hms.next()?.parse().ok()?;
+    if hms.next().is_some() {
+        return None;
+    }
+    // A leap second is a 60 that no calendar carries; it is let through and
+    // lands on the next minute, which is a second of error and nobody's problem.
+    if !(1..=31).contains(&day) || !(1970..=9999).contains(&year) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days from 1970-01-01 to a date of the proleptic Gregorian calendar
+/// (Howard Hinnant's `days_from_civil`, which is exact and has no table).
+const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let year_of_era = y - era * 400;
+    let shifted_month = (month + 9) % 12;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// How far this computer's clock is ahead (positive) of the time a `Date`
+/// header names.
+pub fn clock_out_by_s(header: &str, now_unix_s: i64) -> Option<i64> {
+    Some(now_unix_s - http_date_unix_s(header)?)
+}
+
+/// `D-081`: what the window believes the difference is.
+///
+/// **Only a binary built to be measured can be told to believe something else**,
+/// through `P2P_POKER_PRETEND_CLOCK_OUT`, so that the sentence can be seen and
+/// photographed without setting this computer's clock wrong -- the same bargain
+/// as `compared_version`'s. A player's build reads GitHub's answer and nothing
+/// else.
+pub fn out_by(answered: Option<i64>) -> Option<i64> {
+    #[cfg(feature = "fault-harness")]
+    if let Some(pretended) =
+        std::env::var("P2P_POKER_PRETEND_CLOCK_OUT").ok().and_then(|v| v.parse::<i64>().ok())
+    {
+        return Some(pretended);
+    }
+    answered
+}
+
+/// `D-081`: what the lobby says about a clock that is out, or `None` while it is
+/// close enough to leave alone.
+///
+/// The sentence says the one thing a player can act on and stops. It does not
+/// name GitHub's clock as the right one -- what matters is that the two disagree
+/// -- and it does not name a system's settings, because this client runs on more
+/// than one.
+pub fn clock_words(out_by_s: i64) -> Option<String> {
+    if out_by_s.abs() <= CLOCK_OUT_BY_S {
+        return None;
+    }
+    let out = out_by_s.abs();
+    let span = if out >= 7_200 {
+        format!("{} hours", (out + 1_800) / 3_600)
+    } else {
+        format!("{} minutes", (out + 30) / 60)
+    };
+    let way = if out_by_s > 0 { "ahead of" } else { "behind" };
+    Some(format!(
+        "This computer's clock is about {span} {way} the time the internet gave, and P2Poker looks for the players \
+         who are online now by the hour on the clock. A clock this far out can leave you alone in a lobby that is \
+         not empty. Setting this computer's time automatically puts it right."
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Nothing has been released yet.
@@ -199,8 +315,18 @@ pub fn compared_version() -> String {
 
 /// Ask GitHub. **Blocking** -- called on a thread of its own, never on the
 /// paint thread or the node's loop.
+///
+/// `D-081`: the same answer carries the time GitHub sent it, which is the only
+/// clock this client sees besides its own and costs nothing to read.
 #[cfg(feature = "tox")]
-pub fn check() -> Result<Verdict, String> {
+pub fn check() -> Checked {
+    let mut clock_out_by_s = None;
+    let verdict = ask_github(&mut clock_out_by_s);
+    Checked { verdict, clock_out_by_s }
+}
+
+#[cfg(feature = "tox")]
+fn ask_github(clock_out: &mut Option<i64>) -> Result<Verdict, String> {
     use std::io::Read;
     let response = attohttpc::get(RELEASES_API)
         // GitHub's API refuses a request with no `User-Agent`. The product's
@@ -213,6 +339,15 @@ pub fn check() -> Result<Verdict, String> {
         .timeout(CHECK_TIMEOUT)
         .send()
         .map_err(|e| format!("GitHub could not be reached: {e}"))?;
+    // `D-081`, before anything can return: the header is there on an answer this
+    // client refuses as much as on one it reads.
+    if let Some(sent) = response.headers().get(attohttpc::header::DATE).and_then(|v| v.to_str().ok()) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        *clock_out = clock_out_by_s(sent, now);
+    }
     let status = response.status();
     if matches!(status.as_u16(), 403 | 429) {
         // GitHub's API answers sixty questions an hour from one address, and
@@ -405,5 +540,68 @@ mod tests {
         let r = Release { version: "0.1.1".into(), tag: "v0.1.1".into() };
         assert_eq!(verdict_of("0.1.0", Some(r.clone())), newer("0.1.1", "v0.1.1"));
         assert_eq!(verdict_of("0.1.1", Some(r)), Verdict::Newest { latest: "0.1.1".into() });
+    }
+
+    /// `D-081`: the header's moment, against dates worked out elsewhere.
+    #[test]
+    fn the_time_an_answer_carries_is_read_or_refused() {
+        for (header, when) in [
+            ("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777),
+            ("Thu, 01 Jan 1970 00:00:00 GMT", 0),
+            ("Wed, 23 Sep 2026 12:00:00 GMT", 1_790_164_800),
+            // A leap day, and a century that is not a leap year.
+            ("Mon, 29 Feb 2016 23:59:59 GMT", 1_456_790_399),
+            ("Fri, 31 Dec 2100 23:00:00 GMT", 4_133_977_200),
+        ] {
+            assert_eq!(http_date_unix_s(header), Some(when), "{header:?}");
+        }
+        // Anything but the one form a server is told to send is refused: a
+        // guess about somebody's clock is worse than saying nothing.
+        for bad in [
+            "Sunday, 06-Nov-94 08:49:37 GMT",  // the obsolete RFC 850 form
+            "Sun Nov  6 08:49:37 1994",        // asctime
+            "Sun, 06 Nov 1994 08:49:37 +0100", // a zone that is not GMT
+            "Sun, 06 Nov 1994 08:49:37 GMT extra",
+            "Sun, 06 Nov 1994 08:49 GMT",
+            "Sun, 06 Nov 1994 08:49:37:11 GMT",
+            "Sun, 06 Xxx 1994 08:49:37 GMT",
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 24:49:37 GMT",
+            "Sun, 06 Nov 1994 08:60:37 GMT",
+            "Sun, 06 Nov 1869 08:49:37 GMT",
+            "",
+        ] {
+            assert_eq!(http_date_unix_s(bad), None, "{bad:?}");
+        }
+        // The difference is signed: this computer ahead is positive.
+        let noon = "Wed, 23 Sep 2026 12:00:00 GMT";
+        assert_eq!(clock_out_by_s(noon, 1_790_164_800 + 90), Some(90));
+        assert_eq!(clock_out_by_s(noon, 1_790_164_800 - 90), Some(-90));
+        assert_eq!(clock_out_by_s("not a date", 1_790_164_800), None);
+    }
+
+    /// `D-081`: who is told, and what they are told.
+    #[test]
+    fn a_clock_is_only_spoken_of_when_it_is_far_enough_out() {
+        // Inside the tolerance nothing is said, in either direction, and the
+        // edge itself is silence: 300 s is not "out by".
+        for close in [0, 1, 299, 300, -1, -299, -300] {
+            assert_eq!(clock_words(close), None, "{close} s");
+        }
+        let ahead = clock_words(301).expect("301 s is out by");
+        assert!(ahead.contains("5 minutes"), "{ahead}");
+        assert!(ahead.contains("ahead of"), "{ahead}");
+        let behind = clock_words(-3_600).expect("an hour is out by");
+        assert!(behind.contains("60 minutes"), "{behind}");
+        assert!(behind.contains("behind"), "{behind}");
+        assert!(!behind.contains("ahead"), "{behind}");
+        // Past two hours it is said in hours: nobody reads 480 minutes.
+        let hours = clock_words(2 * 3_600 + 60).expect("two hours is out by");
+        assert!(hours.contains("2 hours"), "{hours}");
+        // And the sentence says what to do about it.
+        for words in [&ahead, &behind, &hours] {
+            assert!(words.contains("clock"), "{words}");
+            assert!(words.contains("automatically"), "{words}");
+        }
     }
 }

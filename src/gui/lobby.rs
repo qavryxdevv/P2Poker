@@ -720,6 +720,9 @@ pub struct LobbyView {
     /// `D-068`: one neutral sentence about the rewards file, when a load had
     /// one to say.
     pub rewards_notice: Option<&'static str>,
+    /// `D-081`: one sentence about this computer's clock being far enough out
+    /// to cost the player company in the lobby.
+    pub clock_notice: Option<String>,
     /// `D-068`: a card or a level to show for a moment -- only while no hand
     /// is being played at any of this client's tables.
     pub reveal: Option<RevealView>,
@@ -1089,6 +1092,7 @@ impl LobbyView {
             found: None,
             rewards: None,
             rewards_notice: None,
+            clock_notice: None,
             reveal: None,
             profile_elsewhere: false,
         }

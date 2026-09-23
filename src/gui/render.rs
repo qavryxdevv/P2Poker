@@ -110,6 +110,8 @@ pub enum LobbyAction {
     RewardsSeen,
     /// `D-068`: the sentence about the rewards file has been read.
     RewardsNoticeSeen,
+    /// `D-081`: the sentence about a clock that is out has been read.
+    ClockNoticeSeen,
     /// `D-068`: make a backup of the profile under this password.
     MakeBackup(String),
     /// `D-068`: open this backup with this password and say what it holds.
@@ -364,6 +366,10 @@ pub struct LobbyUi {
     /// `D-077`: the download of a newer release was asked for, and whether the
     /// system's browser took the address.
     pub download_handed: Option<bool>,
+    /// `D-081`: the sentence about a clock that is out, once the version check
+    /// has read the time GitHub's answer carried. `None` while the clock is
+    /// close enough, and once the player has read it.
+    pub clock_notice: Option<String>,
 }
 
 /// The settings dialog's pages, one at a time: all of them on one page no longer
@@ -424,6 +430,7 @@ impl LobbyUi {
             home: None,
             update: UpdateUi::default(),
             download_handed: None,
+            clock_notice: None,
             settings,
             settings_tab: SettingsTab::default(),
             backup: BackupUi::default(),
@@ -2880,8 +2887,16 @@ fn you_card(ui: &mut egui::Ui, view: &LobbyView) -> Option<LobbyAction> {
     // `D-068`: the end of a game first -- what it came to, truthfully, and
     // what is nearest now; then the card itself.
     if let Some(words) = view.rewards_notice {
-        if rewards_notice(ui, words) {
+        if notice_band(ui, words) {
             action = Some(LobbyAction::RewardsNoticeSeen);
+        }
+    }
+    // `D-081`: a clock far enough out to leave the player looking in an hour
+    // nobody else is in. Said in the same band and dismissed the same way; it
+    // comes back at the next start while the clock is still wrong.
+    if let Some(words) = view.clock_notice.as_deref() {
+        if notice_band(ui, words) {
+            action = Some(LobbyAction::ClockNoticeSeen);
         }
     }
     if let Some(s) = view.rewards.as_ref().and_then(|r| r.summary.as_ref()) {
@@ -3103,8 +3118,10 @@ fn game_summary(ui: &mut egui::Ui, s: &super::rewards::SummaryView, next: Option
     seen
 }
 
-/// `D-068`: the one neutral sentence about the rewards file.
-fn rewards_notice(ui: &mut egui::Ui, words: &str) -> bool {
+/// One neutral sentence with an *OK* under it: `D-068`'s about the rewards
+/// file, `D-081`'s about a clock that is out. Nothing here blinks and nothing
+/// here is a warning sign; it is read once and pressed away.
+fn notice_band(ui: &mut egui::Ui, words: &str) -> bool {
     let mut seen = false;
     egui::Frame::new().fill(theme::FIELD).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(10.0).inner_margin(10.0).show(
         ui,
