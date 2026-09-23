@@ -7097,8 +7097,20 @@ public repository, and the packaging step does nothing until they are set.
 simulates gambling has been PEGI 18 since 2020 even with play money, and the table's chat adds *users interact*. What
 the questionnaire also records is what this client is not: no real money, no purchases, nothing of value to win.
 
+**The listing's pictures are made by the program, not collected by hand.** `tools/store-assets.ps1` writes
+`dist\store`: five screenshots from `--table-preview` and `--album-preview`, which start no node and open no profile,
+so they can be taken while somebody is playing on the same machine; and the two logo images the Store asks for, drawn
+around `assets\icon.png` so the listing and the program's own icon cannot drift apart. The pictures themselves are
+not kept here -- seven megabytes that go stale the moment the table is redrawn, and Partner Center already holds the
+published ones -- but the script that makes them again is. The table's pictures carry the sample's banner (section 22
+of the spec: a sample that looks like a hand says so), and that is as true of a picture in a shop as of one in the
+program: the hand in it was never played.
+
 **What is NOT done.** Nobody has yet run a copy from a package: the packaged behaviour is decided by one call to
 Windows and covered by its unit tests, and certification will be the first real run. The Store's copy is Windows
 only. The *Support* button stays as it is in the packaged copy on the owner's word, to be removed only if
 certification objects to it. And the Store cannot be submitted from here: the account, the identity check and the
-submission are the owner's, and the listing, the answers and the package are prepared for him.
+submission are the owner's, and the listing, the answers and the package are prepared for him. On 2026-09-23 that
+preparation was carried through in his own signed-in browser -- properties, price, rating, package, listing and the
+`runFullTrust` justification are filled and saved, the package validated -- and what is left is the one thing that is
+his alone to do: sending it to certification.
