@@ -7093,6 +7093,19 @@ package installs for nobody, and the signature it is waiting for is Microsoft's.
 Store account (the reserved name, the publisher string, its display name) are repository variables, not lines in a
 public repository, and the packaging step does nothing until they are set.
 
+**Amended 2026-09-23 by the project owner: a release waits for the Store.** The client asks GitHub which version is
+newest and closes the lobby when it is behind (`D-077`), and a copy from the Store can do nothing about that until
+Microsoft has certified the new one -- every submission is certified, not only the first, and the queue is hours to
+days. A release made public first therefore locks those players out for as long as Microsoft takes, and the modal can
+only tell them to wait. So the order is: tag, build, send the package to the Store, and create the GitHub release **as
+a draft**; when the Store has published that version, publish the draft. `newest_release` skips drafts and counts
+pre-releases (`src/app/update.rs`), so while it waits nobody is asked to update and nobody is locked out of a game;
+and if certification refuses, the draft stays where it is and nothing went out -- which is the best shape a failure
+can have. The price is that both channels then move at the Store's pace, and that is a reason to release in fewer,
+larger steps while the protocol still changes from one version to the next. `release.yml` draws the draft when
+`vars.RELEASE_WAITS_FOR_STORE` is set -- only once there is a listing to wait for -- and prints the single command
+that publishes it.
+
 **The age rating is 18 and that is expected.** One IARC questionnaire produces every board's rating; a game that
 simulates gambling has been PEGI 18 since 2020 even with play money, and the table's chat adds *users interact*. What
 the questionnaire also records is what this client is not: no real money, no purchases, nothing of value to win.

@@ -467,4 +467,26 @@ jobs:
           # A full release, marked latest: the owner's word, 2026-09-20. A pre-release is never what GitHub calls
           # the latest, so the repository's front page showed no release and its files sat folded away; that the
           # client is a beta is said in the title and on its own About page, not by hiding the download.
-          gh release create $tag @files --repo '${{ github.repository }}' --title "P2Poker $version beta" --notes-file 'release-notes.md' --latest --verify-tag
+          #
+          # D-080, once the Store carries this client: the release is created as a DRAFT and published by hand when
+          # the Store has published the same version. The client asks GitHub which version is newest and closes the
+          # lobby when it is behind (D-077), and a copy from the Store cannot do anything about that until Microsoft
+          # has certified the new one -- so a release made public first locks those players out for as long as the
+          # queue takes. A draft is nobody's release (src/app/update.rs), so while it waits, everybody keeps playing
+          # the version they have. The variable is set only when there is a Store listing to wait for.
+          $arguments = @('--verify-tag')
+          if ('${{ vars.RELEASE_WAITS_FOR_STORE }}' -ne '') { $arguments += '--draft' } else { $arguments += '--latest' }
+          gh release create $tag @files --repo '${{ github.repository }}' --title "P2Poker $version beta" --notes-file 'release-notes.md' @arguments
+          if ('${{ vars.RELEASE_WAITS_FOR_STORE }}' -ne '') {
+              @(
+                "### $tag is a draft",
+                '',
+                "It waits for the Microsoft Store to publish $version. Until it does, nobody is asked to update and nobody is locked out of a game.",
+                '',
+                'Publish it once the Store has that version:',
+                '',
+                $fence,
+                "gh release edit $tag --draft=false --latest",
+                $fence
+              ) -join "`n" | Out-File -Encoding utf8 -Append $env:GITHUB_STEP_SUMMARY
+          }
