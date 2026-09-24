@@ -116,6 +116,12 @@ impl WaysIn {
         !self.held.is_empty()
     }
 
+    /// `S1-IZ`: whether this relay holds this client's reservation or is being
+    /// asked for one -- which the trim of strangers must never close.
+    pub fn keeps(&self, relay: &PeerId) -> bool {
+        self.held.contains(relay) || self.asked.contains_key(relay)
+    }
+
     pub fn len(&self) -> usize {
         self.held.len()
     }

@@ -140,6 +140,13 @@ impl<Q: Hash + Eq, P: Hash + Eq + Clone> Lookups<Q, P> {
     }
 
     /// The lookup ended, however it ended: what it found, to be said once.
+    /// `S1-IZ`: what a running lookup was asked for, read without ending it --
+    /// the dial book enters a finished query under its walk before the arm that
+    /// says its line takes it out of here.
+    pub fn asked_of(&self, id: &Q) -> Option<Asked> {
+        self.running.get(id).map(|t| t.asked)
+    }
+
     pub fn ended(&mut self, id: &Q, me: &P) -> Option<Found> {
         let t = self.running.remove(id)?;
         Some(Found {

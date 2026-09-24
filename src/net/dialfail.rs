@@ -124,6 +124,35 @@ fn relay(addr: &Multiaddr) -> Option<PeerId> {
     None
 }
 
+/// What one road ended in: the libraries' words first -- a relay's answer
+/// arrives wrapped in an error of no kind -- and the system's verdict where they
+/// say nothing.
+fn road_kind(e: &TransportError<std::io::Error>) -> &'static str {
+    match kind(&chain(e)) {
+        "failed otherwise" => system_kind(e).unwrap_or("failed otherwise"),
+        said => said,
+    }
+}
+
+/// `S1-IZ`: a failed dial as the dial book counts it -- one word for the dial,
+/// and the kind of every road it tried.
+///
+/// **The roads are the unit that costs a router something**, not the dial: a
+/// dial of a peer with four addresses is four attempts, each an entry in the
+/// router's table for as long as the router keeps it -- except a road with no
+/// transport for its address, which never leaves this machine at all.
+pub fn tally(error: &DialError) -> (&'static str, Vec<&'static str>) {
+    match error {
+        DialError::NoAddresses => ("no address", Vec::new()),
+        DialError::DialPeerConditionFalse(_) => ("already dialling", Vec::new()),
+        DialError::Denied { .. } => ("own limit", Vec::new()),
+        DialError::Aborted => ("given up", Vec::new()),
+        DialError::LocalPeerId { .. } => ("own address", Vec::new()),
+        DialError::WrongPeerId { .. } => ("wrong peer", Vec::new()),
+        DialError::Transport(roads) => ("no road", roads.iter().map(|(_, e)| road_kind(e)).collect()),
+    }
+}
+
 /// The failed dial in one line.
 pub fn fold(error: &DialError) -> String {
     match error {
@@ -137,13 +166,7 @@ pub fn fold(error: &DialError) -> String {
             // Relay (or none, for a road straight to it) -> kind -> how many.
             let mut by: BTreeMap<Option<String>, BTreeMap<&'static str, usize>> = BTreeMap::new();
             for (addr, e) in roads {
-                // The libraries' words first -- a relay's answer arrives wrapped in
-                // an error of no kind -- and the system's verdict where they say nothing.
-                let k = match kind(&chain(e)) {
-                    "failed otherwise" => system_kind(e).unwrap_or("failed otherwise"),
-                    said => said,
-                };
-                *by.entry(relay(addr).map(|r| short(&r))).or_default().entry(k).or_default() += 1;
+                *by.entry(relay(addr).map(|r| short(&r))).or_default().entry(road_kind(e)).or_default() += 1;
             }
             let said: Vec<String> = by
                 .into_iter()
@@ -196,6 +219,26 @@ mod tests {
         );
         // No address and no whole id: the line goes into a log a player may post.
         assert!(!fold(&error).contains("147.75") && !fold(&error).contains(relay));
+
+        // `S1-IZ`: the same dial as the dial book counts it -- one dial, five
+        // roads, each by the kind the line above names it, in the order tried.
+        assert_eq!(
+            tally(&error),
+            (
+                "no road",
+                vec![
+                    "given up before the relay was reached",
+                    "given up before the relay was reached",
+                    "the relay holds no reservation for it",
+                    "timed out",
+                    "no transport for the address",
+                ]
+            )
+        );
+        // And a dial that never left this client is a word and no road at all.
+        let own = DialError::Denied { cause: libp2p::swarm::ConnectionDenied::new(std::io::Error::other("limit")) };
+        assert_eq!(tally(&own), ("own limit", vec![]));
+        assert_eq!(tally(&DialError::NoAddresses), ("no address", vec![]));
     }
 
     /// The three refusals `Swarm::dial` returns by value, which leave no event

@@ -441,6 +441,61 @@ fn connections_due(said: Option<ConnectionsReading>, now: ConnectionsReading, qu
     said != Some(now) || quiet_ticks >= CONNECTIONS_HEARTBEAT
 }
 
+/// `S1-IZ`: whether strangers are closed once they are past their grace
+/// (`net::trim`), and the budget held at the ceiling rather than walked down to
+/// what is held -- the trim is what gives connections back now, and a limit
+/// walked down to the pool refuses the next walk's connections after their
+/// handshakes. **Only a binary built to be measured can be told not to**
+/// (`P2P_POKER_NO_TRIM`), so that the client as it was, the control, comes out
+/// of the same build.
+fn trims_strangers() -> bool {
+    #[cfg(feature = "fault-harness")]
+    if std::env::var_os("P2P_POKER_NO_TRIM").is_some() {
+        return false;
+    }
+    true
+}
+
+/// `S1-IZ`: how long after its start a client looks the lobby up on every
+/// discovery tick -- the minutes in which it is the newcomer, and a newcomer is
+/// who does the finding.
+const LOOKUP_WARM: Duration = Duration::from_secs(600);
+
+/// `S1-IZ`: how many discovery ticks apart a settled client looks the lobby up.
+const LOOKUP_SETTLED_EVERY: u32 = 5;
+
+/// `S1-IZ`: whether a settled client looks the lobby up less often. **Only a
+/// binary built to be measured can be told not to** (`P2P_POKER_NO_LOOKUP_BACKOFF`),
+/// so the control comes out of the same build.
+fn backs_off_lookups() -> bool {
+    #[cfg(feature = "fault-harness")]
+    if std::env::var_os("P2P_POKER_NO_LOOKUP_BACKOFF").is_some() {
+        return false;
+    }
+    true
+}
+
+/// `S1-IZ`: whether this discovery tick looks the lobby up -- its key, its
+/// slices, and the hour's while nobody else is here.
+///
+/// **Finding is the newcomer's job, and that is what makes this safe.** A
+/// client that has just started looks every tick, and it finds a client that
+/// has sat in the lobby for an hour by that client's records, which its
+/// announcements keep in the DHT whether or not it looks. So a client past its
+/// first ten minutes looks one tick in `LOOKUP_SETTLED_EVERY` -- enough for two
+/// clients that both settled before they met -- and every tick again while it
+/// wants company: its player searching for a game, or a table it founded still
+/// waiting for its seats. Each lookup asks some 250 to 340 nodes of the public
+/// DHT, most of which never answer, and every one of those is a dial and an
+/// entry in the player's router.
+///
+/// **Tables are not what this finds.** An advert travels the lobby's gossip to
+/// every client connected to anybody in it, in seconds; a lookup is how a client
+/// meets the lobby in the first place.
+fn looks_this_tick(backs_off: bool, since_start: Duration, wants_company: bool, ticks_since_look: u32) -> bool {
+    !backs_off || wants_company || since_start < LOOKUP_WARM || ticks_since_look >= LOOKUP_SETTLED_EVERY
+}
+
 /// `S1-IY`: the ceiling this node's connection budget may rise to.
 ///
 /// **Only a binary built to be measured can be told another one**, through
@@ -455,6 +510,55 @@ fn connection_ceiling() -> u32 {
         return ceiling.max(MIN_CONNECTIONS);
     }
     CONNECTION_CEILING
+}
+
+/// `S1-IZ`: which of this client's walks a finished query of the public DHT
+/// was. A lookup is known by the book that says its line (`lookups`), an
+/// announcement by the key it announced under, and the rest by what the library
+/// reports it as -- which is also how the library's own periodic bootstrap and
+/// republishing show up, walks nobody in this file asked for.
+fn walk_of(
+    result: &libp2p::kad::QueryResult,
+    asked: Option<super::lookups::Asked>,
+    unix_s: u64,
+) -> super::dialbook::Walk {
+    use super::dialbook::Walk;
+    use super::lookups::Asked;
+    use libp2p::kad::QueryResult;
+    match (result, asked) {
+        (QueryResult::GetProviders(_), Some(Asked::Lobby)) => Walk::LobbyLookup,
+        (QueryResult::GetProviders(_), Some(Asked::Hour)) => Walk::HourLookup,
+        (QueryResult::GetProviders(_), Some(Asked::Relays)) => Walk::RelayLookup,
+        (QueryResult::StartProviding(r), _) => {
+            let key = match r {
+                Ok(ok) => &ok.key,
+                Err(e) => e.key(),
+            };
+            let hour = lobby_hour(unix_s);
+            if *key == lobby_namespace() {
+                Walk::LobbyAnnounce
+            } else if *key == relay_namespace() {
+                Walk::RelayAnnounce
+            } else if [hour.saturating_sub(1), hour, hour + 1].iter().any(|h| *key == hour_namespace(*h)) {
+                Walk::HourAnnounce
+            } else {
+                Walk::SliceAnnounce
+            }
+        }
+        (QueryResult::RepublishProvider(_), _) => Walk::Republish,
+        (QueryResult::Bootstrap(_), _) => Walk::Bootstrap,
+        (QueryResult::GetClosestPeers(_), _) => Walk::Closest,
+        _ => Walk::Other,
+    }
+}
+
+/// `S1-IZ`: a peer as the dial book counts distinct peers -- by a hash of its
+/// id, which is all a count needs and nothing a log should hold.
+fn peer_hash(peer: &PeerId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    peer.hash(&mut h);
+    h.finish()
 }
 
 /// `D-070`: which hour of the clock a moment falls in.
@@ -2208,10 +2312,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `S1-IY`: where the budget may rise to -- the constant, or in a binary
     // built to be measured whatever the run was told.
     let ceiling = connection_ceiling();
-    if budget > ceiling {
+    // `S1-IZ`: with strangers trimmed the limit is only the net under the pool,
+    // so it stands at the ceiling from the start.
+    let trims = trims_strangers();
+    let trim = super::trim::Trim::chosen();
+    if budget > ceiling || (trims && budget < ceiling) {
         budget = ceiling;
         *swarm.behaviour_mut().conn_limits.limits_mut() = super::swarm::connection_limits(budget);
     }
+    // `S1-IZ`: when each connected peer's first connection was made, for the
+    // trim's grace; a peer leaves it with its last connection.
+    let mut connected_since: std::collections::HashMap<PeerId, std::time::Instant> =
+        std::collections::HashMap::new();
     // `S1-IT`: connections this client's own limit refused at its ceiling, said
     // once a discovery tick where a run is measured. Below the ceiling a refusal
     // raises the budget and says so; at it, nothing did.
@@ -2306,6 +2418,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // answer, most answers name nobody, and a line for each was 30 % of a log.
     let mut lookups: super::lookups::Lookups<libp2p::kad::QueryId, libp2p::PeerId> =
         super::lookups::Lookups::default();
+    // `S1-IZ`: every finished query under the walk that asked it, and every dial
+    // by what it came to -- said a minute at a time where a run is measured.
+    let mut dialbook = super::dialbook::DialBook::default();
+    // `S1-IZ`: discovery ticks since the lobby was last looked up, and whether
+    // a settled client looks less often (`looks_this_tick`).
+    let mut lookup_ticks: u32 = 0;
+    let backs_off = backs_off_lookups();
 
     // Whether this client has offered itself as a relay. Once only: the record
     // is republished by Kademlia on its own.
@@ -4496,7 +4615,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let _ = events.send(NodeEvent::Listening(address)).await;
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                    // `S1-IZ`: every dial the swarm starts, whoever asked for it.
+                    SwarmEvent::Dialing { peer_id, .. } => dialbook.dialing(peer_id.as_ref().map(peer_hash)),
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
+                        if endpoint.is_dialer() {
+                            dialbook.established();
+                        }
+                        if num_established.get() == 1 {
+                            connected_since.insert(peer_id, std::time::Instant::now());
+                        }
                         lobby_dials.remove(&connection_id);
                         // `D-070`: a connection made by a dial an hour's answer issued.
                         if hour_dials.remove(&connection_id) {
@@ -4596,6 +4723,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // the other in four minutes, for two peers that never
                         // actually went anywhere, and seventeen
                         // direct-connection events for eight arrivals.
+                        if num_established == 0 {
+                            connected_since.remove(&peer_id);
+                        }
                         if num_established == 0 && poker_peers.remove(&peer_id) {
                             reannounce.gone(&peer_id);
                             relay_admits.forget(&peer_id);
@@ -5972,8 +6102,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     SwarmEvent::OutgoingConnectionError {
                         error: libp2p::swarm::DialError::Denied { .. },
                         connection_id,
+                        peer_id,
                         ..
                     } if budget < ceiling => {
+                        dialbook.failed("own limit", &[]);
+                        dialbook.refused_peer(peer_id.as_ref().map(peer_hash));
                         lobby_dials.remove(&connection_id);
                         hour_dials.remove(&connection_id);
                         {
@@ -6074,6 +6207,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // hundred a minute on an open DHT were a good part of
                         // what filled the channel in the first place.
                         dials_failed = dials_failed.saturating_add(1);
+                        {
+                            // `S1-IZ`: the dial in one word and each of its roads.
+                            let (class, roads) = super::dialfail::tally(&error);
+                            dialbook.failed(class, &roads);
+                            if class == "own limit" {
+                                dialbook.refused_peer(peer_id.as_ref().map(peer_hash));
+                            }
+                        }
                         if dials_failed <= DIAL_FAILURES_TOLD {
                             let _ = events
                                 .send(NodeEvent::DialFailed { reason: error.to_string() })
@@ -6279,10 +6420,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    // `S1-IZ`: every test this client's AutoNAT server ran for
+                    // somebody else -- each one a dial of that somebody's address.
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::AutonatServer(served)) => {
+                        dialbook.served(served.result.is_ok());
+                    }
+                    // `S1-IZ`: the poker clients' own DHT, entered in the dial
+                    // book like the public one and otherwise left alone.
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Kademlia(
+                        libp2p::kad::Event::OutboundQueryProgressed { stats, step, .. },
+                    )) => {
+                        if step.last {
+                            dialbook.walked(
+                                super::dialbook::Walk::PrivateDht,
+                                stats.num_requests(),
+                                stats.num_successes(),
+                                stats.num_failures(),
+                            );
+                        }
+                    }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::IpfsKad(
-                        libp2p::kad::Event::OutboundQueryProgressed { id, result, stats, .. },
+                        libp2p::kad::Event::OutboundQueryProgressed { id, result, stats, step, .. },
                     )) => {
                         use libp2p::kad::{GetProvidersOk, QueryResult};
+                        // `S1-IZ`: the finished query under its walk, read before
+                        // anything below takes the lookup out of its book.
+                        if step.last {
+                            let walk = walk_of(&result, lookups.asked_of(&id), super::node::now_unix_ms() / 1_000);
+                            dialbook.walked(walk, stats.num_requests(), stats.num_successes(), stats.num_failures());
+                        }
                         // A query that fails is worth a line. Without one, a
                         // routing table too thin to answer anything looks
                         // exactly like a lobby with nobody in it.
@@ -6937,13 +7103,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 refused_by_own_limit = 0;
                 refused_coming_in = 0;
                 refused_coming_in_by_relay = 0;
+                // `S1-IZ`: the minute's dials and walks, where a run is measured;
+                // a player's client keeps the book and says nothing of it.
+                {
+                    let minute = dialbook.take_lines();
+                    if built_to_be_measured() {
+                        for line in minute {
+                            let _ = events.send(NodeEvent::Warning(line)).await;
+                        }
+                    }
+                }
                 // The cap, downwards. Raising it is an event; lowering it is a
                 // habit, and it needs patience: a client that trimmed its budget
                 // the moment it was under would spend every cycle refusing and
                 // raising again. Three quiet cycles, then a step down.
                 {
                     let held = state_peers;
-                    if held + held / 4 < budget && budget > MIN_CONNECTIONS {
+                    // `S1-IZ`: not while strangers are trimmed -- the trim gives
+                    // the connections back, and a limit walked down to the pool
+                    // is one the next walk runs into after its handshakes.
+                    if !trims && held + held / 4 < budget && budget > MIN_CONNECTIONS {
                         comfortable += 1;
                         if comfortable >= 3 {
                             comfortable = 0;
@@ -7045,19 +7224,38 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    if reads_the_hours_keys(poker_peers.len()) {
+                    // `S1-IZ`: the announcements above go out on their own
+                    // schedule; the lookups below only on the ticks
+                    // `looks_this_tick` allows -- every one while this client is
+                    // new or its player is searching, one in five after that.
+                    lookup_ticks = lookup_ticks.saturating_add(1);
+                    // Every tick while this client wants company: its player
+                    // searching for a game, or a table it founded still waiting
+                    // for its seats -- the owner's question (2026-09-24): a table
+                    // somebody opens must not wait five minutes to be seen.
+                    let wants_company = mm.searching()
+                        || tables
+                            .iter()
+                            .any(|x| x.table.as_ref().is_some_and(|f| f.is_founder() && f.session().is_none()));
+                    let looks = looks_this_tick(backs_off, started.elapsed(), wants_company, lookup_ticks);
+                    if looks {
+                        lookup_ticks = 0;
+                    }
+                    if looks && reads_the_hours_keys(poker_peers.len()) {
                         for h in lobby_hours_to_read(unix_s) {
                             let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(hour_namespace(h));
                             hour_lookups.insert(lookup);
                             lookups.asked(lookup, super::lookups::Asked::Hour);
                         }
                     }
-                    // Read it every cycle either way: a client with nothing
-                    // to announce can still see who is there, and a table it
-                    // can reach is a table it can sit at.
-                    let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
-                    lobby_lookups.insert(lookup, false);
-                    lookups.asked(lookup, super::lookups::Asked::Lobby);
+                    // Read it whether or not there is anything to announce: a
+                    // client with nothing to announce can still see who is
+                    // there, and a table it can reach is a table it can sit at.
+                    if looks {
+                        let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
+                        lobby_lookups.insert(lookup, false);
+                        lookups.asked(lookup, super::lookups::Asked::Lobby);
+                    }
                     // `S1-EX`: and the same for each slice of the lobby this
                     // client listens to, which is what makes a sliced lobby
                     // able to hold a mesh at all -- see `shard_namespace`. At
@@ -7075,8 +7273,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if reachable_here {
                             let _ = swarm.behaviour_mut().ipfs_kad.start_providing(key.clone());
                         }
-                        let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(key);
-                        lookups.asked(lookup, super::lookups::Asked::Lobby);
+                        if looks {
+                            let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(key);
+                            lookups.asked(lookup, super::lookups::Asked::Lobby);
+                        }
                     }
                 }
 
@@ -9356,6 +9556,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                     } else {
                         connections_quiet = connections_quiet.saturating_add(1);
+                    }
+                }
+                // `S1-IZ`: the strangers that have done what they were dialled
+                // for, closed -- the pings keep every connection open otherwise.
+                // Kept: every poker client, every peer let through the limit
+                // because a dial of it matters, every relay holding or asked for
+                // this client's reservation.
+                if trims {
+                    let now = std::time::Instant::now();
+                    let connected: Vec<super::trim::Connected<PeerId>> = connected_since
+                        .iter()
+                        .map(|(peer, since)| super::trim::Connected {
+                            peer: *peer,
+                            since: *since,
+                            kept: poker_peers.contains(peer)
+                                || swarm.behaviour().conn_limits.is_bypassed(peer)
+                                || ways_in.keeps(peer),
+                        })
+                        .collect();
+                    for peer in super::trim::to_close_by(trim, &connected, now) {
+                        if swarm.disconnect_peer_id(peer).is_ok() {
+                            dialbook.closed();
+                        }
                     }
                 }
                 // `S1-IS`: the poker clients identified a few seconds ago. By now a
@@ -18177,6 +18400,71 @@ mod tests {
         assert_ne!(hour_namespace(0), lobby_namespace());
         assert_ne!(hour_namespace(0), shard_namespace("hour"));
         assert_ne!(hour_namespace(494_000), shard_namespace("494000"));
+    }
+
+    /// `S1-IZ`: a client looks every tick while it is new or wants company, one
+    /// tick in five once it has settled, and every tick again in a build told
+    /// not to back off.
+    ///
+    /// The break that must make this fail: stop looking while the player is
+    /// searching or a founded table waits, which is when a settled client is
+    /// the newcomer again.
+    #[test]
+    fn a_settled_client_looks_the_lobby_up_one_tick_in_five() {
+        let new = LOOKUP_WARM - Duration::from_secs(1);
+        let settled = LOOKUP_WARM + Duration::from_secs(1);
+        // New: every tick, whatever the count.
+        for ticks in 0..LOOKUP_SETTLED_EVERY {
+            assert!(looks_this_tick(true, new, false, ticks));
+        }
+        // Settled: the discovery tick's own loop, twelve ticks of it -- a look on
+        // the fifth and the tenth.
+        let mut ticks = 0u32;
+        let mut looked = Vec::new();
+        for tick in 1..=12u32 {
+            ticks = ticks.saturating_add(1);
+            if looks_this_tick(true, settled, false, ticks) {
+                ticks = 0;
+                looked.push(tick);
+            }
+        }
+        assert_eq!(looked, vec![5, 10]);
+        // Wanting company -- searching, or a founded table waiting: every tick again.
+        assert!(looks_this_tick(true, settled, true, 1));
+        // A build told not to back off looks every tick, settled or not.
+        assert!(looks_this_tick(false, settled, false, 1));
+    }
+
+    /// `S1-IZ`: a finished query is entered under the walk that asked it -- a
+    /// lookup by its book, an announcement by its key, the library's own by kind.
+    ///
+    /// The break that must make this fail: read the hour's announcement as a
+    /// slice's, which is what every key that is not the lobby's or the relays'
+    /// falls to.
+    #[test]
+    fn a_finished_query_is_entered_under_the_walk_that_asked_it() {
+        use super::super::dialbook::Walk;
+        use super::super::lookups::Asked;
+        use libp2p::kad::{AddProviderError, AddProviderOk, GetProvidersOk, QueryResult};
+        let now = 494_000 * LOBBY_HOUR_S + 100;
+        let provided = |key: libp2p::kad::RecordKey| QueryResult::StartProviding(Ok(AddProviderOk { key }));
+        assert_eq!(walk_of(&provided(lobby_namespace()), None, now), Walk::LobbyAnnounce);
+        assert_eq!(walk_of(&provided(relay_namespace()), None, now), Walk::RelayAnnounce);
+        assert_eq!(walk_of(&provided(hour_namespace(494_000)), None, now), Walk::HourAnnounce);
+        assert_eq!(walk_of(&provided(hour_namespace(493_999)), None, now), Walk::HourAnnounce, "the hour before");
+        assert_eq!(walk_of(&provided(shard_namespace("0")), None, now), Walk::SliceAnnounce);
+        // A timed-out announcement is still the walk it was.
+        let timed_out = QueryResult::StartProviding(Err(AddProviderError::Timeout { key: lobby_namespace() }));
+        assert_eq!(walk_of(&timed_out, None, now), Walk::LobbyAnnounce);
+
+        let looked = QueryResult::GetProviders(Ok(GetProvidersOk::FinishedWithNoAdditionalRecord {
+            closest_peers: vec![],
+        }));
+        assert_eq!(walk_of(&looked, Some(Asked::Lobby), now), Walk::LobbyLookup);
+        assert_eq!(walk_of(&looked, Some(Asked::Hour), now), Walk::HourLookup);
+        assert_eq!(walk_of(&looked, Some(Asked::Relays), now), Walk::RelayLookup);
+        // A lookup nobody entered in the book is nothing this file asked for.
+        assert_eq!(walk_of(&looked, None, now), Walk::Other);
     }
 
     /// `S1-IY`: a reading goes out when there is none yet, when it moved, and
