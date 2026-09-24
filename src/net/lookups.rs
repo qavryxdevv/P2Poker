@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::time::Duration;
 
 /// The most lookups tallied at once. Kademlia runs a handful; a book fed from
 /// the network is bounded where it is filled all the same, and one that is full
@@ -53,6 +54,19 @@ struct Tally<P> {
     answers: u32,
     naming: u32,
     more: bool,
+    /// `S1-IZ`: the peers the last answer named for the first time, until
+    /// `progress` stamps where the lookup stood.
+    fresh: Vec<P>,
+    /// Nodes asked and time run when somebody other than this client was first
+    /// named, and when the last such peer was named for the first time.
+    first: Option<(u32, Duration)>,
+    last_new: Option<(u32, Duration)>,
+    /// Of those, the ones this client already knew as poker clients when they
+    /// were named, and where the last of them was.
+    players: u32,
+    last_player: Option<(u32, Duration)>,
+    /// The cap on how far a lookup walks finished it.
+    stopped: bool,
 }
 
 /// What one finished lookup found.
@@ -69,6 +83,18 @@ pub struct Found {
     pub naming: u32,
     /// The tally was full: `named` is a floor.
     pub at_least: bool,
+    /// `S1-IZ`: nodes asked and time run when somebody other than this client
+    /// was first named, and when the last one was named for the first time.
+    pub first: Option<(u32, Duration)>,
+    pub last_new: Option<(u32, Duration)>,
+    /// `S1-IZ`: how many of the peers named were poker clients this client
+    /// already knew -- live players, where the rest may be records of clients
+    /// long gone -- and where the last of them was named.
+    pub players: u32,
+    pub last_player: Option<(u32, Duration)>,
+    /// `S1-IZ`: the cap on how far a lookup walks finished this one, so its
+    /// closest are only the closest it reached.
+    pub stopped: bool,
 }
 
 impl Found {
@@ -92,6 +118,33 @@ impl Found {
             Asked::Relays => format!("{n} relay(s) advertised in the DHT ({answers})"),
         }
     }
+
+    /// `S1-IZ`: the lookup's appetite -- how far it walked in all, and where it
+    /// stood when it found the last peer it found at all. What it asked after
+    /// that is what a shorter lookup would have saved. Fixed words with the
+    /// numbers beside them, for a script to read back.
+    pub fn appetite(&self, asked_nodes: u32, running: Duration) -> String {
+        let at = |x: Option<(u32, Duration)>| match x {
+            Some((n, t)) => format!("{n} nodes {:.1} s", t.as_secs_f32()),
+            None => "never".to_owned(),
+        };
+        format!(
+            "appetite {}: {asked_nodes} nodes {:.1} s in all, {} other(s) named, first {}, last new {}, \
+             {} known player(s) named, last of them {}{}",
+            match self.asked {
+                Asked::Lobby => "lobby",
+                Asked::Hour => "hour",
+                Asked::Relays => "relays",
+            },
+            running.as_secs_f32(),
+            self.others,
+            at(self.first),
+            at(self.last_new),
+            self.players,
+            at(self.last_player),
+            if self.stopped { ", stopped at the cap" } else { "" }
+        )
+    }
 }
 
 /// The lookups still running, and who their answers have named so far.
@@ -112,7 +165,22 @@ impl<Q: Hash + Eq, P: Hash + Eq + Clone> Lookups<Q, P> {
         if self.running.len() >= LOOKUPS_TALLIED_MAX && !self.running.contains_key(&id) {
             self.running.clear();
         }
-        self.running.insert(id, Tally { asked, named: HashSet::new(), answers: 0, naming: 0, more: false });
+        self.running.insert(
+            id,
+            Tally {
+                asked,
+                named: HashSet::new(),
+                answers: 0,
+                naming: 0,
+                more: false,
+                fresh: Vec::new(),
+                first: None,
+                last_new: None,
+                players: 0,
+                last_player: None,
+                stopped: false,
+            },
+        );
     }
 
     /// One DHT node's answer to it. An answer to a lookup this book does not
@@ -125,11 +193,14 @@ impl<Q: Hash + Eq, P: Hash + Eq + Clone> Lookups<Q, P> {
     {
         let Some(t) = self.running.get_mut(id) else { return };
         t.answers = t.answers.saturating_add(1);
+        t.fresh.clear();
         let mut any = false;
         for p in providers {
             any = true;
             if t.named.len() < LOOKUP_NAMES_MAX {
-                t.named.insert(p.clone());
+                if t.named.insert(p.clone()) {
+                    t.fresh.push(p.clone());
+                }
             } else if !t.named.contains(p) {
                 t.more = true;
             }
@@ -139,7 +210,6 @@ impl<Q: Hash + Eq, P: Hash + Eq + Clone> Lookups<Q, P> {
         }
     }
 
-    /// The lookup ended, however it ended: what it found, to be said once.
     /// `S1-IZ`: what a running lookup was asked for, read without ending it --
     /// the dial book enters a finished query under its walk before the arm that
     /// says its line takes it out of here.
@@ -147,6 +217,33 @@ impl<Q: Hash + Eq, P: Hash + Eq + Clone> Lookups<Q, P> {
         self.running.get(id).map(|t| t.asked)
     }
 
+    /// `S1-IZ`, a lookup's appetite: where the lookup stood -- how many nodes it
+    /// had asked, how long it had run -- when the answer just [`heard`] was
+    /// taken. Stamped only on an answer that named somebody new other than this
+    /// client, whose own store answers first and names itself; and stamped
+    /// again as a player's when one of those is a poker client this client
+    /// already knows (`is_player`).
+    ///
+    /// [`heard`]: Lookups::heard
+    pub fn progress(&mut self, id: &Q, me: &P, asked_nodes: u32, running: Duration, is_player: impl Fn(&P) -> bool) {
+        let Some(t) = self.running.get_mut(id) else { return };
+        let fresh = std::mem::take(&mut t.fresh);
+        let at = (asked_nodes, running);
+        let mut anybody = false;
+        for p in fresh.iter().filter(|p| *p != me) {
+            anybody = true;
+            if is_player(p) {
+                t.players = t.players.saturating_add(1);
+                t.last_player = Some(at);
+            }
+        }
+        if anybody {
+            t.first.get_or_insert(at);
+            t.last_new = Some(at);
+        }
+    }
+
+    /// The lookup ended, however it ended: what it found, to be said once.
     pub fn ended(&mut self, id: &Q, me: &P) -> Option<Found> {
         let t = self.running.remove(id)?;
         Some(Found {
@@ -156,12 +253,29 @@ impl<Q: Hash + Eq, P: Hash + Eq + Clone> Lookups<Q, P> {
             answers: t.answers,
             naming: t.naming,
             at_least: t.more,
+            first: t.first,
+            last_new: t.last_new,
+            players: t.players,
+            last_player: t.last_player,
+            stopped: t.stopped,
         })
+    }
+
+    /// `S1-IZ`: the cap on how far a lookup walks finished this one.
+    pub fn stopped(&mut self, id: &Q) {
+        if let Some(t) = self.running.get_mut(id) {
+            t.stopped = true;
+        }
     }
 
     /// How many lookups are being tallied.
     pub fn running(&self) -> usize {
         self.running.len()
+    }
+
+    /// `S1-IZ`: the lookups being tallied, for the cap on how far each walks.
+    pub fn ids(&self) -> impl Iterator<Item = &Q> {
+        self.running.keys()
     }
 }
 
@@ -191,6 +305,87 @@ mod tests {
         // Said once: the lookup is gone from the book.
         assert_eq!(l.ended(&7, &"me"), None);
         assert_eq!(l.running(), 0);
+    }
+
+    /// `S1-IZ`: a lookup's appetite -- where it stood when somebody else was
+    /// first named, and when the last newcomer was; this client's own record,
+    /// which its own store answers with first, and a name heard again stamp
+    /// nothing.
+    ///
+    /// The break that must make this fail: stamp every answer that names
+    /// anybody, which puts the last new peer at the lookup's end.
+    #[test]
+    fn a_lookup_says_where_it_stood_when_it_found_its_last_new_peer() {
+        let s = Duration::from_secs;
+        // Ann is a poker client this client knows; bob and old are records.
+        let known = |p: &&str| *p == "ann";
+        let mut l: Lookups<u32, &str> = Lookups::default();
+        l.asked(7, Asked::Hour);
+        // Its own store: this client itself, at once.
+        l.heard(&7, &["me"]);
+        l.progress(&7, &"me", 0, s(0), known);
+        // A node that names nobody.
+        l.heard(&7, &[]);
+        l.progress(&7, &"me", 6, s(2), known);
+        // The first other player, then a second, then a record nobody else
+        // held, then only names heard before.
+        l.heard(&7, &["ann"]);
+        l.progress(&7, &"me", 14, s(4), known);
+        l.heard(&7, &["ann", "bob", "me"]);
+        l.progress(&7, &"me", 25, s(7), known);
+        l.heard(&7, &["bob", "ann"]);
+        l.progress(&7, &"me", 40, s(12), known);
+        l.heard(&7, &["old", "ann"]);
+        l.progress(&7, &"me", 90, s(30), known);
+        l.heard(&7, &["bob", "ann"]);
+        l.progress(&7, &"me", 160, s(58), known);
+        let found = l.ended(&7, &"me").expect("asked");
+        assert_eq!(found.first, Some((14, s(4))));
+        assert_eq!(found.last_new, Some((90, s(30))));
+        assert_eq!((found.players, found.last_player), (1, Some((14, s(4)))), "ann, once, where she was first named");
+        assert_eq!(
+            found.appetite(170, s(60)),
+            "appetite hour: 170 nodes 60.0 s in all, 3 other(s) named, first 14 nodes 4.0 s, \
+             last new 90 nodes 30.0 s, 1 known player(s) named, last of them 14 nodes 4.0 s"
+        );
+
+        // A lookup that found nobody else says so.
+        l.asked(8, Asked::Lobby);
+        l.heard(&8, &["me"]);
+        l.progress(&8, &"me", 0, s(0), known);
+        let alone = l.ended(&8, &"me").expect("asked");
+        assert_eq!(
+            alone.appetite(200, s(60)),
+            "appetite lobby: 200 nodes 60.0 s in all, 0 other(s) named, first never, last new never, \
+             0 known player(s) named, last of them never"
+        );
+    }
+
+    /// `S1-IZ`: the book says which lookups it holds, so the cap on how far
+    /// each walks reads every one that runs and none that has ended; and a
+    /// lookup the cap finished says so when it ends, and only that one.
+    ///
+    /// The breaks that must make this fail: `ids` that yields nothing, which
+    /// lets every walk run to its natural end; a stop that marks nothing.
+    #[test]
+    fn the_book_says_which_lookups_run_and_which_the_cap_stopped() {
+        let mut l: Lookups<u32, &str> = Lookups::default();
+        l.asked(1, Asked::Lobby);
+        l.asked(2, Asked::Hour);
+        l.asked(3, Asked::Relays);
+        let _ = l.ended(&2, &"me");
+        let mut ids: Vec<u32> = l.ids().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3]);
+
+        l.stopped(&1);
+        l.stopped(&2); // ended already: nothing to mark
+        let one = l.ended(&1, &"me").expect("asked");
+        assert!(one.stopped);
+        assert!(one.appetite(80, Duration::from_secs(3)).ends_with(", stopped at the cap"), "{}", one.appetite(80, Duration::from_secs(3)));
+        let three = l.ended(&3, &"me").expect("asked");
+        assert!(!three.stopped);
+        assert!(!three.appetite(200, Duration::from_secs(15)).contains("stopped"));
     }
 
     /// Two lookups run at once -- the lobby's key and an hour's are asked in
@@ -238,7 +433,19 @@ mod tests {
     /// file, the hour's is kept by its decision's number.
     #[test]
     fn the_lines_are_filed_as_the_lines_they_replace_were() {
-        let found = |asked| Found { asked, named: 3, others: 2, answers: 9, naming: 2, at_least: false };
+        let found = |asked| Found {
+            asked,
+            named: 3,
+            others: 2,
+            answers: 9,
+            naming: 2,
+            at_least: false,
+            first: None,
+            last_new: None,
+            players: 0,
+            last_player: None,
+            stopped: false,
+        };
         assert!(!crate::app::worth_logging(&found(Asked::Lobby).words()));
         assert!(!crate::app::worth_logging(&found(Asked::Relays).words()));
         assert!(crate::app::worth_logging(&found(Asked::Hour).words()));

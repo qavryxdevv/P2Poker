@@ -464,6 +464,99 @@ const LOOKUP_WARM: Duration = Duration::from_secs(600);
 /// `S1-IZ`: how many discovery ticks apart a settled client looks the lobby up.
 const LOOKUP_SETTLED_EVERY: u32 = 5;
 
+/// `S1-IZ`: how many nodes of the public DHT one lookup of a provider key may
+/// ask before it is finished, once this client has company (`lookup_cap_now`)
+/// -- the lobby's key, its slices, the hour's, the relays'.
+///
+/// **A lookup meets the players it meets early, and then walks on through
+/// records of clients long gone** (measured 2026-09-24, a measured build saying
+/// where each lookup stood when it named somebody new, and when it named a poker
+/// client this client was connected to). The hour's key names only who
+/// announced this hour, and every lookup of it had named the last of them within
+/// 53 nodes. The lobby's key holds 48 h of records, most of them dead: an
+/// uncapped lookup of it walked 243 to 300 nodes in the median, named its last
+/// new record at 94 to 120 and its last live player at 13 to 38 (p90 96 to
+/// 132). A walk is not a convergence proof here, it is a way to meet somebody,
+/// and every node past the players is a dial, most of them failing, and an
+/// entry in the player's router -- dials of those dead records among them.
+///
+/// Side by side for sixteen minutes, an idle client and a two-seat table in
+/// each arm, `P2P_POKER_LOOKUP_CAP=0` for the control: a lookup of the lobby's
+/// key asked 80 nodes in the median against 297, a client's DHT walking fell
+/// from 488 nodes a minute to 250 in its first ten minutes and its dials from
+/// 801 to 652, and after them the lookups' own nodes from 57 a minute to 16 --
+/// the bootstrap and announcement walks, which this does not touch, being most
+/// of what a settled client walks. Every seat met every other within two
+/// minutes and saw every table in both arms, the tables set in their first
+/// minute, 91 hands dealt uncapped and 86 capped; a lookup named 3.0 of the
+/// players its client was connected to against 3.9 (4.1 against 4.2 in the run
+/// before), a player it stopped short of being named by the next lookup or
+/// reaching this client by its own dial.
+const LOOKUP_NODES_CAP: u32 = 80;
+
+/// `S1-IZ`: the cap this client runs by -- in a binary built to be measured,
+/// whatever `P2P_POKER_LOOKUP_CAP` says, 0 for none.
+fn lookup_cap() -> u32 {
+    #[cfg(feature = "fault-harness")]
+    if let Some(cap) = std::env::var("P2P_POKER_LOOKUP_CAP").ok().and_then(|v| v.parse::<u32>().ok()) {
+        return cap;
+    }
+    LOOKUP_NODES_CAP
+}
+
+/// `S1-IZ`: whether a lookup that has asked this many nodes is finished now.
+fn lookup_has_asked_enough(cap: u32, asked_nodes: u32) -> bool {
+    cap > 0 && asked_nodes >= cap
+}
+
+/// `S1-IZ`: the cap a lookup runs by now -- **none while this client is
+/// connected to no poker client.**
+///
+/// A capped lookup is short in time as well as in nodes: 80 nodes take two or
+/// three seconds where a whole walk takes twelve to twenty. Two clients that
+/// start together each store their record ten to thirteen seconds in, so a
+/// newcomer's short first lookups end before the other's record exists
+/// anywhere, and the next look is a discovery tick away. Measured across two
+/// networks (a founder here and a joiner on the far machine, started together,
+/// rounds alternating): capped from the start, the pair met 64 and 76 s in and
+/// set its table at 77 and 87 s in two rounds of three, against 15 to 19 s and
+/// 23 to 46 s uncapped. A client alone walks the whole way, as it reads the
+/// hour's key only while alone (`D-070`); a client with company is in the
+/// lobby's mesh and hears every table there, and its lookups are the ones the
+/// cap is for.
+fn lookup_cap_now(cap: u32, has_company: bool) -> u32 {
+    if has_company {
+        cap
+    } else {
+        0
+    }
+}
+
+/// `S1-IZ`: every lookup still running that has asked its cap of nodes is
+/// finished, by the query's own count as it stands, and marked as stopped in
+/// its book. Read where a lookup is answered and where it dials -- a node it
+/// asks and is not connected to is a dial -- because a count read only off its
+/// answers is late: most nodes never answer, the walk asks on meanwhile, and a
+/// cap of 150 read that way let walks run to 228. A finished lookup ends as any
+/// lookup ends, with what it found said once.
+fn finish_lookups_that_asked_enough(
+    kad: &mut libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>,
+    lookups: &mut super::lookups::Lookups<libp2p::kad::QueryId, libp2p::PeerId>,
+    cap: u32,
+) {
+    let over: Vec<libp2p::kad::QueryId> = lookups
+        .ids()
+        .copied()
+        .filter(|id| kad.query_mut(id).is_some_and(|q| lookup_has_asked_enough(cap, q.stats().num_requests())))
+        .collect();
+    for id in over {
+        if let Some(mut query) = kad.query_mut(&id) {
+            query.finish();
+            lookups.stopped(&id);
+        }
+    }
+}
+
 /// `S1-IZ`: whether a settled client looks the lobby up less often. **Only a
 /// binary built to be measured can be told not to** (`P2P_POKER_NO_LOOKUP_BACKOFF`),
 /// so the control comes out of the same build.
@@ -2425,6 +2518,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // a settled client looks less often (`looks_this_tick`).
     let mut lookup_ticks: u32 = 0;
     let backs_off = backs_off_lookups();
+    let cap_of_a_lookup = lookup_cap();
 
     // Whether this client has offered itself as a relay. Once only: the record
     // is republished by Kademlia on its own.
@@ -4616,7 +4710,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = events.send(NodeEvent::Listening(address)).await;
                     }
                     // `S1-IZ`: every dial the swarm starts, whoever asked for it.
-                    SwarmEvent::Dialing { peer_id, .. } => dialbook.dialing(peer_id.as_ref().map(peer_hash)),
+                    SwarmEvent::Dialing { peer_id, .. } => {
+                        dialbook.dialing(peer_id.as_ref().map(peer_hash));
+                        // `S1-IZ`: a node a lookup asks and is not connected to
+                        // is a dial, so this is where a walk reaches its cap.
+                        finish_lookups_that_asked_enough(&mut swarm.behaviour_mut().ipfs_kad, &mut lookups, lookup_cap_now(cap_of_a_lookup, !poker_peers.is_empty()));
+                    }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
                         if endpoint.is_dialer() {
                             dialbook.established();
@@ -6448,6 +6547,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if step.last {
                             let walk = walk_of(&result, lookups.asked_of(&id), super::node::now_unix_ms() / 1_000);
                             dialbook.walked(walk, stats.num_requests(), stats.num_successes(), stats.num_failures());
+                            // `S1-IZ`: a walk that is not a lookup says its appetite
+                            // here -- a lookup says it with what it found, below.
+                            if built_to_be_measured()
+                                && !matches!(
+                                    walk,
+                                    super::dialbook::Walk::LobbyLookup
+                                        | super::dialbook::Walk::HourLookup
+                                        | super::dialbook::Walk::RelayLookup
+                                )
+                            {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "appetite {}: {} nodes {:.1} s in all, {} answered",
+                                        walk.name(),
+                                        stats.num_requests(),
+                                        stats.duration().unwrap_or_default().as_secs_f32(),
+                                        stats.num_successes()
+                                    )))
+                                    .await;
+                            }
                         }
                         // A query that fails is worth a line. Without one, a
                         // routing table too thin to answer anything looks
@@ -6460,6 +6579,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // is still what it found.
                                 if let Some(found) = lookups.ended(&id, swarm.local_peer_id()) {
                                     let _ = events.send(NodeEvent::Warning(found.words())).await;
+                                    // `S1-IZ`: and how far it walked for it.
+                                    if built_to_be_measured() {
+                                        let running = stats.duration().unwrap_or_default();
+                                        let line = found.appetite(stats.num_requests(), running);
+                                        let _ = events.send(NodeEvent::Warning(line)).await;
+                                    }
                                 }
                                 let _ = events
                                     .send(NodeEvent::Warning(format!("DHT lookup failed: {e}")))
@@ -6507,20 +6632,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let was_lobby = lobby_lookups.get(&id).copied();
                             // `S1-IV`: the lookup's one line -- who all its
                             // answers named, each once (`net::lookups`).
+                            let mut stopped = false;
                             if let Some(found) = lookups.ended(&id, swarm.local_peer_id()) {
+                                stopped = found.stopped;
                                 let _ = events.send(NodeEvent::Warning(found.words())).await;
+                                // `S1-IZ`: and how far it walked for it.
+                                if built_to_be_measured() {
+                                    let running = stats.duration().unwrap_or_default();
+                                    let line = found.appetite(stats.num_requests(), running);
+                                    let _ = events.send(NodeEvent::Warning(line)).await;
+                                }
                             }
                             // `S1-E`: what one walk of the lobby key costs and what it
                             // says about the DHT it walked -- how many nodes it asked,
                             // and the size its closest nodes put the DHT at, which is
                             // the price of placing a node among them. The first three
                             // walks of a process, as numbers nobody had.
+                            // `S1-IZ`: a walk the cap stopped says so -- its closest
+                            // are the closest it had reached, which the estimate
+                            // reads as the DHT's.
                             if was_lobby.is_some() && LOBBY_WALKS_SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
                                 let estimate = dht_size_from_closest(&lobby_namespace(), closest_peers);
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
-                                        "public lobby walk: {} DHT node(s) asked, {} answered; its {} closest put the DHT at ~{} nodes (S1-E)",
+                                        "public lobby walk: {} DHT node(s) asked{}, {} answered; its {} closest put the DHT at ~{} nodes (S1-E)",
                                         stats.num_requests(),
+                                        if stopped { " before the cap stopped it" } else { "" },
                                         stats.num_successes(),
                                         closest_peers.len(),
                                         estimate.map_or_else(|| "?".to_string(), |n| n.to_string())
@@ -6579,6 +6716,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // reads the sizes of the answers and the moment one
                             // first named somebody else -- and only there.
                             lookups.heard(&id, providers.iter());
+                            // `S1-IZ`: where the lookup stood when this answer came,
+                            // and whether what it named first here were players
+                            // this client is connected to or records of anybody.
+                            lookups.progress(
+                                &id,
+                                swarm.local_peer_id(),
+                                stats.num_requests(),
+                                stats.duration().unwrap_or_default(),
+                                |p| poker_peers.contains(p),
+                            );
+                            // `S1-IZ`: and a lookup that has asked enough nodes is
+                            // finished (`LOOKUP_NODES_CAP`).
+                            finish_lookups_that_asked_enough(&mut swarm.behaviour_mut().ipfs_kad, &mut lookups, lookup_cap_now(cap_of_a_lookup, !poker_peers.is_empty()));
                             if says_every_answer() {
                                 let _ = events
                                     .send(NodeEvent::Warning(if hourly {
@@ -18402,6 +18552,24 @@ mod tests {
         assert_ne!(hour_namespace(494_000), shard_namespace("494000"));
     }
 
+    /// `S1-IZ`: a lookup is finished once it has asked the cap's number of
+    /// nodes, never before, and never when the cap is 0.
+    #[test]
+    fn a_lookup_is_finished_once_it_has_asked_enough() {
+        assert!(!lookup_has_asked_enough(LOOKUP_NODES_CAP, LOOKUP_NODES_CAP - 1));
+        assert!(lookup_has_asked_enough(LOOKUP_NODES_CAP, LOOKUP_NODES_CAP));
+        assert!(lookup_has_asked_enough(LOOKUP_NODES_CAP, LOOKUP_NODES_CAP + 200));
+        assert!(!lookup_has_asked_enough(0, 10_000), "0 is no cap at all");
+        // The measured number (2026-09-24): above every last new peer a lookup
+        // of the hour's key named (53), and the median live player of the
+        // lobby's (31).
+        assert_eq!(LOOKUP_NODES_CAP, 80);
+        // And none while this client is alone: a newcomer's short lookups end
+        // before another newcomer's record exists.
+        assert_eq!(lookup_cap_now(LOOKUP_NODES_CAP, false), 0);
+        assert_eq!(lookup_cap_now(LOOKUP_NODES_CAP, true), LOOKUP_NODES_CAP);
+    }
+
     /// `S1-IZ`: a client looks every tick while it is new or wants company, one
     /// tick in five once it has settled, and every tick again in a build told
     /// not to back off.
@@ -20365,6 +20533,30 @@ mod back_at_the_table {
         let said = code[answer..].find("relay(s) advertised in the DHT\", providers.len())").expect("the answer's line");
         assert!(code[answer..answer + said].contains("if says_every_answer() {"), "an answer is said only where a run is measured");
         assert_eq!(code.matches("relay(s) advertised in the DHT\"").count(), 1);
+        // `S1-IZ`: and a lookup that has asked its cap of nodes is finished,
+        // by its own count as it stands, read on every answer -- Kademlia
+        // reports every answer, naming anybody or nobody -- and on every dial,
+        // because most nodes never answer and the walk asks on meanwhile.
+        let finish = "finish_lookups_that_asked_enough(&mut swarm.behaviour_mut().ipfs_kad, &mut lookups, lookup_cap_now(cap_of_a_lookup, !poker_peers.is_empty()));";
+        assert!(code[answer..answer + said].contains(finish), "the cap is read on every answer");
+        let dialing = code.find("SwarmEvent::Dialing { peer_id, .. } => {").expect("the dial's arm");
+        assert!(code[dialing..dialing + 600].contains(finish), "and on every dial");
+        assert_eq!(code.matches(finish).count(), 2, "and nowhere else");
+        let helper = code.find("fn finish_lookups_that_asked_enough(").expect("the helper");
+        let body = &code[helper..helper + code[helper..].find("\n}\n").expect("its end")];
+        assert!(
+            body.contains("lookup_has_asked_enough(cap, q.stats().num_requests())")
+                && body.contains("query.finish();")
+                && body.contains("lookups.stopped(&id);"),
+            "by the query's live count, and it finishes the query and says it did"
+        );
+        // Another cap, or none, is a measured build's to be told.
+        let knob = code.find("fn lookup_cap() -> u32 {").expect("the cap's knob");
+        assert_eq!(
+            code[knob..].lines().nth(1).map(str::trim),
+            Some("#[cfg(feature = \"fault-harness\")]"),
+            "only a binary built to be measured runs by another cap"
+        );
         // And the rule is the build's and nothing a run can switch on: a
         // player's client has no way to say every answer.
         let rule = code.find("fn says_every_answer() -> bool {").expect("the rule");

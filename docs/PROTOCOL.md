@@ -6779,10 +6779,10 @@ That is the whole of the improvement, and it does not make the lobby private.
 
 **This paragraph named `LOBBY_INFOHASH` and "roughly 100 arbitrary internet hosts
 per announce cycle" until 2026-09-02.** Both were Mainline's, measured against a
-mechanism `56b0b50` deleted, and no counterpart figure has been measured for
-Kademlia — how many distinct nodes one `get_providers` walk contacts is
-`NETWORK_STACK.md` §3.5's first `[UNMEASURED]`. It is left unquantified rather
-than re-quoted at a number that is no longer about anything. That is a
+mechanism `56b0b50` deleted, and no counterpart figure had been measured for
+Kademlia. It has been since: how many distinct nodes one `get_providers` walk
+contacts, and how often the client walks, are `NETWORK_STACK.md` §3.5's, and are
+not restated here (D-011 rule 1). That is a
 discovery-layer property, not a lobby-protocol one, but a reader of this document
 should not come away thinking the lobby is private.
 

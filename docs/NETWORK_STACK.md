@@ -1257,13 +1257,24 @@ price §3.3 says is worth paying — but the user is the one paying it.
   `get_providers` runs over an authenticated libp2p connection, so each node on
   the walk learns the querier's **`PeerId`**, its **IP**, its **identify banner**,
   and the **exact key asked for**. The client asks every **60 seconds**
-  (`run::run`'s discovery timer) — about **1440 times a day**, against the ~150 the Mainline
-  section counted — plus, only while the client has met no poker client, one for
-  the hour's key beside it (`D-070`; two for an hour's first ten minutes), and
-  another for the relay namespace whenever there is no reservation. **One walk asks 85 to 240 distinct nodes, about 125 as a rule,
-  and 24 to 132 of them answer** -- nine walks of three clients on one machine,
-  2026-09-18 (`run164847-3`, the client's own *public lobby walk* line), against
-  the 105-176 the Mainline section counted.
+  (`run::run`'s discovery timer) for its first ten minutes and whenever it wants
+  company -- its player searching, or a table it founded still waiting for its
+  seats -- and every **fifth** tick after that (`S1-IZ`, `looks_this_tick`): about
+  **290 times a day** once settled, against the 1440 of a client that asked every
+  minute until 2026-09-24 and the ~150 the Mainline section counted — plus, only
+  while the client has met no poker client, one for the hour's key beside it
+  (`D-070`; two for an hour's first ten minutes), and another for the relay
+  namespace whenever there is no reservation. **One walk asked 85 to 240 distinct
+  nodes, about 125 as a rule, and 24 to 132 of them answered** -- nine walks of
+  three clients on one machine, 2026-09-18 (`run164847-3`, the client's own
+  *public lobby walk* line), against the 105-176 the Mainline section counted --
+  **and since 2026-09-24 a lookup asks at most 80 once its client is connected
+  to a poker client** (`S1-IZ`, `LOOKUP_NODES_CAP`, `lookup_cap_now`): in three
+  runs an uncapped walk of the lobby's key named the last live player it would
+  name by its 13th to 38th node in the median, its last new record of any kind
+  by its 94th to 120th, and walked on to 243 to 300. A client alone still walks
+  the whole way, because a short walk is short in time too and ends before a
+  newcomer who started with it has stored its record.
 
 * **The audience is worse than "a rotating set of strangers": it is a fixed one,
   and anyone may join it.** The key is a compiled-in constant, so the ~20 nodes
@@ -1364,7 +1375,10 @@ more days, so rotation blunts a historical crawl far less than it looks. Still
 > **Measured 2026-09-18, and `S1-E` closes on them:** (i) the lifetime the
 > **go-libp2p** nodes that store our record give it is 48 h -- a hard edge in
 > `S1-AI`'s census of our own identities (§10.1); (ii) one `get_providers` walk
-> asks 85 to 240 distinct nodes, about 125, and 24 to 132 answer; (iii) the 20
+> asked 85 to 240 distinct nodes, about 125, and 24 to 132 answered -- since
+> `S1-IZ` (2026-09-24) a lookup asks at most 80 once its client has company, and
+> a walk the cap stopped says so in the line, its closest being only the closest
+> it reached; (iii) the 20
 > closest nodes put the DHT the walk sees at 1 200 to 2 000 nodes, so a keypair
 > lands among them after some hundred tries and holds all 20 places after a few
 > thousand: complete passive enumeration costs milliseconds of key generation.
@@ -3131,7 +3145,7 @@ record that outlives the old one by a factor of about sixty.
 | Re-announce interval | **12 h**, and the crate runs it | `behaviour.rs:231`, `jobs.rs:268-279` [SOURCE] |
 | First re-announce | **now + 12 h**, not now | `AddProviderJob::new` sets its first deadline a full interval out [SOURCE] |
 | Explicit announce | the moment an external address first exists, then every **300 s** until confirmed | `run::LobbyAnnounce`, `REANNOUNCE_EVERY`. Until 2026-09-15 this row read *once … latched by `in_public_lobby`*, and the latch was the defect (`S1-FI`) |
-| Re-run `get_providers` | **every 60 s** | `run::run`'s discovery timer |
+| Re-run `get_providers` | **every 60 s** for a client's first ten minutes and while it wants company, **every 300 s** after; **at most 80 nodes** a lookup once the client has company | `run::run`'s discovery timer, `looks_this_tick`, `LOOKUP_NODES_CAP`, `lookup_cap_now` (`S1-IZ`) |
 | Un-announce | **never, and it could not help** | `stop_providing` is never called, and is documented local-only: remote copies run their own 48 h clock (`behaviour.rs:1047-1054`) [SOURCE] |
 
 Three consequences follow, and none of them is the old section's.
