@@ -165,11 +165,29 @@ pub enum NodeEvent {
     /// Somebody joined or left the network this client is on.
     ///
     /// **Any** peer: since this client speaks to the public libp2p DHT there are
-    /// several hundred of them and almost none is a poker client. They are
-    /// counted and never written to the log — a line each was hundreds a minute,
-    /// and it buried everything a player might actually want to read.
+    /// several hundred of them and almost none is a poker client. Never written
+    /// to the log -- a line each was hundreds a minute, and it buried everything
+    /// a player might actually want to read -- and, since `S1-IY`, **not counted
+    /// either**: the count is [`NodeEvent::Connections`].
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    /// `S1-IY`: what this node holds, read off the swarm itself.
+    ///
+    /// The window used to keep the count by adding one for every
+    /// `PeerConnected` and taking one away for every `PeerDisconnected` -- and
+    /// both are advisory, offered and **dropped when the channel is full**. A
+    /// running sum of events that may be dropped is not a count: a window that
+    /// stopped draining for a while (minimised, or a slow frame on the software
+    /// renderer) lost departures, and from then on the sum only told of arrivals.
+    /// The owner saw *connected to* more than 2 000 peers on a client whose own
+    /// limit is `swarm::CONNECTION_CEILING`.
+    ///
+    /// A reading replaces the one before it, so dropping one costs the next
+    /// one's delay and nothing else. `established` is every connection the swarm
+    /// holds, `players` the poker clients among the peers it is connected to,
+    /// and `dials_failed` every dial that did not complete since the node
+    /// started -- counted where it happens, for the same reason.
+    Connections { established: u32, players: u32, dials_failed: u64 },
     /// A peer that turned out to be another **poker** client.
     ///
     /// Told apart by `identify`: the protocol version this client announces is
@@ -691,6 +709,9 @@ impl NodeEvent {
                 // has already cost this project a run where housekeeping did
                 // not fire for three minutes.
                 | NodeEvent::Carrier { .. }
+                // `S1-IY`: a reading, and the next one replaces it -- which is
+                // exactly why the count moved here from the two events above.
+                | NodeEvent::Connections { .. }
                 // `D-064`: a reading a second, and a count; the next says the same.
                 | NodeEvent::Search(_)
                 | NodeEvent::QueueSeen { .. }
@@ -813,9 +834,12 @@ impl NodeEvent {
             | Self::DialFailed { .. }
             | Self::LocalPeer(_)
             | Self::LobbyPeer(_)
-            // Counted only, and the count is not on the header.
+            // Not even counted any more (`S1-IY`).
             | Self::PeerConnected(_)
             | Self::PeerDisconnected(_)
+            // `S1-IY`: on the strip, not the header, and it arrives every few
+            // seconds while the DHT churns; the lazy wake's delay is invisible.
+            | Self::Connections { .. }
             // Log only — and lazily on purpose. A sweep that removes nothing
             // must not cost a repaint, and one that removes a row can wait the
             // fraction of a second the lazy wake takes.
@@ -1031,6 +1055,7 @@ mod wake_tests {
         let later = [
             NodeEvent::PeerConnected(peer),
             NodeEvent::PeerDisconnected(peer),
+            NodeEvent::Connections { established: 37, players: 1, dials_failed: 900 },
             NodeEvent::LocalPeer(peer),
             NodeEvent::MeshPeer(peer),
             NodeEvent::DialFailed { reason: "no route".into() },

@@ -1111,19 +1111,26 @@ impl AppState {
                 self.status.listening.push(addr.to_string());
                 self.note(format!("listening on {addr}"));
             }
-            // Counted, not written down. This client shares a DHT with several
-            // hundred strangers and a line each was hundreds a minute in the
-            // client log, which buried every line a player might have wanted.
-            NodeEvent::PeerConnected(_) => self.status.peers += 1,
-            NodeEvent::PeerDisconnected(_) => {
-                self.status.peers = self.status.peers.saturating_sub(1);
+            // Neither written down nor counted. This client shares a DHT with
+            // several hundred strangers and a line each was hundreds a minute in
+            // the client log. **And `S1-IY`: the count is not made here.** It was,
+            // by adding one for each of these and taking one away, and both are
+            // advisory -- dropped when the channel is full -- so a window that
+            // missed some departures counted arrivals only from then on: over
+            // 2 000 "peers" on a client whose own limit is 320. The node reads
+            // the number off its swarm and says it in `Connections`.
+            NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
+            NodeEvent::Connections { established, players, dials_failed } => {
+                self.status.peers = established as usize;
+                self.status.lobby_peers = players as usize;
+                self.status.failed_dials = usize::try_from(dials_failed).unwrap_or(usize::MAX);
             }
+            // The line is written; the number of players is `Connections`'s, for
+            // the same reason as the number of peers (`S1-IY`).
             NodeEvent::PokerPeer { peer, gone } => {
                 if gone {
-                    self.status.lobby_peers = self.status.lobby_peers.saturating_sub(1);
                     self.note(format!("a player left the network: {peer}"));
                 } else {
-                    self.status.lobby_peers += 1;
                     self.note(format!("another poker client: {peer}"));
                 }
             }
@@ -1996,21 +2003,16 @@ impl AppState {
                     self.note(format!("table {} gone: {why}", crate::gui::lobby::short_key(&key)));
                 }
             }
-            // Kept out of the log by default. Most dials fail on an open DHT and
-            // a log full of them buries the lines that mean something — but the
-            // count is carried, because "most dials fail" and "this client is
-            // broken" look identical without one.
+            // **The first few, in full.** Kept out of the log entirely before
+            // that, which meant a client that could not reach the machine it was
+            // sitting next to looked exactly like one that had nothing to reach.
+            // The window that matters is the first half-minute -- a table
+            // forming -- and after that the count alone is the right amount of
+            // noise. `S1-IY`: the node sends only those few, and the count of
+            // all of them rides in `Connections`, where no dropped event can
+            // make it wrong.
             NodeEvent::DialFailed { reason } => {
-                self.status.failed_dials += 1;
-                // **The first few, in full.** Kept out of the log entirely
-                // before this, which meant a client that could not reach the
-                // machine it was sitting next to looked exactly like one that
-                // had nothing to reach. The window that matters is the first
-                // half-minute — a table forming — and after that the count
-                // alone is the right amount of noise.
-                if self.status.failed_dials <= 12 {
-                    self.note(format!("dial failed: {reason}"));
-                }
+                self.note(format!("dial failed: {reason}"));
             }
             // `D-064`: the search's word, for the search the window holds; a
             // report of a search given up is nobody's.
@@ -4000,28 +4002,49 @@ mod tests {
         assert_eq!(refusal(11), "no reason this client understands");
     }
 
+    /// `S1-IY`: the count is the node's reading, whatever else arrives.
     #[test]
-    fn the_peer_count_follows_the_connections() {
+    fn the_peer_count_is_the_nodes_reading() {
         let mut s = AppState::new();
-        let a = peer();
-        let b = peer();
+        s.apply(NodeEvent::Connections { established: 37, players: 2, dials_failed: 900 });
+        assert_eq!((s.status.peers, s.status.lobby_peers, s.status.failed_dials), (37, 2, 900));
 
-        s.apply(NodeEvent::PeerConnected(a));
-        s.apply(NodeEvent::PeerConnected(b));
-        assert_eq!(s.status.peers, 2);
+        // The events that used to be summed move nothing now.
+        for _ in 0..50 {
+            s.apply(NodeEvent::PeerConnected(peer()));
+        }
+        s.apply(NodeEvent::PeerDisconnected(peer()));
+        s.apply(NodeEvent::PokerPeer { peer: peer(), gone: false });
+        s.apply(NodeEvent::DialFailed { reason: "no route".into() });
+        assert_eq!((s.status.peers, s.status.lobby_peers, s.status.failed_dials), (37, 2, 900));
 
-        s.apply(NodeEvent::PeerDisconnected(a));
-        assert_eq!(s.status.peers, 1);
+        // And the next reading replaces the last, down as well as up.
+        s.apply(NodeEvent::Connections { established: 12, players: 0, dials_failed: 950 });
+        assert_eq!((s.status.peers, s.status.lobby_peers, s.status.failed_dials), (12, 0, 950));
     }
 
-    /// A disconnection this client never saw a connection for must not take the
-    /// count below zero — which on a `usize` is not a negative number but a very
-    /// large one, and would render as "connected to 18446744073709551615 peers".
+    /// `S1-IY`, the way the owner's client got there: connections come and go in
+    /// equal numbers, and the channel -- full while the window was not drawing --
+    /// drops a share of the departures. Summed, the count climbs with every
+    /// wave; read, it is whatever the swarm holds.
     #[test]
-    fn a_stray_disconnection_does_not_wrap_the_count() {
+    fn dropped_departures_do_not_inflate_the_count() {
         let mut s = AppState::new();
-        s.apply(NodeEvent::PeerDisconnected(peer()));
-        assert_eq!(s.status.peers, 0);
+        for _wave in 0..40 {
+            let arrivals: Vec<libp2p::PeerId> = (0..60).map(|_| peer()).collect();
+            for p in &arrivals {
+                s.apply(NodeEvent::PeerConnected(*p));
+            }
+            // Every departure happens; one in three of them never arrives.
+            for (i, p) in arrivals.iter().enumerate() {
+                if i % 3 != 0 {
+                    s.apply(NodeEvent::PeerDisconnected(*p));
+                }
+            }
+            // The swarm holds what it held before the wave.
+            s.apply(NodeEvent::Connections { established: 40, players: 1, dials_failed: 0 });
+        }
+        assert_eq!(s.status.peers, 40, "a sum of these events would have said {}", 40 + 40 * 20);
     }
 
     /// The events come from the network, so the log is bounded like everything

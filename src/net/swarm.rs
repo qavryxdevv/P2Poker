@@ -820,7 +820,23 @@ pub fn connection_limits(budget: u32) -> connection_limits::ConnectionLimits {
         .with_max_established_incoming(Some(budget / 2))
         .with_max_established_per_peer(Some(2))
 }
-pub const CONNECTION_CEILING: u32 = 320;
+
+/// Where the budget may rise to, and no higher.
+///
+/// **`S1-IY`: 96, down from 320.** At 320 every client reached the ceiling
+/// within seconds of starting -- 637 of 644 logs on the bed, the owner's own at
+/// every start -- and then held about 300 connections, idle in the lobby or not:
+/// an entry each in a player's router, three times the high-water mark of IPFS
+/// Kubo's connection manager (96) and more than seven times the 40 that Brave and
+/// IPFS Desktop run it at, for home routers' sake. What the higher number bought
+/// had been taken over by `S1-IT`: the dials that matter -- a founder, a player
+/// the lobby named, the relays their circuits go through -- and every poker
+/// client are let through this limit, so what it governs now is strangers on the
+/// DHT. Measured against a control from one binary before the change: tables of
+/// two formed in every run at both numbers, on one machine and across two
+/// networks in both directions, with as many hands dealt, while the connections
+/// held fell from a mean of 239 to 75.
+pub const CONNECTION_CEILING: u32 = 96;
 
 /// What this client answers with when asked who it is.
 ///

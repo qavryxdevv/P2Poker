@@ -416,6 +416,47 @@ fn hour_namespace(hour: u64) -> libp2p::kad::RecordKey {
     namespace(format!("p2p-poker/main-lobby/v1/hour/{hour}").as_bytes())
 }
 
+/// `S1-IY`: the failed dials whose own words are sent to the window. The window
+/// wrote the first twelve of a run into its log and threw the rest away; it is
+/// told the number of all of them in [`NodeEvent::Connections`].
+const DIAL_FAILURES_TOLD: u64 = 12;
+
+/// `S1-IY`: how many two-second ticks an unchanged reading of the connections
+/// waits before it is said again -- thirty seconds, so that a reading the full
+/// channel dropped is replaced within that even on a client whose count stands
+/// still.
+const CONNECTIONS_HEARTBEAT: u8 = 15;
+
+/// `S1-IY`: what this node holds, as the window is told it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionsReading {
+    established: u32,
+    players: u32,
+    dials_failed: u64,
+}
+
+/// `S1-IY`: whether this tick's reading goes out: the first one, one that moved,
+/// or an unchanged one after `CONNECTIONS_HEARTBEAT` quiet ticks.
+fn connections_due(said: Option<ConnectionsReading>, now: ConnectionsReading, quiet_ticks: u8) -> bool {
+    said != Some(now) || quiet_ticks >= CONNECTIONS_HEARTBEAT
+}
+
+/// `S1-IY`: the ceiling this node's connection budget may rise to.
+///
+/// **Only a binary built to be measured can be told another one**, through
+/// `P2P_POKER_CONNECTION_CEILING`, so that a control and a treatment come out
+/// of one build -- and never below the floor, which is what a client needs to
+/// function at all.
+fn connection_ceiling() -> u32 {
+    #[cfg(feature = "fault-harness")]
+    if let Some(ceiling) =
+        std::env::var("P2P_POKER_CONNECTION_CEILING").ok().and_then(|v| v.parse::<u32>().ok())
+    {
+        return ceiling.max(MIN_CONNECTIONS);
+    }
+    CONNECTION_CEILING
+}
+
 /// `D-070`: which hour of the clock a moment falls in.
 const fn lobby_hour(unix_s: u64) -> u64 {
     unix_s / LOBBY_HOUR_S
@@ -2164,6 +2205,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // setter and no getter, so the only way to know the current value is to be
     // the one who set it.
     let mut budget: u32 = MAX_CONNECTIONS;
+    // `S1-IY`: where the budget may rise to -- the constant, or in a binary
+    // built to be measured whatever the run was told.
+    let ceiling = connection_ceiling();
+    if budget > ceiling {
+        budget = ceiling;
+        *swarm.behaviour_mut().conn_limits.limits_mut() = super::swarm::connection_limits(budget);
+    }
     // `S1-IT`: connections this client's own limit refused at its ceiling, said
     // once a discovery tick where a run is measured. Below the ceiling a refusal
     // raises the budget and says so; at it, nothing did.
@@ -2178,6 +2226,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // Connections held, counted here rather than asked of the swarm: there is
     // no accessor for it, and the two events that change it are already handled.
     let mut state_peers: u32 = 0;
+    // `S1-IY`: every dial that did not complete, counted where it happens; and
+    // the last reading of the connections the window was sent, with the stall
+    // ticks since, so an unchanged reading goes out only now and then.
+    let mut dials_failed: u64 = 0;
+    let mut connections_said: Option<ConnectionsReading> = None;
+    let mut connections_quiet: u8 = 0;
 
     // The QUIC port, kept only so the router can be asked to open it once.
     // It used to be what got announced to Mainline as well; that is gone, and
@@ -5919,11 +5973,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         error: libp2p::swarm::DialError::Denied { .. },
                         connection_id,
                         ..
-                    } if budget < CONNECTION_CEILING => {
+                    } if budget < ceiling => {
                         lobby_dials.remove(&connection_id);
                         hour_dials.remove(&connection_id);
                         {
-                            let raised = (budget + budget / 4).min(CONNECTION_CEILING);
+                            let raised = (budget + budget / 4).min(ceiling);
                             budget = raised;
                             *swarm.behaviour_mut().conn_limits.limits_mut() =
                                 super::swarm::connection_limits(raised);
@@ -6013,9 +6067,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .await;
                             }
                         }
-                        let _ = events
-                            .send(NodeEvent::DialFailed { reason: error.to_string() })
-                            .await;
+                        // `S1-IY`: counted here, where every one of them is seen,
+                        // and the window is told the count in the next reading.
+                        // Only the first few go out with their words: the window
+                        // wrote those and threw the rest away, and several
+                        // hundred a minute on an open DHT were a good part of
+                        // what filled the channel in the first place.
+                        dials_failed = dials_failed.saturating_add(1);
+                        if dials_failed <= DIAL_FAILURES_TOLD {
+                            let _ = events
+                                .send(NodeEvent::DialFailed { reason: error.to_string() })
+                                .await;
+                        }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Identify(
                         libp2p::identify::Event::Received { peer_id, info, .. },
@@ -6866,7 +6929,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if built_to_be_measured() && (refused_by_own_limit > 0 || refused_coming_in > 0) {
                     let _ = events
                         .send(NodeEvent::Warning(format!(
-                            "this client's own connection limit refused {refused_by_own_limit} connection(s) since the last tick, and {refused_coming_in} that came in, {refused_coming_in_by_relay} of them through its relay ({} established, the ceiling is {CONNECTION_CEILING})",
+                            "this client's own connection limit refused {refused_by_own_limit} connection(s) since the last tick, and {refused_coming_in} that came in, {refused_coming_in_by_relay} of them through its relay ({} established, the ceiling is {ceiling})",
                             swarm.network_info().connection_counters().num_established()
                         )))
                         .await;
@@ -9270,6 +9333,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = stall.tick() => {
+                // `S1-IY`: what this node holds, as a reading the window sets
+                // rather than a sum it keeps. Every two seconds when it moved,
+                // and every `CONNECTIONS_HEARTBEAT` ticks when it did not, so a
+                // reading the full channel dropped is replaced soon either way.
+                {
+                    let reading = ConnectionsReading {
+                        established: swarm.network_info().connection_counters().num_established(),
+                        players: u32::try_from(poker_peers.iter().filter(|p| swarm.is_connected(p)).count())
+                            .unwrap_or(u32::MAX),
+                        dials_failed,
+                    };
+                    if connections_due(connections_said, reading, connections_quiet) {
+                        connections_said = Some(reading);
+                        connections_quiet = 0;
+                        let _ = events
+                            .send(NodeEvent::Connections {
+                                established: reading.established,
+                                players: reading.players,
+                                dials_failed: reading.dials_failed,
+                            })
+                            .await;
+                    } else {
+                        connections_quiet = connections_quiet.saturating_add(1);
+                    }
+                }
                 // `S1-IS`: the poker clients identified a few seconds ago. By now a
                 // hello that was going to arrive has arrived; what GossipSub still
                 // does not know of a peer -- **of what that peer can hold** -- is a
@@ -12499,6 +12587,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
+                // `S1-IY`: where a run is measured, what this node holds, in words
+                // a script can read -- every thirty seconds, beside the budget
+                // and the ceiling it moves under. A player's log is spared it:
+                // the number is on the strip, and a line each half-minute would
+                // be most of what an idle client writes.
+                if built_to_be_measured() {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "connections: {} established, {} players, {dials_failed} dials failed, budget {budget} of {ceiling}",
+                            swarm.network_info().connection_counters().num_established(),
+                            poker_peers.iter().filter(|p| swarm.is_connected(p)).count(),
+                        )))
+                        .await;
+                }
                 // `D-064`: the queue's size, said when it changes -- searchers gone
                 // quiet are expired in `tick`.
                 if state.queue.len() != queue_said {
@@ -18077,6 +18179,26 @@ mod tests {
         assert_ne!(hour_namespace(494_000), shard_namespace("494000"));
     }
 
+    /// `S1-IY`: a reading goes out when there is none yet, when it moved, and
+    /// again after a heartbeat of quiet ticks -- never on every tick of a count
+    /// that stands still, and never held back when it changed.
+    #[test]
+    fn a_reading_of_the_connections_goes_out_when_it_moved_or_now_and_then() {
+        let r = |established, players, dials_failed| ConnectionsReading { established, players, dials_failed };
+        let held = r(40, 1, 900);
+        assert!(connections_due(None, held, 0), "the first reading is always said");
+        assert!(!connections_due(Some(held), held, 0), "an unchanged one is not said at once");
+        assert!(!connections_due(Some(held), held, CONNECTIONS_HEARTBEAT - 1));
+        assert!(connections_due(Some(held), held, CONNECTIONS_HEARTBEAT), "and is said again after the heartbeat");
+        // Any one of the three moving is a change, down as well as up.
+        for moved in [r(39, 1, 900), r(41, 1, 900), r(40, 0, 900), r(40, 2, 900), r(40, 1, 901)] {
+            assert!(connections_due(Some(held), moved, 0), "{moved:?} moved");
+        }
+        // Thirty seconds at the stall tick's two, so a dropped reading is
+        // replaced within the time the housekeeping tick used to take.
+        assert_eq!(u64::from(CONNECTIONS_HEARTBEAT) * 2, 30);
+    }
+
     /// `D-070`: **the hour before is read while the clients make their turn, and
     /// every turn is over well before that reading stops.**
     #[test]
@@ -18916,7 +19038,8 @@ mod the_fast_lane {
         // **`Denied`, which is what the paragraph above is about and what
         // nothing pinned.** It is not a hypothetical at this arm: the arm that
         // swallows it does so only while the connection budget is below
-        // `CONNECTION_CEILING` = 320, and 637 of the 644 logs on disk reach that
+        // `CONNECTION_CEILING` (320 when this was measured; 96 since `S1-IY`,
+        // which only makes it truer), and 637 of the 644 logs on disk reach that
         // ceiling, at a median of 24.4 s, 634 of them inside the 120 s the lane
         // is open. So for most of the window this predicate is the only thing
         // between this client's own limiter refusing an **already established**
