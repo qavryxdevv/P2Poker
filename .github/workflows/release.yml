@@ -277,6 +277,26 @@ jobs:
           if [ "$code" -ne 2 ]; then echo "expected the refusal's exit code 2, got $code"; exit 1; fi
           echo "$out" | grep -Eq 'p2p-poker [0-9]+[.][0-9]+[.][0-9]+' || { echo 'the client did not say its version'; exit 1; }
 
+      - name: It confines its own writes, and the helper it opens things through does not (D-082)
+        # Landlock on the runner's kernel: a write in the profile goes through and one in the home folder is refused
+        # (exit 0; 3 would be a kernel that confines nothing, 1 anything else). The helper, started before the
+        # confinement, is asked to open the profile's folder -- a stand-in for the desktop's xdg-open writes a file
+        # where the client may not, which only a helper that kept its rights can.
+        run: |
+          mkdir -p "$RUNNER_TEMP/sbx/bin"
+          printf '%s\n' '#!/bin/sh' 'echo "$1" > "$HOME/.p2poker-opener-probe"' > "$RUNNER_TEMP/sbx/bin/xdg-open"
+          chmod +x "$RUNNER_TEMP/sbx/bin/xdg-open"
+          rm -f "$HOME/.p2poker-opener-probe"
+          set +e
+          PATH="$RUNNER_TEMP/sbx/bin:$PATH" ./target/release/p2p-poker --sandbox-check --profile "$RUNNER_TEMP/sbx/profile"
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then echo "--sandbox-check exited $code"; exit 1; fi
+          for i in 1 2 3 4 5; do [ -f "$HOME/.p2poker-opener-probe" ] && break; sleep 1; done
+          test -f "$HOME/.p2poker-opener-probe" || { echo 'the helper did not open the folder'; exit 1; }
+          echo "the helper opened: $(cat "$HOME/.p2poker-opener-probe")"
+          rm -f "$HOME/.p2poker-opener-probe"
+
       - name: The packages
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)

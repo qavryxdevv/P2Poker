@@ -7169,3 +7169,50 @@ with a wrong clock plays exactly as before, having been told why the lobby may l
 `P2P_POKER_PRETEND_CLOCK_OUT` shows the sentence in a binary built to be measured, so it can be seen and
 photographed without setting this computer's clock wrong; a player's build has no such knob, exactly as `D-077`'s
 `P2P_POKER_PRETEND_VERSION` has none.
+
+## D-082 -- On Linux the client confines its own writes
+
+**Decided 2026-09-25 by the project owner**, from his own observation: a package manager lists a `.deb` as a
+program with access to the whole system, and a fault in it could then reach anything its user can. He asked that it
+have only what it needs.
+
+**What a package manager can and cannot do about it.** `.deb`, `.rpm`, AppImage and `.tar.gz` are unconfined
+formats: the program runs with every right its user has, and the package manager can only say so. The formats a
+package manager does confine are Flatpak and Snap, and both are stores -- Flathub, the owner says, takes no program written with AI (2026-09-25), and a
+Snap needs an account the project does not have. So the limit comes from the program,
+which is where it holds in every one of the four packages.
+
+**Landlock.** The kernel's own sandbox for unprivileged programs (Linux 5.13, 2021; Ubuntu 22.04's kernel and every
+later one have it on): the client asks for it itself, with no root, no package format and no store. Rust and
+nothing else: `landlock 0.4.7`, the maintainers' own crate, compiled by the Linux build alone (`DEPENDENCIES.md` §1 and
+§5.12).
+
+1. **Writes, not reads, and not the network.** The client may write in its profile, the cache Mesa keeps its shaders
+   in, PulseAudio's client folder, `/tmp`, the session's runtime folder and `/dev`, and nowhere else
+   (`sandbox::writable_roots`). A fault cannot delete or overwrite a player's documents, keys or settings. Reading
+   stays as it was, because the window, the GPU driver and the sound library read from all over the system and a
+   list that forgot one would leave a player on some distribution without a window; the network is a peer-to-peer
+   client's whole job. The rights are Landlock's write rights up to ABI 5 and no further: ABI 9's resolving of Unix
+   sockets would stand between the client and the display, the sound server and D-Bus.
+2. **Asked for at the top of `main`, under the profile's lock and before any other thread exists**, because a
+   restriction holds for the thread that asks for it and for what that thread starts after.
+3. **The browser and the file manager are opened by a helper** (`p2p-poker --opener`), started just before the
+   confinement so that it keeps the rights the client gives up: a browser the confined client started itself would
+   inherit the confinement and could not write its own profile. The helper reads one request a line from a pipe
+   (`sandbox::Open`), opens only an `https://` address the client itself would or a folder that exists, and ends
+   when the client does.
+4. **Said at start, and switched off only by the player.** The client says what it got: `writes confined to ...
+   (Landlock)`, `(... as far as this kernel knows it)` on a kernel that knows an older Landlock, or `writes not
+   confined: <why>` on one that has none, where it runs exactly as before. `--no-sandbox` is the player's way out
+   if a desktop needs a folder the list does not have; `--sandbox-check` confines, tries a write in the profile and
+   one in the home folder, asks the helper to open the profile's folder, and says how each went.
+5. **Tested where it runs.** On an Ubuntu 24.04 machine (kernel 6.8, Landlock ABI 4), 2026-09-25: the check found a
+   write in the profile going through and one in the home folder refused, and the helper -- through a stand-in for
+   `xdg-open` -- writing where the client may not; a headless client ran a minute in the public lobby and a window
+   half a minute under Xvfb, each confined, with no write refused anywhere in its log, its profile written, and
+   Mesa's shader cache written in `~/.cache`. The release workflow's Linux job runs the same check on every build.
+
+**What it does not do.** It does not confine reading or the network, and it confines nothing on Windows -- the
+Microsoft Store's copy runs with `runFullTrust` like the downloaded one (`D-080`). It does not change what a
+package manager says about a `.deb`: that label is the format's. And nothing is confined in `--table-preview`,
+`--album-preview` or `--sound-check`, which touch no profile and no network and stop by themselves.

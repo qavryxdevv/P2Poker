@@ -137,6 +137,9 @@ eframe = { version = "0.36.1", default-features = false, features = ["x11", "way
 # Already in the tree for the window's OpenGL (`glutin`), so this adds the edge
 # and nothing to the lockfile; and no ALSA headers are needed to build.
 libloading = "0.8"
+# `D-082`: the client confines its own writes with the kernel's Landlock --
+# the maintainers' own crate, no C, compiled by the Linux build alone.
+landlock = "0.4.7"
 
 # --- dev-only: the arkworks types the vendored ziffle is built on --------
 # Present so tests/deck_constants.rs (ZIFFLE_VERDICT.md C-7) can recompute

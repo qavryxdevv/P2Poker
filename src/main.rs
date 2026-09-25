@@ -36,6 +36,9 @@
 //! p2p-poker --search auto         find a game automatically (hu, 6, 10 or auto;
 //!                                 --search-tables N games at once, --search-again
 //!                                 to search again when the game ends)
+//! p2p-poker --no-sandbox          Linux: do not confine the client's writes (`D-082`)
+//! p2p-poker --sandbox-check       Linux: confine them, try a write inside the profile
+//!                                 and one outside it, say how each went, and stop
 //! ```
 //!
 //! `--renderer` is there to be overridden, not to be typed. The client draws
@@ -192,6 +195,15 @@ fn main() {
             .cloned()
     };
 
+    // `D-082`: the helper a confined client opens the browser and the file
+    // manager through. The client starts it before confining itself, and it
+    // reads what to open from its standard input until the client ends.
+    #[cfg(target_os = "linux")]
+    if args.get(1).map(String::as_str) == Some("--opener") {
+        serve_opener();
+        return;
+    }
+
     // `--table-preview`: the table window drawn from the sample hand, with no
     // node, no network and no profile -- for looking at the table's look.
     // `--preview-seats N` fills the table to N seats, `--preview-panels` opens
@@ -284,6 +296,30 @@ fn main() {
             p2p_poker::storage::profile::ProfileLock::none()
         }
     };
+    // `D-082`: on Linux the client confines its own writes -- here, under the
+    // profile's lock and before any other thread exists, because a restriction
+    // holds for the thread that asks for it and for what that thread starts
+    // after. The helper that opens the browser is started first, so it keeps
+    // the rights the client gives up.
+    #[cfg(target_os = "linux")]
+    {
+        use p2p_poker::sandbox;
+        let confinement = if has("--no-sandbox") {
+            sandbox::Confinement::None("--no-sandbox".into())
+        } else {
+            if !has("--headless") {
+                if let Ok(program) = std::env::current_exe() {
+                    let _ = sandbox::spawn_opener(&program);
+                }
+            }
+            sandbox::confine_writes(&sandbox::writable_roots(&dir, |k| std::env::var_os(k)))
+        };
+        sandbox::set_confined(confinement.confined());
+        println!("sandbox  {}", confinement.words());
+        if has("--sandbox-check") {
+            std::process::exit(sandbox_check(&dir, &confinement));
+        }
+    }
     // `D-068`: a profile restored from a backup takes its place here, under the
     // lock and before a single file of the profile is read. What it replaces is
     // kept in the backups folder.
@@ -788,8 +824,70 @@ fn open_in_browser(url: &str) -> bool {
     }
     #[cfg(not(windows))]
     {
+        // `D-082`: a confined client asks its helper. A browser it started
+        // itself would inherit the confinement, and a browser that cannot write
+        // its own profile does not start.
+        #[cfg(target_os = "linux")]
+        {
+            if p2p_poker::sandbox::ask_opener(&p2p_poker::sandbox::Open::Url(url.to_owned())) {
+                return true;
+            }
+            if p2p_poker::sandbox::is_confined() {
+                return false;
+            }
+        }
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
         std::process::Command::new(opener).arg(url).spawn().is_ok()
+    }
+}
+
+/// `D-082`: the helper's loop -- one request a line, an `https://` address the
+/// client itself would open or a folder that exists, each handed to
+/// `xdg-open` with the rights the confined client gave up; anything else is
+/// read past. It ends when the client closes the pipe, which it does by ending.
+#[cfg(target_os = "linux")]
+fn serve_opener() {
+    use std::io::BufRead;
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let target: std::ffi::OsString = match p2p_poker::sandbox::Open::read(&line) {
+            Some(p2p_poker::sandbox::Open::Url(url)) if is_a_web_address(&url) => url.into(),
+            Some(p2p_poker::sandbox::Open::Folder(folder)) if folder.is_dir() => folder.into_os_string(),
+            _ => continue,
+        };
+        if let Ok(mut child) = std::process::Command::new("xdg-open").arg(&target).spawn() {
+            // Waited for off the loop: `xdg-open` may wait for the browser.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+/// `D-082`, `--sandbox-check`: a write in the profile and one in the home
+/// folder beside it, and what each came to; then the helper is asked to open
+/// the profile's folder, as the About page would. 0 when the client is confined
+/// and both writes came out as they must; 3 when this system confines nothing
+/// (an old kernel, Landlock switched off); 1 for anything else.
+#[cfg(target_os = "linux")]
+fn sandbox_check(profile: &std::path::Path, confinement: &p2p_poker::sandbox::Confinement) -> i32 {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| "/".into());
+    let outside = home.join(".p2poker-sandbox-probe");
+    let (inside, refused) = p2p_poker::sandbox::check_writes(profile, &outside);
+    println!(
+        "sandbox check: a write in the profile {}; a write in the home folder {}",
+        if inside { "went through" } else { "FAILED" },
+        if refused { "was refused" } else { "went through" }
+    );
+    let asked = p2p_poker::sandbox::ask_opener(&p2p_poker::sandbox::Open::Folder(profile.to_path_buf()));
+    println!(
+        "sandbox check: the helper {}",
+        if asked { "was asked to open the profile's folder" } else { "could not be asked" }
+    );
+    match (confinement.confined(), inside, refused) {
+        (true, true, true) => 0,
+        (false, true, false) => 3,
+        _ => 1,
     }
 }
 
@@ -3162,9 +3260,19 @@ impl eframe::App for Client {
                         if let Ok(exe) = std::env::current_exe() {
                             #[cfg(windows)]
                             p2p_poker::install::shell::show_in_explorer(&exe);
-                            // `D-078`: the folder, in whatever the desktop opens folders with.
+                            // `D-078`: the folder, in whatever the desktop opens folders with --
+                            // `D-082`: through the helper where the client is confined.
                             #[cfg(not(windows))]
-                            let _ = exe.parent().map(|folder| std::process::Command::new("xdg-open").arg(folder).spawn());
+                            if let Some(folder) = exe.parent() {
+                                #[cfg(target_os = "linux")]
+                                let asked = p2p_poker::sandbox::ask_opener(&p2p_poker::sandbox::Open::Folder(folder.to_path_buf()))
+                                    || p2p_poker::sandbox::is_confined();
+                                #[cfg(not(target_os = "linux"))]
+                                let asked = false;
+                                if !asked {
+                                    let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+                                }
+                            }
                         }
                     }
                     // `D-073`: this client ends and starts itself again as the

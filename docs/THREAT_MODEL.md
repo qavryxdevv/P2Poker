@@ -831,6 +831,11 @@ observation point and a reliable DoS capability, and nothing more.**
 * Global passive network observation combined with unlimited traffic analysis.
 * An attacker with the resources to sustain a network-level DoS against a target.
 
+**Defence in depth, not a boundary of the model.** A fault in the client -- one a peer's bytes could reach
+among them -- is not assumed away; what it could do to the rest of a player's files is limited on Linux, where the
+client confines its own writes to its profile and the few folders a window and sound need, with the kernel's
+Landlock (`DECISIONS.md` D-082). Reading is not confined, and nothing is confined on Windows.
+
 ---
 
 ## 4. Security goals

@@ -23,6 +23,7 @@ pub mod music;
 pub mod net;
 pub mod poker;
 pub mod protocol;
+pub mod sandbox;
 pub mod security;
 pub mod sound;
 pub mod storage;

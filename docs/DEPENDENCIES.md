@@ -74,9 +74,12 @@ corrected in place and the correction is recorded in §9.7.
 | Figure | Value | How |
 |---|---|---|
 | Crates **compiled into the client** | **444** | `cargo tree --edges normal --target x86_64-pc-windows-msvc`, unique name+version, minus `p2p-poker` itself |
-| Crates **recorded in `Cargo.lock`** | **653** | `[[package]]` entries, minus `p2p-poker` itself |
-| Locked but never compiled | **209** | the difference |
+| Crates **recorded in `Cargo.lock`** | **656** | `[[package]]` entries, minus `p2p-poker` itself |
+| Locked but never compiled | **212** | the difference |
 
+**Re-measured 2026-09-25, after `D-082`'s sandbox on Linux**: 444 / 656 / 212. `Cargo.lock` gained `landlock`,
+`enumflags2` and `enumflags2_derive`, which the Linux build compiles and a Windows build locks and never compiles
+(§5.12).
 **Re-measured 2026-09-21, after `D-078`'s Linux client**: 444 / 653 / 209. The Windows client compiles what it
 did; `Cargo.lock` gained the six crates eframe's `x11` and `wayland` features bring to a Linux build --
 `x11-dl`, `as-raw-xcb-connection`, `glutin_glx_sys`, `smithay-client-toolkit` 0.19.2, `calloop-wayland-source`
@@ -894,6 +897,13 @@ given is the system's own answer or a constant of this build, and the installer 
 on Linux only -- it was in the tree already for the window's OpenGL (`glutin`), so the lockfile gained the line that
 says so and no crate. It opens ALSA's `libasound.so.2` by that constant name; **no byte from a peer reaches it**, and
 what is played through it is this client's own compiled-in sounds and music.
+**And for `D-082`'s sandbox on Linux:** `landlock 0.4.7` (`github.com/landlock-lsm/rust-landlock`, the Landlock
+maintainers' own crate, MIT OR Apache-2.0) is a direct edge on Linux only, with `enumflags2 0.7.12` and
+`enumflags2_derive 0.7.12` (`github.com/meithecatte/enumflags2`, MIT OR Apache-2.0) under it -- Rust and nothing
+else, the three new to the lockfile, compiled by the Linux build alone. At start it asks the kernel which Landlock it
+knows, creates a ruleset, adds a rule for each folder the client may still write in, and confines this process
+(setting `no_new_privs`, which Landlock requires of an unprivileged process). **No byte from a peer reaches it**:
+every path it is given is the profile's or one the session names, read once before the network starts.
 The count moved from 339 with them, and with `serde_json`, which `D-068` took into §5.7. The same holds for the renderer: `naga` compiles shaders, and the
 only shaders it ever sees are `egui`'s own, compiled in. **This assumption fails the moment anything peer-supplied is
 rendered** — an avatar, a table skin, a chat message with an image, a downloaded
