@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  S1-JA: what a software centre reads. GNOME Software and KDE Discover list the components AppStream
+  describes, not the packages a system has installed; a .deb or an .rpm without this file installs a program
+  neither of them shows, and a player who installed it with a double click cannot remove it where they
+  found it. tools/package-linux.sh installs it as /usr/share/metainfo/<id>.metainfo.xml in the .deb and the
+  .rpm; the version a software centre shows is the package's own. tools/check-linux-listing.sh asks the
+  system's AppStream for it once the .deb is installed, and tests/linux_packages_are_listed.rs holds it to
+  the menu entry and the program the packages install.
+-->
+<component type="desktop-application">
+  <id>io.github.qavryxdevv.P2Poker</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>P2Poker</name>
+  <summary>Decentralised poker: no house, no server, every card proven</summary>
+  <description>
+    <p>
+      P2Poker is a No-Limit Texas Hold'em client with no server. Players find each other peer-to-peer and deal
+      the cards themselves, with cryptographic shuffle proofs.
+    </p>
+    <p>
+      Sit &amp; Go tournaments for 2 to 10 players, for play money only: there is no account, nothing to buy
+      and nothing to win.
+    </p>
+  </description>
+  <launchable type="desktop-id">p2poker.desktop</launchable>
+  <provides>
+    <binary>p2p-poker</binary>
+  </provides>
+  <url type="homepage">https://github.com/qavryxdevv/P2Poker</url>
+  <url type="bugtracker">https://github.com/qavryxdevv/P2Poker/issues</url>
+  <url type="help">https://github.com/qavryxdevv/P2Poker/blob/master/FAQ.md</url>
+  <url type="donation">https://github.com/qavryxdevv/P2Poker/blob/master/DONATE.md</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>A table with all ten seats taken</caption>
+      <image>https://raw.githubusercontent.com/qavryxdevv/P2Poker/master/docs/images/table-ten-seats.png</image>
+    </screenshot>
+  </screenshots>
+  <!--
+    OARS 1.1, answered for what the client does: poker for play money (moderate; "intense" is real money),
+    the table's and the lobby's chat, which nobody moderates (docs/PRIVACY.md), and the one question the window
+    asks GitHub as it opens, which is the newest version (D-077).
+  -->
+  <content_rating type="oars-1.1">
+    <content_attribute id="money-gambling">moderate</content_attribute>
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-info">mild</content_attribute>
+  </content_rating>
+</component>

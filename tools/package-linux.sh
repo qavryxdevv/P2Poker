@@ -7,9 +7,12 @@
 #   P2Poker-<version>-linux-x86_64.tar.gz   the program and its menu entry, to run from where it is unpacked
 #
 #   sh tools/package-linux.sh 0.1.3
+#   sh tools/package-linux.sh 0.1.4 2      the same version packaged again: p2poker_0.1.4-2_amd64.deb and
+#                                          p2poker-0.1.4-2.x86_64.rpm (S1-JA, .github/workflows/repackage-linux.yml)
 #
-# The .deb and the .rpm install the program as /usr/bin/p2p-poker, a menu entry and an icon; the profile
-# is in the user's data folder (~/.local/share/p2poker/profile), never under /usr (storage::profile).
+# The .deb and the .rpm install the program as /usr/bin/p2p-poker, a menu entry, an icon and the AppStream
+# metainfo a software centre lists it by (S1-JA); the profile is in the user's data folder
+# (~/.local/share/p2poker/profile), never under /usr (storage::profile).
 #
 # Needs dpkg-deb, rpmbuild, curl and sha256sum. The AppImage tool and the runtime it puts in front of the
 # program are fetched at pinned versions and refused unless their SHA-256 is the one written here, the
@@ -17,9 +20,18 @@
 set -eu
 
 version="${1:?the version, as Cargo.toml says it}"
+# The packaging's number. A version's first packaging is 1 and names nothing more; a later one packages the same
+# program again when only the package was wrong (S1-JA), and its number goes into the package's version -- 0.1.4-2
+# for dpkg and for rpm alike -- so that apt and dnf take it for newer than the one installed.
+packaging="${2:-1}"
+case "$packaging" in
+  '' | *[!0-9]* | 0*) echo "the packaging's number is a whole number from 1, not '$packaging'" >&2; exit 1 ;;
+esac
+if [ "$packaging" = 1 ]; then debversion="$version"; else debversion="$version-$packaging"; fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 bin="$root/target/release/p2p-poker"
 desktop="$root/packaging/linux/p2poker.desktop"
+metainfo="$root/packaging/linux/io.github.qavryxdevv.P2Poker.metainfo.xml"
 icon="$root/assets/icon-256.png"
 dist="$root/dist"
 work="$root/target/package-linux"
@@ -38,11 +50,13 @@ fetch() { # url sha256 file
   echo "$2  $3" | sha256sum -c - >/dev/null || { echo "REFUSED: $1 is not the pinned file" >&2; exit 1; }
 }
 
-# The tree the .deb and the .rpm are made from.
+# The tree the .deb and the .rpm are made from. The metainfo is what GNOME Software and KDE Discover list: without
+# it they showed nothing a player could remove the installed program from (S1-JA).
 stage="$work/stage"
 install -Dm755 "$bin" "$stage/usr/bin/p2p-poker"
 install -Dm644 "$desktop" "$stage/usr/share/applications/p2poker.desktop"
 install -Dm644 "$icon" "$stage/usr/share/icons/hicolor/256x256/apps/p2poker.png"
+install -Dm644 "$metainfo" "$stage/usr/share/metainfo/io.github.qavryxdevv.P2Poker.metainfo.xml"
 install -Dm644 "$root/LICENSE" "$stage/usr/share/doc/p2poker/copyright"
 
 summary="Decentralised poker: no house, no server, every card proven"
@@ -57,7 +71,7 @@ mkdir -p "$deb/DEBIAN"
 size=$(du -sk "$deb/usr" | cut -f1)
 cat > "$deb/DEBIAN/control" <<EOF
 Package: p2poker
-Version: $version
+Version: $debversion
 Architecture: amd64
 Maintainer: P2Poker <270192017+qavryxdev@users.noreply.github.com>
 Installed-Size: $size
@@ -69,7 +83,7 @@ Homepage: https://github.com/qavryxdevv/P2Poker
 Description: $summary
  $description
 EOF
-dpkg-deb --root-owner-group --build "$deb" "$dist/p2poker_${version}_amd64.deb" >/dev/null
+dpkg-deb --root-owner-group --build "$deb" "$dist/p2poker_${debversion}_amd64.deb" >/dev/null
 
 # .rpm -- the same tree, the same libraries by their sonames, which every rpm distribution provides.
 rpmtop="$work/rpm"
@@ -77,7 +91,7 @@ mkdir -p "$rpmtop/SPECS"
 cat > "$rpmtop/SPECS/p2poker.spec" <<EOF
 Name: p2poker
 Version: $version
-Release: 1
+Release: $packaging
 Summary: $summary
 License: GPL-3.0-or-later
 URL: https://github.com/qavryxdevv/P2Poker
@@ -99,10 +113,11 @@ cp -a $stage/. %{buildroot}/
 /usr/bin/p2p-poker
 /usr/share/applications/p2poker.desktop
 /usr/share/icons/hicolor/256x256/apps/p2poker.png
+/usr/share/metainfo/io.github.qavryxdevv.P2Poker.metainfo.xml
 /usr/share/doc/p2poker/copyright
 EOF
 rpmbuild --quiet --define "_topdir $rpmtop" --target x86_64 -bb "$rpmtop/SPECS/p2poker.spec"
-cp "$rpmtop/RPMS/x86_64/p2poker-$version-1.x86_64.rpm" "$dist/"
+cp "$rpmtop/RPMS/x86_64/p2poker-$version-$packaging.x86_64.rpm" "$dist/"
 
 # .tar.gz -- the program, its menu entry, its icon and its licence, in one folder.
 tardir="$work/P2Poker-$version"

@@ -47,7 +47,9 @@ folder, so back it up first (Settings → Profile) if you want to stay the same 
 
 On Linux, the `.deb` and the `.rpm` install it as any program is installed (`sudo apt install ./p2poker_….deb`, or
 `sudo dnf install ./p2poker-….rpm`), and the AppImage is one file you make executable and start. Your player profile
-is then in `~/.local/share/p2poker/profile`.
+is then in `~/.local/share/p2poker/profile`. A package is removed as any package is: `sudo apt remove p2poker`, or
+`sudo dnf remove p2poker`. That leaves your profile where it is, so you are the same player if you install it
+again.
 
 ## Mac or Linux?
 

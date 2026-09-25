@@ -336,6 +336,14 @@ jobs:
           xwd -root -silent | convert xwd:- -resize 1x1 txt:- | tail -n 1
           kill "$pid"
 
+      - name: A software centre lists the installed package, so it can be removed where it was found (S1-JA)
+        # GNOME Software and KDE Discover list the components the system's AppStream knows, not the packages dpkg
+        # installed: the .deb of 0.1.4 carried no metainfo, and neither of them showed the program it had installed.
+        run: |
+          sudo apt-get install -y -q --no-install-recommends appstream
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          sh tools/check-linux-listing.sh "dist/p2poker-${version}-1.x86_64.rpm"
+
       - name: Its sounds are heard, through ALSA, by a sound server (PulseAudio, a sink with no speaker, recorded)
         # D-079: the sounds and the search music go to ALSA's default device, which on a desktop is its sound server
         # behind ALSA's own plugin for it. A runner has no speaker: PulseAudio is started with a sink that plays to

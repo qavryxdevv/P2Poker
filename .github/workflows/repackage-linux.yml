@@ -1,0 +1,143 @@
+# S1-JA: a released version's program, packaged again. When only a package was wrong -- the .deb and the .rpm of
+# 0.1.4 carried no AppStream metainfo, so no software centre listed them -- the fix is a package and not a version:
+# a new version is a new release, and a new release closes the lobby to every older client (D-077), the Microsoft
+# Store's copy included while the Store certifies it.
+#
+# The program is not built again: a build today would not be the bytes attested from the tag. It is taken from the
+# release, refused unless GitHub's attestation says release.yml built it from that tag, and packaged by this
+# commit's tools/package-linux.sh under a packaging number -- for 0.1.4 and 2, p2poker_0.1.4-2_amd64.deb and
+# p2poker-0.1.4-2.x86_64.rpm, which apt and dnf take for newer than 0.1.4 and 0.1.4-1. The new packages are attested
+# by this workflow, so
+#
+#     gh attestation verify p2poker_0.1.4-2_amd64.deb --repo qavryxdevv/P2Poker
+#
+# answers with repackage-linux.yml and the commit it ran on, not release.yml and the tag; that the program inside
+# is the released one, byte for byte, is checked here, and the run's summary says its SHA-256.
+#
+# Nothing here touches a release. The packages are kept with the run; putting them beside a release's files is a
+# separate step, taken by hand and only on the owner's word.
+
+name: repackage-linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release whose program is packaged again, by its tag (v0.1.4)
+        required: true
+      packaging:
+        description: The packaging's number -- a version's first is 1, so the first repackaging is 2
+        required: true
+        default: '2'
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write          # to ask Sigstore for the short-lived certificate
+      attestations: write      # to store the attestation
+      artifact-metadata: write # what actions/attest asks for beside it
+    env:
+      TAG: ${{ inputs.tag }}
+      PACKAGING: ${{ inputs.packaging }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the packaging
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: What is packaged, and as what
+        run: |
+          printf '%s' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "not a version's tag: '$TAG'"; exit 1; }
+          printf '%s' "$PACKAGING" | grep -Eqx '[2-9]|[1-9][0-9]+' || { echo "a repackaging's number is 2 or more, not '$PACKAGING'"; exit 1; }
+          version=${TAG#v}
+          echo "$TAG's program, packaged again as p2poker_${version}-${PACKAGING}_amd64.deb and p2poker-${version}-${PACKAGING}.x86_64.rpm"
+
+      - name: The released program, refused unless release.yml built it from the tag
+        run: |
+          version=${TAG#v}
+          got="$RUNNER_TEMP/released"
+          mkdir -p "$got"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$got" \
+            --pattern "P2Poker-${version}-linux-x86_64.tar.gz" --pattern "p2poker_${version}_amd64.deb"
+          for f in "$got/P2Poker-${version}-linux-x86_64.tar.gz" "$got/p2poker_${version}_amd64.deb"; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" --source-ref "refs/tags/$TAG" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" > /dev/null
+            echo "attested, built by release.yml from refs/tags/$TAG: $(basename "$f")"
+          done
+          tar -xzf "$got/P2Poker-${version}-linux-x86_64.tar.gz" -C "$got"
+          dpkg-deb --fsys-tarfile "$got/p2poker_${version}_amd64.deb" | tar -xO ./usr/bin/p2p-poker > "$got/from-the-deb"
+          program=$(sha256sum < "$got/P2Poker-${version}/p2p-poker" | cut -d' ' -f1)
+          [ "$program" = "$(sha256sum < "$got/from-the-deb" | cut -d' ' -f1)" ] || { echo "the release's .deb and .tar.gz carry different programs"; exit 1; }
+          install -Dm755 "$got/P2Poker-${version}/p2p-poker" target/release/p2p-poker
+          echo "$program" > "$RUNNER_TEMP/program.sha256"
+          echo "the released program, in its .deb and its .tar.gz alike: SHA-256 $program"
+
+      - name: The tools the packages are made with, and AppStream's
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends rpm appstream
+
+      - name: The packages
+        run: |
+          version=${TAG#v}
+          sh tools/package-linux.sh "$version" "$PACKAGING"
+          cd dist
+          # the release's own AppImage and .tar.gz carry the same program and stay what they are
+          rm -f ./*.AppImage ./*.tar.gz
+          deb="p2poker_${version}-${PACKAGING}_amd64.deb"
+          rpm="p2poker-${version}-${PACKAGING}.x86_64.rpm"
+          [ "$(ls)" = "$(printf '%s\n' "$rpm" "$deb" | sort)" ] || { echo "dist holds $(ls), not $deb and $rpm"; exit 1; }
+          sha256sum "$deb" "$rpm" > "SHA256SUMS-linux-${version}-${PACKAGING}.txt"
+          { echo "### $TAG, packaging $PACKAGING"; echo; echo '```'; cat "SHA256SUMS-linux-${version}-${PACKAGING}.txt";
+            echo "program $(cat "$RUNNER_TEMP/program.sha256")  /usr/bin/p2p-poker (the one release.yml built from $TAG)"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Over the released .deb, as a player who has it upgrades, and a software centre lists it (S1-JA)
+        run: |
+          version=${TAG#v}
+          program=$(cat "$RUNNER_TEMP/program.sha256")
+          sudo apt-get install -y -q "$RUNNER_TEMP/released/p2poker_${version}_amd64.deb"
+          echo "installed first: $(dpkg-query -W -f '${Version}' p2poker)"
+          sudo apt-get install -y -q "./dist/p2poker_${version}-${PACKAGING}_amd64.deb"
+          installed=$(dpkg-query -W -f '${Version}' p2poker)
+          [ "$installed" = "${version}-${PACKAGING}" ] || { echo "apt left $installed installed, not ${version}-${PACKAGING}"; exit 1; }
+          [ "$(sha256sum < /usr/bin/p2p-poker | cut -d' ' -f1)" = "$program" ] || { echo "the installed program is not the released one"; exit 1; }
+          echo "apt upgraded $version to $installed, and /usr/bin/p2p-poker is the released program"
+          rpm="dist/p2poker-${version}-${PACKAGING}.x86_64.rpm"
+          [ "$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$rpm")" = "${version}-${PACKAGING}" ] || { echo "the .rpm is not ${version}-${PACKAGING}"; exit 1; }
+          # the digest rpm keeps of each file: SHA-256 where rpm is new enough to default to it, MD5 before that
+          digest=$(rpm -qp --dump "$rpm" | awk '$1 == "/usr/bin/p2p-poker" { print $4 }')
+          case ${#digest} in
+            64) want=$program ;;
+            32) want=$(md5sum < target/release/p2p-poker | cut -d' ' -f1) ;;
+            *) echo "the .rpm keeps no digest of /usr/bin/p2p-poker: '$digest'"; exit 1 ;;
+          esac
+          [ "$digest" = "$want" ] || { echo "the .rpm's program is not the released one"; exit 1; }
+          echo "the .rpm is ${version}-${PACKAGING}, and its /usr/bin/p2p-poker is the released program"
+          sh tools/check-linux-listing.sh "$rpm"
+
+      - name: Attest the packages' provenance
+        id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+
+      - name: Keep the attestation beside the files, for checking offline
+        if: ${{ steps.attest.outputs.bundle-path != '' }}
+        run: cp '${{ steps.attest.outputs.bundle-path }}' "dist/p2poker-linux-${TAG#v}-${PACKAGING}.sigstore.json"
+
+      - name: Keep the packages with the run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: p2poker-linux-repackaged
+          if-no-files-found: error
+          path: dist/*
