@@ -7,9 +7,16 @@
   .rpm; the version a software centre shows is the package's own. tools/check-linux-listing.sh asks the
   system's AppStream for it once the .deb is installed, and tests/linux_packages_are_listed.rs holds it to
   the menu entry and the program the packages install.
+
+  Two things KDE's Discover needs, both found in the owner's Discover the same day and read in its source
+  (5.27 and 6.4 alike). The id is lowercase: the menu's "Uninstall or Manage Add-Ons" opens Discover at
+  appstream://<id>, Qt lowercases that part of an address, and Discover looks the id up exactly, so
+  io.github.qavryxdevv.P2Poker was never found. And it names its package: Discover's PackageKit backend
+  skips a component that names none, so the program was in no list, installed or not.
 -->
 <component type="desktop-application">
-  <id>io.github.qavryxdevv.P2Poker</id>
+  <id>io.github.qavryxdevv.p2poker</id>
+  <pkgname>p2poker</pkgname>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>P2Poker</name>

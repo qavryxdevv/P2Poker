@@ -9,11 +9,13 @@
 # 1. AppStream's own validator reads the tree the .deb and the .rpm are made from, the menu entry included;
 # 2. dpkg says the package p2poker installed the metainfo, the menu entry it names and the program;
 # 3. the system's AppStream -- what the software centres read -- knows the component by its id, as a desktop
-#    application started by that menu entry, with that program as its binary;
+#    application started by that menu entry, with that program as its binary, and with the package's name:
+#    KDE's Discover skips a component that names no package, and it is asked for the id in lowercase (the
+#    menu's appstream://<id>, whose host Qt lowercases);
 # 4. the .rpm carries the same file.
 set -eu
 
-id=io.github.qavryxdevv.P2Poker
+id=io.github.qavryxdevv.p2poker
 rpm="${1:?the .rpm to look into}"
 root=$(cd "$(dirname "$0")/.." && pwd)
 stage="$root/target/package-linux/stage"
@@ -34,7 +36,7 @@ echo "== what the system's AppStream knows"
 sudo -n appstreamcli refresh-cache --force >/dev/null 2>&1 || echo "(the cache was not refreshed; read as it is)"
 dump=$(appstreamcli dump "$id") || { echo "the system's AppStream does not know $id" >&2; exit 1; }
 for want in 'type="desktop-application"' '<launchable type="desktop-id">p2poker.desktop</launchable>' \
-  '<binary>p2p-poker</binary>'; do
+  '<binary>p2p-poker</binary>' '<pkgname>p2poker</pkgname>'; do
   case "$dump" in
     *"$want"*) echo "has $want" ;;
     *) echo "the system's AppStream knows $id without $want:" >&2; echo "$dump" >&2; exit 1 ;;

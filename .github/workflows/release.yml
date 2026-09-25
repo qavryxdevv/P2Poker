@@ -472,7 +472,7 @@ jobs:
             "- **[p2poker-$version-1.x86_64.rpm]($get/p2poker-$version-1.x86_64.rpm)** - Fedora, openSUSE: ``sudo dnf install ./p2poker-$version-1.x86_64.rpm``",
             "- **[P2Poker-$version-linux-x86_64.tar.gz]($get/P2Poker-$version-linux-x86_64.tar.gz)** - the program in a folder, to run from where it is unpacked.",
             '',
-            'On Linux the player profile is kept in `~/.local/share/p2poker/profile` (a `profile` folder beside the program makes a portable copy instead). Sounds are played on Windows only, for now.',
+            'On Linux the player profile is kept in `~/.local/share/p2poker/profile` (a `profile` folder beside the program makes a portable copy instead).',
             '',
             '## This build is verified',
             '',

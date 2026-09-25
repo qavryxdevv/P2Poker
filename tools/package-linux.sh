@@ -31,7 +31,7 @@ if [ "$packaging" = 1 ]; then debversion="$version"; else debversion="$version-$
 root=$(cd "$(dirname "$0")/.." && pwd)
 bin="$root/target/release/p2p-poker"
 desktop="$root/packaging/linux/p2poker.desktop"
-metainfo="$root/packaging/linux/io.github.qavryxdevv.P2Poker.metainfo.xml"
+metainfo="$root/packaging/linux/io.github.qavryxdevv.p2poker.metainfo.xml"
 icon="$root/assets/icon-256.png"
 dist="$root/dist"
 work="$root/target/package-linux"
@@ -56,7 +56,7 @@ stage="$work/stage"
 install -Dm755 "$bin" "$stage/usr/bin/p2p-poker"
 install -Dm644 "$desktop" "$stage/usr/share/applications/p2poker.desktop"
 install -Dm644 "$icon" "$stage/usr/share/icons/hicolor/256x256/apps/p2poker.png"
-install -Dm644 "$metainfo" "$stage/usr/share/metainfo/io.github.qavryxdevv.P2Poker.metainfo.xml"
+install -Dm644 "$metainfo" "$stage/usr/share/metainfo/io.github.qavryxdevv.p2poker.metainfo.xml"
 install -Dm644 "$root/LICENSE" "$stage/usr/share/doc/p2poker/copyright"
 
 summary="Decentralised poker: no house, no server, every card proven"
@@ -113,7 +113,7 @@ cp -a $stage/. %{buildroot}/
 /usr/bin/p2p-poker
 /usr/share/applications/p2poker.desktop
 /usr/share/icons/hicolor/256x256/apps/p2poker.png
-/usr/share/metainfo/io.github.qavryxdevv.P2Poker.metainfo.xml
+/usr/share/metainfo/io.github.qavryxdevv.p2poker.metainfo.xml
 /usr/share/doc/p2poker/copyright
 EOF
 rpmbuild --quiet --define "_topdir $rpmtop" --target x86_64 -bb "$rpmtop/SPECS/p2poker.spec"

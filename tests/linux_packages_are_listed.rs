@@ -16,7 +16,13 @@
 //!
 //! * The metainfo is named by its component's id, the id is the repository's
 //!   (`io.github.<owner>.<repository>`, AppStream's form for a project hosted
-//!   there), and the component is a desktop application.
+//!   there) in lowercase, and the component is a desktop application that
+//!   names the package it came in. The first metainfo had neither, and the
+//!   owner's Discover showed what each costs: KDE's menu opens it at
+//!   `appstream://<id>`, Qt lowercases an address's host and Discover looks
+//!   the id up exactly, so `...P2Poker` was never found; and Discover's
+//!   PackageKit backend skips a component that names no package, so the
+//!   program was in no list at all.
 //! * It is started by the menu entry the packages install, and its binary is
 //!   the program they install, which that menu entry starts.
 //! * `tools/package-linux.sh` installs it where AppStream reads it, in the tree
@@ -30,7 +36,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// The component's id, and the metainfo's file name before `.metainfo.xml`.
-const ID: &str = "io.github.qavryxdevv.P2Poker";
+const ID: &str = "io.github.qavryxdevv.p2poker";
 
 fn read(path: &str) -> String {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
@@ -79,13 +85,26 @@ fn the_metainfo_is_the_repositorys_desktop_application_named_by_its_id() {
     let (owner, repository) = path.split_once('/').expect("github.com/<owner>/<repository>");
     assert_eq!(
         ID,
-        format!("io.github.{owner}.{repository}"),
-        "AppStream's id for a project on GitHub is io.github.<owner>.<repository>"
+        format!("io.github.{owner}.{repository}").to_lowercase(),
+        "AppStream's id for a project on GitHub is io.github.<owner>.<repository>, and in lowercase: \
+         KDE's menu opens Discover at appstream://<id>, whose host Qt lowercases, and Discover looks \
+         the id up exactly"
     );
 
     let script = read("tools/package-linux.sh");
     assert!(script.contains(&format!("Homepage: {home}\n")), "the .deb's Homepage is the metainfo's");
     assert!(script.contains(&format!("URL: {home}\n")), "the .rpm's URL is the metainfo's");
+}
+
+/// Discover's PackageKit backend makes an application only of a component
+/// that names its package (`PackageKitBackend.cpp`, 5.27 and 6.4 alike); a
+/// component from an installed metainfo that names none is skipped.
+#[test]
+fn it_names_the_package_both_formats_install_it_as() {
+    let package = element(&metainfo(), "<pkgname>", "</pkgname>");
+    let script = read("tools/package-linux.sh");
+    assert!(script.contains(&format!("\nPackage: {package}\n")), "the .deb is {package}");
+    assert!(script.contains(&format!("\nName: {package}\n")), "and so is the .rpm");
 }
 
 #[test]
