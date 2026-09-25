@@ -290,6 +290,46 @@ fn not_a_bogon(addr: &libp2p::Multiaddr) -> bool {
 pub struct Bogonless<B> {
     inner: B,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// `S1-IZ`, in a binary built to be measured: the dials the inner behaviour
+    /// asked for, by their connection id, until `net::run` reads each one's
+    /// source as the swarm starts it.
+    dials: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<libp2p::swarm::ConnectionId>>>,
+}
+
+/// `S1-IZ`: the most dial ids [`Bogonless`] holds for `net::run` to read. A dial
+/// the swarm never starts is never read, so the set is bounded, and one that is
+/// full is emptied rather than grown.
+pub const DIALS_HELD_MAX: usize = 4096;
+
+/// `S1-IZ`: how often the public DHT's behaviour bootstraps on its own --
+/// **once an hour, where libp2p's default is every five minutes.**
+///
+/// A bootstrap is a walk to this client's own key and then one to a random key
+/// in every farther bucket, some fifteen walks one after another, each allowed
+/// the query timeout; it took seven to ten minutes and some 4 500 nodes, most
+/// of them dials, and the next began five minutes after this one had -- so at
+/// libp2p's default a client never stopped bootstrapping. Measured 2026-09-25,
+/// side by side for sixteen minutes, an idle client and a two-seat table in each
+/// arm: the bootstraps were 420 to 490 of some 670 nodes a minute a client
+/// asked, and without the periodic one a settled client dialled 41 to 53 times
+/// a minute against 488, held 14 to 15 connections against 60, and still met
+/// every seat within two minutes, saw every table and dealt its hands. The
+/// routing table is kept by this client's own walks -- the lobby's, the hour's,
+/// the announcements -- and by every connection; the hourly bootstrap, its
+/// buckets under `run::BOOTSTRAP_STEP_CAP`, is the guard against a table that
+/// goes stale over a long session, which sixteen minutes cannot measure.
+const PUBLIC_BOOTSTRAP_EVERY: Option<Duration> = Some(Duration::from_secs(60 * 60));
+
+/// `S1-IZ`: the interval this client runs by -- in a binary built to be
+/// measured, whatever `P2P_POKER_BOOTSTRAP_EVERY_S` says, 0 for none. A
+/// bootstrap the routing table asks for when it holds too few peers is the
+/// library's either way.
+fn public_bootstrap_every() -> Option<Duration> {
+    #[cfg(feature = "fault-harness")]
+    if let Some(s) = std::env::var("P2P_POKER_BOOTSTRAP_EVERY_S").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return (s > 0).then(|| Duration::from_secs(s));
+    }
+    PUBLIC_BOOTSTRAP_EVERY
 }
 
 /// `S1-IT`: what becomes of the addresses a behaviour offers for a dial, after
@@ -434,6 +474,7 @@ impl<B> Bogonless<B> {
         Self {
             inner,
             dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dials: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -441,6 +482,13 @@ impl<B> Bogonless<B> {
     /// the swarm.
     pub fn dropped(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         std::sync::Arc::clone(&self.dropped)
+    }
+
+    /// `S1-IZ`: whether the inner behaviour asked for the dial with this id --
+    /// read once, as the swarm starts it. Always `false` in a player's build,
+    /// which records nothing.
+    pub fn asked_for(&self, id: libp2p::swarm::ConnectionId) -> bool {
+        self.dials.lock().unwrap_or_else(|held| held.into_inner()).remove(&id)
     }
 }
 
@@ -551,7 +599,18 @@ impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Bog
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
     {
-        self.inner.poll(cx)
+        let polled = self.inner.poll(cx);
+        // `S1-IZ`: which dials are this behaviour's, where a run is measured.
+        if cfg!(feature = "fault-harness") {
+            if let std::task::Poll::Ready(libp2p::swarm::ToSwarm::Dial { opts }) = &polled {
+                let mut dials = self.dials.lock().unwrap_or_else(|held| held.into_inner());
+                if dials.len() >= DIALS_HELD_MAX {
+                    dials.clear();
+                }
+                dials.insert(opts.connection_id());
+            }
+        }
+        polled
     }
 }
 
@@ -933,6 +992,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<ShapedBehaviour>, Box<dyn std::
 
             let mut ipfs_cfg = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
             ipfs_cfg.set_query_timeout(Duration::from_secs(60));
+            ipfs_cfg.set_periodic_bootstrap_interval(public_bootstrap_every());
             let mut ipfs_kad = kad::Behaviour::with_config(
                 local_peer_id,
                 MemoryStore::new(local_peer_id),
@@ -1696,6 +1756,94 @@ mod tests {
     #[test]
     fn the_transmit_cap_is_the_protocols() {
         assert_eq!(GOSSIP_MAX_TRANSMIT, 65_536);
+    }
+
+    /// `S1-IZ`: the dials the wrapped behaviour asks for are known by their
+    /// connection id, once each -- which is how `net::run` tells the public
+    /// DHT's dials from every other behaviour's in a measured run.
+    ///
+    /// The break that must make this fail: a `poll` that records nothing.
+    #[test]
+    fn the_wrapped_dhts_dials_are_known_by_their_id() {
+        use libp2p::swarm::{dial_opts::DialOpts, FromSwarm, NetworkBehaviour, ToSwarm};
+
+        /// Asks for each dial it holds, one a poll, and does nothing else.
+        struct Dials(Vec<DialOpts>);
+        impl NetworkBehaviour for Dials {
+            type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+            type ToSwarm = std::convert::Infallible;
+            fn handle_established_inbound_connection(
+                &mut self,
+                _: libp2p::swarm::ConnectionId,
+                _: PeerId,
+                _: &libp2p::Multiaddr,
+                _: &libp2p::Multiaddr,
+            ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+                Ok(libp2p::swarm::dummy::ConnectionHandler)
+            }
+            fn handle_established_outbound_connection(
+                &mut self,
+                _: libp2p::swarm::ConnectionId,
+                _: PeerId,
+                _: &libp2p::Multiaddr,
+                _: libp2p::core::Endpoint,
+                _: libp2p::core::transport::PortUse,
+            ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+                Ok(libp2p::swarm::dummy::ConnectionHandler)
+            }
+            fn on_swarm_event(&mut self, _: FromSwarm) {}
+            fn on_connection_handler_event(
+                &mut self,
+                _: PeerId,
+                _: libp2p::swarm::ConnectionId,
+                e: libp2p::swarm::THandlerOutEvent<Self>,
+            ) {
+                match e {}
+            }
+            fn poll(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
+                match self.0.pop() {
+                    Some(opts) => std::task::Poll::Ready(ToSwarm::Dial { opts }),
+                    None => std::task::Poll::Pending,
+                }
+            }
+        }
+
+        let first = DialOpts::peer_id(PeerId::random()).build();
+        let second = DialOpts::peer_id(PeerId::random()).build();
+        let (one, two) = (first.connection_id(), second.connection_id());
+        let mut b = super::Bogonless::new(Dials(vec![first, second]));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        while b.poll(&mut cx).is_ready() {}
+        assert!(b.asked_for(one));
+        assert!(b.asked_for(two));
+        assert!(!b.asked_for(one), "read once");
+        assert!(
+            !b.asked_for(DialOpts::peer_id(PeerId::random()).build().connection_id()),
+            "a dial it never asked for is not its"
+        );
+    }
+
+    /// `S1-IZ`: the public DHT bootstraps on its own once an hour, not at
+    /// libp2p's five minutes -- and only a binary built to be measured can be
+    /// told another interval.
+    ///
+    /// The breaks that must make this fail: the library's default back; the
+    /// knob read in a player's build.
+    #[test]
+    fn the_public_dht_bootstraps_once_an_hour() {
+        assert_eq!(PUBLIC_BOOTSTRAP_EVERY, Some(Duration::from_secs(3_600)));
+        let src = include_str!("swarm.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert!(code.contains("ipfs_cfg.set_periodic_bootstrap_interval(public_bootstrap_every());"), "the interval is set");
+        let knob = code.find("fn public_bootstrap_every() -> Option<Duration> {").expect("the knob");
+        assert_eq!(
+            code[knob..].lines().nth(1).map(str::trim),
+            Some("#[cfg(feature = \"fault-harness\")]"),
+            "only a measured build is told another interval"
+        );
     }
     /// `D-055`: the score judges a peer on what this client refused of it, and
     /// on nothing about how much it talks.

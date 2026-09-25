@@ -956,7 +956,7 @@ reach a relay is invisible rather than merely unplayable.
 | 1 | **Load the cached DHT bootstrap list** and the per-peer DCUtR failure cache from the profile. | missing/corrupt | fall back to the compiled defaults; not fatal. |
 | 2 | **Build the swarm** (§5) and `listen_on` `/ip4/0.0.0.0/udp/P/quic-v1`, `/ip4/0.0.0.0/tcp/P`, plus the `/ip6/::` equivalents. `P` is **0 unless `--port N` is given**: 0 lets the operating system choose afresh at every start, so two instances on one machine never collide, and a player who forwards a port on their router names it with `--port`, which binds that one number on QUIC and TCP alike (`run::listen_addrs`, §4.4). Nothing is persisted. Until 2026-09-15 this row said *`P` is chosen once, persisted, reused every run*, which the client has never done. **The `/ip6/::` half of this row was specified here and not implemented for the whole life of the client** — `S1-Y`, fixed 2026-09-02, and an IPv6 bind failure is reported rather than fatal. | `--port N` already in use | the IPv4 `listen_on` returns the bind error and the node does not start; the IPv6 half is reported and carried on without. There is no fallback to another port — this row used to promise one, persisted, and nothing implements it. |
 | 3 | ~~**Start the Mainline DHT** on its own UDP socket, `.port(0)`, with a deny-all `RequestFilter`.~~ **Gone.** There is no separate DHT socket and no request filter: discovery is a `kad::Behaviour` inside the same swarm, on the same transports, and §11.4 explains why this client deliberately *does* answer strangers' queries. | — | there is no "no-discovery mode" any more: if the swarm cannot bind, nothing runs. |
-| 4 | **Bootstrap the public Kademlia.** Dial the compiled entry point — one name, `/dnsaddr/bootstrap.libp2p.io` (`run::PUBLIC_ENTRY`), never a list of addresses — beside the peers the profile remembers (step 1). On the first `identify` from a peer that speaks `/ipfs/kad/1.0.0`, add its reachable listen addresses to the routing table and call `bootstrap()` once; after that `libp2p-kad`'s own periodic bootstrap keeps the table up (§11.4.1). | the entry is unreachable, or `bootstrap()` has no peer to start from (*"public DHT has no peers yet"*) | **normal**, never fatal, and there is no backoff ladder: while no relay has been seen after three relay searches, every discovery cycle dials the entry again (§9.5). The remembered peers are the way in on a day the entry is down. The failure figures this row carried until 2026-09-15 — *~3 of 35 cold starts failed on the first attempt*, *`router.bittorrent.com` is dead from this network* — were measured against Mainline's bootstrap and describe nothing that runs. |
+| 4 | **Bootstrap the public Kademlia.** Dial the compiled entry point — one name, `/dnsaddr/bootstrap.libp2p.io` (`run::PUBLIC_ENTRY`), never a list of addresses — beside the peers the profile remembers (step 1). On the first `identify` from a peer that speaks `/ipfs/kad/1.0.0`, add its reachable listen addresses to the routing table and call `bootstrap()` once; after that `libp2p-kad`'s own periodic bootstrap keeps the table up -- once an hour, each bucket's refresh stopped at 80 nodes (`S1-IZ`; §11.4.1). | the entry is unreachable, or `bootstrap()` has no peer to start from (*"public DHT has no peers yet"*) | **normal**, never fatal, and there is no backoff ladder: while no relay has been seen after three relay searches, every discovery cycle dials the entry again (§9.5). The remembered peers are the way in on a day the entry is down. The failure figures this row carried until 2026-09-15 — *~3 of 35 cold starts failed on the first attempt*, *`router.bittorrent.com` is dead from this network* — were measured against Mainline's bootstrap and describe nothing that runs. |
 | 5 | **`start_providing(lobby_namespace())`** (§3.2) at the moment an external address first exists — for a client behind a NAT, the relay circuit's arrival — and **again every 300 s (`REANNOUNCE_EVERY`) until the announcement is confirmed**: a walk of this session has handed the record to at least one node, and a node has since answered a lookup of the lobby key with this client's own record. From then on `libp2p-kad` owns the republish loop at its 12 h interval (§10.1). **And `start_providing(hour_namespace(h))` at the same moment (`D-070`, §3.2):** walked again every 300 s until a walk has finished having reached a node, which is what hands the record on — not until a node returns it, because a record comes back only in an answer to a lookup and the hour's keys are read by a client that knows nobody and by no other (step 6); under the next hour's key after every turn of the hour, at this client's own moment of the hour's first 300 s; and once more, on the next discovery cycle, when an external address the record does not name arrives after it went out. The key of the hour before is let go of, so nothing republishes it. | announce error; or a walk that reached few storing nodes, which `start_providing`'s `Ok` cannot show — it comes back `Ok` from a walk that asked nobody | the next walk is the repair: the first happens seconds after the relay reservation, when the routing table is thinnest, and the next five minutes later against a fuller one. **Until 2026-09-15 this row said *once … there is no repair*, and for a client behind a NAT that was what ran** although `79ea1d5` (2026-09-03) had written the repair — the circuit arm latched at dispatch, and the self-sighting meant to confirm was answered by the client's own store (§10.1, `S1-FI`). |
 | 6 | **`get_providers(lobby_namespace())`** → `HashSet<PeerId>` per responding node, emitted as each answers. Repeated every **60 s**. **`get_providers(hour_namespace(h))` is asked beside it and first — while this client has no poker client connected, and not after (`D-070`, §3.2)**; and the key of the hour before as well for an hour's first 600 s, while the clients make their turn. | zero providers | not an error, and the client says so out loud — *"public lobby: nobody else yet"* — because an answer of nobody and a question never asked look identical in a log that only reports findings. |
 | 7 | **Dial the providers** (§4.3), by `PeerId`, at most `DIALS_PER_ANSWER = 8` fresh ones **per answer, not per cycle** — the counter is declared inside the `FoundProviders` arm and resets on every response, and one query draws one response per node that answers (707 of them in a measured 420-second run). This table said *per cycle* until 2026-09-02, and so did the constant's own name; both were wrong, and the effect was to make the crawl read sixty times slower than it is. Start on the first responder's answer — do not wait for the walk to finish. An answer about an **hour's** key is allowed `HOUR_DIALS_PER_ANSWER = 16`: it names the clients of one hour and not of two days, so it is short and mostly alive (`D-070`). The cooldown book is one for all the keys, so a peer named under two of them is dialled once. | most candidates fail | expected: a lobby key holds providers who left up to 48 h ago — which is what the hour's key is for. |
@@ -1263,8 +1263,10 @@ price §3.3 says is worth paying — but the user is the one paying it.
   **290 times a day** once settled, against the 1440 of a client that asked every
   minute until 2026-09-24 and the ~150 the Mainline section counted — plus, only
   while the client has met no poker client, one for the hour's key beside it
-  (`D-070`; two for an hour's first ten minutes), and another for the relay
-  namespace whenever there is no reservation. **One walk asked 85 to 240 distinct
+  (`D-070`; two for an hour's first ten minutes), another for the relay
+  namespace whenever there is no reservation, and one more of the key it
+  announced whenever one of its own announcements ends (`S1-IZ`: two clients
+  started together otherwise met a discovery tick late). **One walk asked 85 to 240 distinct
   nodes, about 125 as a rule, and 24 to 132 of them answered** -- nine walks of
   three clients on one machine, 2026-09-18 (`run164847-3`, the client's own
   *public lobby walk* line), against the 105-176 the Mainline section counted --
@@ -3145,7 +3147,7 @@ record that outlives the old one by a factor of about sixty.
 | Re-announce interval | **12 h**, and the crate runs it | `behaviour.rs:231`, `jobs.rs:268-279` [SOURCE] |
 | First re-announce | **now + 12 h**, not now | `AddProviderJob::new` sets its first deadline a full interval out [SOURCE] |
 | Explicit announce | the moment an external address first exists, then every **300 s** until confirmed | `run::LobbyAnnounce`, `REANNOUNCE_EVERY`. Until 2026-09-15 this row read *once … latched by `in_public_lobby`*, and the latch was the defect (`S1-FI`) |
-| Re-run `get_providers` | **every 60 s** for a client's first ten minutes and while it wants company, **every 300 s** after; **at most 80 nodes** a lookup once the client has company | `run::run`'s discovery timer, `looks_this_tick`, `LOOKUP_NODES_CAP`, `lookup_cap_now` (`S1-IZ`) |
+| Re-run `get_providers` | **every 60 s** for a client's first ten minutes and while it wants company, **every 300 s** after, and once more as each of its own announcements ends; **at most 80 nodes** a lookup once the client has company | `run::run`'s discovery timer, `looks_this_tick`, `looks_again_when_announced`, `LOOKUP_NODES_CAP`, `lookup_cap_now` (`S1-IZ`) |
 | Un-announce | **never, and it could not help** | `stop_providing` is never called, and is documented local-only: remote copies run their own 48 h clock (`behaviour.rs:1047-1054`) [SOURCE] |
 
 Three consequences follow, and none of them is the old section's.
@@ -3356,7 +3358,8 @@ built it" is the point, and a deleted row cannot say which it was.
   filters lost their home for the same reason: this client never sees a
   provider's addresses.
 * *"Bootstrap retry backoff 2 s, 5 s, 15 s, 60 s, then 5 min"* — `libp2p-kad`
-  runs a **5-minute periodic bootstrap** and there is no backoff ladder.
+  runs a periodic bootstrap -- every five minutes by its default, **once an hour
+  here** since `S1-IZ` -- and there is no backoff ladder.
 
 <details><summary>The old table, for the record</summary>
 
@@ -3444,7 +3447,7 @@ below moved**; the line numbers are the new ones. The changes `0.49.0` does carr
 | k-bucket size | 20 (`kbucket.rs:101`) | no |
 | Pending-replacement timeout | 60 s (`kbucket.rs:102`) | no |
 | Kademlia packet size | 16 KiB (`protocol.rs:51`) | no |
-| Periodic bootstrap | 5 min (`behaviour.rs:235`) | no |
+| Periodic bootstrap | 5 min (`behaviour.rs:235`) | **set — to 1 h** (`S1-IZ`, `net::swarm::PUBLIC_BOOTSTRAP_EVERY`); the client also finishes each bucket refresh past a bootstrap's first step at 80 nodes (`run::BOOTSTRAP_STEP_CAP`) |
 | Write-back caching | on, 1 peer (`behaviour.rs:234`) | no |
 | Mode at construction | `Client`, automatic (`behaviour.rs:512-513`) | **set — see §11.4.3** |
 
@@ -3456,22 +3459,27 @@ wrong.
 
 #### 11.4.2 What the client sets, and what it inherits
 
-**One line of Kademlia configuration, and it changes nothing.** `net::swarm`
+**Two lines of Kademlia configuration, and one of them changes nothing.** `net::swarm`
 builds both behaviours with `kad::Config::new(<protocol name>)` and calls
 `set_query_timeout(Duration::from_secs(60))` on each — which is exactly what
-`QueryConfig::default()` already carries. The store is `MemoryStore::new`, so
+`QueryConfig::default()` already carries — and, on the public one since
+`S1-IZ` (2026-09-25), `set_periodic_bootstrap_interval` to one hour: at the
+crate's five minutes a bootstrap of some fifteen walks never finished before the
+next began, and it was most of what a client dialled. The store is `MemoryStore::new`, so
 `MemoryStoreConfig::default()` in full. There is no `set_replication_factor`,
 `set_parallelism`, `set_provider_record_ttl`,
 `set_provider_publication_interval`, `set_kbucket_size`,
-`set_kbucket_pending_timeout`, `set_caching`, `set_max_packet_size`,
-`disjoint_query_paths` or `set_periodic_bootstrap_interval` call anywhere in
-`src/`.
+`set_kbucket_pending_timeout`, `set_caching`, `set_max_packet_size` or
+`disjoint_query_paths` call anywhere in `src/`.
 
 That is stated plainly because the section this replaces described a page of
 hardening — a deny-all request filter, a four-field `ServerSettings` clamp — and
-there is no counterpart to describe. **The only Kademlia knob this client turns
-is `set_mode`.** Every quantity above is the crate's choice, and the paragraphs
-below are what those choices cost a lobby, not what we tuned them to.
+there is no counterpart to describe. **The Kademlia knobs this client turns are
+`set_mode` and the bootstrap's interval**, and past them it finishes each bucket
+refresh of a bootstrap, and a lookup once it has company, when it has asked 80
+nodes (`S1-IZ`, through `query_mut`, which is no configuration). Every other
+quantity above is the crate's choice, and the paragraphs below are what those
+choices cost a lobby, not what we tuned them to.
 
 #### 11.4.3 Client mode and server mode, and which this client is when
 
@@ -3557,7 +3565,8 @@ disconnected node in a full 20-slot bucket and a replacement has been pending fo
 60 s (`kbucket/bucket.rs:326-365` inserts the replacement, `:220-274` applies it,
 and a node that reconnects first keeps its place, `:299`), or when the application
 removes it — which this client never does. A table that has gone stale is
-refreshed by the 5 min periodic bootstrap, not by anything ageing entries out.
+refreshed by the periodic bootstrap -- hourly here (`S1-IZ`) -- and by this
+client's own walks, not by anything ageing entries out.
 
 > Verification: [SOURCE] `libp2p-kad-0.49.0/src/behaviour.rs:223-238, 512-513,
 > 1047-1054, 1168-1216, 1242-1252, 2001-2016, 2365-2399, 2556-2574, 3377-3379`;

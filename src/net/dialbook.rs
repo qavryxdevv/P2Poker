@@ -74,6 +74,108 @@ pub struct Walked {
     pub failures: u64,
 }
 
+/// `S1-IZ`: who asked for a dial. The walks' own counts cover only the nodes a
+/// query asked; a measured client dialled four times as often as its walks
+/// asked, and this is where the rest are told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Source {
+    /// The public DHT's behaviour asking a node for a query.
+    KadQuery,
+    /// The public DHT's behaviour checking whether the oldest node of a full
+    /// bucket is still there, because a new peer is waiting for its place.
+    KadBucketCheck,
+    /// A player the lobby's answers named (`DIALS_PER_ANSWER`).
+    LobbyProvider,
+    /// The founder of a table this client is joining.
+    Founder,
+    /// The public network's entry points.
+    EntryPoint,
+    /// A peer found on this network by multicast.
+    Mdns,
+    /// Any other behaviour: the relay client, the hole punch, the poker
+    /// clients' own DHT, a request to a peer not connected.
+    OtherBehaviour,
+}
+
+impl Source {
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::KadQuery => "kad-query",
+            Source::KadBucketCheck => "kad-bucket-check",
+            Source::LobbyProvider => "lobby-provider",
+            Source::Founder => "founder",
+            Source::EntryPoint => "entry-point",
+            Source::Mdns => "mdns",
+            Source::OtherBehaviour => "other-behaviour",
+        }
+    }
+}
+
+/// What a dial came to, for the book of sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Established,
+    /// This client's own limit refused it once its handshake was done.
+    OwnLimit,
+    Failed,
+}
+
+/// One source's dials in a minute: started, and what the ones that ended came
+/// to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FromSource {
+    pub started: u64,
+    pub established: u64,
+    pub own_limit: u64,
+    pub failed: u64,
+}
+
+/// `S1-IZ`: the most dials held in flight with their source. A dial whose end
+/// is never reported would otherwise be held for ever; a book that is full is
+/// emptied, and the dials it held end unattributed.
+const IN_FLIGHT_MAX: usize = 4096;
+
+/// `S1-IZ`: the dials in flight, by their connection id, with who asked for
+/// them -- this client's own sites say so before they dial, anything else is
+/// told at the start, and the end reads the source back once.
+#[derive(Debug)]
+pub struct InFlight<K: std::hash::Hash + Eq> {
+    ours: std::collections::HashMap<K, Source>,
+    started: std::collections::HashMap<K, Source>,
+}
+
+impl<K: std::hash::Hash + Eq> Default for InFlight<K> {
+    fn default() -> Self {
+        InFlight { ours: Default::default(), started: Default::default() }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> InFlight<K> {
+    /// One of this client's own sites is about to dial with this id.
+    pub fn ours(&mut self, id: K, source: Source) {
+        if self.ours.len() >= IN_FLIGHT_MAX {
+            self.ours.clear();
+        }
+        self.ours.insert(id, source);
+    }
+
+    /// The swarm started the dial with this id: its source, which is this
+    /// client's own site's word if one gave it and `otherwise` if none did.
+    pub fn start(&mut self, id: K, otherwise: impl FnOnce() -> Source) -> Source {
+        let source = self.ours.remove(&id).unwrap_or_else(otherwise);
+        if self.started.len() >= IN_FLIGHT_MAX {
+            self.started.clear();
+        }
+        self.started.insert(id, source);
+        source
+    }
+
+    /// The dial with this id ended: who had asked for it, once.
+    pub fn end(&mut self, id: &K) -> Option<Source> {
+        self.started.remove(id)
+    }
+}
+
 /// One minute of dials, and the walks that finished in it.
 #[derive(Debug, Default)]
 pub struct DialBook {
@@ -89,6 +191,9 @@ pub struct DialBook {
     /// far above it is somebody dialling the same peers again and again.
     dialled: std::collections::HashSet<u64>,
     refused_peers: std::collections::HashSet<u64>,
+    /// `S1-IZ`: the dials by who asked for them. Fed only where a run is
+    /// measured; empty, and said as empty, anywhere else.
+    sources: BTreeMap<Source, FromSource>,
 }
 
 impl DialBook {
@@ -108,6 +213,22 @@ impl DialBook {
         self.started += 1;
         if let Some(p) = peer {
             self.dialled.insert(p);
+        }
+    }
+
+    /// `S1-IZ`: a dial started, asked for by this source.
+    pub fn dialing_from(&mut self, source: Source) {
+        self.sources.entry(source).or_default().started += 1;
+    }
+
+    /// `S1-IZ`: what a dial this source asked for came to. A dial started in
+    /// the minute before is entered in this one, as the walks are.
+    pub fn came_to(&mut self, source: Source, outcome: Outcome) {
+        let s = self.sources.entry(source).or_default();
+        match outcome {
+            Outcome::Established => s.established += 1,
+            Outcome::OwnLimit => s.own_limit += 1,
+            Outcome::Failed => s.failed += 1,
         }
     }
 
@@ -167,6 +288,11 @@ impl DialBook {
             .iter()
             .map(|(w, t)| format!("{}={}q/{}r/{}ok/{}fail", w.name(), t.queries, t.requests, t.successes, t.failures))
             .collect();
+        let sources: Vec<String> = minute
+            .sources
+            .iter()
+            .map(|(s, n)| format!("{}={}d/{}e/{}l/{}f", s.name(), n.started, n.established, n.own_limit, n.failed))
+            .collect();
         vec![
             format!(
                 "dialbook dials: {} started, {} established, {failed} failed ({}), {} strangers closed",
@@ -193,6 +319,12 @@ impl DialBook {
                 "dialbook distinct peers: {} dialled, {} refused by the own limit",
                 minute.dialled.len(),
                 minute.refused_peers.len()
+            ),
+            // `S1-IZ`: dials started, established, refused by the own limit,
+            // failed otherwise -- by who asked for them.
+            format!(
+                "dialbook sources: {}",
+                if sources.is_empty() { "none".into() } else { sources.join(", ") }
             ),
         ]
     }
@@ -247,8 +379,9 @@ mod tests {
         );
         assert_eq!(lines[3], "dialbook reachability tests served to others: 3 (1 reached, 2 not)");
         assert_eq!(lines[4], "dialbook distinct peers: 2 dialled, 1 refused by the own limit");
+        assert_eq!(lines[5], "dialbook sources: none", "a book nobody told the sources of says so");
 
-        // A fresh minute says nothing happened, in the same three lines.
+        // A fresh minute says nothing happened, in the same lines.
         assert_eq!(
             book.take_lines(),
             vec![
@@ -257,8 +390,74 @@ mod tests {
                 "dialbook walks: none".to_owned(),
                 "dialbook reachability tests served to others: 0 (0 reached, 0 not)".to_owned(),
                 "dialbook distinct peers: 0 dialled, 0 refused by the own limit".to_owned(),
+                "dialbook sources: none".to_owned(),
             ]
         );
+    }
+
+    /// `S1-IZ`: the dials by who asked for them, each source with its own
+    /// four numbers, and forgotten with the minute.
+    ///
+    /// The break that must make this fail: enter a refusal by the own limit as
+    /// a failure like any other, which hides what the limit costs.
+    #[test]
+    fn the_sources_are_said_each_with_what_its_dials_came_to() {
+        let mut book = DialBook::default();
+        for _ in 0..3 {
+            book.dialing_from(Source::KadBucketCheck);
+        }
+        book.dialing_from(Source::KadQuery);
+        book.dialing_from(Source::LobbyProvider);
+        book.came_to(Source::KadBucketCheck, Outcome::OwnLimit);
+        book.came_to(Source::KadBucketCheck, Outcome::OwnLimit);
+        book.came_to(Source::KadBucketCheck, Outcome::Established);
+        book.came_to(Source::KadQuery, Outcome::Failed);
+        // A dial started last minute ends in this one.
+        book.came_to(Source::Founder, Outcome::Established);
+        let lines = book.take_lines();
+        assert_eq!(
+            lines[5],
+            "dialbook sources: kad-query=1d/0e/0l/1f, kad-bucket-check=3d/1e/2l/0f, lobby-provider=1d/0e/0l/0f, founder=0d/1e/0l/0f"
+        );
+        assert_eq!(book.take_lines()[5], "dialbook sources: none");
+    }
+
+    /// `S1-IZ`: a dial this client's own site announced keeps that site's
+    /// source; any other is what the start says; the end reads it once.
+    ///
+    /// The break that must make this fail: take the start's word over the
+    /// site's, which puts every own dial under the behaviour that carried it.
+    #[test]
+    fn a_dial_keeps_the_source_that_asked_for_it_until_it_ends() {
+        let mut f: InFlight<u32> = InFlight::default();
+        f.ours(1, Source::LobbyProvider);
+        assert_eq!(f.start(1, || Source::OtherBehaviour), Source::LobbyProvider);
+        assert_eq!(f.start(2, || Source::KadBucketCheck), Source::KadBucketCheck);
+        assert_eq!(f.end(&1), Some(Source::LobbyProvider));
+        assert_eq!(f.end(&1), None, "once");
+        assert_eq!(f.end(&2), Some(Source::KadBucketCheck));
+        assert_eq!(f.end(&3), None, "a dial never started ends unattributed");
+        // Bounded: a book fed ids that never end stays below its limit.
+        for id in 0..(IN_FLIGHT_MAX as u32 * 2) {
+            f.start(id, || Source::KadQuery);
+        }
+        assert!(f.started.len() <= IN_FLIGHT_MAX);
+    }
+
+    /// Every source has a name of its own.
+    #[test]
+    fn every_source_is_named_once() {
+        let all = [
+            Source::KadQuery,
+            Source::KadBucketCheck,
+            Source::LobbyProvider,
+            Source::Founder,
+            Source::EntryPoint,
+            Source::Mdns,
+            Source::OtherBehaviour,
+        ];
+        let names: std::collections::HashSet<&str> = all.iter().map(|s| s.name()).collect();
+        assert_eq!(names.len(), all.len());
     }
 
     /// Every walk has a name of its own, so no two are added up in a script.

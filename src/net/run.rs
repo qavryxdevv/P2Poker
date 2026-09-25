@@ -509,6 +509,72 @@ fn lookup_has_asked_enough(cap: u32, asked_nodes: u32) -> bool {
     cap > 0 && asked_nodes >= cap
 }
 
+/// `S1-IZ`: whether a client looks the key it just announced up again as its
+/// own announcement walk ends. **Only a binary built to be measured can be told
+/// not to** (`P2P_POKER_NO_RELOOK`), so the control comes out of the same build.
+fn looks_again_when_announced() -> bool {
+    #[cfg(feature = "fault-harness")]
+    if std::env::var_os("P2P_POKER_NO_RELOOK").is_some() {
+        return false;
+    }
+    true
+}
+
+/// `S1-IZ`: how many nodes one step of a public DHT bootstrap past its first
+/// may ask. A bootstrap walks to this client's own key and then, to refresh the
+/// routing table, to a random key in every farther bucket -- some fifteen walks,
+/// each allowed the query timeout of 60 s, one after another: seven to ten
+/// minutes of walking at every start, some 4 500 nodes asked, most of them
+/// dials. A refresh wants live peers in a bucket's range, not the closest
+/// twenty to a key nobody will ever ask for.
+const BOOTSTRAP_STEP_CAP: u32 = 80;
+
+/// `S1-IZ`: the step cap this client runs by -- in a binary built to be
+/// measured, whatever `P2P_POKER_BOOTSTRAP_STEP_CAP` says, 0 for none.
+fn bootstrap_step_cap() -> u32 {
+    #[cfg(feature = "fault-harness")]
+    if let Some(cap) = std::env::var("P2P_POKER_BOOTSTRAP_STEP_CAP").ok().and_then(|v| v.parse::<u32>().ok()) {
+        return cap;
+    }
+    BOOTSTRAP_STEP_CAP
+}
+
+/// `S1-IZ`: every bootstrap step past the first that has asked its cap of
+/// nodes is finished; the bootstrap goes on to its next bucket, as it does when
+/// a step converges.
+fn finish_bootstrap_steps_that_asked_enough(
+    kad: &mut libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>,
+    steps: &std::collections::HashSet<libp2p::kad::QueryId>,
+    cap: u32,
+) {
+    for id in steps {
+        if let Some(mut query) = kad.query_mut(id) {
+            if lookup_has_asked_enough(cap, query.stats().num_requests()) {
+                query.finish();
+            }
+        }
+    }
+}
+
+/// `S1-IZ`: whether a dial of this peer, one the public DHT's behaviour asked
+/// for, is that behaviour checking on the oldest node of a full bucket: the peer
+/// is the bucket's first entry, it is disconnected, and a newcomer waits for its
+/// place (`libp2p-kad 0.49.0` `behaviour.rs:639` and `:1424`). A query that
+/// happens to ask exactly that node is read as a check too, which is this
+/// reading's error and a small one: a query asks a node for its distance to a
+/// key, a check asks the bucket's oldest.
+fn checks_a_full_bucket(
+    kad: &mut libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>,
+    peer: libp2p::PeerId,
+) -> bool {
+    let Some(bucket) = kad.kbucket(peer) else { return false };
+    bucket.has_pending()
+        && bucket
+            .iter()
+            .next()
+            .is_some_and(|e| *e.node.key.preimage() == peer && e.status == libp2p::kad::NodeStatus::Disconnected)
+}
+
 /// `S1-IZ`: the cap a lookup runs by now -- **none while this client is
 /// connected to no poker client.**
 ///
@@ -1979,10 +2045,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             .await;
     }
 
+    // `S1-IZ`: the dials in flight with who asked for them, where a run is
+    // measured -- from the first one, which is this.
+    let mut in_flight: super::dialbook::InFlight<libp2p::swarm::ConnectionId> = Default::default();
     for entry in PUBLIC_ENTRY {
         match entry.parse::<libp2p::Multiaddr>() {
             Ok(addr) => {
-                if let Err(e) = swarm.dial(addr) {
+                let opts = libp2p::swarm::dial_opts::DialOpts::from(addr);
+                if built_to_be_measured() {
+                    in_flight.ours(opts.connection_id(), super::dialbook::Source::EntryPoint);
+                }
+                if let Err(e) = swarm.dial(opts) {
                     let _ = events
                         .send(NodeEvent::Warning(format!("{entry}: {e}")))
                         .await;
@@ -2511,6 +2584,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // answer, most answers name nobody, and a line for each was 30 % of a log.
     let mut lookups: super::lookups::Lookups<libp2p::kad::QueryId, libp2p::PeerId> =
         super::lookups::Lookups::default();
+    // `S1-IZ`: the public DHT's bootstraps past their first step, by the id
+    // every step of one shares, so each bucket's refresh walks no further than
+    // `BOOTSTRAP_STEP_CAP`.
+    let mut bootstraps: std::collections::HashSet<libp2p::kad::QueryId> = std::collections::HashSet::new();
+    let cap_of_a_bootstrap_step = bootstrap_step_cap();
     // `S1-IZ`: every finished query under the walk that asked it, and every dial
     // by what it came to -- said a minute at a time where a run is measured.
     let mut dialbook = super::dialbook::DialBook::default();
@@ -4710,15 +4788,33 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = events.send(NodeEvent::Listening(address)).await;
                     }
                     // `S1-IZ`: every dial the swarm starts, whoever asked for it.
-                    SwarmEvent::Dialing { peer_id, .. } => {
+                    SwarmEvent::Dialing { peer_id, connection_id } => {
                         dialbook.dialing(peer_id.as_ref().map(peer_hash));
+                        // `S1-IZ`: and who asked for it, where a run is measured.
+                        if built_to_be_measured() {
+                            let source = in_flight.start(connection_id, || {
+                                if !swarm.behaviour().ipfs_kad.asked_for(connection_id) {
+                                    super::dialbook::Source::OtherBehaviour
+                                } else if peer_id.is_some_and(|p| checks_a_full_bucket(&mut swarm.behaviour_mut().ipfs_kad, p)) {
+                                    super::dialbook::Source::KadBucketCheck
+                                } else {
+                                    super::dialbook::Source::KadQuery
+                                }
+                            });
+                            dialbook.dialing_from(source);
+                        }
                         // `S1-IZ`: a node a lookup asks and is not connected to
                         // is a dial, so this is where a walk reaches its cap.
                         finish_lookups_that_asked_enough(&mut swarm.behaviour_mut().ipfs_kad, &mut lookups, lookup_cap_now(cap_of_a_lookup, !poker_peers.is_empty()));
+                        // And a bootstrap's refresh of a bucket.
+                        finish_bootstrap_steps_that_asked_enough(&mut swarm.behaviour_mut().ipfs_kad, &bootstraps, cap_of_a_bootstrap_step);
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
                         if endpoint.is_dialer() {
                             dialbook.established();
+                        }
+                        if let Some(source) = in_flight.end(&connection_id) {
+                            dialbook.came_to(source, super::dialbook::Outcome::Established);
                         }
                         if num_established.get() == 1 {
                             connected_since.insert(peer_id, std::time::Instant::now());
@@ -6206,6 +6302,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     } if budget < ceiling => {
                         dialbook.failed("own limit", &[]);
                         dialbook.refused_peer(peer_id.as_ref().map(peer_hash));
+                        if let Some(source) = in_flight.end(&connection_id) {
+                            dialbook.came_to(source, super::dialbook::Outcome::OwnLimit);
+                        }
                         lobby_dials.remove(&connection_id);
                         hour_dials.remove(&connection_id);
                         {
@@ -6307,11 +6406,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // what filled the channel in the first place.
                         dials_failed = dials_failed.saturating_add(1);
                         {
-                            // `S1-IZ`: the dial in one word and each of its roads.
+                            // `S1-IZ`: the dial in one word and each of its roads,
+                            // and under who asked for it.
                             let (class, roads) = super::dialfail::tally(&error);
                             dialbook.failed(class, &roads);
                             if class == "own limit" {
                                 dialbook.refused_peer(peer_id.as_ref().map(peer_hash));
+                            }
+                            if let Some(source) = in_flight.end(&connection_id) {
+                                dialbook.came_to(
+                                    source,
+                                    if class == "own limit" {
+                                        super::dialbook::Outcome::OwnLimit
+                                    } else {
+                                        super::dialbook::Outcome::Failed
+                                    },
+                                );
                             }
                         }
                         if dials_failed <= DIAL_FAILURES_TOLD {
@@ -6543,8 +6653,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     )) => {
                         use libp2p::kad::{GetProvidersOk, QueryResult};
                         // `S1-IZ`: the finished query under its walk, read before
-                        // anything below takes the lookup out of its book.
-                        if step.last {
+                        // anything below takes the lookup out of its book. **And
+                        // every step of a bootstrap**: a bootstrap walks to this
+                        // client's own key and then to a random key in every
+                        // farther bucket, each step a query of its own whose
+                        // event carries that step's stats alone
+                        // (`libp2p-kad 0.49.0` `behaviour.rs:1457-1515`), where
+                        // any other query's events carry one query's running
+                        // count. Entered at its last step only, the walks came
+                        // to 2.2 to 2.7 of the public DHT's own dials a request
+                        // they counted (2026-09-25, a measured build telling
+                        // every dial's source).
+                        if step.last || matches!(&result, libp2p::kad::QueryResult::Bootstrap(_)) {
                             let walk = walk_of(&result, lookups.asked_of(&id), super::node::now_unix_ms() / 1_000);
                             dialbook.walked(walk, stats.num_requests(), stats.num_successes(), stats.num_failures());
                             // `S1-IZ`: a walk that is not a lookup says its appetite
@@ -6566,6 +6686,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         stats.num_successes()
                                     )))
                                     .await;
+                            }
+                        }
+                        // `S1-IZ`: a bootstrap whose first step has ended is
+                        // refreshing buckets, each step under its cap
+                        // (`BOOTSTRAP_STEP_CAP`); the book forgets it at its last.
+                        if matches!(&result, QueryResult::Bootstrap(_)) {
+                            if step.last {
+                                bootstraps.remove(&id);
+                            } else {
+                                if bootstraps.len() >= 64 {
+                                    bootstraps.clear();
+                                }
+                                bootstraps.insert(id);
                             }
                         }
                         // A query that fails is worth a line. Without one, a
@@ -6615,6 +6748,34 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // (`LobbyAnnounce`). `Ok` alone is no evidence.
                                 if matches!(r, Ok(done) if done.key == lobby_namespace()) {
                                     announce.record_walk_finished(stats.num_successes());
+                                }
+                                // `S1-IZ`: **its own record out, a client looks
+                                // again at once** -- the key it just announced,
+                                // the hour's only while it is alone (`D-070`).
+                                // Two clients that start together each store
+                                // their record ten to thirteen seconds in, and
+                                // the lookups each asked as it started had ended
+                                // by then, often before the other's record
+                                // existed anywhere: the pair met a discovery tick
+                                // late. A lookup asked now finds the other's
+                                // record if the other's walk finished first.
+                                // Measured (2026-09-25, four rounds of a pair
+                                // across two networks, with the rest of this
+                                // row's changes): the joiner found the founder's
+                                // table at a median 20 s against 48 s.
+                                if looks_again_when_announced() {
+                                    if matches!(r, Ok(done) if done.key == lobby_namespace()) {
+                                        let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
+                                        lobby_lookups.insert(lookup, false);
+                                        lookups.asked(lookup, super::lookups::Asked::Lobby);
+                                    }
+                                    if hourly && reads_the_hours_keys(poker_peers.len()) {
+                                        for h in lobby_hours_to_read(super::node::now_unix_ms() / 1_000) {
+                                            let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(hour_namespace(h));
+                                            hour_lookups.insert(lookup);
+                                            lookups.asked(lookup, super::lookups::Asked::Hour);
+                                        }
+                                    }
                                 }
                             }
                             QueryResult::Bootstrap(Err(e)) => {
@@ -6931,6 +7092,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // asynchronous failure log is capped at twelve
                                 // and was spent by 12.6 s.
                                 let id = opts.connection_id();
+                                if built_to_be_measured() {
+                                    in_flight.ours(id, super::dialbook::Source::LobbyProvider);
+                                }
                                 if swarm.dial(opts).is_ok() {
                                     // **Only a dial the crawl itself decided to
                                     // make.** This loop walks the providers of
@@ -7028,7 +7192,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // the dial failed and the peer's real address was
                             // never tried. Two clients on one machine stopped
                             // connecting at all.
-                            let _ = swarm.dial(addr);
+                            let opts = libp2p::swarm::dial_opts::DialOpts::from(addr);
+                            if built_to_be_measured() {
+                                in_flight.ours(opts.connection_id(), super::dialbook::Source::Mdns);
+                            }
+                            let _ = swarm.dial(opts);
                             if seen_locally.insert(peer) {
                                 let _ = events.send(NodeEvent::LocalPeer(peer)).await;
                             }
@@ -7459,7 +7627,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // that was unreachable a minute ago may not be now.
                         for entry in PUBLIC_ENTRY {
                             if let Ok(addr) = entry.parse::<libp2p::Multiaddr>() {
-                                let _ = swarm.dial(addr);
+                                let opts = libp2p::swarm::dial_opts::DialOpts::from(addr);
+                                if built_to_be_measured() {
+                                    in_flight.ours(opts.connection_id(), super::dialbook::Source::EntryPoint);
+                                }
+                                let _ = swarm.dial(opts);
                             }
                         }
                     }
@@ -8264,6 +8436,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(founder)
                                         .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
                                         .build();
+                                    if built_to_be_measured() {
+                                        in_flight.ours(opts.connection_id(), super::dialbook::Source::Founder);
+                                    }
                                     if let Err(e) = swarm.dial(opts) {
                                         if !matches!(e, libp2p::swarm::DialError::DialPeerConditionFalse(_)) {
                                             let _ = events
@@ -20525,7 +20700,20 @@ mod back_at_the_table {
                 "a lookup is started and not entered in the book: {line}"
             );
         }
-        assert_eq!(started, 6, "the lobby's key and the hours' on two roads, a slice's and the relays' on one");
+        assert_eq!(
+            started, 8,
+            "the lobby's key and the hours' on three roads -- the first address, the tick, the own record out -- \
+             a slice's and the relays' on one"
+        );
+        // `S1-IZ`: the third road is taken where an announcement walk has
+        // ended, behind the one rule a measured build can switch off.
+        let announced = code.find("QueryResult::StartProviding(r) => {").expect("the announcement's arm");
+        let arm = &code[announced..announced + code[announced..].find("QueryResult::Bootstrap(Err(e)) => {").expect("its end")];
+        assert!(arm.contains("if looks_again_when_announced() {"), "a client looks again as its own record is out");
+        assert_eq!(arm.matches(".get_providers(").count(), 2, "the lobby's key, and the hour's while alone");
+        assert!(arm.contains("if hourly && reads_the_hours_keys(poker_peers.len()) {"), "the hour's only while alone (D-070)");
+        let relook = code.find("fn looks_again_when_announced() -> bool {").expect("the rule");
+        assert_eq!(code[relook..].lines().nth(1).map(str::trim), Some("#[cfg(feature = \"fault-harness\")]"));
         assert_eq!(code.matches("lookups.heard(&id, providers.iter())").count(), 1, "every answer is tallied");
         assert_eq!(code.matches("lookups.ended(&id, swarm.local_peer_id())").count(), 2, "a finished lookup and a failed one");
         // And the answer's own line is said only behind the one rule.
@@ -20539,8 +20727,8 @@ mod back_at_the_table {
         // because most nodes never answer and the walk asks on meanwhile.
         let finish = "finish_lookups_that_asked_enough(&mut swarm.behaviour_mut().ipfs_kad, &mut lookups, lookup_cap_now(cap_of_a_lookup, !poker_peers.is_empty()));";
         assert!(code[answer..answer + said].contains(finish), "the cap is read on every answer");
-        let dialing = code.find("SwarmEvent::Dialing { peer_id, .. } => {").expect("the dial's arm");
-        assert!(code[dialing..dialing + 600].contains(finish), "and on every dial");
+        let dialing = code.find("SwarmEvent::Dialing { peer_id, connection_id } => {").expect("the dial's arm");
+        assert!(code[dialing..dialing + 2_000].contains(finish), "and on every dial");
         assert_eq!(code.matches(finish).count(), 2, "and nowhere else");
         let helper = code.find("fn finish_lookups_that_asked_enough(").expect("the helper");
         let body = &code[helper..helper + code[helper..].find("\n}\n").expect("its end")];
@@ -20566,6 +20754,76 @@ mod back_at_the_table {
             "only a binary built to be measured says every answer"
         );
     }
+    /// `S1-IZ`: every dial this file makes says who asked for it before it is
+    /// made, so the book of sources never enters one of this client's own under
+    /// the behaviour that carried it; and the start of every dial asks.
+    ///
+    /// The break that must make this fail: a `swarm.dial(..)` with no
+    /// `in_flight.ours(..)` before it.
+    #[test]
+    fn every_own_dial_says_who_asked_for_it() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let mut sites = 0;
+        for (at, _) in code.match_indices("swarm.dial(") {
+            let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+            if code[line_start..at].trim_start().starts_with("//") {
+                continue;
+            }
+            sites += 1;
+            let before = &code[at.saturating_sub(400)..at];
+            assert!(
+                before.contains("in_flight.ours("),
+                "a dial that does not say who asked for it: {}",
+                &code[line_start..(at + 40).min(code.len())]
+            );
+        }
+        assert_eq!(sites, 5, "the entry points twice, the lobby's providers, a neighbour found by multicast, a founder");
+        let dialing = code.find("SwarmEvent::Dialing { peer_id, connection_id } => {").expect("the dial's arm");
+        assert!(code[dialing..dialing + 1_200].contains("in_flight.start(connection_id,"), "every dial started is told its source");
+        assert!(code[dialing..dialing + 1_600].contains("dialbook.dialing_from(source);"), "and entered under it");
+        assert_eq!(code.matches("in_flight.end(&connection_id)").count(), 3, "established, refused while the budget grows, failed");
+    }
+
+    /// `S1-IZ`: a bootstrap is entered in the dial book step by step, and every
+    /// step past its first -- a bucket's refresh -- is finished at its cap, read
+    /// where it dials; the book holds a bootstrap from its first step's end to
+    /// its last.
+    ///
+    /// The breaks that must make this fail: enter a bootstrap at its last step
+    /// only; drop the cap from the dial's arm; hold a bootstrap past its end.
+    #[test]
+    fn a_bootstrap_is_counted_by_its_steps_and_capped_past_its_first() {
+        assert_eq!(super::BOOTSTRAP_STEP_CAP, 80);
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert!(
+            code.contains("if step.last || matches!(&result, libp2p::kad::QueryResult::Bootstrap(_)) {"),
+            "every step of a bootstrap is a walk of its own"
+        );
+        let dialing = code.find("SwarmEvent::Dialing { peer_id, connection_id } => {").expect("the dial's arm");
+        assert!(
+            code[dialing..dialing + 2_500].contains(
+                "finish_bootstrap_steps_that_asked_enough(&mut swarm.behaviour_mut().ipfs_kad, &bootstraps, cap_of_a_bootstrap_step);"
+            ),
+            "a step is capped where it dials"
+        );
+        let book = code.find("if matches!(&result, QueryResult::Bootstrap(_)) {").expect("the book of bootstraps");
+        let body = &code[book..book + 500];
+        assert!(
+            body.contains("if step.last {") && body.contains("bootstraps.remove(&id);") && body.contains("bootstraps.insert(id);"),
+            "held from its first step's end to its last"
+        );
+        let helper = code.find("fn finish_bootstrap_steps_that_asked_enough(").expect("the helper");
+        let helper_body = &code[helper..helper + code[helper..].find("\n}\n").expect("its end")];
+        assert!(
+            helper_body.contains("lookup_has_asked_enough(cap, query.stats().num_requests())") && helper_body.contains("query.finish();"),
+            "by the step's live count"
+        );
+        let knob = code.find("fn bootstrap_step_cap() -> u32 {").expect("the knob");
+        assert_eq!(code[knob..].lines().nth(1).map(str::trim), Some("#[cfg(feature = \"fault-harness\")]"));
+    }
+
     /// `S1-IT`: the four places in this loop the row stands on, read as they are
     /// written -- because each was a line somebody could put back without a test
     /// noticing, and the first of them was the fault itself.
