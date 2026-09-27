@@ -30,7 +30,7 @@
 //! this task — and would make the ordering of two writes a question somebody
 //! could get wrong.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use libp2p::{gossipsub, Multiaddr, PeerId};
 
@@ -188,6 +188,12 @@ pub enum NodeEvent {
     /// and `dials_failed` every dial that did not complete since the node
     /// started -- counted where it happens, for the same reason.
     Connections { established: u32, players: u32, dials_failed: u64 },
+    /// `S1-JB`: the wall clock moved `by_ms` more than the monotonic clock did
+    /// between two of the node's two-second ticks (`crate::clock::Watch`) --
+    /// the computer's time was changed, or it slept where the monotonic clock
+    /// does not count sleep. The window asks the internet's time again. One
+    /// word per jump, and not a reading the next replaces: never dropped.
+    ClockJumped { by_ms: i64 },
     /// A peer that turned out to be another **poker** client.
     ///
     /// Told apart by `identify`: the protocol version this client announces is
@@ -816,7 +822,9 @@ impl NodeEvent {
             | Self::Search(_)
             | Self::SearchEnded { .. }
             | Self::QueueSeen { .. }
-            | Self::SearchSlot { .. } => true,
+            | Self::SearchSlot { .. }
+            // `S1-JB`: the lobby's warning about the clock, at once.
+            | Self::ClockJumped { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //
@@ -869,11 +877,9 @@ pub const REBROADCAST: Duration = Duration::from_millis(AD_REBROADCAST_MS);
 ///
 /// A local view and never canonical state (D-012): two honest peers may read
 /// different values, so nothing derived from this may enter a hash.
+/// `S1-JB`: read through [`crate::clock`], the one place the wall clock is read.
 pub fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::clock::now_unix_ms()
 }
 
 /// The per-node state the loop owns.

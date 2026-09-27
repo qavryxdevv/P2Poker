@@ -81,6 +81,10 @@ Press **Find a game** and choose a format — heads-up, six seats, ten, or whate
 looking, it opens a table of its own and waits there, and players who search after you are seated with you. The
 project is new, so it is quiet most of the time.
 
+If an amber band at the top of the lobby says this computer's clock is out, put the clock right first. While it
+is more than a minute or two out, other players' tables are hidden from you and yours from them. Setting the time
+automatically fixes it, and the tables come back within a minute or two.
+
 ## Can I play privately with friends?
 
 Not yet. Every table is public for now.

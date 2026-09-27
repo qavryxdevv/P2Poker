@@ -1747,6 +1747,29 @@ const REASK_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
 const REASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl TableRun {
+    /// `S1-JB`: the wall clock jumped by `by_ms`. Every moment this table keeps
+    /// on this client's own wall clock moves with it, the running hand's too, so
+    /// the time since each stays the time that passed. The timers this table
+    /// keeps on the monotonic clock (`tokio::time::Instant`) need nothing.
+    /// `the_moments_a_table_keeps_on_the_wall_clock_move_when_it_jumps` holds
+    /// that a new field of the kind is moved here or named as one that is not.
+    fn rebase_clock(&mut self, by_ms: i64) {
+        use crate::clock::{rebase, rebase_opt};
+        rebase(&mut self.resume_since_ms, by_ms);
+        rebase_opt(&mut self.resume_last_peer_ms, by_ms);
+        rebase(&mut self.ratification_echo_ms, by_ms);
+        rebase(&mut self.ratification_asked_ms, by_ms);
+        rebase(&mut self.chat_refused_said_ms, by_ms);
+        rebase(&mut self.hand_said_again_ms, by_ms);
+        rebase(&mut self.stage_waiting.1, by_ms);
+        for sat in self.sat_down_ms.values_mut() {
+            rebase(sat, by_ms);
+        }
+        if let Some(h) = self.hand.as_mut() {
+            h.rebase_clock(by_ms);
+        }
+    }
+
     fn new(
         slot: u8,
         profile_dir: &std::path::Path,
@@ -2510,6 +2533,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut dials_failed: u64 = 0;
     let mut connections_said: Option<ConnectionsReading> = None;
     let mut connections_quiet: u8 = 0;
+    // `S1-JB`: the wall clock against the monotonic one, every tick.
+    let mut clock_watch = crate::clock::Watch::new();
 
     // The QUIC port, kept only so the router can be asked to open it once.
     // It used to be what got announced to Mainline as well; that is gone, and
@@ -9858,6 +9883,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = stall.tick() => {
+                // `S1-JB`: a time of day that moved further than the time that
+                // passed. What the node stamps its messages with has moved with
+                // it, and the lobby's freshness rules with that; the window is
+                // told, and asks the internet what the time is.
+                let by_ms = clock_watch.moved();
+                if by_ms.abs() >= crate::clock::REBASE_MS {
+                    // Every moment a table keeps on this clock moves with it, the
+                    // running hand's too: its budgets stay the time that passed.
+                    for t in tables.iter_mut() {
+                        t.rebase_clock(by_ms);
+                    }
+                }
+                if crate::clock::is_jump(by_ms) {
+                    let _ = events.send(NodeEvent::ClockJumped { by_ms }).await;
+                }
                 // `S1-IY`: what this node holds, as a reading the window sets
                 // rather than a sum it keeps. Every two seconds when it moved,
                 // and every `CONNECTIONS_HEARTBEAT` ticks when it did not, so a
@@ -18255,8 +18295,9 @@ async fn report_hand(
         Some(t) if t.mine => {
             // `S1-FS`: the own clock and the window's countdown start at the same
             // instant, and neither before the player could see the turn.
+            // `S1-JB`: from a stamp this client's clock can be compared with.
             let began = own_clock_began_ms(
-                t.began_unix_ms,
+                trusted_turn_began_ms(t.began_unix_ms, t.shown_unix_ms),
                 t.shown_unix_ms,
                 t.taken_up,
                 h.action_deadline().as_millis() as u64,
@@ -18286,7 +18327,7 @@ async fn report_hand(
                 .send(NodeEvent::NotYourTurn {
                     hand_id,
                     seat: Some(t.seat),
-                    elapsed_ms: turn_elapsed_ms(t.began_unix_ms),
+                    elapsed_ms: turn_elapsed_ms(trusted_turn_began_ms(t.began_unix_ms, t.shown_unix_ms)),
                 })
                 .await;
             return Report {
@@ -18352,6 +18393,25 @@ fn turn_elapsed_ms(began_unix_ms: u64) -> u64 {
         return 0;
     }
     super::node::now_unix_ms().saturating_sub(began_unix_ms)
+}
+
+/// `S1-JB`: the giver's stamp on a turn as far as this client can take it --
+/// `D-034`'s start while it is within `MAX_CLOCK_SKEW_MS` of the moment this
+/// client heard the turn, and that moment when it is further off. That far
+/// apart is two clocks disagreeing, not a delivery that late: on the bed, a
+/// clock an hour ahead of the giver's, or a giver's an hour behind, made every
+/// stamp an hour old, so the player had `S1-FS`'s ten seconds a turn and the
+/// other window counted the seat an hour on the clock and asked whether to
+/// wait for it. A turn that really comes through a line down for longer than
+/// that has the whole clock instead of `S1-FS`'s ten seconds: the others have
+/// waited two minutes by then, and twenty seconds more is little to them.
+fn trusted_turn_began_ms(began_unix_ms: u64, heard_unix_ms: u64) -> u64 {
+    let skew = crate::protocol::constants::MAX_CLOCK_SKEW_MS;
+    if began_unix_ms != 0 && heard_unix_ms != 0 && began_unix_ms.abs_diff(heard_unix_ms) > skew {
+        heard_unix_ms
+    } else {
+        began_unix_ms
+    }
 }
 
 /// `S1-FS`: the least time a turn that reaches this client late leaves its
@@ -18725,6 +18785,69 @@ mod tests {
         assert_ne!(hour_namespace(0), lobby_namespace());
         assert_ne!(hour_namespace(0), shard_namespace("hour"));
         assert_ne!(hour_namespace(494_000), shard_namespace("494000"));
+    }
+
+    /// `S1-JB`: every moment a table or its hand keeps on this client's own wall
+    /// clock is moved when the clock jumps (`TableRun::rebase_clock`,
+    /// `Hand::rebase_clock`), or is named here as a field that only looks like
+    /// one. The first run on the bed with a clock set an hour ahead aborted the
+    /// hand being played -- its budget read as an hour spent -- and a field of
+    /// the kind added and forgotten would do that again.
+    ///
+    /// **To make this fail:** take `opened_at_ms` out of `Hand::rebase_clock`.
+    #[test]
+    fn the_moments_a_table_keeps_on_the_wall_clock_move_when_it_jumps() {
+        fn fields(source: &str, header: &str) -> Vec<(String, String)> {
+            let body = &source[source.find(header).unwrap_or_else(|| panic!("{header}"))..];
+            let body = &body[..body.find("\n}\n").expect("the struct's end")];
+            body.lines()
+                .skip(1)
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.starts_with("//") || line.starts_with('#') {
+                        return None;
+                    }
+                    let (name, ty) = line.split_once(':')?;
+                    let name = name.trim().trim_start_matches("pub ").trim();
+                    (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                        .then(|| (name.to_owned(), ty.trim().to_owned()))
+                })
+                .collect()
+        }
+        fn method(source: &str, header: &str) -> String {
+            let body = &source[source.find(header).unwrap_or_else(|| panic!("{header}"))..];
+            body[..body.find("\n    }\n").expect("the method's end")].to_owned()
+        }
+        let run = include_str!("run.rs");
+        let hand = include_str!("../table/hand.rs");
+        // What looks like a moment on the wall clock and is not one.
+        let not_moments: [(&str, &str); 4] = [
+            ("resend_at", "a key of the hand and its sequence, `(hand_id << 20) | sequence`"),
+            ("last_stamp_ms", "the emitter's clock (`D-034`), another seat's as often as not"),
+            ("turn_began_unix_ms", "the clock of the seat that gave the turn (`D-034`)"),
+            ("last_heard_at", "a stage sequence per seat, not a time"),
+        ];
+        let mut unmoved = Vec::new();
+        for (source, header, mover) in [
+            (run, "struct TableRun {", "    fn rebase_clock(&mut self, by_ms: i64) {"),
+            (hand, "pub struct Hand {", "    pub fn rebase_clock(&mut self, by_ms: i64) {"),
+        ] {
+            let moved = method(source, mover);
+            for (name, ty) in fields(source, header) {
+                let looks = (name.ends_with("_ms") || name.ends_with("_at")) && ty.contains("u64");
+                if looks && !moved.contains(&format!("self.{name}")) && !not_moments.iter().any(|(n, _)| *n == name) {
+                    unmoved.push(format!("{header} {name}: {ty}"));
+                }
+            }
+        }
+        assert!(
+            unmoved.is_empty(),
+            "fields that look like moments on the wall clock, neither moved by rebase_clock nor named as not one: {unmoved:?}"
+        );
+        // And the ones named as not moments are there to be named.
+        for (name, why) in not_moments {
+            assert!(run.contains(&format!(" {name}:")) || hand.contains(&format!(" {name}:")), "{name}: {why}");
+        }
     }
 
     /// `S1-IZ`: a lookup is finished once it has asked the cap's number of
@@ -20515,7 +20638,7 @@ mod a_joiner_before_the_first_hand {
 
 #[cfg(test)]
 mod back_at_the_table {
-    use super::{own_clock_began_ms, LATE_TURN_LEFT_MS};
+    use super::{own_clock_began_ms, trusted_turn_began_ms, LATE_TURN_LEFT_MS};
 
     const T: u64 = 1_800_000_000_000;
     const THIRTY: u64 = 30_000;
@@ -20542,6 +20665,45 @@ mod back_at_the_table {
             T + 5_000,
             "a stamp from a clock ahead stays, and `Clock::apply` gives the plain timeout for it"
         );
+    }
+
+    /// `S1-JB`: a stamp further from the moment the turn was heard than the
+    /// lobby lets two clocks be is two clocks disagreeing, not a delivery that
+    /// late -- a clock set an hour ahead, or a giver's an hour behind. The turn
+    /// counts from when it was heard, and the player has the whole clock; inside
+    /// the bound `D-034` and `S1-FS` stand as they were.
+    #[test]
+    fn a_stamp_an_hour_off_is_a_clock_and_the_turn_counts_from_when_it_was_heard() {
+        let skew = crate::protocol::constants::MAX_CLOCK_SKEW_MS;
+        for off in [skew + 1, 3_600_000, 7_200_000] {
+            for began in [T - off, T + off] {
+                assert_eq!(trusted_turn_began_ms(began, T), T, "a stamp {off} ms off");
+                let own = own_clock_began_ms(trusted_turn_began_ms(began, T), T, false, THIRTY);
+                assert_eq!(left_when_shown(own, T, THIRTY), THIRTY, "a stamp {off} ms off leaves the whole clock");
+            }
+        }
+        for late in [0, 400, 20_001, 64_000, skew] {
+            assert_eq!(trusted_turn_began_ms(T - late, T), T - late, "{late} ms late is a delivery");
+        }
+        assert_eq!(
+            left_when_shown(own_clock_began_ms(trusted_turn_began_ms(T - 64_000, T), T, false, THIRTY), T, THIRTY),
+            LATE_TURN_LEFT_MS,
+            "S1-FS's late delivery keeps its ten seconds"
+        );
+        assert_eq!(trusted_turn_began_ms(0, T), 0, "an unknown stamp stays unknown");
+        assert_eq!(trusted_turn_began_ms(T - 3_600_000, 0), T - 3_600_000, "a turn not heard yet changes nothing");
+    }
+
+    /// `S1-JB`: the own clock and the other seats' countdowns read a turn's
+    /// stamp through the rule above, and nothing reads it around it -- one
+    /// raw read gives the ten-second turns back to a player with a wrong clock.
+    #[test]
+    fn every_read_of_a_turns_stamp_goes_through_the_rule() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests")];
+        let trusted = code.matches("trusted_turn_began_ms(t.began_unix_ms, t.shown_unix_ms)").count();
+        assert_eq!(trusted, 2, "the own clock and the countdown of another seat's turn");
+        assert_eq!(code.matches("t.began_unix_ms").count(), trusted, "a turn's stamp read around the rule");
     }
 
     /// `S1-FS`: a turn that comes through a line that was down leaves its

@@ -186,6 +186,9 @@ fn ask_for(
 }
 
 fn main() {
+    // `S1-JB`: the process's life is counted from here, for a measured binary's
+    // schedule of clock jumps.
+    p2p_poker::clock::start();
     let args: Vec<String> = std::env::args().collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
     let value_of = |flag: &str| {
@@ -598,6 +601,14 @@ fn main() {
 /// (`D-081`) how far this computer's clock is from the one GitHub's answer
 /// carried.
 type UpdateAnswer = p2p_poker::app::update::Checked;
+
+/// `S1-JB`: a jump of the clock the node saw, and how far this computer's clock
+/// is from the one GitHub's answer carried afterwards (`None`: no time read).
+type ClockChannel = (std::sync::mpsc::Sender<(i64, Option<i64>)>, std::sync::mpsc::Receiver<(i64, Option<i64>)>);
+
+/// `S1-JB`: the least time between two questions to GitHub about the time. A
+/// clock that jumps again within it is asked about when it has passed.
+const CLOCK_ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `D-073`: the installer's turn, if this start is one. `None`: start the
 /// client as always. `Some(code)`: the installer ran, and this process ends.
@@ -1737,6 +1748,9 @@ fn windowed(player: Player, run: Run) -> Started {
                 preview_rewards,
                 backup_done: std::sync::mpsc::channel(),
                 update_done: std::sync::mpsc::channel(),
+                clock_done: std::sync::mpsc::channel(),
+                clock_asked: None,
+                clock_pending: None,
                 backup_opened: None,
                 backups_listed: None,
                 profile_dir,
@@ -2299,6 +2313,12 @@ struct Client {
     backup_done: (std::sync::mpsc::Sender<BackupDone>, std::sync::mpsc::Receiver<BackupDone>),
     /// `D-075`: what the version check came back with.
     update_done: (std::sync::mpsc::Sender<UpdateAnswer>, std::sync::mpsc::Receiver<UpdateAnswer>),
+    /// `S1-JB`: what GitHub said the time is after the clock jumped -- with the
+    /// jump it was asked about -- when it was last asked, and a jump still to
+    /// ask about.
+    clock_done: ClockChannel,
+    clock_asked: Option<std::time::Instant>,
+    clock_pending: Option<i64>,
     backup_opened: Option<p2p_poker::storage::backup::Contents>,
     backups_listed: Option<std::time::Instant>,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
@@ -2478,9 +2498,52 @@ impl Client {
                 self.state.note_update(format!(
                     "this computer's clock is {out} s from the time GitHub's answer carried (D-081)"
                 ));
-                self.ui.clock_notice = p2p_poker::app::update::clock_words(out);
+                self.ui.clock_notice = p2p_poker::app::update::clock_notice(out);
             }
             self.ui.update = render::UpdateUi::Done(answer.verdict);
+        }
+    }
+
+    /// `S1-JB`: the node saw the clock jump. GitHub is asked what the time is --
+    /// once a minute at most, the jumps between added up -- and the lobby's
+    /// warning follows its answer: shown, changed, or taken away when the jump
+    /// was the clock being put right.
+    fn clock_jumps(&mut self, ctx: &eframe::egui::Context) {
+        if let Some(by_ms) = self.state.take_clock_jump() {
+            self.clock_pending = Some(self.clock_pending.unwrap_or(0).saturating_add(by_ms));
+        }
+        let Some(by_ms) = self.clock_pending else {
+            return;
+        };
+        if self.clock_asked.is_some_and(|at| at.elapsed() < CLOCK_ASK_EVERY) {
+            return;
+        }
+        self.clock_pending = None;
+        self.clock_asked = Some(std::time::Instant::now());
+        self.state.note_update("asked GitHub what the time is, because the clock jumped (S1-JB)".into());
+        let (tx, ctx) = (self.clock_done.0.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((by_ms, p2p_poker::app::update::github_clock_out_by_s()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn clock_answers(&mut self) {
+        while let Ok((by_ms, answered)) = self.clock_done.1.try_recv() {
+            match p2p_poker::app::update::out_by(answered) {
+                Some(out) => {
+                    self.state.note_update(format!(
+                        "after the jump, this computer's clock is {out} s from the time GitHub's answer carried (S1-JB)"
+                    ));
+                    self.ui.clock_notice = p2p_poker::app::update::clock_notice(out);
+                }
+                None => {
+                    self.state.note_update(
+                        "after the jump, GitHub's answer carried no time this client could read (S1-JB)".into(),
+                    );
+                    self.ui.clock_notice = p2p_poker::app::update::jump_notice(by_ms);
+                }
+            }
         }
     }
 
@@ -2987,6 +3050,8 @@ impl eframe::App for Client {
         self.reward_notices();
         self.backup_answers();
         self.update_answers();
+        self.clock_jumps(&ctx);
+        self.clock_answers();
 
         // `S1-CS`: a join nobody answers is called failed on the clock.
         self.state.tick_join();

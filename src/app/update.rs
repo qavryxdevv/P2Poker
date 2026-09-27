@@ -61,17 +61,26 @@ pub const RELEASES_ANSWER_MAX: usize = 512 * 1024;
 /// what it is sent. A network that is simply not there answers at once.
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// `D-081`: how far out this computer's clock may be before the player is told.
+/// `D-081`, amended by `S1-JB`: how far out this computer's clock may be before
+/// the player is told.
 ///
-/// **Why the clock is worth a word at all.** The lobby's key in the public DHT
-/// is the hour of the clock -- `unix_s / 3600` (`net::run::lobby_hour`, `D-070`)
-/// -- so two clients announce under the same key only while their clocks agree
-/// on which hour it is. A time zone cannot do that: every client works in
-/// seconds since the epoch, which is the same number everywhere on earth.
-/// A clock that is simply *wrong* can, and then a player looks in an hour that
-/// nobody else is in and finds an empty lobby that is not empty. Ten minutes of
-/// every hour are read from the hour before as well, so this is set below that.
-pub const CLOCK_OUT_BY_S: i64 = 300;
+/// **Why the clock is worth a word at all.** A time zone cannot separate two
+/// players: every client works in seconds since the epoch, the same number
+/// everywhere on earth. A clock that is simply *wrong* can. `D-081` set this at
+/// five minutes, below the ten of every hour that `D-070`'s hour keys forgive --
+/// but the lobby forgives far less than the hour keys do: an advert lives
+/// `AD_TTL_MS` (90 s) on its sender's clock, and chat, the players' list, a
+/// forming table's list and the search's queue refuse what is more than
+/// `CLOCK_SLACK_MS` or `MAX_CLOCK_SKEW_MS` (120 s) from this one. A clock two
+/// to five minutes out saw no tables and no players and was told nothing. So
+/// the line is below the tightest of them.
+pub const CLOCK_OUT_BY_S: i64 = 60;
+
+/// `S1-JB`: this client's own clock, in whole seconds, as the rest of it reads
+/// it (`crate::clock`).
+fn now_unix_s() -> i64 {
+    (crate::clock::now_unix_ms() / 1_000) as i64
+}
 
 /// What one question to GitHub came back with: the verdict, and how far this
 /// computer's clock is from GitHub's own.
@@ -152,29 +161,90 @@ pub fn out_by(answered: Option<i64>) -> Option<i64> {
     answered
 }
 
-/// `D-081`: what the lobby says about a clock that is out, or `None` while it is
+/// `D-081`, `S1-JB`: what the lobby says about a clock -- a heading the band
+/// shows in bold, and the words under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockNotice {
+    pub title: String,
+    pub text: String,
+}
+
+/// An amount of time as a player reads it: seconds under two minutes, minutes
+/// under two hours, hours beyond.
+fn span_words(out_s: i64) -> String {
+    if out_s >= 7_200 {
+        format!("{} hours", (out_s + 1_800) / 3_600)
+    } else if out_s >= 120 {
+        format!("{} minutes", (out_s + 30) / 60)
+    } else {
+        format!("{out_s} seconds")
+    }
+}
+
+/// What a clock that is out costs, and the one thing to do about it: said by
+/// both notices. It names no system's settings, because this client runs on
+/// more than one, and it does not call the internet's time the right one --
+/// what matters is that the clocks disagree.
+const WHAT_IT_COSTS: &str = "P2Poker's lobby only trusts what other players' clients say when their clocks and \
+    this one agree to within about two minutes. With the clock this far out you may see no tables and no players, \
+    and they may not see yours. A game you are already playing at a table goes on. Setting this computer's time \
+    automatically puts it right.";
+
+/// `D-081`: what the lobby says about a clock that is out by `out_by_s`
+/// (positive: ahead) against the time the internet gave, or `None` while it is
 /// close enough to leave alone.
-///
-/// The sentence says the one thing a player can act on and stops. It does not
-/// name GitHub's clock as the right one -- what matters is that the two disagree
-/// -- and it does not name a system's settings, because this client runs on more
-/// than one.
-pub fn clock_words(out_by_s: i64) -> Option<String> {
+pub fn clock_notice(out_by_s: i64) -> Option<ClockNotice> {
     if out_by_s.abs() <= CLOCK_OUT_BY_S {
         return None;
     }
-    let out = out_by_s.abs();
-    let span = if out >= 7_200 {
-        format!("{} hours", (out + 1_800) / 3_600)
-    } else {
-        format!("{} minutes", (out + 30) / 60)
-    };
     let way = if out_by_s > 0 { "ahead of" } else { "behind" };
-    Some(format!(
-        "This computer's clock is about {span} {way} the time the internet gave, and P2Poker looks for the players \
-         who are online now by the hour on the clock. A clock this far out can leave you alone in a lobby that is \
-         not empty. Setting this computer's time automatically puts it right."
-    ))
+    Some(ClockNotice {
+        title: format!("This computer's clock is about {} {way} the time the internet gave", span_words(out_by_s.abs())),
+        text: WHAT_IT_COSTS.to_owned(),
+    })
+}
+
+/// `S1-JB`: what the lobby says when the clock jumped by `by_ms` while the
+/// client ran and the internet could not be asked what the time is -- or
+/// `None` for a jump too small to cost anything. A jump that was the clock being
+/// put right looks the same from here, so the words say *if*.
+pub fn jump_notice(by_ms: i64) -> Option<ClockNotice> {
+    let by_s = by_ms / 1_000;
+    if by_s.abs() <= CLOCK_OUT_BY_S {
+        return None;
+    }
+    let way = if by_s > 0 { "forward" } else { "back" };
+    Some(ClockNotice {
+        title: format!("This computer's clock just jumped {} {way}", span_words(by_s.abs())),
+        text: format!(
+            "P2Poker could not ask the internet for the time just now, so it cannot tell whether the clock is now \
+             wrong or was just put right. If it is wrong: {WHAT_IT_COSTS}"
+        ),
+    })
+}
+
+/// `S1-JB`: how far this computer's clock is from GitHub's, asked again after
+/// the clock jumped. The releases page's redirect is the question -- its header
+/// and not a byte of the page, outside the API's count of sixty an hour -- and
+/// its `Date` is the answer. **Blocking**; a thread of its own. `None` when
+/// there was no answer this client could read.
+#[cfg(feature = "tox")]
+pub fn github_clock_out_by_s() -> Option<i64> {
+    let page = format!("{}/latest", crate::gui::render::RELEASES_URL);
+    let response = attohttpc::head(&page)
+        .header("User-Agent", "P2Poker")
+        .follow_redirects(false)
+        .timeout(CHECK_TIMEOUT)
+        .send()
+        .ok()?;
+    let sent = response.headers().get(attohttpc::header::DATE)?.to_str().ok()?;
+    clock_out_by_s(sent, now_unix_s())
+}
+
+/// A build without the HTTPS client cannot ask.
+#[cfg(not(feature = "tox"))]
+pub fn github_clock_out_by_s() -> Option<i64> {
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,11 +412,7 @@ fn ask_github(clock_out: &mut Option<i64>) -> Result<Verdict, String> {
     // `D-081`, before anything can return: the header is there on an answer this
     // client refuses as much as on one it reads.
     if let Some(sent) = response.headers().get(attohttpc::header::DATE).and_then(|v| v.to_str().ok()) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        *clock_out = clock_out_by_s(sent, now);
+        *clock_out = clock_out_by_s(sent, now_unix_s());
     }
     let status = response.status();
     if matches!(status.as_u16(), 403 | 429) {
@@ -580,28 +646,62 @@ mod tests {
         assert_eq!(clock_out_by_s("not a date", 1_790_164_800), None);
     }
 
-    /// `D-081`: who is told, and what they are told.
+    /// `D-081`, `S1-JB`: who is told, and what they are told.
     #[test]
     fn a_clock_is_only_spoken_of_when_it_is_far_enough_out() {
         // Inside the tolerance nothing is said, in either direction, and the
-        // edge itself is silence: 300 s is not "out by".
-        for close in [0, 1, 299, 300, -1, -299, -300] {
-            assert_eq!(clock_words(close), None, "{close} s");
+        // edge itself is silence: 60 s is not "out by".
+        for close in [0, 1, 59, 60, -1, -59, -60] {
+            assert_eq!(clock_notice(close), None, "{close} s");
         }
-        let ahead = clock_words(301).expect("301 s is out by");
-        assert!(ahead.contains("5 minutes"), "{ahead}");
-        assert!(ahead.contains("ahead of"), "{ahead}");
-        let behind = clock_words(-3_600).expect("an hour is out by");
-        assert!(behind.contains("60 minutes"), "{behind}");
-        assert!(behind.contains("behind"), "{behind}");
-        assert!(!behind.contains("ahead"), "{behind}");
+        // Under two minutes it is said in seconds: "1 minutes" is nobody's
+        // English, and "1 minute" hides a difference that already costs.
+        let ahead = clock_notice(61).expect("61 s is out by");
+        assert!(ahead.title.contains("61 seconds ahead of"), "{ahead:?}");
+        let behind = clock_notice(-3_600).expect("an hour is out by");
+        assert!(behind.title.contains("60 minutes behind"), "{behind:?}");
+        assert!(!behind.title.contains("ahead"), "{behind:?}");
         // Past two hours it is said in hours: nobody reads 480 minutes.
-        let hours = clock_words(2 * 3_600 + 60).expect("two hours is out by");
-        assert!(hours.contains("2 hours"), "{hours}");
-        // And the sentence says what to do about it.
-        for words in [&ahead, &behind, &hours] {
-            assert!(words.contains("clock"), "{words}");
-            assert!(words.contains("automatically"), "{words}");
+        let hours = clock_notice(2 * 3_600 + 60).expect("two hours is out by");
+        assert!(hours.title.contains("2 hours"), "{hours:?}");
+        // And the words say what it costs and what to do about it.
+        for n in [&ahead, &behind, &hours] {
+            assert!(n.title.contains("clock"), "{n:?}");
+            assert!(n.text.contains("two minutes"), "{n:?}");
+            assert!(n.text.contains("automatically"), "{n:?}");
         }
+    }
+
+    /// `S1-JB`: the line sits below the tightest tolerance the lobby keeps, so
+    /// a clock that costs a player his company is one he is told about. At five
+    /// minutes (`D-081`'s line) a clock two to five minutes out saw an empty
+    /// lobby and was told nothing.
+    ///
+    /// **To make this fail:** put `CLOCK_OUT_BY_S` back to 300.
+    #[test]
+    fn the_line_is_below_every_tolerance_of_the_lobby() {
+        use crate::protocol::constants::{AD_TTL_MS, MAX_CLOCK_SKEW_MS};
+        let tightest_ms = [AD_TTL_MS, MAX_CLOCK_SKEW_MS, crate::net::lobbytalk::CLOCK_SLACK_MS]
+            .into_iter()
+            .min()
+            .expect("three tolerances");
+        assert!(
+            (CLOCK_OUT_BY_S as u64) * 1_000 < tightest_ms,
+            "a clock {CLOCK_OUT_BY_S} s out is not told about, but the lobby stops trusting it at {tightest_ms} ms"
+        );
+    }
+
+    /// `S1-JB`: a jump, when the internet could not be asked, is said with an
+    /// *if* -- it may have been the clock being put right.
+    #[test]
+    fn a_jump_is_spoken_of_with_an_if() {
+        assert_eq!(jump_notice(59_000), None);
+        assert_eq!(jump_notice(-60_000), None);
+        let forward = jump_notice(3_600_000).expect("an hour");
+        assert!(forward.title.contains("60 minutes forward"), "{forward:?}");
+        let back = jump_notice(-3 * 60_000).expect("three minutes");
+        assert!(back.title.contains("3 minutes back"), "{back:?}");
+        assert!(back.text.contains("If it is wrong"), "{back:?}");
+        assert!(back.text.contains("automatically"), "{back:?}");
     }
 }

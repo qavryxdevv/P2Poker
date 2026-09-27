@@ -1086,7 +1086,9 @@ lobby needs and the one `S1-AI` measured being lost among the dead; GossipSub
 brings the rest. The lobby's own key stays exactly what it was — read, dialled
 and announced under as before — so a client that knows nothing of the hour keys
 meets everybody there, and so does one whose clock is an hour wrong, which
-announces where nobody looks. A slice is at most four hexadecimal characters, so
+announces where nobody looks — though meeting is not playing: while its clock
+is more than two minutes out, the others refuse its adverts and it refuses
+theirs (`D-081`, `S1-JB`). A slice is at most four hexadecimal characters, so
 no slice's key is an hour's. What the hour's key costs in privacy is §3.5's.
 
 **The derivation is in `src/net/run.rs`'s `namespace`, computed rather than

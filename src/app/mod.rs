@@ -185,10 +185,7 @@ fn log_line(line: &str) {
     }
     let file = std::fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut f) = file {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let now = u128::from(crate::clock::now_unix_ms());
         let secs = (now / 1000) % 86_400;
         let at = format!("{:02}:{:02}:{:02}.{:03}", secs / 3600, (secs / 60) % 60, secs % 60, now % 1000);
         if let Some(n) = folded {
@@ -589,6 +586,9 @@ pub struct AppState {
     pub search_again: Option<crate::net::matchmaker::SearchRequest>,
     pub search_again_slots: std::collections::BTreeSet<u8>,
     pub search_again_due: bool,
+    /// `S1-JB`: the node saw the clock jump by this many milliseconds, and the
+    /// window has not asked the internet's time since.
+    pub clock_jumped: Option<i64>,
     /// `D-064`: the slots of reservations the search ended with, hidden until
     /// the node has left each -- the node says the search ended before the
     /// leaves it queued run, and a window that opened for the moment between
@@ -2064,6 +2064,14 @@ impl AppState {
             }
             NodeEvent::QueueSeen { searching } => self.searching = searching,
             NodeEvent::Warning(w) => self.note(w),
+            NodeEvent::ClockJumped { by_ms } => {
+                self.note(format!(
+                    "the computer's clock moved {:+} s more than the time that passed: its time was changed, or it \
+                     slept (S1-JB)",
+                    by_ms / 1_000
+                ));
+                self.clock_jumped = Some(by_ms);
+            }
 
             NodeEvent::PortMapped { how, external } => {
                 self.status.port_mapped = Some(how);
@@ -2523,9 +2531,7 @@ impl AppState {
             // `D-067`: the lobby's card about the player keeps the place, from
             // this same word of the node's and no other.
             if let Some(s) = self.seated.as_ref() {
-                let when_unix_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64);
+                let when_unix_ms = crate::clock::now_unix_ms();
                 self.results_owed.push(crate::storage::results::Entry {
                     when_unix_ms,
                     table: s.name.clone(),
@@ -3505,6 +3511,11 @@ impl AppState {
 
     /// `D-064`: the search owed now -- a game it started ended and the player
     /// asked to search again -- as the command that starts it.
+    /// `S1-JB`: the jump the window has not asked the internet's time about yet.
+    pub fn take_clock_jump(&mut self) -> Option<i64> {
+        self.clock_jumped.take()
+    }
+
     pub fn take_search_again(&mut self) -> Option<NodeCommand> {
         if !self.search_again_due {
             return None;

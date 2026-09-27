@@ -9448,6 +9448,27 @@ impl Hand {
         self.patience = waits.to_vec();
     }
 
+    /// `S1-JB`: this client's wall clock just jumped by `by_ms` -- the node saw
+    /// it move that much more than the time that passed. Every moment this hand
+    /// keeps on this client's own clock moves with it, so what is measured from
+    /// them -- the stage's budget, the hand's own, a vote's wait, the showdown's
+    /// -- stays the time that passed. Before this, a clock set an hour ahead
+    /// read the hand as an hour old and aborted it; one set back kept a stalled
+    /// stage from timing out for the hour. The stamps kept from other seats'
+    /// clocks (`last_stamp_ms`, `turn_began_unix_ms`) are theirs and stay.
+    pub fn rebase_clock(&mut self, by_ms: i64) {
+        use crate::clock::{rebase, rebase_opt};
+        rebase(&mut self.turn_heard_ms, by_ms);
+        rebase(&mut self.taken_up_ms, by_ms);
+        rebase_opt(&mut self.own_vote_at, by_ms);
+        rebase_opt(&mut self.quiet_vote_at, by_ms);
+        rebase_opt(&mut self.sealed_at, by_ms);
+        rebase(&mut self.stage_at_ms, by_ms);
+        rebase(&mut self.opened_at_ms, by_ms);
+        rebase_opt(&mut self.showdown_opened_ms, by_ms);
+        rebase_opt(&mut self.muck_held_until_ms, by_ms);
+    }
+
     /// `D-059`: the table's cryptographic step, in milliseconds.
     pub fn crypto_step_ms(&self) -> u64 {
         u64::from(self.open.crypto_step_timeout_ms)

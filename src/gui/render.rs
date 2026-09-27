@@ -366,10 +366,11 @@ pub struct LobbyUi {
     /// `D-077`: the download of a newer release was asked for, and whether the
     /// system's browser took the address.
     pub download_handed: Option<bool>,
-    /// `D-081`: the sentence about a clock that is out, once the version check
-    /// has read the time GitHub's answer carried. `None` while the clock is
-    /// close enough, and once the player has read it.
-    pub clock_notice: Option<String>,
+    /// `D-081`, `S1-JB`: the warning about a clock that is out, once the version
+    /// check has read the time GitHub's answer carried -- or asked again after
+    /// the clock jumped. `None` while the clock is close enough, and once the
+    /// player has pressed it away.
+    pub clock_notice: Option<crate::app::update::ClockNotice>,
 }
 
 /// The settings dialog's pages, one at a time: all of them on one page no longer
@@ -659,6 +660,14 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     if view.profile_elsewhere {
         egui::Panel::top("profile-elsewhere").frame(egui::Frame::NONE).show(ui, profile_elsewhere_band);
     }
+    // `S1-JB`: a clock that is out, across the whole window under the header.
+    // `D-081` said it in the quiet band on the player's card, and the owner
+    // read past it: a lobby that looks empty because of the clock is the one
+    // thing on this screen the player has to act on.
+    let mut clock_seen = false;
+    if let Some(notice) = view.clock_notice.as_ref() {
+        egui::Panel::top("clock-out").frame(egui::Frame::NONE).show(ui, |ui| clock_seen = clock_band(ui, notice));
+    }
 
     // `D-071`: the strip's one button that leaves the client, where no other
     // button was pressed in the same pass.
@@ -741,6 +750,9 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     }
     if donate && action == LobbyAction::None {
         action = LobbyAction::OpenDonationPage;
+    }
+    if clock_seen && action == LobbyAction::None {
+        action = LobbyAction::ClockNoticeSeen;
     }
     if let Some(text) = said {
         action = LobbyAction::Say(text);
@@ -1588,6 +1600,61 @@ fn profile_page(ui: &mut egui::Ui, b: &mut BackupUi) -> Option<LobbyAction> {
 
 /// `D-068`: the notice that this profile runs somewhere else as well -- a band
 /// under the header, not a window over the lobby: the games it shows go on.
+/// `S1-JB`: the warning about this computer's clock -- the lobby's one amber
+/// band, across the window: a warning sign, the heading in bold, what it costs
+/// and what to do, and *OK*. Nothing blinks; it stays until pressed, and comes
+/// back when the clock jumps again or at the next start while it is still out.
+fn clock_band(ui: &mut egui::Ui, notice: &crate::app::update::ClockNotice) -> bool {
+    let mut seen = false;
+    egui::Frame::new()
+        .fill(theme::WARN)
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .outer_margin(egui::Margin { left: 5, right: 5, top: 4, bottom: 0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                warning_sign(ui, 30.0);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.add(
+                        egui::Label::new(RichText::new(&notice.title).color(theme::INK_ON_GOLD).size(18.0).strong())
+                            .wrap(),
+                    );
+                    ui.add(egui::Label::new(RichText::new(&notice.text).color(theme::INK_ON_GOLD).size(14.5)).wrap());
+                    ui.add_space(2.0);
+                    let ok = egui::Button::new(RichText::new("OK").color(theme::INK_ON_GOLD).size(14.0).strong())
+                        .fill(theme::GOLD_ACTION)
+                        .stroke(Stroke::new(1.0, theme::INK_ON_GOLD))
+                        .min_size(egui::vec2(72.0, 28.0));
+                    if ui.add(ok).clicked() {
+                        seen = true;
+                    }
+                });
+            });
+        });
+    seen
+}
+
+/// A warning triangle with an exclamation mark, drawn rather than typed: the
+/// fonts this client carries have no such glyph, and a missing one is a box.
+fn warning_sign(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let p = ui.painter();
+    let top = egui::pos2(rect.center().x, rect.top() + 1.0);
+    let left = egui::pos2(rect.left() + 1.0, rect.bottom() - 2.0);
+    let right = egui::pos2(rect.right() - 1.0, rect.bottom() - 2.0);
+    p.add(egui::Shape::convex_polygon(vec![top, right, left], theme::INK_ON_GOLD, Stroke::NONE));
+    let x = rect.center().x;
+    let bar = size * 0.09;
+    p.line_segment(
+        [egui::pos2(x, rect.top() + size * 0.34), egui::pos2(x, rect.top() + size * 0.66)],
+        Stroke::new(bar, theme::WARN),
+    );
+    p.circle_filled(egui::pos2(x, rect.top() + size * 0.79), bar * 0.6, theme::WARN);
+}
+
 fn profile_elsewhere_band(ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(theme::FIELD)
@@ -2891,14 +2958,6 @@ fn you_card(ui: &mut egui::Ui, view: &LobbyView) -> Option<LobbyAction> {
             action = Some(LobbyAction::RewardsNoticeSeen);
         }
     }
-    // `D-081`: a clock far enough out to leave the player looking in an hour
-    // nobody else is in. Said in the same band and dismissed the same way; it
-    // comes back at the next start while the clock is still wrong.
-    if let Some(words) = view.clock_notice.as_deref() {
-        if notice_band(ui, words) {
-            action = Some(LobbyAction::ClockNoticeSeen);
-        }
-    }
     if let Some(s) = view.rewards.as_ref().and_then(|r| r.summary.as_ref()) {
         if game_summary(ui, s, view.rewards.as_ref().and_then(|r| r.goal.as_ref())) {
             action = Some(LobbyAction::RewardsSeen);
@@ -3119,8 +3178,9 @@ fn game_summary(ui: &mut egui::Ui, s: &super::rewards::SummaryView, next: Option
 }
 
 /// One neutral sentence with an *OK* under it: `D-068`'s about the rewards
-/// file, `D-081`'s about a clock that is out. Nothing here blinks and nothing
-/// here is a warning sign; it is read once and pressed away.
+/// file. Nothing here blinks and nothing here is a warning sign; it is read
+/// once and pressed away. (`D-081`'s clock was said here too, and read past:
+/// it has its own band now, [`clock_band`].)
 fn notice_band(ui: &mut egui::Ui, words: &str) -> bool {
     let mut seen = false;
     egui::Frame::new().fill(theme::FIELD).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(10.0).inner_margin(10.0).show(

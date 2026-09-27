@@ -69,6 +69,15 @@ param(
     # search queue falls silent, as the owner's far client's did. Without it only the
     # table's line goes.
     [switch]$CutBoth,
+    # S1-JB: the nodes -ClockNodes names -- every far node when it is empty -- are told
+    # P2P_POKER_CLOCK_JUMPS: at_s:shift_s[,at_s:shift_s...], seconds of each life's own run.
+    # Only that client's reading of the wall clock moves; neither machine's time is touched.
+    [string]$ClockJumps = '',
+    [string]$ClockNodes = '',
+    # How long every client thinks before it acts, in milliseconds (`--autoplay N`); 0 acts
+    # at once. Longer than the ten seconds S1-FS leaves a late turn, a slow player shows what
+    # a clock that is out costs at the table.
+    [ValidateRange(0, 60000)][int]$AutoplayMs = 0,
     # Every seat's stack at a table founded here: 300 against blinds of 50/100
     # ends a tournament in a few hands.
     [ValidateRange(0, 100000)][int]$StartStack = 300,
@@ -137,6 +146,14 @@ if ($cutList.Count -gt 0 -and ($CutAt -le 0 -or $CutFor -le 0)) { throw '-CutNod
 $shuffled = @($nodeList | Sort-Object { $rng.Next() })
 $far = if ($farList.Count -gt 0) { $farList } else { @($shuffled | Select-Object -First $There) }
 $There = $far.Count
+$jumpList = @()
+if ($ClockJumps) {
+    if ($ClockJumps -notmatch '^\s*\d+:[+-]?\d+(\s*,\s*\d+:[+-]?\d+)*\s*$') { throw "-ClockJumps '$ClockJumps': at_s:shift_s[,at_s:shift_s...]" }
+    $jumpList = if ($ClockNodes) { @("$ClockNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ }) } else { @($far) }
+    foreach ($j in $jumpList) { if ($nodeList -notcontains $j) { throw "-ClockNodes ${j}: not a node of $Nodes" } }
+    if ($jumpList.Count -eq 0) { throw '-ClockJumps needs -ClockNodes when no node runs on the far machine' }
+}
+$jumpSet = ',' + ($jumpList -join ',') + ','
 $roles = @{}
 $order = @($nodeList | Sort-Object { $rng.Next() })
 $k = 0
@@ -187,6 +204,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
     table = $table; nodes = $Nodes; seconds = $Seconds; seed = $Seed; churn_until = $ChurnUntil
     far = $far; roles = $roles; lives = $lives; formats = $formatList; tables = $tableList
     start_stack = $StartStack; again = [bool]$Again; cut_both = [bool]$CutBoth
+    clock_jumps = $ClockJumps; clock_nodes = $jumpList
 } | ConvertTo-Json -Depth 5 | Out-File (Join-Path $work 'plan.json') -Encoding utf8
 
 $header = @(
@@ -195,6 +213,7 @@ $header = @(
     "for    $Seconds s, seed $Seed, faults before $ChurnUntil s, start stack $StartStack$(if ($Again) { ', search again after the game' })"
     "roles  $(($roles.GetEnumerator() | Sort-Object Name | ForEach-Object { "n$($_.Name) $($_.Value)" }) -join ', ')"
     "work   $work"
+    $(if ($ClockJumps) { "clock  n$($jumpList -join ', n') read the wall clock $ClockJumps off the system's (S1-JB; seconds of each life)" })
 )
 $header | ForEach-Object { Write-Host $_ }
 $header | Out-File (Join-Path $work 'run.txt') -Encoding utf8
@@ -295,13 +314,14 @@ foreach (`$e in (`$events | Sort-Object At)) {
     }
     `$log = Join-Path `$dir ("n{0}-{1}.log" -f `$l.Node, `$l.Life)
     `$for = [int](`$l.Stop - `$l.Start) + 5
-    `$a = @('--headless', '--autoplay', '--no-mdns', '--for', "`$for", '--profile', `$p, '--search', "`$(`$l.Format)", '--search-tables', "`$(`$l.Tables)")
+    `$a = @('--headless', '--autoplay') + @($(if ($AutoplayMs -gt 0) { "$AutoplayMs" })) + @('--no-mdns', '--for', "`$for", '--profile', `$p, '--search', "`$(`$l.Format)", '--search-tables', "`$(`$l.Tables)")
     if ('$againFlag' -eq '1') { `$a += '--search-again' }
     if (`$l.Resume) { `$a += '--resume' }
     `$knobs = @{ P2P_POKER_STAYS = '1'; P2P_POKER_START_STACK = '$StartStack' }
     if (`$l.OfflineFor -gt 0) { `$knobs['P2P_POKER_OFFLINE_AT'] = "`$(`$l.OfflineAt)"; `$knobs['P2P_POKER_OFFLINE_FOR'] = "`$(`$l.OfflineFor)" }
     if (`$l.OfflineFor -gt 0 -and '$bothFlag' -eq '1') { `$knobs['P2P_POKER_OFFLINE_BOTH'] = '1' }
     if (`$l.CancelAt -gt 0) { `$knobs['P2P_POKER_CANCEL_SEARCH_AT'] = "`$(`$l.CancelAt)"; `$knobs['P2P_POKER_SEARCH_AGAIN_AT'] = "`$(`$l.AgainAt)" }
+    if ('$ClockJumps' -ne '' -and '$jumpSet'.Contains(",`$(`$l.Node),")) { `$knobs['P2P_POKER_CLOCK_JUMPS'] = '$ClockJumps' }
     `$jobs += Start-Job -ArgumentList `$exe, `$a, `$log, `$knobs, `$t0 -ScriptBlock {
         param(`$exe, `$a, `$log, `$knobs, `$t0)
         foreach (`$k in `$knobs.Keys) { Set-Item -Path "env:`$k" -Value `$knobs[`$k] }
@@ -368,13 +388,14 @@ Get-CimInstance Win32_Process -Filter "Name = 'p2p-poker.exe'" |
         }
         $log = Join-Path $work ("n{0}-{1}.log" -f $l.Node, $l.Life)
         $for = [int]($l.Stop - $l.Start) + 5
-        $a = @('--headless', '--autoplay', '--no-mdns', '--for', "$for", '--profile', $p, '--search', "$($l.Format)", '--search-tables', "$($l.Tables)")
+        $a = @('--headless', '--autoplay') + @($(if ($AutoplayMs -gt 0) { "$AutoplayMs" })) + @('--no-mdns', '--for', "$for", '--profile', $p, '--search', "$($l.Format)", '--search-tables', "$($l.Tables)")
         if ($Again) { $a += '--search-again' }
         if ($l.Resume) { $a += '--resume' }
         $knobs = @{ P2P_POKER_STAYS = '1'; P2P_POKER_START_STACK = "$StartStack" }
         if ($l.OfflineFor -gt 0) { $knobs['P2P_POKER_OFFLINE_AT'] = "$($l.OfflineAt)"; $knobs['P2P_POKER_OFFLINE_FOR'] = "$($l.OfflineFor)" }
         if ($l.OfflineFor -gt 0 -and $CutBoth) { $knobs['P2P_POKER_OFFLINE_BOTH'] = '1' }
         if ($l.CancelAt -gt 0) { $knobs['P2P_POKER_CANCEL_SEARCH_AT'] = "$($l.CancelAt)"; $knobs['P2P_POKER_SEARCH_AGAIN_AT'] = "$($l.AgainAt)" }
+        if ($ClockJumps -and $jumpList -contains $l.Node) { $knobs['P2P_POKER_CLOCK_JUMPS'] = $ClockJumps }
         $jobs += Start-Job -ArgumentList $Exe, $a, $log, $knobs, $t0 -ScriptBlock {
             param($exe, $a, $log, $knobs, $t0)
             foreach ($k in $knobs.Keys) { Set-Item -Path "env:$k" -Value $knobs[$k] }

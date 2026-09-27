@@ -41,8 +41,7 @@ pub struct Now {
 
 impl Now {
     pub fn system() -> Now {
-        let unix_ms =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let unix_ms = crate::clock::now_unix_ms();
         Now { unix_ms, offset_min: local_offset_min() }
     }
 }

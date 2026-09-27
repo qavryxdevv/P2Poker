@@ -3398,16 +3398,15 @@ fn freshest(
         .min_by_key(|group_key| quiet_of(group_key).unwrap_or(u64::MAX))
 }
 
-/// Milliseconds for the reassembler's timers.
+/// Milliseconds for the reassembler's timers and the flood meters.
 ///
-/// Wall time, and it only ever measures a difference between two readings taken
-/// here — nothing in the protocol depends on it, which is `PROTOCOL.md` §8.2's
-/// rule about deadlines being local.
+/// **Monotonic** (`S1-JB`): it only ever measures a difference between two
+/// readings taken here, and nothing in the protocol depends on it --
+/// `PROTOCOL.md` §8.2's rule about deadlines being local. On the wall clock, as
+/// it was, a system time set ahead swept every message half received, and one
+/// set back kept a flood meter's minute counting for as long as it was set back.
 fn millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::clock::mono_ms()
 }
 
 #[cfg(test)]

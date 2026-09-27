@@ -16,6 +16,7 @@
 #[cfg(target_os = "linux")]
 pub mod alsa;
 pub mod app;
+pub mod clock;
 pub mod gui;
 pub mod install;
 pub mod mental_poker;
