@@ -1586,6 +1586,9 @@ struct TableRun {
     /// seat has not said it is ready.
     mesh_trouble: std::collections::BTreeMap<u8, tokio::time::Instant>,
     ready_stall: std::collections::BTreeMap<u8, tokio::time::Instant>,
+    /// `S1-JF`: at the founder, since when its own reading of its group has
+    /// named each settled seat without a break while the table could start.
+    founder_unheard_since: std::collections::BTreeMap<u8, tokio::time::Instant>,
     /// `D-060`: when the founder last said the roster again to a seat that spoke
     /// of an older one.
     roster_resaid: Option<tokio::time::Instant>,
@@ -1908,6 +1911,7 @@ impl TableRun {
             hearing_said: None,
             mesh_trouble: std::collections::BTreeMap::new(),
             ready_stall: std::collections::BTreeMap::new(),
+            founder_unheard_since: std::collections::BTreeMap::new(),
             roster_resaid: None,
             founder_gone: None,
             continues_heard: std::collections::BTreeMap::new(),
@@ -4159,6 +4163,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.hearing_said = None;
             $t.mesh_trouble.clear();
             $t.ready_stall.clear();
+            $t.founder_unheard_since.clear();
             $t.roster_resaid = None;
             $t.founder_gone = None;
             $t.continues_heard.clear();
@@ -10420,7 +10425,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // is in trouble on its own word, which costs a liar only its own
                         // seat; a seat is in trouble for not being heard only on the word
                         // of two seats at least, so no one seat can have another given
-                        // back. Of the seats whose trouble has lasted `MESH_GRACE`, the
+                        // back -- save the founder's own reading of its group, which
+                        // counts as two once it has named a seat for
+                        // `FOUNDER_READING_AFTER` while the table could start (`S1-JF`):
+                        // the founder says it is ready only once it hears every seat, so
+                        // nothing else could move a seat only it cannot hear. Of the
+                        // seats whose trouble has lasted `MESH_GRACE`, the
                         // worst goes first, and between equals the later seated. And once
                         // every seat hears every seat, one that has not said it is ready
                         // for `READY_GRACE` holds the table up, and goes too.
@@ -10464,7 +10474,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 && seats.len() == f.roster().len()
                                 && seats.iter().all(|s| fresh(*s).is_some_and(|u| u.is_empty()))
                                 && f.may_start();
-                            let marks: Vec<(u8, usize, usize, bool, u64, bool)> = settled
+                            // `S1-JF`: the settled seats this founder's own reading of its
+                            // group names while the table could start, and whether it has
+                            // named each long enough to count.
+                            let reading: Vec<u8> = founders_reading(
+                                t.tox_sink.is_on_tox(),
+                                founder_wants && f.may_start(),
+                                seats_unheard(f, &t.tox_sink),
+                                f.roster().len().saturating_sub(1),
+                            )
+                            .into_iter()
+                            .filter(|s| seats.contains(s) && Some(*s) != me)
+                            .collect();
+                            let reading_now = tokio::time::Instant::now();
+                            let marks: Vec<(u8, usize, usize, bool, u64, bool, bool)> = settled
                                 .iter()
                                 .filter(|(x, _)| Some(*x) != me)
                                 .map(|(x, sat)| {
@@ -10483,22 +10506,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .filter(|y| *y != x)
                                         .filter(|y| fresh(**y).is_some_and(|u| u.contains(x)))
                                         .count();
-                                    (*x, cannot, by, everybody_hears && !ratified.contains(x), *sat, fresh(*x).is_some())
+                                    let founders = reading.contains(x)
+                                        && founders_word_counts(&t.founder_unheard_since, *x, reading_now);
+                                    (*x, cannot, by, everybody_hears && !ratified.contains(x), *sat, fresh(*x).is_some(), founders)
                                 })
                                 .collect();
                             let behind = t
                                 .hearing
                                 .iter()
                                 .any(|(s, (said, _, at))| *said < serial && at.elapsed() < HEARING_FRESH && seats.contains(s));
-                            (marks, behind)
+                            (marks, behind, reading)
                         });
-                        if let Some((marks, behind)) = judged {
+                        // `S1-JF`: the founder's reading is timed only while it judges.
+                        note_founders_reading(
+                            &mut t.founder_unheard_since,
+                            judged.as_ref().map(|(_, _, reading)| reading.as_slice()),
+                            tokio::time::Instant::now(),
+                        );
+                        if let Some((marks, behind, _)) = judged {
                             let now_i = tokio::time::Instant::now();
                             let mut due: Vec<(u8, usize, usize, u64, bool)> = Vec::new();
-                            for (x, cannot, by, stalling, sat, speaking) in &marks {
-                                if in_hearing_trouble(*cannot, *by, *speaking) {
+                            for (x, cannot, by, stalling, sat, speaking, founders) in &marks {
+                                let by = unheard_with_the_founders_word(*by, *founders);
+                                if in_hearing_trouble(*cannot, by, *speaking) {
                                     if t.mesh_trouble.entry(*x).or_insert(now_i).elapsed() >= MESH_GRACE {
-                                        due.push((*x, *cannot, *by, *sat, *speaking));
+                                        due.push((*x, *cannot, by, *sat, *speaking));
                                     }
                                 } else {
                                     t.mesh_trouble.remove(x);
@@ -10516,16 +10548,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // `S1-HV`: what the founder waits for, for the search's window.
                             t.forming_note = marks
                                 .iter()
-                                .find(|(_, cannot, by, stalling, _, speaking)| {
-                                    in_hearing_trouble(*cannot, *by, *speaking) || *stalling
+                                .find(|(_, cannot, by, stalling, _, speaking, founders)| {
+                                    in_hearing_trouble(*cannot, unheard_with_the_founders_word(*by, *founders), *speaking) || *stalling
                                 })
-                                .map(|(x, cannot, by, _, _, _)| {
+                                .map(|(x, cannot, by, _, _, _, founders)| {
                                     let since = t
                                         .mesh_trouble
                                         .get(x)
                                         .or_else(|| t.ready_stall.get(x))
                                         .map_or(0, |at| at.elapsed().as_secs());
-                                    if cannot + by > 0 {
+                                    if *founders && *cannot == 0 && *by < 2 {
+                                        format!("seat {x} is not heard by the founder in the table's group ({since} s)")
+                                    } else if cannot + by > 0 {
                                         format!("seat {x} cannot hear {cannot} seat(s), unheard by {by} ({since} s)")
                                     } else {
                                         format!("seat {x} has not said it is ready ({since} s)")
@@ -10541,7 +10575,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .table
                                     .as_ref()
                                     .and_then(|f| f.roster().seats().iter().find(|e| e.seat == x).map(|e| (e.peer_id.clone(), e.tox_key)));
-                                let why = if cannot + by > 0 {
+                                // `S1-JF`: the seats' own words, and whether the founder's
+                                // reading is what made the trouble.
+                                let (by, founders) = marks.iter().find(|m| m.0 == x).map_or((by, false), |m| (m.2, m.6));
+                                let why = if founders && cannot == 0 && by < 2 {
+                                    format!(
+                                        "was not heard in the table's group by its founder, which hears more than half the table, for {} s before the table was set",
+                                        (FOUNDER_READING_AFTER + MESH_GRACE).as_secs()
+                                    )
+                                } else if cannot + by > 0 {
                                     format!(
                                         "could not hear {cannot} seat(s) of the table and was not heard by {by}, for {} s before the table was set",
                                         MESH_GRACE.as_secs()
@@ -13833,6 +13875,75 @@ fn is_a_hand_frame(bytes: &[u8]) -> bool {
 /// itself, any one seat cannot.
 fn in_hearing_trouble(cannot_speaking: usize, unheard_by: usize, speaking: bool) -> bool {
     cannot_speaking >= 1 || unheard_by >= 2 || (!speaking && unheard_by >= 1)
+}
+
+/// `S1-JF`: how long the founder's own reading of its group must have named a
+/// seat, without a break, before it counts against that seat. Longer than the Tox
+/// library takes to time out a member this client has stopped hearing -- 58 s from
+/// its last packet, `QUIET_LIMIT_S` of which pass before the seat reads unheard at
+/// all -- so that when the founder's own line fails for several seats at once,
+/// their timeouts reach `own_line_suspect` (`S1-GX`) first and the founder judges
+/// nobody, as it did before this rule.
+const FOUNDER_READING_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `S1-JF`: the seats a founder cannot hear in its table's group (`unheard`, its
+/// own reading) that the reading may count against. None unless the table rides a
+/// group and could start now (`could_start`: the founder wants to start, `D-064`,
+/// and the roster may) -- the reading is there to unblock a set that only the
+/// founder is holding. Then all of them while they are fewer than half of the
+/// `others`, and none from there: a founder that cannot hear half its table is
+/// most likely the client whose line fails, and its readings judge nobody
+/// (`S1-GE`). Heads-up, one of one is all of them, and one player never removes
+/// the other.
+fn founders_reading(on_group: bool, could_start: bool, unheard: Vec<u8>, others: usize) -> Vec<u8> {
+    if on_group && could_start && unheard.len() * 2 < others {
+        unheard
+    } else {
+        Vec::new()
+    }
+}
+
+/// `S1-JF`: keep, per seat, since when the founder's reading has named it without
+/// a break -- forgetting a seat the moment the reading names it no more, and every
+/// seat at a tick the founder judges nobody (`reading` is `None`: its own line
+/// suspect or deaf, or the table set).
+fn note_founders_reading(
+    since: &mut std::collections::BTreeMap<u8, tokio::time::Instant>,
+    reading: Option<&[u8]>,
+    now: tokio::time::Instant,
+) {
+    match reading {
+        None => since.clear(),
+        Some(r) => {
+            since.retain(|s, _| r.contains(s));
+            for s in r {
+                since.entry(*s).or_insert(now);
+            }
+        }
+    }
+}
+
+/// `S1-JF`: whether the founder's reading counts against `seat` now: it has named
+/// the seat for `FOUNDER_READING_AFTER`.
+fn founders_word_counts(
+    since: &std::collections::BTreeMap<u8, tokio::time::Instant>,
+    seat: u8,
+    now: tokio::time::Instant,
+) -> bool {
+    since.get(&seat).is_some_and(|at| now.saturating_duration_since(*at) >= FOUNDER_READING_AFTER)
+}
+
+/// `S1-JF`: the words against a seat not being heard -- `by`, counted from the
+/// seats' own -- with the founder's reading worth two where it counts. The founder
+/// says it is ready only once it hears every seat (`D-060`), so a seat it alone
+/// could not hear in its group -- every other seat heard it, and it spoke -- was
+/// in no trouble on that one word, and held the table for ever.
+fn unheard_with_the_founders_word(by: usize, founders: bool) -> usize {
+    if founders {
+        by.max(2)
+    } else {
+        by
+    }
 }
 
 /// `S1-GR`, the owner's word (2026-09-16): *only the peer that keeps sitting down
@@ -20426,6 +20537,74 @@ mod a_joiner_before_the_first_hand {
         assert!(in_hearing_trouble(0, 2, true));
         assert!(in_hearing_trouble(0, 1, false), "one word against a silent seat is");
         assert!(!in_hearing_trouble(0, 0, false), "silence alone is the founder's other readings'");
+    }
+
+    /// `S1-JF`: a seat only the founder cannot hear in its group -- every other
+    /// seat hears it, and it speaks -- was in no trouble on the founder's one
+    /// word, while the founder never said it was ready without hearing it
+    /// (`D-060`): the table waited for ever. The founder's reading counts as two
+    /// -- only on a group, only while the table could start, and only while it
+    /// names fewer than half the others.
+    #[test]
+    fn a_seat_only_the_founder_cannot_hear_is_judged() {
+        // A table of five: the founder cannot hear seat 3, the three others hear
+        // it, and its own word says it hears every seat.
+        assert_eq!(founders_reading(true, true, vec![3], 4), vec![3]);
+        let by = 1; // the founder's own word, the only one against seat 3
+        assert!(!in_hearing_trouble(0, by, true), "what held the table: one word against a speaking seat");
+        assert!(
+            in_hearing_trouble(0, unheard_with_the_founders_word(by, true), true),
+            "the founder's reading, once it counts, is worth two"
+        );
+        assert!(!in_hearing_trouble(0, unheard_with_the_founders_word(by, false), true), "and nothing before");
+        assert_eq!(unheard_with_the_founders_word(3, true), 3, "never fewer words than the seats said");
+
+        assert!(founders_reading(true, false, vec![3], 4).is_empty(), "nothing to unblock while the table could not start");
+        assert!(founders_reading(false, true, vec![3], 4).is_empty(), "a table without a group has no such reading");
+        // A founder that cannot hear half its table or more is the one in
+        // trouble (`S1-GE`): its reading judges nobody.
+        assert!(founders_reading(true, true, vec![2, 3], 4).is_empty(), "two of four others is half");
+        assert!(founders_reading(true, true, vec![2, 3, 4], 5).is_empty(), "three of five is more");
+        assert_eq!(founders_reading(true, true, vec![2, 3], 5), vec![2, 3], "two of five is fewer");
+        assert!(founders_reading(true, true, vec![2], 2).is_empty(), "a table of three: one of two is half");
+        assert!(founders_reading(true, true, vec![2], 1).is_empty(), "heads-up: one player never removes the other");
+    }
+
+    /// `S1-JF`: the founder's reading counts only once it has named a seat for
+    /// `FOUNDER_READING_AFTER` without a break. By then the Tox library has timed
+    /// out a member the founder stopped hearing, so a founder whose own line lost
+    /// several seats at once reads its own line first (`S1-GX`, two timeouts)
+    /// and judges nobody -- and a tick that judges nobody forgets every seat.
+    /// Found by refuting the first shape of this rule, which counted at once and
+    /// gave healthy seats back about forty seconds into a failure of the
+    /// founder's own line, before `S1-GX` could see it.
+    #[test]
+    fn the_founders_reading_counts_only_after_its_own_line_had_time_to_show() {
+        use std::time::Duration;
+        let t0 = tokio::time::Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut since = std::collections::BTreeMap::new();
+        note_founders_reading(&mut since, Some(&[3]), t0);
+        assert!(!founders_word_counts(&since, 3, s(59)));
+        note_founders_reading(&mut since, Some(&[3]), s(30));
+        assert!(founders_word_counts(&since, 3, s(60)), "named without a break since t0");
+        assert!(!founders_word_counts(&since, 4, s(60)), "a seat it never named");
+
+        note_founders_reading(&mut since, Some(&[]), s(61));
+        note_founders_reading(&mut since, Some(&[3]), s(62));
+        assert!(!founders_word_counts(&since, 3, s(121)), "a break starts the clock again");
+        assert!(founders_word_counts(&since, 3, s(122)));
+
+        note_founders_reading(&mut since, None, s(130));
+        assert!(since.is_empty(), "a tick that judges nobody -- its own line suspect -- forgets every seat");
+
+        // The order that keeps `S1-GX` first: a seat reads unheard after
+        // `QUIET_LIMIT_S` of silence, the library drops it 58 s after its last
+        // packet and the client learns it at its next five-second sweep -- all
+        // before the reading counts.
+        const LIBRARY_DROPS_S: u64 = 58;
+        const SWEEP_S: u64 = 5;
+        assert!(QUIET_LIMIT_S + FOUNDER_READING_AFTER.as_secs() > LIBRARY_DROPS_S + SWEEP_S);
     }
 
     /// `D-062`: the seats of one game meet at the table with most players, then
