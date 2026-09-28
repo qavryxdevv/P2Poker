@@ -1598,7 +1598,7 @@ struct TableRun {
     founder_heard_last: std::collections::BTreeMap<u8, tokio::time::Instant>,
     /// `S1-JJ`: the table whose being set to start this client has tried to
     /// keep on disk, whether that write went through, and when it was tried --
-    /// written once, tried again a minute after a failure, a failure said once.
+    /// written once, tried again ten seconds after a failure, a failure said once.
     set_to_start_noted: Option<([u8; 32], bool, tokio::time::Instant)>,
     /// `D-060`: when the founder last said the roster again to a seat that spoke
     /// of an older one.
@@ -10305,17 +10305,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // took a roster below the minimum as short. Only where the
                             // minimum is above two (at two, `D-044`'s floor is the minimum,
                             // and the search's tables would crowd the few kept out); a write
-                            // that fails is tried again a minute later, and said once.
+                            // that fails is tried again ten seconds later, and said once.
                             if f.set_to_start()
                                 && f.ad().min_players_to_start > 2
-                                && !t.set_to_start_noted.is_some_and(|(k, kept, at)| k == f.table_id() && (kept || at.elapsed() < std::time::Duration::from_secs(60)))
+                                && !t.set_to_start_noted.is_some_and(|(k, kept, at)| k == f.table_id() && (kept || at.elapsed() < std::time::Duration::from_secs(10)))
                             {
                                 match crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms) {
                                     Ok(()) => t.set_to_start_noted = Some((f.table_id(), true, now_tick)),
                                     Err(e) => {
                                         if t.set_to_start_noted.map(|(k, _, _)| k) != Some(f.table_id()) {
                                             note_failed = Some(format!(
-                                                "could not keep on disk that this table was set to start ({e}); tried again every minute"
+                                                "could not keep on disk that this table was set to start ({e}); tried again every ten seconds"
                                             ));
                                         }
                                         t.set_to_start_noted = Some((f.table_id(), false, now_tick));
