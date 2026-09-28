@@ -114,7 +114,10 @@ def fold(path):
             tag, sec(told), sec(wide), "-" if added is None else "%d own relay(s)" % added, sec(contact),
             "" if took is None else " (+%.1f s)" % took, nothing, ",".join("%.0f" % r for r in reaps) or "-"))
     far_reaps = sum(1 for t, x in far if t <= JOIN_PHASE_S and is_reap(x))
-    given = sum(1 for L in logs.values() for t, x in L if "could not hear" in x and "is free again" in x)
+    # D-060's reasons, and S1-JF's: a seat given back on the founder's own reading of its group.
+    given = sum(1 for L in logs.values() for t, x in L
+                if ("could not hear" in x or "was not heard in the table's group by its founder" in x)
+                and "is free again" in x)
     full = next((t for t, x in far if re.search(r"group (\d+) seen/\1 confirmed/\1 wanted", x)), None)
     print("   the far seat reaped %d of its own entries in the join phase; read the whole group first at %s" % (
         far_reaps, "-" if full is None else "%.1f s" % full))

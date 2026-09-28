@@ -1589,6 +1589,10 @@ struct TableRun {
     /// `S1-JF`: at the founder, since when its own reading of its group has
     /// named each settled seat without a break while the table could start.
     founder_unheard_since: std::collections::BTreeMap<u8, tokio::time::Instant>,
+    /// `S1-JF`: at the founder, the seats it lost while its own line was the
+    /// suspect -- its line's until it hears them again, and never judged by
+    /// its reading meanwhile.
+    founder_line_lost: std::collections::BTreeSet<u8>,
     /// `D-060`: when the founder last said the roster again to a seat that spoke
     /// of an older one.
     roster_resaid: Option<tokio::time::Instant>,
@@ -1912,6 +1916,7 @@ impl TableRun {
             mesh_trouble: std::collections::BTreeMap::new(),
             ready_stall: std::collections::BTreeMap::new(),
             founder_unheard_since: std::collections::BTreeMap::new(),
+            founder_line_lost: std::collections::BTreeSet::new(),
             roster_resaid: None,
             founder_gone: None,
             continues_heard: std::collections::BTreeMap::new(),
@@ -3738,6 +3743,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // given back again at 91.0 s and then refused for sitting down too often.
                         // The table was played by eight.
                         forget_the_seating(&mut $t.sat_down_ms, &mut $t.seat_since, leaving_key.as_ref(), seat);
+                        // `S1-JF`: and the founder's reading of it -- whoever sits there
+                        // next is read from the start.
+                        $t.founder_unheard_since.remove(&seat);
+                        $t.founder_line_lost.remove(&seat);
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "seat {seat} {why} and the seat is free again"
@@ -4164,6 +4173,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.mesh_trouble.clear();
             $t.ready_stall.clear();
             $t.founder_unheard_since.clear();
+            $t.founder_line_lost.clear();
             $t.roster_resaid = None;
             $t.founder_gone = None;
             $t.continues_heard.clear();
@@ -10436,6 +10446,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // worst goes first, and between equals the later seated. And once
                         // every seat hears every seat, one that has not said it is ready
                         // for `READY_GRACE` holds the table up, and goes too.
+                        //
+                        // `S1-JF`: first, which seats this founder lost to its own line.
+                        let founders_line: Option<(bool, Vec<u8>, Vec<u8>)> = t
+                            .table
+                            .as_ref()
+                            .filter(|f| f.is_founder() && f.session().is_none())
+                            .map(|f| {
+                                let own_line = (t.ever_on_line && hears_nobody(f, &t.tox_sink)) || own_line_suspect(t);
+                                let others: Vec<u8> =
+                                    f.roster().seats().iter().map(|e| e.seat).filter(|s| Some(*s) != f.my_seat()).collect();
+                                (own_line, others, seats_unheard(f, &t.tox_sink))
+                            });
+                        match founders_line {
+                            Some((own_line, others, unheard)) => {
+                                note_founders_line(&mut t.founder_line_lost, own_line, &others, &unheard)
+                            }
+                            None => t.founder_line_lost.clear(),
+                        }
                         let judged = t.table.as_ref().filter(|f| {
                             // `S1-GX`: nor through its own line -- a founder whose line was
                             // cut gave every seat back once its group copy had timed them
@@ -10486,7 +10514,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 f.roster().len().saturating_sub(1),
                             )
                             .into_iter()
-                            .filter(|s| seats.contains(s) && Some(*s) != me)
+                            .filter(|s| seats.contains(s) && Some(*s) != me && !t.founder_line_lost.contains(s))
                             .collect();
                             let reading_now = tokio::time::Instant::now();
                             let marks: Vec<(u8, usize, usize, bool, u64, bool, bool)> = settled
@@ -13922,6 +13950,28 @@ fn note_founders_reading(
                 since.entry(*s).or_insert(now);
             }
         }
+    }
+}
+
+/// `S1-JF`: the seats a founder lost while its own line was the suspect stay its
+/// line's until it hears them again. On a tick its own line is the suspect
+/// (`own_line`: it hears nobody, or `own_line_suspect`) every other seat is noted;
+/// on any other tick a seat it hears again -- one `unheard` no longer names -- is
+/// forgotten. Its reading counts against none of them: `S1-GX` names the
+/// founder's line only while two timeouts are a minute old, and a founder that
+/// forgot why it lost two healthy seats gave both back when that minute ended,
+/// as surely as without the minute (found by refuting the second shape of this
+/// rule).
+fn note_founders_line(
+    lost: &mut std::collections::BTreeSet<u8>,
+    own_line: bool,
+    others: &[u8],
+    unheard: &[u8],
+) {
+    if own_line {
+        lost.extend(others.iter().copied());
+    } else {
+        lost.retain(|s| unheard.contains(s));
     }
 }
 
@@ -20613,11 +20663,39 @@ mod a_joiner_before_the_first_hand {
 
         // The order that keeps `S1-GX` first: a seat reads unheard after
         // `QUIET_LIMIT_S` of silence, the library drops it 58 s after its last
-        // packet and the client learns it at its next five-second sweep -- all
+        // packet and the node reads the drop on its next two-second tick -- all
         // before the reading counts.
         const LIBRARY_DROPS_S: u64 = 58;
-        const SWEEP_S: u64 = 5;
-        assert!(QUIET_LIMIT_S + FOUNDER_READING_AFTER.as_secs() > LIBRARY_DROPS_S + SWEEP_S);
+        const TICK_S: u64 = 2;
+        assert!(QUIET_LIMIT_S + FOUNDER_READING_AFTER.as_secs() > LIBRARY_DROPS_S + TICK_S);
+    }
+
+    /// `S1-JF`: seats the founder lost while its own line was the suspect stay
+    /// its line's until it hears them again. `S1-GX` names the founder's line
+    /// only while two timeouts are a minute old; before this, when that minute
+    /// ended the founder's reading started on the two healthy seats afresh and
+    /// gave them back two minutes later.
+    #[test]
+    fn a_seat_lost_to_the_founders_own_line_stays_its_lines() {
+        let others = [1u8, 2, 3, 4, 5];
+        let mut lost = std::collections::BTreeSet::new();
+        // Seats 1 and 2 go quiet at the founder, and both time out: its own
+        // line is the suspect, and every other seat is noted.
+        note_founders_line(&mut lost, true, &others, &[1, 2]);
+        assert_eq!(lost.len(), 5);
+        // The minute ends; the founder judges again, still not hearing 1 and 2.
+        note_founders_line(&mut lost, false, &others, &[1, 2]);
+        assert_eq!(lost.iter().copied().collect::<Vec<u8>>(), vec![1, 2], "the seats it hears are forgotten");
+        // Its reading names 1 and 2 -- fewer than half of five -- and counts
+        // against neither: the judgement filters the reading by `lost`.
+        let reading: Vec<u8> = founders_reading(true, true, vec![1, 2], 5).into_iter().filter(|s| !lost.contains(s)).collect();
+        assert!(reading.is_empty(), "never judged by the reading of the line that lost them");
+        // It hears seat 1 again; later it loses seat 1 alone, its line sound.
+        note_founders_line(&mut lost, false, &others, &[2]);
+        note_founders_line(&mut lost, false, &others, &[1, 2]);
+        assert_eq!(lost.iter().copied().collect::<Vec<u8>>(), vec![2], "a seat heard again is read again");
+        let reading: Vec<u8> = founders_reading(true, true, vec![1, 2], 5).into_iter().filter(|s| !lost.contains(s)).collect();
+        assert_eq!(reading, vec![1], "a seat only the founder cannot hear, its line sound: judged after its minute");
     }
 
     /// `D-062`: the seats of one game meet at the table with most players, then
