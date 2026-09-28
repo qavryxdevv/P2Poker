@@ -892,8 +892,9 @@ pub fn already_at_window(ctx: &egui::Context, a: &super::lobby::AlreadyAtView) -
 }
 
 /// `S1-JG`: the table the player asked for was not opened -- its Tox group did
-/// not come up, and a hand travels only over Tox -- said, with the reason and
-/// what to do. Nothing else is asked: the player creates the table again.
+/// not come up, and a hand travels only over Tox, or this client plays at the
+/// most tables it can -- said, with the reason, which carries what to do.
+/// Nothing else is asked.
 pub fn not_opened_window(ctx: &egui::Context, why: &str) -> Option<LobbyAction> {
     let mut action = None;
     egui::Window::new(RichText::new("The table was not opened").size(19.0).strong())
@@ -902,10 +903,7 @@ pub fn not_opened_window(ctx: &egui::Context, why: &str) -> Option<LobbyAction> 
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             ui.set_min_width(320.0);
-            // The window's ground is light, so the reason takes the label's
-            // own colour (`shots-de/r3`).
             ui.label(RichText::new(format!("Your table could not be opened: {why}.")).color(theme::DANGER).strong());
-            ui.label("Try creating it again in a moment.");
             ui.add_space(6.0);
             if ui.button("OK").clicked() {
                 action = Some(LobbyAction::DismissNotOpened);
@@ -4098,7 +4096,7 @@ mod tests {
                 ..Default::default()
             };
             let mut out = ctx.run_ui(input, |ui| {
-                let _ = not_opened_window(ui.ctx(), "its Tox group did not come up");
+                let _ = not_opened_window(ui.ctx(), "its Tox group did not come up; try creating it again in a moment");
             });
             found.clear();
             std::mem::take(&mut out.shapes).iter().for_each(|c| words(&c.shape, &mut found));
@@ -4106,8 +4104,7 @@ mod tests {
         }
         for said in [
             "The table was not opened",
-            "Your table could not be opened: its Tox group did not come up.",
-            "Try creating it again in a moment.",
+            "Your table could not be opened: its Tox group did not come up; try creating it again in a moment.",
             "OK",
         ] {
             assert!(found.iter().any(|t| t == said), "{said:?} not painted: {found:?}");

@@ -4574,7 +4574,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     .filter(|(_, players, rank)| {
                         me.is_none_or(|m| better_table((*players, *rank), (1, m)) == std::cmp::Ordering::Greater)
                     });
-                let word = $t.continues_heard.iter().find(|(s, _)| **s <= successor).map(|(_, c)| c.clone());
+                let word = $t
+                    .continues_heard
+                    .iter()
+                    .find(|(s, _)| **s <= successor)
+                    .map(|(_, c)| c.clone())
+                    // `S1-JG`: a word naming a table this build does not deal -- an
+                    // older client's continuation founded with no group, which never
+                    // deals a hand -- is no word: the seat waits, and passes that
+                    // successor over as it does one that says nothing. Checked from
+                    // the advert's own bytes, every tick alike: `advert::receive` counts
+                    // against the sender's rate, and its second answer was a rate limit.
+                    .filter(|c| advert::verify_echoed(&c.advert).is_ok_and(|(ad, _)| advert::plays(&ad)));
                 if let Some((key, players, rank)) = offered {
                     let why = format!(
                         "the founder is gone: the table goes on at the table the lobby offers for it -- seat {rank}'s, {players} seated (D-062)"
@@ -7767,6 +7778,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     command,
                     NodeCommand::CreateTable { .. } | NodeCommand::JoinTable { .. }
                 );
+                // `S1-JG`: and first the slots that hold nothing any more go, as at
+                // the end of every command -- a founding refused leaves its slot
+                // with its clock set back, and ends in `continue`, past that; three
+                // such slots left the fourth creation on the table being played.
+                if opening && tables.len() > 1 {
+                    let keep = tables[active].slot;
+                    tables.retain(|x| {
+                        slot_holds(x).is_some()
+                            || x.continuing.is_some()
+                            || x.slot == keep
+                            || x.opened_at.elapsed() < std::time::Duration::from_secs(60)
+                    });
+                    active = tables.iter().position(|x| x.slot == keep).unwrap_or(0);
+                }
                 // The new slot takes the command; the active one stays the window's
                 // until it turns there (`NodeCommand::Focus`). `S1-FD`: a join for
                 // a table a slot already holds goes to that slot -- see
@@ -7987,11 +8012,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `S1-FY`: nor over a seat this slot asks for again.
                         if t.table.is_some() || t.rejoin_key.is_some() {
                             let why = format!(
-                                "this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before founding another"
+                                "this client already plays at the most tables it can ({MAX_TABLES}, a search's among them): leave one before founding another"
                             );
                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
                             // `S1-JG`: said in the window too, as any table not opened is.
-                            if !for_search && t.continuing.is_none() {
+                            if !for_search && continuing_slot.is_none() {
                                 let _ = events.send(NodeEvent::TableNotOpened { why }).await;
                             }
                             continue;
@@ -8158,12 +8183,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .await;
                                         Ok(ad.on_tox(mine, chat))
                                     }
-                                    None => Err("its Tox group did not come up".to_string()),
+                                    None => Err("its Tox group did not come up; try creating it again in a moment".to_string()),
                                 }
                             }
                             // A build without Tox: no group an advert could name.
                             Ok(None) => Err("this client has no Tox to carry its hands on".to_string()),
-                            Err(e) => Err(format!("there is no Tox for it ({e})")),
+                            Err(e) => Err(format!("there is no Tox for it ({e}); try creating it again in a moment")),
                         };
                         let ad = match on_its_group {
                             Ok(ad) => ad,
@@ -15156,9 +15181,13 @@ async fn handle_gossip(
             // The same distinction as everywhere else: only a finding about the
             // **sender** costs it anything. A rate limit is about this client's
             // own budget and a full lobby is about its own memory; neither is
-            // evidence the peer did wrong.
+            // evidence the peer did wrong. `S1-JG`: nor is a legal advert of a
+            // game this build does not deal -- a cash table (`D-072`), a table
+            // an older client founded with no group -- and scored as a reject it
+            // cost the peers relaying it their standing on the mesh, as
+            // `NotPlayed`'s own word says it never does.
             match e {
-                advert::NotAccepted::RateLimited | advert::NotAccepted::NotTaken(_) => {
+                advert::NotAccepted::RateLimited | advert::NotAccepted::NotTaken(_) | advert::NotAccepted::NotPlayed => {
                     gossipsub::MessageAcceptance::Ignore
                 }
                 _ => gossipsub::MessageAcceptance::Reject,
@@ -21042,9 +21071,9 @@ mod a_joiner_before_the_first_hand {
         let before = &code[arm..publish];
         assert!(before.contains("Ok(ad.on_tox(mine, chat))"), "only a table on its group goes on");
         for failed in [
-            "None => Err(\"its Tox group did not come up\".to_string()),",
+            "None => Err(\"its Tox group did not come up; try creating it again in a moment\".to_string()),",
             "Ok(None) => Err(\"this client has no Tox to carry its hands on\".to_string()),",
-            "Err(e) => Err(format!(\"there is no Tox for it ({e})\")),",
+            "Err(e) => Err(format!(\"there is no Tox for it ({e}); try creating it again in a moment\")),",
         ] {
             assert!(before.contains(failed), "a way to fail that is not refused: {failed}");
         }
@@ -21059,6 +21088,10 @@ mod a_joiner_before_the_first_hand {
         assert!(refusal.contains("t.opened_at = tokio::time::Instant::now()"), "an empty slot goes at once");
         // And a founding refused at the most tables keeps the played table's
         // origin, and is said in the window too.
+        // A `D-061` word naming a table this build does not deal is no word --
+        // read from the advert's own bytes, not through `receive`, whose second
+        // answer for the same sender is a rate limit.
+        assert!(code.contains(".filter(|c| advert::verify_echoed(&c.advert).is_ok_and(|(ad, _)| advert::plays(&ad)));"));
         let guard = before.find("if t.table.is_some() || t.rejoin_key.is_some() {").expect("the guard");
         let origin = before.find("t.origin = None;").expect("the origin reset");
         assert!(guard < origin, "the origin is reset after the guard");
