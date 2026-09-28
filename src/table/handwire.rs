@@ -608,9 +608,8 @@ pub struct HandAbort {
     #[cbor(n(2), with = "minicbor::bytes")]
     pub cert_hash: Option<[u8; 32]>,
     /// Required for causes 2 and 3, which are the two a single chained event
-    /// proves on its own. Empty otherwise. Byte strings since protocol major 2
-    /// (`S1-AO`).
-    #[cbor(n(3), with = "crate::protocol::serialization::byte_strings")]
+    /// proves on its own. Empty otherwise.
+    #[n(3)]
     pub evidence: Vec<Vec<u8>>,
     /// **All zeroes, always.** An abort moves no chips, so there is no delta to
     /// carry. The field is kept rather than removed so that `HAND_ABORT` and
@@ -967,9 +966,8 @@ pub struct TimeoutCert {
     /// The whole signed events and not just their signatures: a receiver
     /// verifies each one the way it verifies any other event, against the
     /// sender key inside it, so a certificate carries its own proof and needs
-    /// nothing from the receiver's store to be checkable. Byte strings since
-    /// protocol major 2, which nearly halved the certificate (`S1-AO`).
-    #[cbor(n(1), with = "crate::protocol::serialization::byte_strings")]
+    /// nothing from the receiver's store to be checkable.
+    #[n(1)]
     pub votes: Vec<Vec<u8>>,
     /// `D-063`: for every seat named whose player left the table by its own
     /// signed word (`TABLE_LEAVE`, §7.10), that word -- a complete
@@ -977,7 +975,7 @@ pub struct TimeoutCert {
     /// named counts for nothing against the floor: its own word is its
     /// consent, and the seats left need no majority to remove a player that
     /// said it left.
-    #[cbor(n(2), with = "crate::protocol::serialization::byte_strings")]
+    #[n(2)]
     pub resignations: Vec<Vec<u8>>,
 }
 

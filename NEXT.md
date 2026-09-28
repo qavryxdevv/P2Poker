@@ -1448,10 +1448,7 @@ moving off GossipSub is to leave that loop behind.
 Two findings from picking up the RNG beacon, and the second is why the first is
 still there.
 
-**1. Whoever ratifies last can choose the button. Measured.** *(Closed by `D-083`,
-2026-09-28: the seating draw decides the seats and the first button before the
-table is set, `TABLE_READY` binds it, and `provisional_button` and the test below
-are gone with the grind. What follows is the finding as it stood.)*
+**1. Whoever ratifies last can choose the button. Measured.**
 
 `provisional_button` reads `session_id`; `session_id` (§4.3) is a hash over the
 ratifications' `event_hash`es; an event hash covers the whole signed envelope,
@@ -3152,11 +3149,11 @@ argument.
   settled hand and has nothing to fire on. `src/protocol/checkpoint.rs` and
   `seats.rs` are the draft of §6.2's records and are deliberately kept unwired
   for this; `tests/anti_replay_authority.rs` holds them to that.
-* **The RNG beacon.** *Built by `D-083` (2026-09-28) as the seating draw of a
-  forming table, seed to seating to first button, with every rogue shape the
-  owner named measured on the bed.* Before it, `provisional_button` stood in, and
-  **it was biasable by whoever ratified last, measured at under a hundred hashes
-  to choose any seat.**
+* **The RNG beacon.** `provisional_button` stands in for it. It is not merely
+  provisional: **it is biasable by whoever ratifies last, measured at under a
+  hundred hashes to choose any seat.** The beacon is specified up to the seed
+  and no further - the seed-to-button rule is named as another document's in
+  every document that mentions it. See the section above.
 * **`HAND_ABORT` causes 2 and 3 are done** - see above. What is left of the
   cause register is `4` (the §6.3 divergence terminus) and `6` (D-014's
   anti-cheat void), and both need machinery that does not exist yet rather than

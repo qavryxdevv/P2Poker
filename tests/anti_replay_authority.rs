@@ -11,11 +11,8 @@
 //! re-ratifies on every serial change (`net/formation.rs` `adopt`, which resets
 //! `sent_ready`). The fields that distinguish those emissions — `list_serial`
 //! and `roster_hash` — live in the payload, which §5.2.1 deliberately excludes.
-//! So a five-seat formation that gives one seat back before the first hand
-//! (`D-044`) puts several distinct honest bodies in one slot, and the predicate
-//! over that key calls each of them equivocation. (Since `D-083` a seat
-//! ratifies only a roster its complete seating draw sits, so a formation
-//! nobody leaves ratifies once a seat; one that loses a seat still re-ratifies.)
+//! So an ordinary five-seat formation puts several distinct honest bodies in
+//! one slot, and the predicate over that key calls each of them equivocation.
 //!
 //! Each test below says, in its own doc comment, how to make it fail.
 
@@ -136,9 +133,8 @@ fn walk(dir: &std::path::Path, f: &mut impl FnMut(&std::path::Path)) {
 
 /// **The reason for the deletion, executable.**
 ///
-/// An attack-free five-seat formation, one seat of which is given back before
-/// the first hand (`D-044`: the rest go on). Several honest `TABLE_READY`
-/// bodies from one seat land in one §5.2.1 slot — same `protocol_version`, `table_id`,
+/// An attack-free five-seat formation. Several honest `TABLE_READY` bodies from
+/// one seat land in one §5.2.1 slot — same `protocol_version`, `table_id`,
 /// `hand_id = 0`, `sequence = 0`, `sender_public_key`, `event_class = 0`,
 /// `event_type`, and no subject — with different `event_hash` values, because
 /// `list_serial` and `roster_hash` are payload fields and the key excludes the
@@ -156,7 +152,7 @@ fn walk(dir: &std::path::Path, f: &mut impl FnMut(&std::path::Path)) {
 /// that has to be decided on its own merits, not smuggled in with a store.
 #[test]
 fn an_honest_formation_puts_several_bodies_in_one_slot_key() {
-    let mut t = Table::new(5);
+    let mut t = Table::new();
     for seed in 1..=4u8 {
         t.add(seed);
     }
@@ -165,13 +161,6 @@ fn an_honest_formation_puts_several_bodies_in_one_slot_key() {
     let settled = t.founder.session().expect("the founder settles");
     for x in &t.seats {
         assert_eq!(x.session(), Some(settled), "every seat agrees");
-    }
-    // A player leaves before the first hand, and the rest go on.
-    t.release(4);
-    let again = t.founder.session().expect("set again at four");
-    assert_ne!(again, settled);
-    for x in &t.seats[..3] {
-        assert_eq!(x.session(), Some(again), "every seat that stayed agrees");
     }
 
     // Now group every broadcast ratification by the §5.2.1 key, rebuilt here
@@ -408,11 +397,11 @@ fn opening3(my_seat: u8) -> Opening {
         present_run: vec![0; 3],
         returns: vec![0; 3],
         out: Vec::new(),
-        button: Some(1),
+        button: None,
     }
 }
 
-fn ad(founder_app: [u8; 32], founder_peer: Vec<u8>, min: u8) -> TableAd {
+fn ad(founder_app: [u8; 32], founder_peer: Vec<u8>) -> TableAd {
     let (action, grace, crypto, delay) = (20_000u32, 5_000u32, 30_000u32, 7_000u32);
     let seats = 6u8;
     TableAd {
@@ -428,7 +417,7 @@ fn ad(founder_app: [u8; 32], founder_peer: Vec<u8>, min: u8) -> TableAd {
         start_stack: 0,
         players: 1,
         max_players: seats,
-        min_players_to_start: min,
+        min_players_to_start: 2,
         blind_schedule: BlindSchedule {
             mode: 1,
             every_n_hands: 20,
@@ -474,11 +463,10 @@ struct Table {
 }
 
 impl Table {
-    /// A table that starts at `min` players.
-    fn new(min: u8) -> Table {
+    fn new() -> Table {
         let table_key = key(100);
         let founder_app = key(0);
-        let a = ad(founder_app.verifying_key().to_bytes(), vec![0u8; 38], min);
+        let a = ad(founder_app.verifying_key().to_bytes(), vec![0u8; 38]);
         let event = advert::publish(&a, &table_key).unwrap();
         let (_, advert_hash) = advert::verify_echoed(&event).unwrap();
         let table_id = table_key.verifying_key().to_bytes();
@@ -525,81 +513,48 @@ impl Table {
             .founder
             .on_join_request(&request, &[seed; 38], false, NOW)
             .unwrap();
-        let mut first = Vec::new();
+        let (mut accept, mut list, mut founder_ready) = (None, None, None);
         for s in out {
             match s {
-                Emit::Reply(b) => {
-                    joiner.on_join_answer(&b, NOW).expect("an acceptance");
+                Emit::Reply(b) => accept = Some(b),
+                Emit::Broadcast(b) => {
+                    if joinwire::receive_player_list(&b).is_ok() {
+                        list = Some(b);
+                    } else {
+                        founder_ready = Some(b);
+                    }
                 }
-                Emit::Broadcast(b) => first.push((0, b)),
             }
         }
-        assert!(!first.is_empty(), "a player list");
+        let accept = accept.expect("an acceptance");
+        let list = list.expect("a player list");
+        joiner.on_join_answer(&accept, NOW).unwrap();
+
+        let mut readies: Vec<Vec<u8>> = vec![];
+        if let Some(b) = founder_ready {
+            readies.push(b);
+        }
+        for s in self.seats.iter_mut() {
+            for e in s.on_player_list(&list, NOW).unwrap() {
+                if let Emit::Broadcast(b) = e {
+                    readies.push(b);
+                }
+            }
+        }
+        for e in joiner.on_player_list(&list, NOW).unwrap() {
+            if let Emit::Broadcast(b) = e {
+                readies.push(b);
+            }
+        }
         self.seats.push(joiner);
-        self.spread(first, NOW);
-    }
 
-    /// The founder gives player `seed`'s seat back before the first hand.
-    fn release(&mut self, seed: u8) {
-        let out = self
-            .founder
-            .release_seat_before_the_first_hand(&[seed; 38], NOW + 10)
-            .unwrap();
-        let first = out
-            .into_iter()
-            .filter_map(|s| match s {
-                Emit::Broadcast(b) => Some((0, b)),
-                Emit::Reply(_) => None,
-            })
-            .collect();
-        self.spread(first, NOW + 10);
-    }
-
-    /// Every broadcast to every other client, and whatever they say in answer,
-    /// until the table is quiet; the founder ticks its seating draw (`D-083`)
-    /// between rounds. Every `TABLE_READY` said is recorded once.
-    fn spread(&mut self, first: Vec<(usize, Vec<u8>)>, now: u64) {
-        let mut queue: std::collections::VecDeque<(usize, Vec<u8>)> = first.into();
-        loop {
-            while let Some((from, bytes)) = queue.pop_front() {
-                let kind = chained::peek(&bytes, CAP).map(|(k, _, _)| k).ok();
-                if kind == Some(EventType::TableReady) {
-                    self.seen_ready.push(bytes.clone());
-                }
-                let mut everyone: Vec<&mut Formation> = vec![&mut self.founder];
-                everyone.extend(self.seats.iter_mut());
-                for (i, who) in everyone.into_iter().enumerate() {
-                    if i == from {
-                        continue;
-                    }
-                    let said = match kind {
-                        Some(EventType::PlayerList) => who.on_player_list(&bytes, now).unwrap_or_default(),
-                        Some(EventType::TableReady) => who.on_table_ready(&bytes).unwrap_or_default(),
-                        Some(EventType::RngCommit) => who.on_lot(&bytes, now, true).unwrap_or_default(),
-                        Some(EventType::RngReveal) => who.on_opening(&bytes, now).unwrap_or_default(),
-                        _ => Vec::new(),
-                    };
-                    for s in said {
-                        if let Emit::Broadcast(b) = s {
-                            queue.push_back((i, b));
-                        }
-                    }
-                }
+        for r in &readies {
+            let _ = self.founder.on_table_ready(r);
+            for s in self.seats.iter_mut() {
+                let _ = s.on_table_ready(r);
             }
-            let ticked: Vec<(usize, Vec<u8>)> = self
-                .founder
-                .draw_tick(now, true)
-                .into_iter()
-                .filter_map(|s| match s {
-                    Emit::Broadcast(b) => Some((0, b)),
-                    Emit::Reply(_) => None,
-                })
-                .collect();
-            if ticked.is_empty() {
-                break;
-            }
-            queue.extend(ticked);
         }
+        self.seen_ready.extend(readies);
     }
 }
 
@@ -656,7 +611,7 @@ fn unsigned_junk_is_neither_held_nor_forwarded() {
 fn a_seat_that_ratifies_twice_is_named_rather_than_letting_the_last_one_win() {
     use p2p_poker::net::formation::Failed as FormFailed;
 
-    let mut t = Table::new(3);
+    let mut t = Table::new();
     for seed in 1..=2u8 {
         t.add(seed);
     }
@@ -664,13 +619,13 @@ fn a_seat_that_ratifies_twice_is_named_rather_than_letting_the_last_one_win() {
 
     // One seat's own ratification, re-sealed a millisecond later. Same body,
     // same serial, same roster — a different envelope, so a different hash.
+    let (body, _, first_hash) = joinwire::receive_table_ready(
+        t.seen_ready.last().expect("somebody ratified"),
+        &t.table_id,
+        &t.founder.genesis(),
+    )
+    .expect("the ratification this table already took");
     let seat_key = key(2);
-    let (body, _, first_hash) = t
-        .seen_ready
-        .iter()
-        .filter_map(|b| joinwire::receive_table_ready(b, &t.table_id, &t.founder.genesis()).ok())
-        .find(|(_, sender, _)| *sender == seat_key.verifying_key().to_bytes())
-        .expect("the ratification this table already took from that seat");
     let again = joinwire::publish_table_ready(
         &body,
         &t.table_id,
@@ -722,15 +677,14 @@ fn a_seat_that_ratifies_twice_is_named_rather_than_letting_the_last_one_win() {
 /// `Formation::on_table_ready`.
 #[test]
 fn a_ratification_for_a_serial_already_passed_is_not_held() {
-    let mut t = Table::new(3);
+    let mut t = Table::new();
     t.add(1);
-    t.add(2);
     // Every ratification broadcast so far names the serial the table had then.
     let recorded = t.seen_ready.clone();
     assert!(!recorded.is_empty(), "somebody ratified at the first serial");
 
     // The roster moves on, which raises the serial and clears what was held.
-    t.release(2);
+    t.add(2);
     let before = t.founder.held_early();
 
     // A bystander replays everything it heard at the earlier serial.

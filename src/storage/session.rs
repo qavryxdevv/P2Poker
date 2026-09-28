@@ -38,9 +38,8 @@ use minicbor::{Decode, Encode};
 use crate::protocol::constants::{RESUME_GIVE_UP_MS, RESUME_RECORD_MAX_AGE_MS};
 
 /// The record's own version, so a later shape can refuse an older one rather
-/// than misread it. 5 since protocol major 2 (`D-083`): a table recorded by a
-/// client of version 1 is one no client of version 2 can go back to.
-pub const RECORD_VERSION: u8 = 5;
+/// than misread it.
+pub const RECORD_VERSION: u8 = 4;
 
 /// An unfinished session, as the node last knew it.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

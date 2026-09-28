@@ -1941,7 +1941,7 @@ all of them.
 | # | State | Trigger | Guard | Next | Side effects |
 |---|---|---|---|---|---|
 | T1 | `Seating` | `PlayerSeated` | seat empty ∧ occupied+1 < `min_players_to_start` ∧ config valid | `Seating` | — |
-| T2 | `Seating` | `PlayerSeated` | occupied+1 == `min_players_to_start` | `AwaitingSeatRngCommit` | `ArmDeadline{Crypto}`; request commits from all seated. **Superseded by `D-083`:** the seating draw runs in the formation before `TABLE_READY` (the box above T6) |
+| T2 | `Seating` | `PlayerSeated` | occupied+1 == `min_players_to_start` | `AwaitingSeatRngCommit` | `ArmDeadline{Crypto}`; request commits from all seated |
 | T3 | `Seating` | `PlayerLeft` | seat occupied | `Seating` | seat → `Empty`, stack returned to nothing (no chips exist yet) |
 | T4 | `Seating` \| `AwaitingSeatRngCommit` \| `AwaitingSeatRngReveal` \| `Diverged` | `FormationAbandoned` | no `HAND_INIT` has happened — equivalently `hand_id == 0` ∧ `ledger_in == 0` | `TableClosed` | no `Fault`, no attribution, no chips: the table simply never started |
 | T5 | `Seating` | any other | — | `Seating` | `Rejection` |
@@ -2000,26 +2000,6 @@ and no commitment exists, and the only reachable next phase is the absorbing `Ta
 hand *is* live, `Diverged` is left by T57 instead, not by T4.
 
 #### Seat-order randomness beacon (`SPEC_CS.md` §7, `MENTAL_POKER.md` §6)
-
-> **Superseded by `D-083` (protocol major 2, 2026-09-28), and kept for the record.** The seat-order
-> draw no longer runs in the setup chain after `TABLE_READY`: it runs while the table forms, before
-> `TABLE_READY`, and it is the formation's (`net::seating`, `net::formation`), not this engine's.
-> T2's `AwaitingSeatRngCommit`, T6, T7, T9, T10 and T11 describe major 1's design, which no client
-> built; no state of the engine reaches them. A table is set on a roster the complete draw has
-> already seated, and hand 1 opens from it with the drawn first button (`Opening.button`, from
-> `Formation::first_button`) -- which is what T10's side effects were for. What changed in substance,
-> against this section's own arguments below:
->
-> * **G4 still holds: nobody is unseated from a set table for the beacon.** A mismatched opening is
->   refused by every receiver -- it does not open the lot (`PROTOCOL.md` §4.4) -- and its sender
->   simply still owes its opening.
-> * **A stalled draw no longer waits for `join_deadline_ms` and T4.** Before the table is set, and so
->   before any chip exists, the founder gives back every member that has owed the round its lot or
->   its opening for `DRAW_GRACE` (30 s), and the round begins again without them: a seat given back
->   before the first hand (`D-044`, `S1-M`), not a removal from a set table, which is all D-010 point
->   3 speaks of. The griefing cost P4 and G4 accepted below -- *one seat can stall any forming table
->   until `join_deadline_ms`* -- is gone with it, and that is the owner's requirement of the draw: a
->   player that gives no lot, or several of them, never freezes a table.
 
 | # | State | Trigger | Guard | Next | Side effects |
 |---|---|---|---|---|---|
@@ -3654,16 +3634,6 @@ everyone. That is the only moment a seat ever publishes a token for its own card
 it at any earlier moment.
 
 ### 7.9 The randomness beacon
-
-> **Amended by `D-083` (protocol major 2, 2026-09-28).** The draw runs once per table **while it
-> forms**, before `TABLE_READY` -- not in the setup chain after it -- and `TABLE_READY` binds its
-> outcome (`PROTOCOL.md` §4.3, §4.4). The seating is the members' keys, ascending, shuffled by the
-> seed; the drawn table is compact, `n` members at seats `0` to `n − 1`; the first button is
-> `pick(2, 0) mod n`. **A seat given back after the draw leaves everybody else where the draw put
-> them:** its seat stays empty, and the first hand's button is the drawn seat if a player sits there
-> and otherwise the first occupied seat above it, wrapping past the last seat to the first -- the
-> ring §7.2 moves the button round. The rules are `PROTOCOL.md` §4.4's and are not restated here
-> (H8); the engine is handed the seating as the ratified roster and the button as `Opening.button`.
 
 **Recorded spec deviation.** `RNG_COMMIT` / `RNG_REVEAL` run **once per table** (the setup chain),
 not per hand as `SPEC_CS.md` §16 reads. The deviation is recorded — not absorbed — in the single

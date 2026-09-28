@@ -59,7 +59,6 @@ pub const RELEASES_ANSWER_MAX: usize = 512 * 1024;
 /// lobby waits for the question the window asks as it opens, so this is also
 /// the longest a player can be kept from the tables by a network that drops
 /// what it is sent. A network that is simply not there answers at once.
-#[cfg(feature = "tox")]
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `D-081`, amended by `S1-JB`: how far out this computer's clock may be before
@@ -79,7 +78,6 @@ pub const CLOCK_OUT_BY_S: i64 = 60;
 
 /// `S1-JB`: this client's own clock, in whole seconds, as the rest of it reads
 /// it (`crate::clock`).
-#[cfg(feature = "tox")]
 fn now_unix_s() -> i64 {
     (crate::clock::now_unix_ms() / 1_000) as i64
 }
@@ -465,14 +463,10 @@ fn latest_by_page() -> Result<Verdict, String> {
     Ok(verdict_of(&compared_version(), Some(Release { version: version.to_owned(), tag: tag.to_owned() })))
 }
 
-/// A build without the HTTPS client (`--no-default-features`) cannot ask, and
-/// hears no clock either.
+/// A build without the HTTPS client (`--no-default-features`) cannot ask.
 #[cfg(not(feature = "tox"))]
-pub fn check() -> Checked {
-    Checked {
-        verdict: Err("this build has no way to ask; the releases page says what the newest version is".into()),
-        clock_out_by_s: None,
-    }
+pub fn check() -> Result<Verdict, String> {
+    Err("this build has no way to ask; the releases page says what the newest version is".into())
 }
 
 #[cfg(test)]

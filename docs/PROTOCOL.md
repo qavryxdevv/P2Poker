@@ -201,39 +201,22 @@ There are two version numbers and they do different jobs.
 
 | Name | Type | Where | Meaning |
 |---|---|---|---|
-| `PROTOCOL_MAJOR` | compile-time constant, `2` | libp2p protocol name strings, GossipSub topic strings, the DHT keys | wire-format epoch. Two peers with different majors cannot negotiate anything; they never meet, because the protocol strings differ. |
-| `protocol_version` | `u16`, currently `2` | every signed envelope, every table advertisement | the exact rule set and encoding in force for this session. Must equal the value pinned by the table advertisement for every event of that table. |
+| `PROTOCOL_MAJOR` | compile-time constant, `1` | libp2p protocol name strings, GossipSub topic string | wire-format epoch. Two peers with different majors cannot negotiate anything; they never meet, because the protocol strings differ. |
+| `protocol_version` | `u16`, currently `1` | every signed envelope, every table advertisement | the exact rule set and encoding in force for this session. Must equal the value pinned by the table advertisement for every event of that table. |
 
-For `PROTOCOL_MAJOR = 2` there are **eight** strings, exactly:
+For `PROTOCOL_MAJOR = 1` there are **eight** strings, exactly:
 
 ```
-identify protocol             /p2p-poker/2
-GossipSub lobby topic         /p2p-poker/lobby/2        (IdentTopic, not Sha256Topic)
-GossipSub lobby slice topic   /p2p-poker/lobby/2/<slice> (S1-EX; see below)
-GossipSub lobby chat topic    /p2p-poker/lobby-chat/2   (IdentTopic; see §7.7)
-GossipSub search-queue topic  /p2p-poker/search-queue/2 (IdentTopic, and /<slice>
+identify protocol             /p2p-poker/1
+GossipSub lobby topic         /p2p-poker/lobby/1        (IdentTopic, not Sha256Topic)
+GossipSub lobby slice topic   /p2p-poker/lobby/1/<slice> (S1-EX; see below)
+GossipSub lobby chat topic    /p2p-poker/lobby-chat/1   (IdentTopic; see §7.7)
+GossipSub search-queue topic  /p2p-poker/search-queue/1 (IdentTopic, and /<slice>
                                                          beside each lobby slice; §7.13)
-lobby snapshot RPC            /p2p-poker/lobby-snapshot/2
-join RPC                      /p2p-poker/join/2
-table event stream            /p2p-poker/table/2
+lobby snapshot RPC            /p2p-poker/lobby-snapshot/1
+join RPC                      /p2p-poker/join/1
+table event stream            /p2p-poker/table/1
 ```
-
-A table's own GossipSub topic (§1.4) and the private Kademlia protocol
-(`/p2p-poker/kad/2`, `NETWORK_STACK.md`) carry the major as well, and so do the
-lobby's DHT keys below.
-
-**Major 2 (`D-083`, 2026-09-28).** Major 1 shipped in releases 0.1.0 to 0.1.5;
-major 2 is the seating draw. A forming table's roster carries it (§4.3,
-§4.4), `JOIN_ACCEPT` names the roster it answers with, `TABLE_READY` binds the
-complete draw, `RNG_COMMIT` and `RNG_REVEAL` are words of a forming table
-rather than stages of a hand, a joiner's asked-for seat is no longer granted,
-and every list of signed events a message carries is a list of CBOR byte
-strings (`S1-AO`, §2.3). Each is a change to a payload's field set or meaning,
-which §10.2 makes a major-version matter, so a client of major 1 and a client
-of major 2 never meet: every string above, every table topic and every DHT key
-differs. The domain-separation strings of §2.8 keep their `v1`: they name the
-hash, not the release, and a domain string changed for no reason would only
-be one more thing two implementations could spell differently.
 
 **The lobby's slices (`S1-EX`).** A lobby topic may carry a `<slice>`: the
 leading bits of the advertised table's own key, written in hexadecimal, four
@@ -257,13 +240,13 @@ itself, unchanged and unversioned.
   swapped for another every few minutes so that a client holding four slices of
   a large network still walks across it.
 * The peers of a slice find each other under the slice's own DHT provider key
-  (`p2p-poker/main-lobby/v2/<slice>`). This is not optional: a mesh is built
+  (`p2p-poker/main-lobby/v1/<slice>`). This is not optional: a mesh is built
   only out of connected peers that share the topic, so without it a sliced lobby
   cannot hold a mesh at all.
 
 **The lobby's hours (`D-070`).** Beside the lobby's DHT provider key
-(`p2p-poker/main-lobby/v2`) a client provides the key of the current hour,
-`p2p-poker/main-lobby/v2/hour/<n>`, where `n` is the Unix time in seconds divided
+(`p2p-poker/main-lobby/v1`) a client provides the key of the current hour,
+`p2p-poker/main-lobby/v1/hour/<n>`, where `n` is the Unix time in seconds divided
 by 3600, rounded down and written in decimal, and looks it up while it has no
 poker client to talk to. A provider record outlives
 its client by two days; an hour's key names nobody who was not here within the
@@ -272,22 +255,22 @@ hour, so it is where a newcomer finds a client that is running now
 it: a client that knows nothing of the hours meets everybody under the lobby's
 own key, exactly as before.
 
-`/p2p-poker/join/2` is a one-shot request-response RPC, not table-stream traffic
-(C-7 of `docs/research/PHASE0_FIXPLAN.md`; see §1.4 and §4.3).
-`/p2p-poker/lobby-chat/2` carries `SPEC_CS.md` §22's lobby chat (§7.7).
+`/p2p-poker/join/1` is new: the join exchange is a one-shot request-response RPC,
+not table-stream traffic (C-7 of `docs/research/PHASE0_FIXPLAN.md`; see §1.4 and
+§4.3). `/p2p-poker/lobby-chat/1` carries `SPEC_CS.md` §22's lobby chat (§7.7).
 
 `IdentTopic` and `Sha256Topic` both exist in `libp2p-gossipsub` 0.49.5; `IdentTopic`
 sends the topic string in the clear, which is correct here because the string is
 public anyway and debuggable. [LIBP2P §6]
 
 The identify protocol name doubles as the relay-admission discriminator of D-002:
-a peer that advertises `/p2p-poker/2` through `identify` is a poker peer. This is
+a peer that advertises `/p2p-poker/1` through `identify` is a poker peer. This is
 the first of the two candidate admission rules D-002 left open; settling it is
 `NETWORK_STACK.md`'s job, not this document's.
 
 ### 1.2 HELLO / CAPABILITIES
 
-The handshake runs on a freshly opened `/p2p-poker/table/2` stream, immediately
+The handshake runs on a freshly opened `/p2p-poker/table/1` stream, immediately
 after the libp2p security handshake completes, before any other message. It is
 symmetric: each side sends `HELLO`, then each side sends `CAPABILITIES`.
 
@@ -383,12 +366,12 @@ identifier, and the framing, which is ours and survives a change of crate.
 
 | Channel | Protocol string | Framing |
 |---|---|---|
-| **Lobby broadcast** | `/p2p-poker/lobby/2` | one `SignedEvent` per broadcast message, no extra framing |
-| **Lobby chat broadcast** | `/p2p-poker/lobby-chat/2` (§7.7) | one `SignedEvent` per broadcast message |
-| **Search queue broadcast** | `/p2p-poker/search-queue/2` and its slices (§7.13) | one `SignedEvent` per broadcast message |
-| **Lobby RPC** | `/p2p-poker/lobby-snapshot/2` | the RPC codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
-| **Join RPC** | `/p2p-poker/join/2` | the RPC codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
-| **Table mesh** | the table's Tox group (`D-019`), named by the advert's `n(31) tox_chat_id` (§7.2); and the table's own GossipSub topic `/p2p-poker/table/<table_id>/2`, `<table_id>` in 64 lowercase hex digits | on the group, `table::fragment`: an 8-byte header -- `message_id` `u32`, `index` `u16`, `total` `u16`, all big-endian -- then at most 492 bytes of one `SignedEvent`, the message reassembled whole before §4.0 and a claimed `total` above `MAX_FRAGMENTS` refused before anything is allocated; on the topic, one `SignedEvent` per message |
+| **Lobby broadcast** | `/p2p-poker/lobby/1` | one `SignedEvent` per broadcast message, no extra framing |
+| **Lobby chat broadcast** | `/p2p-poker/lobby-chat/1` (§7.7) | one `SignedEvent` per broadcast message |
+| **Search queue broadcast** | `/p2p-poker/search-queue/1` and its slices (§7.13) | one `SignedEvent` per broadcast message |
+| **Lobby RPC** | `/p2p-poker/lobby-snapshot/1` | the RPC codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
+| **Join RPC** | `/p2p-poker/join/1` | the RPC codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
+| **Table mesh** | the table's Tox group (`D-019`), named by the advert's `n(31) tox_chat_id` (§7.2); and the table's own GossipSub topic `/p2p-poker/table/<table_id>/1`, `<table_id>` in 64 lowercase hex digits | on the group, `table::fragment`: an 8-byte header -- `message_id` `u32`, `index` `u16`, `total` `u16`, all big-endian -- then at most 492 bytes of one `SignedEvent`, the message reassembled whole before §4.0 and a claimed `total` above `MAX_FRAGMENTS` refused before anything is allocated; on the topic, one `SignedEvent` per message |
 
 **Which message is legal on which channel.** This is a table rather than prose so
 that adding a channel or a message type cannot leave it stale. §4.11 repeats it
@@ -396,7 +379,7 @@ per message code.
 
 | Message | Channel |
 |---|---|
-| `HELLO`, `CAPABILITIES` | the table stream `/p2p-poker/table/2`, before anything else on it -- **not built in version 1**: the stream has no implementation, and neither message has an emitter or a receiver (`S1-A`) |
+| `HELLO`, `CAPABILITIES` | the table stream `/p2p-poker/table/1`, before anything else on it -- **not built in version 1**: the stream has no implementation, and neither message has an emitter or a receiver (`S1-A`) |
 | `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE` | lobby broadcast |
 | `LOBBY_CHAT` | lobby chat broadcast |
 | `TABLE_CHAT` | table mesh: the table's group, or its topic where there is no group (§7.8) |
@@ -407,8 +390,7 @@ per message code.
 | `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
 | `PLAYER_LIST`, `TABLE_READY` | table mesh: the table's topic, and its group as well once the seat is in it (`D-019`'s amendment of 2026-09-02, additive) |
-| `RNG_COMMIT`, `RNG_REVEAL` | table mesh: the table's group and its topic, before the table is set -- the seating draw's words (`D-083`, §4.4) |
-| all of groups 3–8 but those two | table mesh: the table's group; its topic only where the table has no group (a build without Tox) |
+| all of groups 3–8 | table mesh: the table's group; its topic only where the table has no group (a build without Tox) |
 
 **The one requirement this document places on the transport**, stated as a
 requirement rather than as a crate choice: the table channel must be long-lived
@@ -419,7 +401,7 @@ change the wire.
 
 **Amended 2026-09-28 (`S1-A`, the owner's word): the table mesh is what `D-019`
 built, and this section now says so.** The rows above described a length-prefixed
-`/p2p-poker/table/2` stream between every pair of seats, which was specified and
+`/p2p-poker/table/1` stream between every pair of seats, which was specified and
 never built: `TABLE_PROTOCOL` is declared and read nowhere, and `NETWORK_STACK.md`
 §8 carries the same correction. `D-019`, an accepted decision -- and a numbered
 decision beats a specification document (`CONTRIBUTING.md`) -- put a formed table's
@@ -440,7 +422,7 @@ transport already authenticated the sender has accepted a forged action.
 
 ### 1.5 The table is a full mesh; forwarding is allowed
 
-Every seated participant holds a `/p2p-poker/table/2` stream to every other
+Every seated participant holds a `/p2p-poker/table/1` stream to every other
 seated participant. There is no forwarding node, no host, and no star topology.
 For 10 seats that is 45 connections, which is unremarkable.
 
@@ -590,32 +572,10 @@ Unchained message types, exhaustively: `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`,
 `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, `LOBBY_TABLE_AD`,
 `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE`, `LOBBY_SNAPSHOT_REQUEST`,
 `LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, `TABLE_LEAVE`, `TABLE_HEARING`, `TABLE_CONTINUES`,
-`SEARCH_PRESENCE`, `RNG_COMMIT`, `RNG_REVEAL`, **`DISPUTE`**. Everything else is
-chained.
+`SEARCH_PRESENCE`, **`DISPUTE`**. Everything else is chained.
 
-**`RNG_COMMIT` and `RNG_REVEAL` joined the list in major 2 (`D-083`).** They
-were the first two stages of every hand's setup; they are now the seating
-draw's words, said by the members of a table that is still forming (§4.4) --
-before there is a setup chain to put them in, by players a draw may yet leave
-out, and again every few seconds while the draw waits on them. A word said
-again under a fresh signature is a second body from one sender, which a stage
-slot would call equivocation; unchained, it is simply said again.
-
-**Every list of signed events a payload carries is a CBOR array of byte
-strings (`S1-AO`, major 2).** A certificate's votes, an abort's evidence, a
-dispute's proof, the draw's lots and openings: each element is the signed event
-exactly as it was received, as one CBOR byte string, never as an array of
-integers. The integer form -- what a derived `Vec<Vec<u8>>` field encodes to --
-spent one CBOR item per byte and very nearly doubled every such message; a full
-table's certificate carried 2 400 B of votes in 4 699 B. The count of entries
-is definite and a receiver refuses a count above 64 before it allocates
-anything (`protocol::serialization::byte_strings`); each field is held to its
-own, smaller bound where it is read.
-
-`DISPUTE` is on this list, which is worth one sentence because an earlier draft
-had it chained. (It was once called the only table-mesh message on it; `PLAYER_LIST`,
-`TABLE_CHAT`, `TABLE_LEAVE`, `TABLE_HEARING`, `TABLE_CONTINUES` and the draw's two
-words ride the table mesh too.) `chain_scope = 1`
+`DISPUTE` is on this list and it is the only table-mesh message that is, which is
+worth one sentence because an earlier draft had it chained. `chain_scope = 1`
 means *the event occupies a stage slot*, and `DISPUTE` occupies none by its own
 definition: §4.9 makes it legal outside its stage and emittable at any time, and
 §3.2's `stage_hash` is taken over `event_class = 0` or `event_class = 2` events of
@@ -829,10 +789,8 @@ Both properties were asserted in the Phase 0 probe: length prefixing makes
 `h(D, ["AB","C"]) != h(D, ["A","BC"])`, and two domains over identical parts
 differ. [CRYPTO §3.3]
 
-Complete list of domain strings for `protocol_version = 2`. Adding one is a minor
-change; changing or removing one is a major change. The four draw rows and
-the succession row were added with major 2 (`D-083`); every string keeps its
-`v1`, which names the hash construction and not the release (§1.1).
+Complete list of domain strings for `protocol_version = 1`. Adding one is a minor
+change; changing or removing one is a major change.
 
 | Domain string | Used for |
 |---|---|
@@ -843,13 +801,8 @@ the succession row were added with major 2 (`D-083`); every string keeps its
 | `p2p-poker v1 abort-terminal` | `ABORT_TERMINAL(k)`, the terminal value of an aborted chain (§3.1) |
 | `p2p-poker v1 state` | `STATE_HASH` (§6) |
 | `p2p-poker v1 roster` | `roster_hash` (§3.1) |
-| `p2p-poker v1 rng-commit` | a seating-draw lot's commitment, which `RNG_COMMIT` says (§4.4) |
-| `p2p-poker v1 rng-beacon` | the seating draw's seed, from every opened lot (§4.4) |
-| `p2p-poker v1 rng-members` | the membership digest of one round of the seating draw: the table and its members' keys, ascending (§4.4) |
-| `p2p-poker v1 rng-lots` | the digest of one round's sealed lots, which every `RNG_REVEAL` names (§4.4) |
-| `p2p-poker v1 seat-draw` | what the seed says about one question of the draw -- a step of the seating's shuffle, or the first button (§4.4) |
-| `p2p-poker v1 rng-draw` | the digest of a complete draw as the roster carries it, which `TABLE_READY` binds (§4.3) |
-| `p2p-poker v1 succession` | the order in which a table's seats succeed its founder and rank among its game's continuations: `h(domain, [table_id, app_public_key])`, ascending (§7.12, `D-083`) |
+| `p2p-poker v1 rng-commit` | `RNG_COMMIT` commitment (§4.4) |
+| `p2p-poker v1 rng-beacon` | the combined seed from `RNG_REVEAL` (§4.4) |
 | `p2p-poker v1 deck-commit` | `DECK_COMMIT` digest (§4.5) |
 | `p2p-poker v1 deck-ctx` | the `ctx` byte string handed to the deck library (§4.5) |
 | `p2p-poker v1 session` | `session_id` (§4.3) |
@@ -1022,10 +975,7 @@ claim for it.
 
 A **chain** is the ordered sequence of events for one `(table_id, hand_id)`.
 `hand_id = 0` is the *setup chain*, covering everything from `JOIN_REQUEST` to
-`TABLE_READY`; its one stage is `TABLE_READY`, and the seating draw that precedes
-it is unchained and bound into it by `TABLE_READY n(5)` (§4.3, §4.4 -- major 1
-had placed the draw in this chain as stages 1 and 2, after `TABLE_READY`, and it
-was never built there). `hand_id = 1, 2, …` are the hands.
+`TABLE_READY` plus the seating beacon. `hand_id = 1, 2, …` are the hands.
 
 Chains are linked end to end, so the whole table session is one hash chain:
 
@@ -2364,7 +2314,7 @@ Codes `0x0200`–`0x02FF`. Group 1 (lobby) is specified in §7 because it has it
 transport, TTL and anti-spam rules.
 
 `JOIN_REQUEST`, `JOIN_ACCEPT` and `JOIN_REJECT` run over
-`request_response::cbor::Behaviour` on `/p2p-poker/join/2` (§1.4). Join is a
+`request_response::cbor::Behaviour` on `/p2p-poker/join/1` (§1.4). Join is a
 one-shot RPC with a natural timeout and free size caps, and it avoids opening a
 table stream to a peer that has not been admitted. `PLAYER_LIST` stays on the
 table mesh, because it is a broadcast to already-admitted peers, and
@@ -2374,14 +2324,6 @@ All three join messages and `PLAYER_LIST` are **unchained** (§2.3):
 `chain_scope = 0`, `event_class = 0`, `table_id = ZERO32`,
 `hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `previous_event_hash = ZERO32`,
 `sequence = 0`. The table each concerns is named in its payload.
-
-**Who sits where is the seating draw's, not the founder's (`D-083`, protocol
-major 2).** A forming table's rosters carry a commit-reveal draw among their
-players (§4.4): the founder seals every player's lot in a roster, the players
-open, and the roster that follows re-seats everybody where the draw says and
-fixes the first hand's button. `TABLE_READY` ratifies only a roster that sits
-as its complete draw put it. No seat is asked for and granted, and nobody sits
-down once the lots are sealed.
 
 ---
 
@@ -2402,7 +2344,7 @@ slot and can never appear in an `EquivocationProof` (§5.2).
 | `n(1) app_public_key` | `bytes[32]` | must equal the envelope's `sender_public_key` |
 | `n(2) peer_id` | `bytes` | ≤ 42 B, must equal the connection's authenticated remote PeerId |
 | `n(3) display_name` | `bytes` | ≤ 32 B UTF-8, no control characters |
-| `n(4) requested_seat` | `Option<u8>` | `< max_players` when present. **Not granted since major 2 (`D-083`, `S1-AD`):** the seating draw decides every seat, a joiner is placed at the lowest free seat until it does, and this client sends it absent. A player that named its own seat could sit beside a partner for a whole tournament |
+| `n(4) requested_seat` | `Option<u8>` | `< max_players`, or absent for "any" |
 | `n(5) password_proof` | `Option<bytes[32]>` | present iff the advert has `password_required`; see below |
 | `n(6) buyin` | `u64` | within `[min_buyin, max_buyin]` of the advert |
 | `n(7) join_nonce` | `bytes[32]` | fresh; the anti-replay for this RPC, since the envelope's `sequence` is a sentinel |
@@ -2418,12 +2360,10 @@ one proof, and the UI must say so.
 *Receiver must validate:* the advert hash names an advert this founder actually
 signed and which has not expired; `n(8) table_id` equals that advert's
 `table_public_key`; `app_public_key == sender_public_key`;
-`peer_id` matches the connection; the buy-in is in range; the password proof
-recomputes; this `app_public_key` is not already seated; the table is not full;
-the lots of its seating draw are not sealed -- unless the key is a member of the
-complete draw coming back, which is seated at the seat the draw gave it (§4.4);
-`display_name` is well-formed UTF-8 (and is treated as untrusted display data
-forever — it is never an identifier).
+`peer_id` matches the connection; the buy-in is in range; the seat is free; the
+password proof recomputes; this `app_public_key` is not already seated; the table
+is not full; `display_name` is well-formed UTF-8 (and is treated as untrusted
+display data forever — it is never an identifier).
 
 ---
 
@@ -2440,7 +2380,6 @@ unchained sentinel `ZERO32`, so the table's identity here is the signing key).
 | `n(1) seat` | `u8` | `< max_players` |
 | `n(2) advert_event` | `bytes` | ≤ `TABLE_AD_SIGNED_MAX` = 1 536 B; the complete `SignedEvent` of the `LOBBY_TABLE_AD`, repeated verbatim so the joiner is not relying on a gossip copy and can re-verify the table key's signature itself |
 | `n(3) roster_so_far` | `Vec<SeatEntry>` | ≤ `MAX_SEATS` entries |
-| `n(4) list_serial` | `u64` | the `PLAYER_LIST` serial `roster_so_far` is (major 2, `D-083`) |
 
 `SeatEntry` = `#[cbor(array)] { n(0) seat: u8, n(1) app_public_key: bytes[32],
 n(2) peer_id: bytes(≤42), n(3) display_name: bytes(≤32), n(4) buyin: u64,
@@ -2488,13 +2427,6 @@ who is at the table — see `TABLE_READY`.
 > `JOIN_ACCEPT` the `list_serial` its two siblings carry, and this becomes the
 > same `NotNewer` check as everywhere else. That is a wire change and is not
 > made here.
->
-> **Made in protocol major 2 (`D-083`).** The seating draw re-seats a table
-> between rosters, so a slow acceptance would now put back a seating the draw
-> had since changed. `n(4) list_serial` names the roster `roster_so_far` is, and a
-> joiner takes an acceptance's seat and roster only when that serial is newer than
-> the roster it holds; the serial itself stays the lists' to move, so the list of
-> that serial is still taken when it arrives.
 
 ---
 
@@ -2505,7 +2437,7 @@ who is at the table — see `TABLE_READY`.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) request_hash` | `bytes[32]` | |
-| `n(1) reason` | `u16` | enumerated: `1` table full, `2` seat taken, `3` bad password, `4` buy-in out of range, `5` advert expired, `6` banned, `7` capability mismatch, `8` already seated, `9` out for good (`D-047`), `10` too soon (`S1-GR`), `11` held the seating draw up (`D-083`) |
+| `n(1) reason` | `u16` | enumerated: `1` table full, `2` seat taken, `3` bad password, `4` buy-in out of range, `5` advert expired, `6` banned, `7` capability mismatch, `8` already seated, `9` out for good (`D-047`), `10` too soon (`S1-GR`) |
 | `n(2) retry_after_ms` | `u32` | ≤ 3 600 000; advisory -- for `10`, when the founder seats the key again |
 
 **`10` too soon** (`S1-GR`, the owner's word): a key whose seat ended at this table
@@ -2513,13 +2445,6 @@ who is at the table — see `TABLE_READY`.
 minutes, and that holds no seat now, is seated again only 30 s after its latest end,
 the wait doubling with each further end up to 5 minutes. Every other key is seated at
 once. Before the table is set only.
-
-**`11` held the seating draw up** (`D-083`): a key the founder gave back because it
-owed the seating draw its sealed lot or its opening for `DRAW_GRACE` (§4.4) is not
-seated at that table again while it forms. Seated again, a player that gave no lot
-held the round up once more: measured, given back at 74 s, back at 76 s, given back
-again at 116 s, and the table set at 120 s (`runs/run150257-4`); refused, the table
-was set four seconds after the one give-back (`runs/run151240-4`).
 
 *Receiver must validate:* signature and `request_hash`. The reason code is
 advisory: a rejection is never proof of anything, since the founder may lie. The
@@ -2539,8 +2464,6 @@ before `TABLE_READY`.
 | `n(0) roster` | `Vec<SeatEntry>` | ≤ `MAX_SEATS`, sorted by `seat`, unique seats, unique keys |
 | `n(1) table_params_hash` | `bytes[32]` | §3.1's box, over the parameters this table is being formed under. **This field was `advert_hash` and is replaced (J1, D-013)** |
 | `n(2) list_serial` | `u64` | strictly increasing per table |
-| `n(3) started` | `bool` | the founder's word that a roster at `min_players_to_start` was adopted here once (`D-044`): from then on a roster may be ratified down to two seats. Major 2 (`D-083`); it was each client's own memory, and a player seated after seats were given back held a floor the table had left behind |
-| `n(4) draw` | `Option<DrawWire>` | the seating draw (§4.4), from the moment the founder seals the round's lots; absent before, and **not encoded at all when absent** -- a trailing absent field shortens the array by one, and a `null` in its place is refused by §2.5's gate. Major 2 (`D-083`) |
 
 **Roster uniqueness is on three keys and not two, and the third closes `U17`:
 `seat`, `app_public_key` **and `peer_id`**.** The field was carried in every
@@ -2585,17 +2508,7 @@ this client's own recomputation under §3.1 from the advertisement it joined und
 — a mismatch means the founder is forming a table under parameters other than the
 ones this client agreed to, and the client leaves rather than sitting down; every
 entry's `app_public_key` is one this client has completed a §1.2 handshake with, or
-is one it must now connect to; **and, where the roster names this client, that
-its `n(4) draw` -- or its want of one -- is one this client takes**: §4.4's list of
-what a member refuses, checked before anything of the roster is taken. A roster
-that no longer names this client is taken whatever its draw says: the client has
-been given back.
-
-**The size of a list with a draw.** At ten seats a complete draw carries ten
-signed lots and ten signed openings -- some 6 500 B beside the roster's 1 600 --
-so `PLAYER_LIST_MAX` is 12 288 B since major 2 (§9.3), the next multiple of
-4 096 above the widest list a founder can say, which
-`the_widest_list_a_ten_seat_draw_says_fits_its_cap` builds.
+is one it must now connect to.
 
 A `PLAYER_LIST` is a **proposal**, not a fact. It becomes fact only when every
 listed seat signs `TABLE_READY` over it.
@@ -2609,7 +2522,6 @@ seated participant emits exactly one, to every other.
 *Legal:* once `PLAYER_LIST` names a roster of at least `min_players_to_start` -- or, after
 one that size was named, a roster the founder says again of at least two seats (D-044: a
 seat given back before the first hand does not un-set the table; the floor is heads-up) --
-that sits as its complete seating draw put it (§4.4, `D-083`),
 and this client **hears every other listed seat** on the table mesh (D-060): each is in this
 client's copy of the table's group and has been heard there within `QUIET_LIMIT_S` (20 s). A
 receiver cannot check that and does not try; it is the sender's rule, and the one that makes a
@@ -2624,15 +2536,11 @@ cannot hear (§7.11).
 | `n(2) table_params_hash` | `bytes[32]` | §3.1's box, recomputed by this sender from the parameters it joined under. **This field was `advert_hash` and is replaced (J1, D-013)** |
 | `n(3) my_seat` | `u8` | must equal the sender's seat in that roster |
 | `n(4) capability_set` | `Vec<bytes>` | ≤ 32; repeated inside the signed table scope so the roster binds capabilities |
-| `n(5) draw` | `bytes[32]` | `draw_digest` of the complete seating draw the ratified roster carries (§4.4). Major 2 (`D-083`): `session_id` is a hash over every ratification, so it binds the seating and the first button too |
 
 *Receiver must validate:* the sender is in the roster at `my_seat`; `roster_hash`
 recomputes; **`n(2) table_params_hash` equals this receiver's own recomputation
 under §3.1 and equals the `n(1) table_params_hash` of the `PLAYER_LIST` being
-ratified**; **`n(5) draw` equals the digest of the complete draw this receiver
-holds for that roster, which the roster sits as** -- a receiver that holds none
-refuses every ratification, and the table cannot be set on a roster no draw
-seated; every seat's `capability_set` contains `deck/bs-bg12-secp256k1/1` and
+ratified**; every seat's `capability_set` contains `deck/bs-bg12-secp256k1/1` and
 a seat-count capability covering `max_players`. If any seat's capabilities are
 insufficient, the table does not start and the founder must re-form it.
 
@@ -2669,10 +2577,7 @@ carries none; and a `TABLE_READY` body is `roster_hash`, `list_serial`,
 `table_params_hash`, `my_seat` and `capability_set`, which carries none. A
 `join_nonce` reaches `JOIN_REQUEST` alone, and that message is unchained and enters
 nothing downstream — which §4.3 states in the same breath as the reason it is
-unchained. **Since major 2 a `TABLE_READY` also carries the seating draw's digest
-(`n(5)`), which covers every player's secret lot** (§4.4), so `session_id` is
-unpredictable to anybody until the draw is complete; the uniqueness argument
-above does not rest on it and does not change.
+unchained.
 
 The correction matters in one direction in particular: an editor who believed a
 nonce carried the uniqueness could relax the freshness requirement on `table_id`
@@ -2714,9 +2619,10 @@ Codes `0x0300`–`0x03FF`.
 This is a deviation from a binding spec section and is recorded as such, in the
 same form `CRYPTOGRAPHY.md` §7.2 uses for the `OsRng` rename. The single
 deviation register for the corpus is `THREAT_MODEL.md` §9.1.1; this is entry 2 in
-it. `SPEC_CS.md` §16 lists them after `HAND_INIT`. They run instead **once per
-table, while it forms**, for its seating and its first button and nothing else.
-The reason is a Phase 0 finding: *the shuffle chain is already the per-hand
+it. `SPEC_CS.md` §16 lists them
+after `HAND_INIT`. They are placed in the **setup chain** instead, run exactly
+once per table, for seat assignment and the initial button position only. The
+reason is a Phase 0 finding: *the shuffle chain is already the per-hand
 distributed randomness.* Each player applies a secret permutation and fresh
 re-randomisation drawn from the OS CSPRNG, so the final order is the composition
 of all `n` permutations and is uniform as long as one player is honest — no
@@ -2727,216 +2633,30 @@ towards. [MENTAL §6] A per-hand commit/reveal beacon would add two stages of
 latency per hand and buy nothing. The commit/reveal construction is still needed
 for the non-deck randomness, which is exactly what it is used for.
 
-**Protocol major 2 moved them from the setup chain into the formation (`D-083`).**
-Major 1 specified them as collective stages 1 and 2 of the setup chain, after
-`TABLE_READY`, and no client ever built them: the seats were the founder's
-arrival order, an asked-for seat was granted, and the first button was read off
-`session_id` -- a hash the last seat to ratify could re-sign until it came out as
-it liked, in under a hundred tries at six seats (`S1-B`), beside the partner it
-had asked to sit next to (`S1-AD`). A draw after `TABLE_READY` comes too late for
-the seats, which `roster_hash`, `session_id` and every seat-numbered rule have
-fixed by then. So the draw runs before it: the founder's rosters carry it
-(`PLAYER_LIST n(4)`, §4.3), the members' words are unchained (§2.3), and
-`TABLE_READY` binds the outcome.
-
-#### The seating draw (`D-083`) — normative
-
-**A round** of the draw is for the members of one roster at or above the table's
-floor -- `min_players_to_start`, or two once the table was set to start (§4.3,
-`D-044`) -- and is numbered by that roster's `list_serial`. A membership can come
-round again; a round never does. The round's membership digest is
-
-```
-members = h("p2p-poker v1 rng-members", [ table_id, key_1, …, key_n ])   application keys, ascending
-```
-
-1. **Lots.** A member that takes a roster without a draw, at or above the floor,
-   which names it, draws a lot -- `r` and `salt`, 32 bytes each from the operating
-   system's generator (`SPEC_CS.md` §7) -- and says `RNG_COMMIT` with the
-   commitment below. The founder is a member and draws one too. A roster below the
-   floor ends the round, and a new roster begins a new one. A member says its lot
-   again, signed afresh, every `LOT_EVERY_MS` (5 s) until the lots are sealed.
-2. **Sealing.** Once it holds every member's lot for the round -- the newest each
-   said -- and wants the table to start (a table a search founded, once the search
-   arms it, `D-064`), the founder says the roster again with `n(4) draw = { round,
-   lots, openings }`: every member's signed `RNG_COMMIT`, whole and ascending by
-   key, and its own `RNG_REVEAL` alone. **The founder opens first:** it is the
-   party that sees every lot, so it must never be the one that opens last.
-3. **Opening.** A member that takes that roster checks the draw (below), checks
-   that the lot sealed under its key is the one it drew, and says `RNG_REVEAL`
-   naming the round and the digest of the sealed lots,
-   `lots = h("p2p-poker v1 rng-lots", [ lot_1, …, lot_n ])`, over the lots' bytes
-   in the roster's order. An opening is good for that set of lots and no other. A
-   member says it again, signed afresh, every `LOT_EVERY_MS` until the draw is
-   complete.
-4. **Completion.** Once every sealed lot is opened, the founder says the roster a
-   third time **re-seated** -- every player at the seat the draw gave it -- with
-   every opening in `n(4)`. The draw is complete: every roster of the table carries
-   it unchanged from then on, and `TABLE_READY` (§4.3) binds it.
-
-```
-commitment = h("p2p-poker v1 rng-commit", [ table_id, u64_be(round), members, app_key, r, salt ])
-seed       = h("p2p-poker v1 rng-beacon", [ table_id, u64_be(round), members, lots,
-                                            r of every member, ascending by the members' keys ])
-pick(role, i) = the first 8 bytes, big-endian, of h("p2p-poker v1 seat-draw", [ seed, u8(role), u8(i) ])
-seating    = the members ascending by key; then for i from n-1 down to 1, entry i
-             swaps with entry pick(1, i) mod (i + 1). Seat s holds entry s.
-button     = pick(2, 0) mod n
-```
-
-The drawn table is compact: `n` members at seats `0` to `n − 1`. The modulo is
-biased by less than one part in 10^18 at ten seats and is accepted rather than
-rejected and redrawn: a rule with a loop in it is one more thing two
-implementations could write differently. A member given back after it opened
-leaves its drawn seat empty and moves nobody, and the first hand's button is then
-the drawn button's seat if a player sits there, and otherwise the first occupied
-seat above it, wrapping past the last seat to the first -- the ring the dealing
-goes round (`STATE_MACHINE.md` §7.9).
-
-**What a member refuses.** The founder assembles the draw, and the founder is
-exactly the party a draw must not trust. A member does not take a roster -- and
-does not ratify one -- that:
-
-* carries a round older than the one it is in;
-* comes without the complete draw it holds, or with another: a complete draw is
-  never discarded;
-* begins a new round once this member holds every opening of its own round, or
-  one that leaves out no member whose opening this member never heard -- **a
-  sealed round is run again only for a player that did not open, and that player
-  is not in the new round**, so every re-run costs a seat (members that did open
-  may go with it);
-* adds a player once the lots are sealed -- or, from the first sealing until the
-  table is set, begins a round with any player the round before it did not have:
-  a round run again is for the players that remain, so a player given back for
-  not opening cannot sit down again and open the next round instead;
-* seals other lots than the ones it opened under, or a lot under its key that is
-  not the one it drew;
-* carries an unfinished draw without the founder's own opening, or a draw the
-  founder has no lot in, or does not seat the founder at all -- **the founder
-  opens first, and every member checks that it did**: a founder that did not
-  could learn every opening before committing its own, and run the round again
-  by leaving itself out of it;
-* carries an unfinished draw with a lot whose player is not at the table and
-  whose opening the roster does not carry -- a lot only the founder could know
-  the opening of, which would make it a last opener nobody sees. A founder's
-  unfinished draw therefore carries every opening it holds;
-* seats a player the draw did not draw, or anywhere but at its drawn seat.
-
-A roster that gives this member back is taken whatever it does to the draw: the
-member is leaving it.
-
-**Who sits down when.** Until a round's lots are first sealed anybody the founder
-admits sits down, and the roster that seats them begins a new round. From the
-first sealing until the table is set, nobody new does (`JOIN_REJECT` `1`, table
-full), a round run again included; a member of a complete draw that was given
-back and asks again is seated at the seat the draw gave it and nowhere else,
-whatever seat it asks for -- and only until the founder ratifies, since the
-founder's ratification sets the table and a seat added under it would split the
-table between two rosters (`S1-HE`). A founder left alone -- every other player
-gone before the first hand -- keeps no draw: nobody it protects is left, and the
-table fills as a new one.
-
-**The founder seals only once the table's hearing is judged.** It seals when it
-wants the table to start and, at a table with a group, every seat hears every
-seat (`D-060`, §7.11): a seat given back for its hearing is given back while
-nobody can know the draw's outcome. A seat's word counts there -- and in the
-judgement of who has not ratified -- only where it names a seat of the roster
-other than the founder and itself: a word naming a seat nobody sits at, or the
-founder (whose trouble `D-061` reads), would hold the table off for ever, and no
-judgement reads it. **From the sealing on, other seats' words against a seat
-count only when most of the other seats say them** -- then it is the odd one out
-and goes first -- so two players cannot have a third given back once the seating
-is known, to move the drawn seating or the button; a seat's own word (it cannot
-hear a seat), its own silence, its own failure to ratify and its own leave count
-as before. The founder's own reading that it cannot hear a seat counts as the
-table's while the seats it cannot hear are fewer than half the others: the hands
-ride the group, and such a seat would hold the table for ever; more than that is
-the founder's own line, which judges nobody. A seat speaks when it said a word
-of its hearing lately, about whichever roster: rosters that come fast -- the
-draw says three -- must not make a far seat one that never speaks.
-
-**Nothing waits for ever on a word a member chooses whether to say.** The founder
-gives back, in one roster, every member that has owed the round its lot or its
-opening for `DRAW_GRACE` (30 s, local): it reads only whether what the round waits
-on came, never what a member says about itself. The clock on a member starts once
-it has been seated `GROUP_JOIN_GRACE` (40 s), as every other judgement of a seat
-does, and runs while it owes the same thing, round after round -- a round begun
-again by somebody else's join or leave does not start it again -- and a member is
-given back only when it has also given the draw no word at all, no lot of any
-round and no opening, for the whole grace, so one keeping up with rounds begun
-again by others is never given back for the newest one's lot. While a sealed
-round waits on a member's opening, only this judgement gives it back -- not a
-reading of its silence, and not its own goodbye, which may overtake an opening
-the others already hold: given back then, its round would fail at the founder
-while every member holding its opening refused the round run again. It goes once
-its opening completes the draw, or at the grace. For the same reason an opening
-is taken from any member of the sealed round, seated or given back, and never
-held to a clock: it opens its own lot under those lots and nothing else. A
-player the judgement gives back is not seated at that table again while it forms
-(`JOIN_REJECT` `11`, §4.3). At a table without a group, whose lost roster is
-repaired only by the founder saying it again every half minute and whose lost
-ratification only by a verbatim repeat GossipSub refuses for two minutes, the
-graces are 90 s for the draw and 150 s for the ratification. Before the sealing that begins a
-new round without them. After it, a member given back before it opened fails the
-round, which begins again without it, and a member given back after it opened
-keeps its lot in the draw and leaves its seat empty. However many hold a round up,
-they cost the table one grace between them. A member carries every other member's
-lot and opening it holds, verbatim, with its own -- they are signed by their
-authors, like a ratification carried (`S1-P`) -- once, the moment it first hears
-it, and again with its own every `LOT_EVERY_MS` -- so a founder that cannot hear
-one member directly still gets its word rather than giving back a player the
-others heard. A lot is carried on the first time it is heard in a round, an
-opening the first time at all; a founder takes up to four times a table's seats
-in such words from one carrier in each `LOT_EVERY_MS`, and no more. **A table without a group** has no
-hearing to judge: its founder ratifies last all the same, once every other seat
-has, and a seat that takes the complete draw and does not ratify within its
-grace is given back. What the draw cannot prevent, and what it costs:
-
-* the last member to open learns the outcome before anybody else and can decline
-  to open; the founder gives it back and the round runs again without it -- a veto
-  that costs the vetoing player its seat, every time;
-* a founder may give back any seat before the first hand (`D-044`), as it always
-  could; what it cannot do is keep a round and change its outcome, or run a round
-  again without a player that did not open. **Once the draw is complete a
-  dishonest founder can therefore still shape the table by giving players back**
-  -- the seats between two others, or the button's -- each one visible to every
-  seat as a player given back, and each costing that player its place; and a
-  founder that gives back every other player is left alone, keeps no draw, and
-  seats whoever asks next, the players it gave back among them, in a new draw;
-* `n(3) started` is the founder's word: a founder that says it at once lets a
-  table start below its advertised minimum -- which a founder could always reach
-  by seating players of its own and giving them back;
-* a seat that stops sending to one other seat after the draw makes that seat's
-  word true that it cannot hear it, and a seat's own word costs it its place
-  (`D-060`: the claimant pays, since nothing tells a bad line from a withheld
-  one) -- so a player can have one other given back, visibly, per seat it stops
-  sending to.
-
 ---
 
-**`0x0301 RNG_COMMIT`** — a member's sealed lot
+**`0x0301 RNG_COMMIT`**
 
-*Direction:* a member of a forming table → the table: its group and its topic
-(§1.4). Signed by the member's application key.
-*Legal:* while its table forms, for the round of the newest roster at or above the
-floor that names it, until the lots are sealed.
-*Envelope:* **unchained** (§2.3).
+*Direction:* collective stage 1 of the setup chain; the required emitter set is
+`P(0)`, the seats that signed `TABLE_READY` (§3.2). The phrase "every seated
+participant" stood here and is deleted: it is a status word, and §3.2 forbids an
+`R` defined on one.
+*Legal:* after `TABLE_READY` is complete.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) table_id` | `bytes[32]` | the table |
-| `n(1) round` | `u64` | the `list_serial` of the roster whose members are drawn |
-| `n(2) members` | `bytes[32]` | the round's membership digest |
-| `n(3) commitment` | `bytes[32]` | the commitment above |
+| `n(0) commitment` | `bytes[32]` | the canonical five-part commitment below |
+
+```
+commitment_i = h("p2p-poker v1 rng-commit",
+                 [ table_id, session_id, committer_app_public_key, r_i, salt_i ])
+```
 
 **This section is the normative owner of `commitment_i` and of the `seed` combine
 below, for the whole corpus, and this is the disposition of K6 (D-011 rule 1).**
 The earlier two-part `h(..., [r_i, salt_i])` is deleted: it bound neither the
 table, nor the session, nor the committer, so a commitment could be lifted from
-one table into another (C-2). Major 2 binds the round and the membership where
-major 1 bound `session_id`, which does not exist yet while a table forms and
-draws (`D-083`); what the binding is for is unchanged -- no lot is carried to
-another table, round or player.
+one table into another (C-2).
 
 **`K-6` is closed and this paragraph is rewritten in the past tense, which is the
 disposition of `L6`.** `CRYPTOGRAPHY.md` §7.3 **used to** reproduce both
@@ -3007,51 +2727,43 @@ structural guarantee from the dependency graph is claimed or available**.
 [CRYPTO §1] The `OsRng` rename is deviation 1 in `THREAT_MODEL.md` §9.1.1's
 register and is recorded in `docs/CRYPTOGRAPHY.md` §7.2.
 
-*Receiver must validate:* the signature; `table_id`; that it was said within
-`CLOCK_SLACK_MS` of the receiver's own clock, when it arrives on its own; that the
-signer holds a seat of the receiver's roster. The founder keeps a member's newest
-lot for the round and membership it holds. **A lot inside a roster is never held
-to a clock:** the roster is signed and fresh, and the lots in it were said
-earlier, by the keys the draw itself names.
+*Receiver must validate:* exactly 32 bytes; exactly one commitment per seat; the
+stage is not already complete.
 
 ---
 
-**`0x0302 RNG_REVEAL`** — a member's opened lot
+**`0x0302 RNG_REVEAL`**
 
-*Direction, envelope:* as `RNG_COMMIT`.
-*Legal:* once the founder's roster has sealed the round's lots with this member's
-own among them unchanged, until the draw is complete.
+*Direction:* collective stage 2 of the setup chain; the required emitter set is
+`P(0)` (§3.2), the same set as stage 1's.
+*Legal:* only once the `RNG_COMMIT` stage is **complete**, i.e. every seat's
+commitment has been received and chained. This is what makes the commitment
+binding: no player sees any `r_j` while still able to change its own.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) table_id` | `bytes[32]` | the table |
-| `n(1) round` | `u64` | the round |
-| `n(2) lots` | `bytes[32]` | the digest of the sealed lots this member opened under |
-| `n(3) r` | `bytes[32]` | |
-| `n(4) salt` | `bytes[32]` | |
+| `n(0) r` | `bytes[32]` | |
+| `n(1) salt` | `bytes[32]` | |
 
-*Receiver must validate:* as `RNG_COMMIT`; and that the commitment recomputes from
-`(table_id, round, members, the signer's key, r, salt)` and equals the lot sealed
-under that key. Every client keeps the openings it hears: they are what lets a
-member refuse a round abandoned over an opening it holds.
-
-**The draw inside a roster.** `PLAYER_LIST n(4) draw` is
-`#[cbor(array)] { n(0) round: u64, n(1) lots: [bytes], n(2) openings: [bytes] }`,
-the lots and the openings each a CBOR array of byte strings (§2.3), each element a
-signed `RNG_COMMIT` or `RNG_REVEAL` whole. It is checked from the roster alone,
-needing no word its receiver may have missed: at least one lot and at most
-`MAX_SEATS`; no more openings than lots; every lot a signed `RNG_COMMIT` of this
-table and of the draw's round, ascending by its signer's key, one a member, every
-one naming the digest of its own signers' keys; every opening a signed
-`RNG_REVEAL` of the round, naming these lots, by a member, opening that member's
-lot, ascending by key. With every lot opened the seed, the seating and the button
-follow, and every receiver computes the same.
+*Receiver must validate:* the five-part `commitment_i` of stage 1 recomputes from
+`(table_id, session_id, that seat's app public key, r, salt)` and equals the
+commitment that seat published. A mismatch, or a failure to reveal, is a protocol
+violation attributed to that seat, and the table does not start.
 
 ```
-draw_digest = h("p2p-poker v1 rng-draw", [ canonical CBOR of the draw ])
+seed = h("p2p-poker v1 rng-beacon", [ r_1, …, r_n ])     ascending by seat index
 ```
 
-is what `TABLE_READY n(5)` binds (§4.3).
+This is the canonical combine for the whole corpus (C-2). The retired forms are
+`CRYPTOGRAPHY.md` §7.3's `p2p-poker v1 rng-seed` and `STATE_MACHINE.md` §7.9's
+unprefixed `BLAKE3("p2p-poker/seat-beacon/v1" ‖ …)`; both are listed as never
+valid in §2.8. The seed carries no `session_id` part of its own — each `r_s` is
+already bound to the session by its stage-1 commitment, and the beacon's own
+events are bound to `GENESIS(0)` by the chain.
+
+The seed determines the seat permutation and the initial button position, by a
+deterministic rule specified in `STATE_MACHINE.md`. Nothing else. It is not used
+for cards.
 
 ---
 
@@ -4902,10 +4614,10 @@ operationally: not that emitters are asked not to write one, but that a receiver
 will not accept one.
 
 **A note on the wire format.** Deleting an enumerated value and fixing two field
-contents is, by §10.2, a major-version matter. Major 1 had not shipped when this
-was written and no peer was emitting `cause = 5`, so this was a revision of version
-1's definition rather than a break — but it had to land before the first release,
-and after that it would have needed a major bump.
+contents is, by §10.2, a major-version matter. `PROTOCOL_MAJOR = 1` has not
+shipped and no peer is emitting `cause = 5`, so this is a revision of version 1's
+definition rather than a break — but it must land before the first release, and
+after that it would need a major bump.
 
 **Chip handling on abort: neutral, always, in every case (D-010).** Every stack
 is restored to its start-of-hand value. `n(4) deltas` is all zeroes,
@@ -5289,8 +5001,8 @@ means it does not and never can be.
 | `0x0203` | `JOIN_REJECT` | join RPC | 0 | — | table key |
 | `0x0204` | `PLAYER_LIST` | table mesh | 0 | — | table key |
 | `0x0205` | `TABLE_READY` | table mesh | 1 | collective | every seat of the `PLAYER_LIST` roster; its signers **are** `P(0)` |
-| `0x0301` | `RNG_COMMIT` | table mesh | 0 | — | each member of a round of a forming table's seating draw (§4.4, `D-083`) |
-| `0x0302` | `RNG_REVEAL` | table mesh | 0 | — | each member whose lot the founder's roster sealed (§4.4, `D-083`) |
+| `0x0301` | `RNG_COMMIT` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers |
+| `0x0302` | `RNG_REVEAL` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers |
 | `0x0303` | `HAND_INIT` | table mesh | 1 | collective | `P(k-1)` — §3.2, §4.4. §4.9's readmission set `A` widens the **accepted** emitter set to `P(k-1) ∪ A` and leaves the required set alone (`P2`); it is the second stage in the document whose accepted set is wider than its required one, the first being checkpoint 8 |
 | `0x0304` | `DECK_INIT` | table mesh | 1 | collective | dealt-in seats |
 | `0x0305` | `SHUFFLE_STEP` | table mesh | 1 | single | shuffler `j` |
@@ -5318,8 +5030,8 @@ means it does not and never can be.
 | `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; the one type a seat outside `P(k)` may emit |
 | `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; counts into no `P` (§3.2) |
 
-43 message types. Lobby chat is on `/p2p-poker/lobby-chat/2` and not on the lobby
-topic, and the search queue's presence is on `/p2p-poker/search-queue/2` (§7.13),
+43 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
+topic, and the search queue's presence is on `/p2p-poker/search-queue/1` (§7.13),
 so §1.4's "a message on the wrong channel is dropped" rule covers them like any
 other.
 
@@ -5340,25 +5052,20 @@ showdown set, `V(subject)`) or `P` (§3.2). Four rows used to read "all present
 seats" or "all seats" and were changed in this pass — `HAND_INIT`, `STATE_HASH`,
 `STATE_ACK`, `HAND_COMPLETE`, plus `RNG_COMMIT` and `RNG_REVEAL`'s "every seated
 participant" in §4.4. **A new row whose emitter cell names a status is a defect**
-(J2, D-013, §2.9's enumeration 2). The two draw rows name a round's members, which
-the founder's roster fixes and every member checks (§4.4).
+(J2, D-013, §2.9's enumeration 2).
 
-**The table-mesh messages with `chain_scope = 0` are the ones the table above
-marks 0 — `HELLO`, `CAPABILITIES`, `PLAYER_LIST`, `TABLE_CHAT`, `TABLE_LEAVE`,
-`TABLE_HEARING`, `TABLE_CONTINUES`, `RNG_COMMIT`, `RNG_REVEAL` and `DISPUTE` — and
-the table is the normative statement of it; §2.3's exhaustive list is the other
-index and the two must be kept in step.** (This sentence named four, and §2.3's
-list thirteen types, for several revisions after both had grown.) This sentence read *"`DISPUTE` is the one table-mesh message with
+**Four table-mesh messages carry `chain_scope = 0` — `HELLO`, `CAPABILITIES`,
+`PLAYER_LIST` and `DISPUTE` — and the table above is the normative statement of
+it; §2.3's exhaustive thirteen-type list is the other index and the two must be
+kept in step.** This sentence read *"`DISPUTE` is the one table-mesh message with
 `chain_scope = 0`"* and contradicted the table three lines above it, which is
 `M-1` in `DECISIONS.md`'s open list, found while transcribing the table into
 `src/protocol/messages.rs`. **An implementer builds the sentinel check off §2.3's
 list or off this table, never off prose.** What the deleted sentence was reaching
 for is true of the three groups that carry hand state and is stated that way:
-**`DISPUTE` is the only message of groups 4–8 with `chain_scope = 0`**, which is
+**`DISPUTE` is the only message of groups 3–8 with `chain_scope = 0`**, which is
 why it is the only one that can be legal outside its stage and the only one that
-can never appear in an `EquivocationProof` (§5.2). In group 3 the seating draw's
-two words are unchained too since major 2 (`D-083`): they are said while a table
-forms, before there is any chain. Its `Stage kind` is
+can never appear in an `EquivocationProof` (§5.2). Its `Stage kind` is
 "out-of-stage" precisely because it occupies no slot — the two cells are
 consistent, not in tension. `PLAYER_LEAVE` is on the chained side of that line
 with no exception of any kind (M4, §4.10).
@@ -5381,9 +5088,9 @@ when some key component changes with it.
 | # | Type(s) | Required / permitted honest emissions | Varies within one `(hand_id, sender)` | Verdict |
 |---:|---|---|---|---|
 | 1–13 | `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, the six `LOBBY_*`, `DISPUTE` | any number, any time | — | **Outside the predicate.** `chain_scope = 0` occupies no slot; per-type anti-replay in §5.2.1's box |
-| 14 | `TABLE_READY` | **one per seat per `list_serial`**, all of them at `hand_id = 0, sequence = 0` on the setup chain — an honest client re-ratifies whenever `adopt` sees a new serial | `list_serial`, `roster_hash`, `emitted_at_unix_ms` — **all three in the payload or outside the key, so none of them separates the slots** | **FAILS, and this is the sixth recurrence.** The row read *"one per seat, setup chain / — / Clean"* for five revisions; the emission count was simply wrong. Two ratifications by one honest seat at two serials are one slot and two `event_hash`es, which is §5.2.2's predicate exactly. Measured: 14 honest ratifications on a five-seat formation produce 5 slots and **9** convictions. Since major 2 a seat ratifies only a roster its complete seating draw sits (`D-083`), so a formation nobody leaves ratifies once a seat, and one that gives a seat back before the first hand (`D-044`) re-ratifies -- which `tests/anti_replay_authority.rs` now forms. This row is why §5.2.1 is not implemented (see its header) and it is the first thing a future wire-in must fix — by giving each ratification its own `sequence`, not by narrowing the key |
-| 15 | `RNG_COMMIT` | any number while a table forms: said again every `LOT_EVERY_MS` under a fresh signature, once per round | — | **Outside the predicate since major 2 (`D-083`).** Two honest bodies from one sender are the ordinary case, and `chain_scope = 0` occupies no slot. Major 1's verdict was *one per seat, own stage / — / Clean*, for a stage no client built |
-| 16 | `RNG_REVEAL` | any number while a table forms, as row 15 | — | **Outside the predicate since major 2**, same reason. Major 1's was *one per seat, the next stage / `sequence` / Clean* |
+| 14 | `TABLE_READY` | **one per seat per `list_serial`**, all of them at `hand_id = 0, sequence = 0` on the setup chain — an honest client re-ratifies whenever `adopt` sees a new serial | `list_serial`, `roster_hash`, `emitted_at_unix_ms` — **all three in the payload or outside the key, so none of them separates the slots** | **FAILS, and this is the sixth recurrence.** The row read *"one per seat, setup chain / — / Clean"* for five revisions; the emission count was simply wrong. Two ratifications by one honest seat at two serials are one slot and two `event_hash`es, which is §5.2.2's predicate exactly. Measured: 14 honest ratifications on a five-seat formation produce 5 slots and **9** convictions. This row is why §5.2.1 is not implemented (see its header) and it is the first thing a future wire-in must fix — by giving each ratification its own `sequence`, not by narrowing the key |
+| 15 | `RNG_COMMIT` | one per seat, own stage | — | **Clean** |
+| 16 | `RNG_REVEAL` | one per seat, the next stage | `sequence` | **Clean** |
 | 17 | `HAND_INIT` | one derived copy per seat of `P(k-1)` | — | **Clean.** A `HAND_INIT` that stalls is disposed of by a `HAND_ABORT` at `HAND_INIT`'s own `sequence`, which differs in `event_type` — row 36 |
 | 18 | `DECK_INIT` | one per dealt-in seat | — | **Clean** |
 | 19 | `SHUFFLE_STEP` | one, single-writer | — | **Clean** |
@@ -6292,10 +5999,9 @@ own use (`STATE_MACHINE.md`
 rule 1).
 
 **Adding it is a wire change on the same footing as the `absent` deletion below.**
-Major 1 had not shipped when this was written and no peer was emitting this struct,
-so it was a revision of version 1's definition rather than a break; it had to land
-before the first release, and after that the same edit would have needed a major
-bump (§10.2). It
+`PROTOCOL_MAJOR = 1` has not shipped and no peer is emitting this struct, so it is
+a revision of version 1's definition rather than a break; it must land before the
+first release, and after that the same edit would need a major bump (§10.2). It
 changes `state_hash` for every peer at every checkpoint, which is why
 `src/protocol/messages.rs` must not write `PublicTableState` before this field is
 in it.
@@ -6352,9 +6058,9 @@ one path where dead weight is dangerous.
 
 Deleting it is a wire change, and it is a revision of version 1's definition rather
 than a break, on exactly the footing §4.10 states for `HAND_ABORT`'s `cause = 5`:
-major 1 had not shipped when this was written and no peer was emitting this struct,
-so it had to land before the first release, and after that the same edit would have
-needed a major bump (§10.2). `SeatStatus::Absent` itself and its remaining readers are
+`PROTOCOL_MAJOR = 1` has not shipped and no peer is emitting this struct, so it
+must land before the first release and after that the same edit would need a major
+bump (§10.2). `SeatStatus::Absent` itself and its remaining readers are
 `STATE_MACHINE.md`'s (D-011 rule 1) and are filed in `DECISIONS.md`'s open list as
 J-3. What **this** document is normative about is that no vector named `absent` is
 hashed here, and that none may be re-added.
@@ -7373,15 +7079,10 @@ already on a roster is answered with the roster, not admitted; so a client that 
 a table's roster without its session -- a player back at a table that has dealt --
 never goes on, while a seat its founder admitted goes on even alone, and the table
 fills again at its continuation. A seat of a set table takes no `TABLE_CONTINUES` at
-all. The seat it goes on at is the first of the roster in the table's **succession
-order** -- `h("p2p-poker v1 succession", [table_id, app_public_key])`, ascending
-(§2.8) -- the founder's excepted, not passed over -- itself included. (It was the
-lowest seat number until `D-083`: the seating draw moves players between seats,
-and two seats holding the rosters from either side of it would each have chosen
-itself; the lowest key, next, could be ground offline by anybody who wanted to
-found every continuation it sat at.) If that is itself, it founds the new table and
-says this word. Otherwise it goes on at the table of the first in that order whose
-word it has, once that seat is its choice or earlier; a choice that says nothing within `CONTINUES_WAIT`
+all. The seat it goes on at is the lowest seat number of the roster, the founder's
+excepted, not passed over -- itself included. If that is itself, it founds the new
+table and says this word. Otherwise it goes on at the table of the lowest seat whose word it has, once
+that seat is its choice or lower; a choice that says nothing within `CONTINUES_WAIT`
 (20 s) is passed over for the next -- within 8 s when the seat does not hear it, since it
 may still be founding, heard by others, and two seats must not both found one.
 
@@ -7393,10 +7094,8 @@ with its seat, and the advert it was joined under -- across every continuation, 
 its player leaves or joins a table that is none of the origin's. A *table of its
 game* is the origin, offered by its founder, or a table founded by a key of the
 origin's rosters that plays the origin's game (the same `table_params_hash`,
-`table_name` and `password_required`); its rank is 0 for the origin and
-otherwise the founder's place in the origin's succession order -- 1 for the
-first of the keys its rosters seated, the origin's founder excepted, and up
-(`D-083`; it was the founder's origin seat). The best table of the game is the one with most
+`table_name` and `password_required`); its rank is 0 for the origin and the
+founder's origin seat otherwise. The best table of the game is the one with most
 players (the advert's `players`), then the origin, then the lowest rank -- among the
 tables heard within 90 s, joinable, not full, and not one that refused this seat
 within 5 minutes. Every 30 s: a seat that reads its founder as gone goes to the best
@@ -8388,11 +8087,11 @@ Names and values are §13's; this table is the per-channel view of them.
 |---|---|---|
 | `GOSSIP_MAX_TRANSMIT` | 65 536 B | GossipSub `max_transmit_size`; two-sided. The crate default, pinned there for interoperability |
 | `LOBBY_MSG_MAX` | 8 192 B | application ceiling for any lobby message of any type; the transport limit above is a backstop, never the operative limit |
-| `SNAPSHOT_REQ_MAX` | 1 024 B | `set_request_size_maximum` on `/p2p-poker/lobby-snapshot/2` |
+| `SNAPSHOT_REQ_MAX` | 1 024 B | `set_request_size_maximum` on `/p2p-poker/lobby-snapshot/1` |
 | `SNAPSHOT_RESP_MAX` | 262 144 B | `set_response_size_maximum`; fits `128 × 1 536 = 196 608` plus overhead |
-| `JOIN_REQ_MAX` | 4 096 B | `set_request_size_maximum` on `/p2p-poker/join/2`; `JOIN_REQUEST`'s own payload cap is 512 B, so this is envelope headroom only |
-| `JOIN_RESP_MAX` | 16 384 B | `set_response_size_maximum`; `JOIN_ACCEPT` embeds a whole advert (≤ 1 536 B) plus a ten-entry roster; also the ceiling of a whole signed `PLAYER_LIST`, whose payload cap is 12 288 B since major 2 |
-| `TABLE_FRAME_MAX` | 262 144 B | `u32` length prefix on `/p2p-poker/table/2` |
+| `JOIN_REQ_MAX` | 4 096 B | `set_request_size_maximum` on `/p2p-poker/join/1`; `JOIN_REQUEST`'s own payload cap is 512 B, so this is envelope headroom only |
+| `JOIN_RESP_MAX` | 16 384 B | `set_response_size_maximum`; `JOIN_ACCEPT` embeds a whole advert (≤ 1 536 B) plus a ten-entry roster |
+| `TABLE_FRAME_MAX` | 262 144 B | `u32` length prefix on `/p2p-poker/table/1` |
 | `MAX_EMBEDDED_EVENT` | 32 768 B | per-element cap for an embedded `SignedEvent` in `DISPUTE` and `HAND_ABORT` |
 | `TABLE_AD_SIGNED_MAX` | 1 536 B | a complete `SignedEvent` of an advert, wherever one is embedded or forwarded |
 | `MAX_BODY` | frame − 128 B | `EventBody` bytes |
@@ -8423,10 +8122,10 @@ reading the body.
 | `JOIN_REQUEST` | 512 | ~180 |
 | `JOIN_ACCEPT` | 8 192 | ~1 800 |
 | `JOIN_REJECT` | 128 | ~45 |
-| `PLAYER_LIST` | 12 288 | ~1 200 without a draw; ~7 500 at ten seats with a complete seating draw, and about 8 300 at the widest (§4.3). **2 048 until major 2 (`D-083`)** |
+| `PLAYER_LIST` | 2 048 | ~1 200 |
 | `TABLE_READY` | 1 536 | ~200[^ready-cap] |
-| `RNG_COMMIT` | 2 048 (`LOBBY_CHAT_MAX`, as every word of a forming table) | ~105; the whole signed word ~310. **64 until major 2**, for a body of one commitment |
-| `RNG_REVEAL` | 2 048 (the same) | ~140; the whole signed word ~345. **128 until major 2** |
+| `RNG_COMMIT` | 64 | 34 |
+| `RNG_REVEAL` | 128 | 68 |
 | `HAND_INIT` | 512 | ~140 |
 | `DECK_INIT` | 256 | 102 |
 | `SHUFFLE_STEP` | 8 192 | 3 435 |
@@ -8520,8 +8219,6 @@ processed.
 | `capabilities` | 32 | each name ≤ 32 B, sorted, unique |
 | adverts in a snapshot (`SNAPSHOT_MAX_ADS`) | 128 | each a complete `SignedEvent` ≤ `TABLE_AD_SIGNED_MAX` = 1 536 B; 128 × 1 536 = 196 608 B, inside `SNAPSHOT_RESP_MAX` |
 | `ledger_delta` in `HAND_INIT` | `MAX_SEATS` | ascending by seat, unique |
-| lots, openings of a seating draw (`PLAYER_LIST n(4)`) | `MAX_SEATS` each | lots ascending by their signers' keys, one a member; no more openings than lots, ascending likewise (§4.4) |
-| any list of signed events as byte strings (§2.3) | 64 | refused at decode before anything is allocated; each field is held to its own bound above |
 | `MAX_STAGES_PER_HAND` | 2 048 | exceeding it aborts the hand |
 | `MAX_TRACKED_TABLES` | 512 | the row shown longest makes way, D-055; never the table this client is at |
 | `MAX_TRACKED_PRESENCE` | 512 | the player shown longest makes way, at the tables' pace, D-076 |
@@ -8691,19 +8388,6 @@ A major bump changes `PROTOCOL_MAJOR`, hence every protocol string, hence old an
 new clients never negotiate. That is the intended behaviour: silent partial
 incompatibility in a signed, hash-chained protocol is far worse than a clean
 refusal to connect.
-
-**The first bump, 1 → 2 (`D-083`, 2026-09-28).** Major 1 had shipped (releases
-0.1.0 to 0.1.5), so the seating draw could not revise it in place as the
-pre-release corrections before it had. It touches five items of the list above:
-payload field sets (`JOIN_ACCEPT n(4)`, `PLAYER_LIST n(3)` and `n(4)`,
-`TABLE_READY n(5)`, the new bodies of `RNG_COMMIT` and `RNG_REVEAL`, and every
-list of signed events carried as byte strings, §2.3); a per-message cap loosened
-(`PLAYER_LIST`, 2 048 → 12 288 B); the setup chain's stage numbering (its stages 1
-and 2, never built, are gone: `TABLE_READY` is its only stage); four new domain
-strings (a minor change by itself, §10.1); and every protocol string, table topic
-and DHT key. This client speaks major 2 alone: an envelope with
-`protocol_version = 1` is refused like any version it does not speak, and a
-client of major 1 neither finds it in the DHT nor hears it on a topic.
 
 ### 10.3 Version pinning within a session
 
@@ -8941,19 +8625,18 @@ protocol-version change. Everything else is two-sided, and changing it is a
 major-version change (§10.2).
 
 ```
-PROTOCOL_VERSION                = 2             (D-083; 1 until 2026-09-28)
-PROTOCOL_MAJOR                  = 2
+PROTOCOL_VERSION                = 1
+PROTOCOL_MAJOR                  = 1
 
-IDENTIFY_PROTOCOL               = "/p2p-poker/2"
-LOBBY_TOPIC                     = "/p2p-poker/lobby/2"
-LOBBY_CHAT_TOPIC                = "/p2p-poker/lobby-chat/2"
-SEARCH_QUEUE_TOPIC              = "/p2p-poker/search-queue/2"
-SNAPSHOT_PROTOCOL               = "/p2p-poker/lobby-snapshot/2"
-JOIN_PROTOCOL                   = "/p2p-poker/join/2"
-TABLE_PROTOCOL                  = "/p2p-poker/table/2"
+IDENTIFY_PROTOCOL               = "/p2p-poker/1"
+LOBBY_TOPIC                     = "/p2p-poker/lobby/1"
+LOBBY_CHAT_TOPIC                = "/p2p-poker/lobby-chat/1"
+SNAPSHOT_PROTOCOL               = "/p2p-poker/lobby-snapshot/1"
+JOIN_PROTOCOL                   = "/p2p-poker/join/1"
+TABLE_PROTOCOL                  = "/p2p-poker/table/1"
 
-LOBBY_DERIVATION_STRING         = "p2p-poker/main-lobby/v2"
-LOBBY_NAMESPACE_KEY             = 122010ff86e6a7b7c62abd79a9c00a863630417d412bc0c5f1f124185730057de280
+LOBBY_DERIVATION_STRING         = "p2p-poker/main-lobby/v1"
+LOBBY_NAMESPACE_KEY             = 12207e342925602a7c6558d6ac574207bcc56f7989e17ad52b7694f2c964d772c4b6
 RELAY_DERIVATION_STRING         = "/libp2p/relay"
 RELAY_NAMESPACE_KEY             = 1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f3ef52c452a369e6ef7b610
 
@@ -8982,12 +8665,6 @@ RELAY_NAMESPACE_KEY             = 1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f
   Pinned by `the_lobby_rendezvous_key_is_the_published_one` in `src/net/run.rs`,
   which asserts the bytes rather than recomputing them: a test that recomputes
   the thing it checks passes whatever the code does.
-
-  Protocol major 2 (`D-083`) moved the derivation string to `.../v2`, and the key
-  with it -- it was `12207e3429…` under `.../v1` -- so that a client of major 1
-  and a client of major 2 never find each other in the DHT, where they would
-  only have wasted each other's dials. The slice keys (`.../v2/<slice>`) and the
-  hour keys (`.../v2/hour/<n>`) moved with it (§1.1).
 
 DOMAIN_EVENT                    = "p2p-poker/v1/event" NUL-padded to 24 bytes
   hex: 70 32 70 2d 70 6f 6b 65 72 2f 76 31 2f 65 76 65 6e 74 00 00 00 00 00 00
@@ -9394,8 +9071,8 @@ a side effect.
 **2. C-7 says there are "now five" protocol strings; §1.1 lists six.** C-7 adds
 `/p2p-poker/join/1` to the four strings this document carried and states the new
 total as five. C-8, applied to the same section's constant register, adds
-`LOBBY_CHAT_TOPIC = /p2p-poker/lobby-chat/1`, which is also a protocol string of
-major 1. §1.1 therefore lists six and says six. The two rulings are
+`LOBBY_CHAT_TOPIC = /p2p-poker/lobby-chat/1`, which is also a protocol string for
+`PROTOCOL_MAJOR = 1`. §1.1 therefore lists six and says six. The two rulings are
 individually right and their arithmetic does not compose; the count in C-7 is
 stale rather than wrong.
 

@@ -134,56 +134,6 @@ pub fn h(domain: &'static str, parts: &[&[u8]]) -> Hash {
     *hasher.finalize().as_bytes()
 }
 
-/// A list of byte strings on the wire as what it is: an array of CBOR **byte
-/// strings**.
-///
-/// `S1-AO`: a plain `Vec<Vec<u8>>` field encodes as an array of arrays of
-/// integers, one CBOR item per byte, which very nearly doubles every signed
-/// event a certificate, an abort or a dispute carries -- a full table's
-/// certificate came to 4 699 B where the votes in it were 2 400, and the widest
-/// joint one to within a few hundred bytes of its cap, on the one message a
-/// table sends when its network is already struggling. Protocol major 2 carries
-/// every such list with this (`D-083`), and a field keeps its Rust type:
-/// `#[cbor(n(k), with = "crate::protocol::serialization::byte_strings")]`.
-pub mod byte_strings {
-    use minicbor::encode::Write;
-    use minicbor::{Decoder, Encoder};
-
-    /// No list of byte strings in this protocol has more entries than this --
-    /// the widest is a joint certificate's twenty-five votes -- and a claimed
-    /// count above it is refused before a byte is allocated for it. Each field
-    /// is held to its own, smaller bound by whoever reads it.
-    pub const MAX_ENTRIES: u64 = 64;
-
-    pub fn encode<C, W: Write>(
-        xs: &[Vec<u8>],
-        e: &mut Encoder<W>,
-        _ctx: &mut C,
-    ) -> Result<(), minicbor::encode::Error<W::Error>> {
-        e.array(xs.len() as u64)?;
-        for x in xs {
-            e.bytes(x)?;
-        }
-        Ok(())
-    }
-
-    pub fn decode<'b, C>(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Vec<Vec<u8>>, minicbor::decode::Error> {
-        // Definite length only: canonical CBOR has none other, and the
-        // re-encoding gate would refuse one anyway -- this says so first.
-        let n = d
-            .array()?
-            .ok_or_else(|| minicbor::decode::Error::message("a list of byte strings: indefinite array"))?;
-        if n > MAX_ENTRIES {
-            return Err(minicbor::decode::Error::message("a list of byte strings: too many"));
-        }
-        let mut out = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            out.push(d.bytes()?.to_vec());
-        }
-        Ok(out)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

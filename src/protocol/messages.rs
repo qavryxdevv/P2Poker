@@ -79,12 +79,7 @@ pub enum EventType {
     PlayerList = 0x0204,
     TableReady = 0x0205,
 
-    /// `D-083`: a member's sealed lot for the seating draw, before its table is
-    /// set -- an unchained word like `TABLE_HEARING`, and no longer a stage of
-    /// the setup chain (§4.4).
     RngCommit = 0x0301,
-    /// `D-083`: a member's opened lot, once the founder's roster has fixed every
-    /// member's commitment (§4.4).
     RngReveal = 0x0302,
     HandInit = 0x0303,
     DeckInit = 0x0304,
@@ -200,19 +195,16 @@ impl EventType {
 
     /// Whether the event occupies a place in a table's chain.
     ///
-    /// Twenty types have no chain scope. Ten of them ride the table mesh --
-    /// `HELLO`, `CAPABILITIES`, `TABLE_CHAT`, `TABLE_LEAVE`, `TABLE_HEARING`,
-    /// `TABLE_CONTINUES`, `PLAYER_LIST`, the two lots of the seating draw
-    /// (`D-083`) and `DISPUTE` -- which contradicts `PROTOCOL.md`'s old prose
-    /// claim that `DISPUTE` is the only one. The §4.11 table is the normative
-    /// data and this follows it.
+    /// Fourteen types have no chain scope. Five of them ride the table mesh -
+    /// `HELLO`, `CAPABILITIES`, `PLAYER_LIST`, `TABLE_CHAT` and `DISPUTE` - which contradicts
+    /// `PROTOCOL.md`'s prose claim that `DISPUTE` is the only one. The §4.11
+    /// table is the normative data and this follows it.
     pub const fn chain_scope(self) -> u8 {
         use EventType::*;
         match self {
             Hello | Capabilities | LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence
             | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | TableLeave | TableHearing
-            | TableContinues | SearchPresence | JoinRequest | JoinAccept | JoinReject | PlayerList | RngCommit
-            | RngReveal | Dispute => 0,
+            | TableContinues | SearchPresence | JoinRequest | JoinAccept | JoinReject | PlayerList | Dispute => 0,
             _ => 1,
         }
     }
@@ -234,8 +226,7 @@ impl EventType {
             // Unchained: no stage at all.
             Hello | Capabilities | LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence
             | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | TableLeave | TableHearing
-            | TableContinues | SearchPresence | JoinRequest | JoinAccept | JoinReject | PlayerList | RngCommit
-            | RngReveal => StageKind::Unchained,
+            | TableContinues | SearchPresence | JoinRequest | JoinAccept | JoinReject | PlayerList => StageKind::Unchained,
 
             // Chained, but legal outside its stage.
             Dispute => StageKind::OutOfStage,
@@ -251,7 +242,7 @@ impl EventType {
             }
 
             // Every required emitter produces a byte-identical body.
-            TableReady | HandInit | DeckInit | DeckCommit | DealPrivate
+            TableReady | RngCommit | RngReveal | HandInit | DeckInit | DeckCommit | DealPrivate
             | BoardReveal | ShowdownReveal | ShowdownMuck | TimeoutCert | ReturnCert | StateHash | StateAck
             | HandComplete => StageKind::Collective,
         }
@@ -636,10 +627,8 @@ mod tests {
     #[test]
     fn a_version_this_build_does_not_speak_is_rejected() {
         let mut body = chained_body(EventType::ActionFold);
-        body.protocol_version = PROTOCOL_VERSION + 1;
-        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(PROTOCOL_VERSION + 1)));
-        body.protocol_version = PROTOCOL_VERSION - 1;
-        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(PROTOCOL_VERSION - 1)), "nor one it spoke before");
+        body.protocol_version = 2;
+        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(2)));
     }
 
     #[test]
@@ -781,10 +770,8 @@ mod tests {
             .into_iter()
             .filter(|t| t.chain_scope() == 0)
             .collect();
-        // `D-064`: and `SEARCH_PRESENCE`, the queue's word, is the eighteenth;
-        // `D-083`: the seating draw's two lots, words of a forming table, the
-        // nineteenth and twentieth.
-        assert_eq!(unchained.len(), 20, "got {unchained:?}");
+        // `D-064`: and `SEARCH_PRESENCE`, the queue's word, is the eighteenth.
+        assert_eq!(unchained.len(), 18, "got {unchained:?}");
 
         for t in unchained {
             assert!(!t.is_chained(), "{t}");
@@ -824,21 +811,13 @@ mod tests {
                 EventType::TableHearing,
                 EventType::TableContinues,
                 EventType::PlayerList,
-                EventType::RngCommit,
-                EventType::RngReveal,
                 EventType::Dispute
             ],
             "the set of unchained table-mesh types changed"
         );
-        // Only DISPUTE is out-of-stage; the others are simply unchained.
+        // Only DISPUTE is out-of-stage; the other three are simply unchained.
         assert_eq!(EventType::Dispute.stage_kind(), StageKind::OutOfStage);
-        for t in [
-            EventType::Hello,
-            EventType::Capabilities,
-            EventType::PlayerList,
-            EventType::RngCommit,
-            EventType::RngReveal,
-        ] {
+        for t in [EventType::Hello, EventType::Capabilities, EventType::PlayerList] {
             assert_eq!(t.stage_kind(), StageKind::Unchained, "{t}");
         }
     }

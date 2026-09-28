@@ -61,21 +61,6 @@ pub enum Domain {
     RngCommit,
     /// The combined seed from `RNG_REVEAL` (§4.4).
     RngBeacon,
-    /// `D-083`: the membership a round of the seating draw is for -- the table
-    /// and its members' keys (§4.4).
-    RngMembers,
-    /// `D-083`: what the seed says about the seating and the first button
-    /// (§4.4).
-    SeatDraw,
-    /// `D-083`: the sealed lots of one round, which every opening names (§4.4).
-    RngLots,
-    /// `D-083`: the whole draw as a roster carries it, which `TABLE_READY`
-    /// binds (§4.3).
-    RngDraw,
-    /// `D-083`: the order in which a table's seats succeed its founder
-    /// (`D-061`) and rank among its game's continuations (`D-062`) -- the table
-    /// and a seat's key, so that no player can choose its place by its key.
-    Succession,
     /// The `DECK_COMMIT` digest (§4.5).
     DeckCommit,
     /// The `ctx` byte string handed to the deck library (§4.5).
@@ -114,11 +99,6 @@ impl Domain {
             Domain::Roster => "p2p-poker v1 roster",
             Domain::RngCommit => "p2p-poker v1 rng-commit",
             Domain::RngBeacon => "p2p-poker v1 rng-beacon",
-            Domain::RngMembers => "p2p-poker v1 rng-members",
-            Domain::SeatDraw => "p2p-poker v1 seat-draw",
-            Domain::RngLots => "p2p-poker v1 rng-lots",
-            Domain::RngDraw => "p2p-poker v1 rng-draw",
-            Domain::Succession => "p2p-poker v1 succession",
             Domain::DeckCommit => "p2p-poker v1 deck-commit",
             Domain::DeckCtx => "p2p-poker v1 deck-ctx",
             Domain::Session => "p2p-poker v1 session",
@@ -133,7 +113,7 @@ impl Domain {
     }
 
     /// Every variant, so tests and audits can enumerate the register.
-    pub const ALL: [Domain; 23] = [
+    pub const ALL: [Domain; 18] = [
         Domain::Transcript,
         Domain::Stage,
         Domain::Genesis,
@@ -142,11 +122,6 @@ impl Domain {
         Domain::Roster,
         Domain::RngCommit,
         Domain::RngBeacon,
-        Domain::RngMembers,
-        Domain::SeatDraw,
-        Domain::RngLots,
-        Domain::RngDraw,
-        Domain::Succession,
         Domain::DeckCommit,
         Domain::DeckCtx,
         Domain::Session,

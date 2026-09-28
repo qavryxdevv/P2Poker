@@ -5,9 +5,6 @@
 //! defect between two well-tested halves has nowhere else to live.
 
 pub mod dealing;
-/// `D-083`: the seating draw -- who sits where and who holds the first button,
-/// from lots every member draws and nobody can choose.
-pub mod draw;
 pub mod hand;
 pub mod handwire;
 pub mod stage;

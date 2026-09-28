@@ -6,10 +6,10 @@
 //! two clients arrive at the **same `session_id`** — the value every subsequent
 //! hand's genesis contains.
 //!
-//! Everything here travels: the join RPC over `/p2p-poker/join/2` on a QUIC
-//! connection, and `PLAYER_LIST`, the seating draw's `RNG_COMMIT` and
-//! `RNG_REVEAL` (`D-083`) and `TABLE_READY` over the table's own GossipSub
-//! topic. Nothing is handed between the two `Formation` values in memory.
+//! Everything here travels: the join RPC over `/p2p-poker/join/1` on a QUIC
+//! connection, and `PLAYER_LIST` and `TABLE_READY` over the table's own
+//! GossipSub topic. Nothing is handed between the two `Formation` values in
+//! memory.
 //!
 //! # What this does not cover
 //!
@@ -104,37 +104,6 @@ fn ad(founder_app: [u8; 32], founder_peer: Vec<u8>) -> TableAd {
 /// does: by what it decodes as, not by what it hoped it would be.
 fn is_list(bytes: &[u8]) -> bool {
     joinwire::receive_player_list(bytes).is_ok()
-}
-
-/// A publish on the table's topic went out -- or was a word the other seat said
-/// first, carried on verbatim by this one (`D-083`), which GossipSub has already
-/// carried and refuses as a duplicate. Anything else is the topic without a peer.
-fn said(outcome: Result<gossipsub::MessageId, gossipsub::PublishError>) {
-    match outcome {
-        Ok(_) | Err(gossipsub::PublishError::Duplicate) => {}
-        Err(e) => panic!("the table topic has a peer on it: {e:?}"),
-    }
-}
-
-/// One frame off the table's topic, into a formation by the door its type
-/// names -- a roster, a ratification, or one of the seating draw's two words
-/// (`D-083`) -- and whatever the formation says in answer.
-fn route(f: &mut Formation, bytes: &[u8]) -> Vec<Vec<u8>> {
-    use p2p_poker::net::chained::peek;
-    use p2p_poker::protocol::messages::EventType;
-    let said = match peek(bytes, 65_536).map(|(k, _, _)| k) {
-        Ok(EventType::PlayerList) => f.on_player_list(bytes, NOW).expect("the founder's list holds"),
-        Ok(EventType::TableReady) => f.on_table_ready(bytes).unwrap_or_default(),
-        Ok(EventType::RngCommit) => f.on_lot(bytes, NOW, true).unwrap_or_default(),
-        Ok(EventType::RngReveal) => f.on_opening(bytes, NOW).unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    said.into_iter()
-        .filter_map(|s| match s {
-            Emit::Broadcast(b) => Some(b),
-            Emit::Reply(_) => None,
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -262,15 +231,12 @@ async fn run() -> ([u8; 32], [u8; 32]) {
                     }
                 }
                 // A founder hears its own proposal back from nobody, so
-                // anything arriving on the table topic is the other seat's:
-                // its lot, its opening, its ratification. The founder seals
-                // the lots and completes the draw in answer.
+                // anything arriving on the table topic is the other seat's
+                // ratification.
                 SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
                     gossipsub::Event::Message { message, .. },
-                )) => {
-                    for bytes in route(&mut founder, &message.data) {
-                        said(host.behaviour_mut().gossipsub.publish(topic.clone(), bytes));
-                    }
+                )) if !is_list(&message.data) => {
+                    let _ = founder.on_table_ready(&message.data);
                 }
                 _ => {}
             },
@@ -297,8 +263,21 @@ async fn run() -> ([u8; 32], [u8; 32]) {
                 SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
                     gossipsub::Event::Message { message, .. },
                 )) => {
-                    for bytes in route(&mut joiner, &message.data) {
-                        said(guest.behaviour_mut().gossipsub.publish(topic.clone(), bytes));
+                    if is_list(&message.data) {
+                        for send in joiner
+                            .on_player_list(&message.data, NOW)
+                            .expect("the founder's list holds")
+                        {
+                            if let Emit::Broadcast(bytes) = send {
+                                guest
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topic.clone(), bytes)
+                                    .expect("the table topic has a peer on it");
+                            }
+                        }
+                    } else {
+                        let _ = joiner.on_table_ready(&message.data);
                     }
                 }
                 _ => {}
@@ -316,9 +295,7 @@ async fn run() -> ([u8; 32], [u8; 32]) {
 }
 
 /// The founder's own seat is in the roster it proposes, and the joiner's is the
-/// one the founder gave it — not the one it asked for and not seat zero. Until
-/// the seating draw re-seats them both (`D-083`): these are the seats a player
-/// waits in.
+/// one the founder gave it — not the one it asked for and not seat zero.
 #[tokio::test]
 async fn the_two_seats_are_the_ones_the_founder_assigned() {
     // Formed in memory rather than over the wire: this is a question about the
