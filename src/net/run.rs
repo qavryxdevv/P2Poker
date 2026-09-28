@@ -1597,9 +1597,9 @@ struct TableRun {
     /// table in its group; a seat it has not heard in this sitting has none.
     founder_heard_last: std::collections::BTreeMap<u8, tokio::time::Instant>,
     /// `S1-JJ`: the table whose being set to start this client has tried to
-    /// keep on disk, and whether that write went through -- written once, tried
-    /// again while it fails, and a failure said once.
-    set_to_start_noted: Option<([u8; 32], bool)>,
+    /// keep on disk, whether that write went through, and when it was tried --
+    /// written once, tried again a minute after a failure, a failure said once.
+    set_to_start_noted: Option<([u8; 32], bool, tokio::time::Instant)>,
     /// `D-060`: when the founder last said the roster again to a seat that spoke
     /// of an older one.
     roster_resaid: Option<tokio::time::Instant>,
@@ -10287,20 +10287,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // took a roster below the minimum as short. Only where the
                             // minimum is above two (at two, `D-044`'s floor is the minimum,
                             // and the search's tables would crowd the few kept out); a write
-                            // that fails is tried again at the next tick, and said once.
+                            // that fails is tried again a minute later, and said once.
                             if f.set_to_start()
                                 && f.ad().min_players_to_start > 2
-                                && !t.set_to_start_noted.is_some_and(|(k, kept)| k == f.table_id() && kept)
+                                && !t.set_to_start_noted.is_some_and(|(k, kept, at)| k == f.table_id() && (kept || at.elapsed() < std::time::Duration::from_secs(60)))
                             {
                                 match crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms) {
-                                    Ok(()) => t.set_to_start_noted = Some((f.table_id(), true)),
+                                    Ok(()) => t.set_to_start_noted = Some((f.table_id(), true, now_tick)),
                                     Err(e) => {
-                                        if t.set_to_start_noted.map(|(k, _)| k) != Some(f.table_id()) {
+                                        if t.set_to_start_noted.map(|(k, _, _)| k) != Some(f.table_id()) {
                                             note_failed = Some(format!(
-                                                "could not keep on disk that this table was set to start ({e}); tried again at every tick"
+                                                "could not keep on disk that this table was set to start ({e}); tried again every minute"
                                             ));
                                         }
-                                        t.set_to_start_noted = Some((f.table_id(), false));
+                                        t.set_to_start_noted = Some((f.table_id(), false, now_tick));
                                     }
                                 }
                             }
@@ -21012,7 +21012,7 @@ mod a_joiner_before_the_first_hand {
         assert!(
             code.contains("if f.set_to_start()\n                                && f.ad().min_players_to_start > 2")
                 && code.contains("match crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms) {")
-                && code.contains("Ok(()) => t.set_to_start_noted = Some((f.table_id(), true)),"),
+                && code.contains("Ok(()) => t.set_to_start_noted = Some((f.table_id(), true, now_tick)),"),
             "kept the moment it is known, where the minimum is above two, and marked kept only once written"
         );
         let join = code.find("NodeCommand::JoinTable { key, buyin, seat, password } => {").expect("the join arm");
