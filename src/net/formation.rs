@@ -1346,6 +1346,22 @@ impl Formation {
         self.ratified.keys().copied().collect()
     }
 
+    /// `D-044`, `S1-JJ`: whether this client knows its table was set to start --
+    /// a roster at the advert's minimum was adopted here, or it was told so
+    /// (`with_set_to_start`, `with_recorded_ratification`).
+    pub fn set_to_start(&self) -> bool {
+        self.started
+    }
+
+    /// `S1-JJ`: a formation for a table this client knows was set to start --
+    /// kept on disk the moment it learnt it (`storage::set_to_start`), so that a
+    /// client restarted before its table was set does not take a roster below
+    /// the minimum as short.
+    pub fn with_set_to_start(mut self) -> Self {
+        self.started = true;
+        self
+    }
+
     /// This client's ratification of the roster it holds, from seat `seat`.
     fn ratify(&mut self, seat: u8, now_ms: u64) -> Result<Vec<Send>, Failed> {
         // `S1-CR`: a seat that restarted says the ratification it recorded,
@@ -3068,6 +3084,86 @@ mod tests {
             back.on_table_ready(bytes).expect("a ratification holds");
         }
         assert_eq!(back.session(), Some(session), "the table's session, and no other");
+    }
+
+    /// `S1-JJ`: a table that starts at three, set with three, gives a seat back
+    /// before its first hand; the client of one that remains restarts before it
+    /// has said it is ready to the roster of two -- no session record yet. Built
+    /// knowing the table was set to start (kept on disk, `storage::set_to_start`)
+    /// it ratifies that roster and the table of two sets; built afresh it took
+    /// the roster as short and said nothing.
+    #[test]
+    fn a_seat_restarted_before_the_set_below_the_minimum_ratifies_knowing_it_was_set_to_start() {
+        let (mut t, _, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (mut j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap();
+            let out = t.founder.on_join_request(&request, &peer(n), false, NOW).expect("seated");
+            deliver(&mut t, &mut j, out, table_id, NOW);
+            t.joiners.push(j);
+        }
+        assert!(t.joiners[0].set_to_start(), "it adopted the roster of three");
+        // Seat 3 is given back; seat 2's client restarts before the roster of
+        // two reaches it.
+        t.founder
+            .release_seat_before_the_first_hand(&peer(3), NOW + 1_000)
+            .expect("given back");
+        let fresh = |seed: u8| {
+            Formation::join(
+                key(2),
+                a.clone(),
+                hash,
+                table_id,
+                peer(2),
+                "player 2".into(),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW + 2_000,
+                None,
+            )
+            .unwrap()
+            .0
+        };
+        let said = t.founder.say_again(NOW + 2_000);
+        let list = said.iter().find(|b| joinwire::receive_player_list(b).is_ok()).expect("the roster of two").clone();
+
+        let mut afresh = fresh(20);
+        assert!(!afresh.set_to_start());
+        assert!(afresh.on_player_list(&list, NOW + 2_000).expect("the list holds").is_empty(), "short: nothing said");
+
+        let mut back = fresh(21).with_set_to_start();
+        let mine: Vec<Vec<u8>> = back
+            .on_player_list(&list, NOW + 2_000)
+            .expect("the list holds")
+            .into_iter()
+            .filter_map(|s| match s {
+                Send::Broadcast(b) => Some(b),
+                Send::Reply(_) => None,
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "it says it is ready to the roster of two");
+        t.founder.on_table_ready(&mine[0]).expect("the founder takes it");
+        for b in said.iter().filter(|b| joinwire::receive_player_list(b).is_err()) {
+            back.on_table_ready(b).expect("a ratification holds");
+        }
+        assert!(t.founder.session().is_some(), "the table of two is set");
+        assert_eq!(back.session(), t.founder.session(), "on one session");
     }
 
     /// `D-044`, the owner's ruling: a table set to start goes on with the seats

@@ -1596,6 +1596,9 @@ struct TableRun {
     /// `S1-JF`: at the founder, when it last heard each seat of its forming
     /// table in its group; a seat it has not heard in this sitting has none.
     founder_heard_last: std::collections::BTreeMap<u8, tokio::time::Instant>,
+    /// `S1-JJ`: the table whose being set to start this client has kept on
+    /// disk, so that it is written once.
+    set_to_start_noted: Option<[u8; 32]>,
     /// `D-060`: when the founder last said the roster again to a seat that spoke
     /// of an older one.
     roster_resaid: Option<tokio::time::Instant>,
@@ -1921,6 +1924,7 @@ impl TableRun {
             founder_unheard_since: std::collections::BTreeMap::new(),
             founder_line_lost: std::collections::BTreeSet::new(),
             founder_heard_last: std::collections::BTreeMap::new(),
+            set_to_start_noted: None,
             roster_resaid: None,
             founder_gone: None,
             continues_heard: std::collections::BTreeMap::new(),
@@ -4180,6 +4184,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.founder_unheard_since.clear();
             $t.founder_line_lost.clear();
             $t.founder_heard_last.clear();
+            $t.set_to_start_noted = None;
             $t.roster_resaid = None;
             $t.founder_gone = None;
             $t.continues_heard.clear();
@@ -8441,6 +8446,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     Some(r) => f.with_recorded_ratification(r.ratification.clone()),
                                     None => f,
                                 };
+                                // `S1-JJ`: a table this client already knew was set to
+                                // start -- kept on disk, for a restart before the set.
+                                if crate::storage::set_to_start::was(&profile_dir, &key, now) {
+                                    f = f.with_set_to_start();
+                                }
                                 // `D-060`: a seat says it is ready once it hears every
                                 // seat -- not one coming back to a table already set.
                                 f.hold_ratification(t.tox_sink.is_on_tox() && !t.resuming);
@@ -10241,6 +10251,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             for e in f.roster().seats() {
                                 t.roster_keys_seen.insert(e.app_public_key, e.seat);
+                            }
+                            // `S1-JJ`: the moment this client learns its table was set to
+                            // start, it keeps that on disk -- restarted before the set, it
+                            // took a roster below the minimum as short.
+                            if f.set_to_start() && t.set_to_start_noted != Some(f.table_id()) {
+                                let _ = crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms);
+                                t.set_to_start_noted = Some(f.table_id());
                             }
                             // `D-062`: the table this seat first sat at, and every key its
                             // rosters seat -- what its continuations are read against.
@@ -20932,6 +20949,29 @@ mod a_joiner_before_the_first_hand {
         t.group_timeouts.clear();
         t.tox_down_at = Some(now);
         assert!(own_line_suspect(&t), "the library said offline a moment ago");
+    }
+
+    /// `S1-JJ`: a client keeps on disk that its table was set to start the moment
+    /// it learns it, and a formation it builds to join that table again knows
+    /// it -- a restart before the set took a roster below the minimum as short.
+    #[test]
+    fn a_table_set_to_start_is_kept_on_disk_and_read_back_on_joining_it() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert!(
+            code.contains("if f.set_to_start() && t.set_to_start_noted != Some(f.table_id()) {")
+                && code.contains("crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms)"),
+            "kept once, the moment it is known"
+        );
+        let join = code.find("NodeCommand::JoinTable { key, buyin, seat, password } => {").expect("the join arm");
+        let built = join + code[join..].find("Formation::join(").expect("it builds a formation");
+        let held = built + code[built..].find("f.hold_ratification(").expect("and holds it");
+        let read_back = &code[built..held];
+        assert!(
+            read_back.contains("crate::storage::set_to_start::was(&profile_dir, &key, now)")
+                && read_back.contains("f = f.with_set_to_start();"),
+            "read back for the table being joined, before the formation is used"
+        );
     }
 
     /// `S1-JL`: a seat that busted and stays to watch had its record written
