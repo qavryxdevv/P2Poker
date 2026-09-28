@@ -2276,17 +2276,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         };
         ($t:ident, $hand_id:expr, $terminal:expr, $stack:expr, $kept:expr) => {{
             let kept: Option<[u8; 32]> = $kept;
-            // `S1-JL`: never a record with no chips, whichever road writes it --
-            // a hand's boundary, the deck stage's card material (`D-033`), the
-            // set. A seat that busted has nothing to come back to, and one that
-            // stayed to watch had its record written back with 0 at the next
-            // hand's deck stage.
-            let with_chips = $stack > 0;
             // `D-037`: the founder's record too -- its own table, advert and
             // hash, with the table key's seed and its last signed roster, so
             // that it can come back as the founder. A seat that joined records
             // what it joined under.
-            let who = $t.table.as_ref().filter(|_| with_chips).and_then(|f| {
+            let who = $t.table.as_ref().and_then(|f| {
                 if f.is_founder() {
                     Some((f.table_id(), f.ad().clone(), f.advert_hash(), f))
                 } else {
@@ -2979,7 +2973,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // the next tick, which a stop at the deal beat by a
                                 // second (`run110811-2`).
                                 let material = $h.secret().and_then(|s| {
-                                    if $t.material_recorded == Some($h.hand_id()) {
+                                    // `S1-JL`: only for a seat dealt into the hand. One
+                                    // that busted and watches on has no cards to keep,
+                                    // and its record came back here with no chips.
+                                    if $t.material_recorded == Some($h.hand_id()) || !$h.dealt_in().contains(&$h.my_seat()) {
                                         return None;
                                     }
                                     Some(($h.hand_id(), $h.stack_at_boundary($h.my_seat()), s.keep()))
@@ -11319,7 +11316,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // hand can take it up again and play it out.
                     let material = t.hand.as_ref().and_then(|h| {
                         let s = h.secret()?;
-                        if t.material_recorded == Some(h.hand_id()) {
+                        // `S1-JL`: only for a seat dealt into the hand, as above.
+                        if t.material_recorded == Some(h.hand_id()) || !h.dealt_in().contains(&h.my_seat()) {
                             return None;
                         }
                         let stack = h.stack_at_boundary(h.my_seat());
@@ -21087,14 +21085,19 @@ mod a_joiner_before_the_first_hand {
             1,
             "the boundary writes its record in one place"
         );
-        // Nor does any other road: the deck stage's card material (`D-033`)
-        // wrote the busted seat's record back with 0 until the macro refused it.
-        let mac = code.find("macro_rules! remember_session {").expect("the macro");
-        let body = &code[mac..mac + 3_000];
-        assert!(
-            body.contains("let with_chips = $stack > 0;") && body.contains(".filter(|_| with_chips)"),
-            "no road writes a record with no chips"
+        // Nor does the deck stage's card material (`D-033`), which wrote the
+        // busted watcher's record back with 0: it is written only for a seat
+        // dealt into the hand, at both its roads. (Not a refusal of every 0 in
+        // `remember_session!`: at a table with a hole in its seat numbers a seat
+        // with chips reads 0 there, `S1-JN`, and its record would have gone.)
+        assert_eq!(
+            code.matches("|| !$h.dealt_in().contains(&$h.my_seat())").count()
+                + code.matches("|| !h.dealt_in().contains(&h.my_seat())").count(),
+            2,
+            "the card material for a seat dealt in, at both roads"
         );
+        let mac = code.find("macro_rules! remember_session {").expect("the macro");
+        assert!(!code[mac..mac + 3_000].contains("with_chips"), "and the macro writes what it is given");
         let at = code.find("match at_the_boundary(stack, h.checkpoint8().is_some() || h.late_settled()) {").expect("decided by the rule, late settlements settled");
         let write = code.find("remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);").expect("the write");
         assert!(at < write && write - at < 2_000, "and only on the rule's word");
