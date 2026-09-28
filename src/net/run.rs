@@ -12903,20 +12903,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // after an abort, and reading it here forgot the session at every
                     // aborted boundary (`run193358-3`).
                     let stack = h.stack_at_boundary(me);
-                    if stack == 0 && h.checkpoint8().is_some() {
-                        // `S1-JK`: this table's record -- the key `remember_session!`
-                        // files it under -- and not another slot's.
-                        let own_key = t.table.as_ref().and_then(|f| if f.is_founder() { Some(f.table_id()) } else { t.joined_key });
-                        let _ = match own_key {
-                            Some(k) => crate::storage::session::forget_the_record_of(&profile_dir, &k),
-                            None => crate::storage::session::forget(&profile_dir),
-                        };
-                        t.resume = None;
-                        let _ = events
-                            .send(NodeEvent::Warning(format!("hand #{}: seat {me} busted; the session record is forgotten", h.hand_id())))
-                            .await;
-                    } else {
-                        remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);
+                    match at_the_boundary(stack, h.checkpoint8().is_some()) {
+                        AtTheBoundary::Forget => {
+                            // `S1-JK`: this table's record -- the key `remember_session!`
+                            // files it under -- and not another slot's.
+                            let own_key = t.table.as_ref().and_then(|f| if f.is_founder() { Some(f.table_id()) } else { t.joined_key });
+                            let _ = match own_key {
+                                Some(k) => crate::storage::session::forget_the_record_of(&profile_dir, &k),
+                                None => crate::storage::session::forget(&profile_dir),
+                            };
+                            t.resume = None;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("hand #{}: seat {me} busted; the session record is forgotten", h.hand_id())))
+                                .await;
+                        }
+                        AtTheBoundary::Nothing => {}
+                        AtTheBoundary::Write => {
+                            remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);
+                        }
                     }
                 }
                 // `S1-CR`: a resumed client still outside the roster derives
@@ -14172,6 +14176,33 @@ const OWN_LINE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 /// the new table's replaces it.
 fn end_the_rejoin_for_a_new_table(t: &mut TableRun) {
     t.resuming = false;
+}
+
+/// `S1-CR`, `S1-JL`: what a hand's boundary does with this seat's session record.
+#[derive(Debug, PartialEq, Eq)]
+enum AtTheBoundary {
+    /// A seat that busted at a boundary the table settled: nothing to come back to.
+    Forget,
+    /// A seat with no chips at a boundary the table aborted: one that busted
+    /// before and watches on. Nothing is written -- the record it forgot then
+    /// stays forgotten.
+    Nothing,
+    /// A seat with chips: the record, with the boundary's stack.
+    Write,
+}
+
+/// `S1-JL`: a record is never written with a boundary stack of 0. A boundary the
+/// table aborted has no checkpoint 8, and a seat that had busted and stayed to
+/// watch had its record written back there with no chips -- so a client that
+/// stopped before the next settled boundary was offered a rejoin of a table
+/// where it held nothing. After an abort a seat's boundary stack is its stack
+/// before the hand, so 0 there is a seat that busted before.
+fn at_the_boundary(stack: crate::poker::state::Chips, settled: bool) -> AtTheBoundary {
+    match (stack, settled) {
+        (0, true) => AtTheBoundary::Forget,
+        (0, false) => AtTheBoundary::Nothing,
+        _ => AtTheBoundary::Write,
+    }
 }
 
 /// `S1-JK`: forget the session record a slot resumes from -- that one, and not
@@ -20901,6 +20932,30 @@ mod a_joiner_before_the_first_hand {
         t.group_timeouts.clear();
         t.tox_down_at = Some(now);
         assert!(own_line_suspect(&t), "the library said offline a moment ago");
+    }
+
+    /// `S1-JL`: a seat that busted and stays to watch had its record written
+    /// back, with no chips, at the next boundary its table aborted -- no
+    /// checkpoint 8 there to forget it by. A record is never written with a
+    /// boundary stack of 0; a settled boundary forgets it, an aborted one
+    /// writes nothing.
+    #[test]
+    fn a_record_is_never_written_with_no_chips() {
+        assert_eq!(at_the_boundary(0, true), AtTheBoundary::Forget, "busted at a settled boundary");
+        assert_eq!(at_the_boundary(0, false), AtTheBoundary::Nothing, "watching, at a boundary the table aborted");
+        assert_eq!(at_the_boundary(1, false), AtTheBoundary::Write, "an aborted hand's stacks are the stacks before it");
+        assert_eq!(at_the_boundary(1_200, true), AtTheBoundary::Write);
+
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert_eq!(
+            code.matches("remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);").count(),
+            1,
+            "the boundary writes its record in one place"
+        );
+        let at = code.find("match at_the_boundary(stack, h.checkpoint8().is_some()) {").expect("decided by the rule");
+        let write = code.find("remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);").expect("the write");
+        assert!(at < write && write - at < 2_000, "and only on the rule's word");
     }
 
     /// `S1-JH`: a rejoin from the session record that found nobody left the
