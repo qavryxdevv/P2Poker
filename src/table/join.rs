@@ -133,6 +133,10 @@ pub enum RejectReason {
     /// again in the last minutes; the founder seats it again after
     /// `retry_after_ms`, and seats every other key at once.
     TooSoon = 10,
+    /// `D-083`: this key was given back for holding the table's seating draw up
+    /// -- its sealed lot or its opening did not come in time -- and is not seated
+    /// at this table again while it forms.
+    HeldTheDrawUp = 11,
 }
 
 impl RejectReason {
@@ -165,6 +169,7 @@ pub fn refusal_words(code: u16) -> &'static str {
         8 => "already seated",
         9 => "this seat was removed after its fourth absence; the game at this table is over for good (D-047)",
         10 => "this client sat down at this table and left it -- or lost the seat -- too often in a short time; the founder seats it again a little later",
+        11 => "this client was given back for holding the table's seating draw up -- its sealed lot or its opening did not come in time -- and is not seated there again (D-083)",
         _ => "no reason this client understands",
     }
 }
@@ -202,7 +207,14 @@ impl JoinedUnder {
 /// The founder's admission check for a `JOIN_REQUEST`.
 ///
 /// `connection_peer_id` is what the transport authenticated, and `roster` is what
-/// the founder has seated so far.
+/// the founder has seated so far. `assigned` is the seat the founder must give
+/// this player -- a member of a completed seating draw coming back takes the
+/// seat the draw gave it (`D-083`) -- and `None` is the lowest free seat.
+///
+/// **`requested_seat` is not read** (`D-083`, `S1-AD`): a player that names
+/// its own seat can sit beside a partner for a whole tournament, and the seats
+/// are the draw's to decide. The field stays on the wire, absent from this
+/// client.
 pub fn admit_join(
     req: &JoinRequest,
     sender_public_key: &[u8; 32],
@@ -210,6 +222,7 @@ pub fn admit_join(
     under: &JoinedUnder,
     roster: &Roster,
     password: Option<&[u8]>,
+    assigned: Option<u8>,
 ) -> Result<SeatEntry, JoinRefused> {
     if req.advert_hash != under.advert_hash {
         return Err(JoinRefused::UnknownAdvert);
@@ -247,7 +260,7 @@ pub fn admit_join(
         return Err(JoinRefused::AlreadySeated);
     }
 
-    let seat = match req.requested_seat {
+    let seat = match assigned {
         Some(s) => {
             if s >= under.ad.max_players || roster.seats().iter().any(|e| e.seat == s) {
                 return Err(JoinRefused::SeatUnavailable { seat: s });
@@ -255,7 +268,8 @@ pub fn admit_join(
             s
         }
         // `U7` leaves the founder's rule undefined. Lowest free is deterministic,
-        // which is the only kind a joiner could ever check.
+        // which is the only kind a joiner could ever check -- and since `D-083`
+        // it is only where a player waits for the draw, which seats everybody.
         None => roster
             .lowest_free_seat(under.ad.max_players)
             .ok_or(JoinRefused::TableFull)?,
@@ -296,6 +310,12 @@ pub struct JoinAccept {
     /// signature instead of trusting a gossip copy or the founder's word.
     pub advert_event: Vec<u8>,
     pub roster_so_far: Vec<SeatEntry>,
+    /// `D-083`: the serial of the roster `roster_so_far` is -- the field
+    /// `PROTOCOL.md` §4.3's own box asked for, taken with protocol major 2. A
+    /// joiner takes the roster of an acceptance only when it is newer than the
+    /// one it holds: a reply measured ten seconds behind the lists would
+    /// otherwise put back a seating the draw has since changed.
+    pub list_serial: u64,
 }
 
 /// Why a joiner will not act on an acceptance.
@@ -398,6 +418,15 @@ pub struct PlayerList {
     /// Strictly increasing per table. The anti-replay for a message that is not
     /// yet in a hash chain.
     pub list_serial: u64,
+    /// `D-044`, carried since `D-083`: the founder's word that a roster at the
+    /// advert's minimum was adopted here once -- the table was set to start, so
+    /// a roster may now be ratified down to two seats. It was each client's own
+    /// memory, and a player sitting down after seats were given back held a
+    /// floor the table had left behind and never ratified.
+    pub started: bool,
+    /// `D-083`: the seating draw of this roster's members, from the moment the
+    /// founder seals their lots; absent before. See [`crate::table::draw`].
+    pub draw: Option<crate::table::draw::DrawWire>,
 }
 
 /// Why a player list is not accepted.
@@ -454,6 +483,10 @@ pub struct TableReady {
     pub table_params_hash: Hash,
     pub my_seat: u8,
     pub capability_set: Vec<Vec<u8>>,
+    /// `D-083`: the digest of the draw the ratified roster carried
+    /// ([`crate::table::draw::draw_digest`]), so the session -- which is a hash
+    /// over every ratification -- binds the seating and the first button too.
+    pub draw: Hash,
 }
 
 /// Why a ratification is not accepted.
@@ -476,6 +509,9 @@ pub enum ReadyRefused {
     /// A founder could ratify a two-seat roster for a table advertised as
     /// needing ten.
     TooFewToStart { seated: usize, need: u8 },
+    /// `D-083`: a ratification of another draw than the one this client holds
+    /// for the roster -- or of a roster this client holds no complete draw for.
+    DrawMismatch,
 }
 
 /// The check on somebody else's `TABLE_READY`.
@@ -486,6 +522,7 @@ pub fn admit_ready(
     list_serial: u64,
     under: &JoinedUnder,
     floor: usize,
+    draw: Option<&Hash>,
 ) -> Result<(), ReadyRefused> {
     // `TABLE_READY` is where a proposal becomes a fact, and it is therefore the
     // one place `min_players_to_start` can be enforced. Nothing enforced it.
@@ -518,6 +555,11 @@ pub fn admit_ready(
     }
     if ready.roster_hash != roster.hash_at_zero() {
         return Err(ReadyRefused::RosterMismatch);
+    }
+    // `D-083`: a table is set only on a complete draw that fits its roster, and
+    // every seat's ratification names the same one.
+    if draw != Some(&ready.draw) {
+        return Err(ReadyRefused::DrawMismatch);
     }
     Ok(())
 }
@@ -599,14 +641,24 @@ mod tests {
         Roster::form(entries, &ad(), false).unwrap()
     }
 
+    /// A ratification's draw digest, in these tests where no draw is run.
+    const DRAW: Hash = [0x5D; 32];
+
+    /// `D-083`, `S1-AD`: a player that names its seat is seated where the rules
+    /// say, not where it asked -- the lowest free seat, which the seating draw
+    /// then re-seats with everybody else.
     #[test]
-    fn an_ordinary_request_is_seated() {
+    fn an_ordinary_request_is_seated_and_its_asked_for_seat_is_not_read() {
         let u = under();
         let req = request(1, 1, Some(2));
-        let e = admit_join(&req, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None)
+        let e = admit_join(&req, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None, None)
             .expect("a legal request");
-        assert_eq!(e.seat, 2);
+        assert_eq!(e.seat, 0, "the lowest free seat, whatever it asked for");
         assert_eq!(e.buyin, 500);
+        // A member of a complete draw coming back is given the seat the draw
+        // gave it, by the founder and not by its own asking.
+        let back = admit_join(&req, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None, Some(4)).unwrap();
+        assert_eq!(back.seat, 4);
     }
 
     /// `U7` has no founder rule, so this one is deterministic — the only kind a
@@ -628,7 +680,7 @@ mod tests {
             &[1u8; 12],
             &u,
             &roster,
-            None,
+            None, None,
         )
         .unwrap();
         assert_eq!(e.seat, 1);
@@ -643,11 +695,11 @@ mod tests {
         let req = request(1, 1, Some(0));
 
         assert_eq!(
-            admit_join(&req, &[2u8; 32], &[1u8; 12], &u, &empty_roster(), None),
+            admit_join(&req, &[2u8; 32], &[1u8; 12], &u, &empty_roster(), None, None),
             Err(JoinRefused::KeyIsNotTheSender)
         );
         assert_eq!(
-            admit_join(&req, &[1u8; 32], &[2u8; 12], &u, &empty_roster(), None),
+            admit_join(&req, &[1u8; 32], &[2u8; 12], &u, &empty_roster(), None, None),
             Err(JoinRefused::PeerIdIsNotTheConnection)
         );
     }
@@ -671,7 +723,7 @@ mod tests {
                 &[1u8; 12],
                 &u,
                 &roster,
-                None
+                None, None
             ),
             Err(JoinRefused::AlreadySeated)
         );
@@ -696,7 +748,7 @@ mod tests {
                 &[1u8; 12],
                 &u,
                 &roster,
-                None
+                None, None
             ),
             Err(JoinRefused::AlreadySeated)
         );
@@ -713,27 +765,21 @@ mod tests {
             buyin: 500,
             tox_key: None,
         }]);
+        // The seat the founder assigns -- a draw member's own, coming back --
+        // must be free and on the table.
         assert_eq!(
-            admit_join(
-                &request(1, 1, Some(3)),
-                &[1u8; 32],
-                &[1u8; 12],
-                &u,
-                &roster,
-                None
-            ),
+            admit_join(&request(1, 1, None), &[1u8; 32], &[1u8; 12], &u, &roster, None, Some(3)),
             Err(JoinRefused::SeatUnavailable { seat: 3 })
         );
         assert_eq!(
-            admit_join(
-                &request(1, 1, Some(9)),
-                &[1u8; 32],
-                &[1u8; 12],
-                &u,
-                &roster,
-                None
-            ),
+            admit_join(&request(1, 1, None), &[1u8; 32], &[1u8; 12], &u, &roster, None, Some(9)),
             Err(JoinRefused::SeatUnavailable { seat: 9 })
+        );
+        // A seat the player asks for itself decides nothing: taken or not, the
+        // lowest free seat is given.
+        assert_eq!(
+            admit_join(&request(1, 1, Some(3)), &[1u8; 32], &[1u8; 12], &u, &roster, None, None).map(|e| e.seat),
+            Ok(0)
         );
     }
 
@@ -757,7 +803,7 @@ mod tests {
                 &[1u8; 12],
                 &u,
                 &seated(full),
-                None
+                None, None
             ),
             Err(JoinRefused::TableFull)
         );
@@ -771,7 +817,7 @@ mod tests {
         let mut req = request(1, 1, Some(0));
         req.buyin = 10;
         assert!(matches!(
-            admit_join(&req, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None),
+            admit_join(&req, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None, None),
             Err(JoinRefused::Seat(_))
         ));
     }
@@ -793,7 +839,7 @@ mod tests {
             &[1u8; 12],
             &u,
             &empty_roster(),
-            Some(secret)
+            Some(secret), None
         )
         .is_ok());
 
@@ -807,7 +853,7 @@ mod tests {
                 &[1u8; 12],
                 &u,
                 &empty_roster(),
-                Some(secret)
+                Some(secret), None
             ),
             Err(JoinRefused::BadPassword)
         );
@@ -820,7 +866,7 @@ mod tests {
                 &[1u8; 12],
                 &u,
                 &empty_roster(),
-                Some(secret)
+                Some(secret), None
             ),
             Err(JoinRefused::BadPassword)
         );
@@ -836,7 +882,7 @@ mod tests {
                 &[1u8; 12],
                 &open,
                 &empty_roster(),
-                None
+                None, None
             ),
             Err(JoinRefused::BadPassword)
         );
@@ -860,7 +906,7 @@ mod tests {
                 &[1u8; 12],
                 &u,
                 &empty_roster(),
-                Some(secret)
+                Some(secret), None
             ),
             Err(JoinRefused::BadPassword)
         );
@@ -872,14 +918,14 @@ mod tests {
         let mut req = request(1, 1, Some(0));
         req.table_id = [0xCC; 32];
         assert_eq!(
-            admit_join(&req, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None),
+            admit_join(&req, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None, None),
             Err(JoinRefused::WrongTable)
         );
 
         let mut other = request(1, 1, Some(0));
         other.advert_hash = [0xCC; 32];
         assert_eq!(
-            admit_join(&other, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None),
+            admit_join(&other, &[1u8; 32], &[1u8; 12], &u, &empty_roster(), None, None),
             Err(JoinRefused::UnknownAdvert)
         );
     }
@@ -892,6 +938,7 @@ mod tests {
             seat,
             advert_event: Vec::new(),
             roster_so_far: roster,
+            list_serial: 1,
         }
     }
 
@@ -1061,6 +1108,8 @@ mod tests {
             roster: two(),
             table_params_hash: u.params,
             list_serial: 5,
+            started: false,
+            draw: None,
         };
         assert!(admit_list(&list, &[0xBB; 32], None, &u).is_ok());
         assert!(admit_list(&list, &[0xBB; 32], Some(4), &u).is_ok());
@@ -1079,6 +1128,8 @@ mod tests {
             roster: two(),
             table_params_hash: [0xEE; 32],
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         assert_eq!(
             admit_list(&list, &[0xBB; 32], None, &u),
@@ -1093,6 +1144,8 @@ mod tests {
             roster: two(),
             table_params_hash: u.params,
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         assert_eq!(
             admit_list(&list, &[0xCC; 32], None, &u),
@@ -1110,8 +1163,9 @@ mod tests {
             table_params_hash: u.params,
             my_seat: 1,
             capability_set: vec![b"nlhe/2-6".to_vec()],
+            draw: DRAW,
         };
-        assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize), Ok(()));
+        assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize, Some(&DRAW)), Ok(()));
     }
 
 
@@ -1160,14 +1214,15 @@ mod tests {
             table_params_hash: u.params,
             my_seat: 1,
             capability_set: Vec::new(),
+            draw: DRAW,
         };
         assert_eq!(
-            admit_ready(&ready, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
+            admit_ready(&ready, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize, Some(&DRAW)),
             Err(ReadyRefused::TooFewToStart { seated: 2, need: 4 })
         );
         // `D-044`: once the table was set to start, the caller's floor is two
         // and the same two seats ratify.
-        assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u, 2), Ok(()));
+        assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u, 2, Some(&DRAW)), Ok(()));
     }
 
     /// Every way a ratification can fail to be about the same table, one at a
@@ -1183,25 +1238,26 @@ mod tests {
             table_params_hash: u.params,
             my_seat: 1,
             capability_set: Vec::new(),
+            draw: DRAW,
         };
 
         // Not at that seat.
         let mut wrong_seat = good.clone();
         wrong_seat.my_seat = 0;
         assert_eq!(
-            admit_ready(&wrong_seat, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
+            admit_ready(&wrong_seat, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize, Some(&DRAW)),
             Err(ReadyRefused::NotAtThatSeat { seat: 0 })
         );
 
         // Not in the roster at all.
         assert_eq!(
-            admit_ready(&good, &[7u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
+            admit_ready(&good, &[7u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize, Some(&DRAW)),
             Err(ReadyRefused::NotAtThatSeat { seat: 1 })
         );
 
         // A different list.
         assert_eq!(
-            admit_ready(&good, &[1u8; 32], &roster, 8, &u, u.ad.min_players_to_start as usize),
+            admit_ready(&good, &[1u8; 32], &roster, 8, &u, u.ad.min_players_to_start as usize, Some(&DRAW)),
             Err(ReadyRefused::WrongList { got: 7, held: 8 })
         );
 
@@ -1209,7 +1265,7 @@ mod tests {
         let mut wrong_params = good.clone();
         wrong_params.table_params_hash = [0xEE; 32];
         assert_eq!(
-            admit_ready(&wrong_params, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
+            admit_ready(&wrong_params, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize, Some(&DRAW)),
             Err(ReadyRefused::ParametersMismatch)
         );
 
@@ -1217,7 +1273,7 @@ mod tests {
         let mut wrong_roster = good;
         wrong_roster.roster_hash = [0xEE; 32];
         assert_eq!(
-            admit_ready(&wrong_roster, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
+            admit_ready(&wrong_roster, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize, Some(&DRAW)),
             Err(ReadyRefused::RosterMismatch)
         );
     }

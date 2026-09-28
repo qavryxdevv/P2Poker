@@ -357,7 +357,7 @@ mod tests {
     fn a_chained_event_survives_its_own_slot() {
         let k = key(3);
         let wire = seal(
-            EventType::RngCommit,
+            EventType::TableReady,
             &slot(),
             &probe(),
             &k,
@@ -366,7 +366,7 @@ mod tests {
             JOIN_RESP_MAX,
         )
         .unwrap();
-        let o = open(&wire, JOIN_RESP_MAX, EventType::RngCommit, &slot()).unwrap();
+        let o = open(&wire, JOIN_RESP_MAX, EventType::TableReady, &slot()).unwrap();
         assert_eq!(o.sender, k.verifying_key().to_bytes());
         assert_eq!(payload::<Probe>(&o, JOIN_RESP_MAX).unwrap(), probe());
     }
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn an_event_of_another_slot_is_refused() {
         let wire = seal(
-            EventType::RngCommit,
+            EventType::TableReady,
             &slot(),
             &probe(),
             &key(3),
@@ -421,7 +421,7 @@ mod tests {
         ];
         for (what, wrong) in elsewhere {
             assert!(
-                open(&wire, JOIN_RESP_MAX, EventType::RngCommit, &wrong).is_err(),
+                open(&wire, JOIN_RESP_MAX, EventType::TableReady, &wrong).is_err(),
                 "an event from {what} was taken"
             );
         }
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn a_type_is_not_interchangeable() {
         let wire = seal(
-            EventType::RngCommit,
+            EventType::TableReady,
             &slot(),
             &probe(),
             &key(3),
@@ -442,7 +442,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            open(&wire, JOIN_RESP_MAX, EventType::RngReveal, &slot()).err(),
+            open(&wire, JOIN_RESP_MAX, EventType::HandInit, &slot()).err(),
             Some(WireError::WrongType)
         );
     }
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn a_single_altered_byte_is_refused() {
         let wire = seal(
-            EventType::RngCommit,
+            EventType::TableReady,
             &slot(),
             &probe(),
             &key(3),
@@ -464,7 +464,7 @@ mod tests {
         for i in 0..wire.len() {
             let mut bad = wire.clone();
             bad[i] ^= 0x01;
-            if open(&bad, JOIN_RESP_MAX, EventType::RngCommit, &slot()).is_err() {
+            if open(&bad, JOIN_RESP_MAX, EventType::TableReady, &slot()).is_err() {
                 refused += 1;
             }
         }
@@ -473,13 +473,17 @@ mod tests {
 
     /// An unchained type cannot be sealed here. The four join messages are
     /// unchained precisely so they enter nothing, and a sealer that would put
-    /// one in a stage slot would undo that.
+    /// one in a stage slot would undo that -- and since `D-083` so are the two
+    /// lots of the seating draw, which a forming table says before it has a
+    /// chain to put them in.
     #[test]
     fn an_unchained_type_cannot_be_chained() {
         for kind in [
             EventType::JoinRequest,
             EventType::JoinAccept,
             EventType::LobbyTableAd,
+            EventType::RngCommit,
+            EventType::RngReveal,
         ] {
             assert!(
                 seal(kind, &slot(), &probe(), &key(3), NOW, 0, JOIN_RESP_MAX).is_err(),
@@ -510,7 +514,7 @@ mod tests {
             vec![0x82, 0x40, 0x40],
             (0..255u8).collect::<Vec<u8>>(),
         ] {
-            let _ = open(&bytes, JOIN_RESP_MAX, EventType::RngCommit, &slot());
+            let _ = open(&bytes, JOIN_RESP_MAX, EventType::TableReady, &slot());
         }
     }
 }

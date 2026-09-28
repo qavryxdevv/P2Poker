@@ -19,7 +19,7 @@ Specification of the transport and discovery layer of `p2p-poker`.
 > infohash or a `SocketAddrV4` says in the same breath that it is history.
 >
 > What the client does: `net::run::lobby_namespace` provides and looks up
-> `sha2-256("p2p-poker/main-lobby/v1")` on the public IPFS Kademlia
+> `sha2-256("p2p-poker/main-lobby/v2")` on the public IPFS Kademlia
 > (`/ipfs/kad/1.0.0`), and `relay_namespace` does the same for
 > `sha2-256("/libp2p/relay")`, both keyed the way go-libp2p's routing discovery
 > keys a namespace (§3.2). A provider record carries whatever multiaddrs a node
@@ -1021,7 +1021,7 @@ recomputable meeting place.
 Two namespaces, and the key each becomes:
 
 ```
-lobby namespace = ASCII("p2p-poker/main-lobby/v1")
+lobby namespace = ASCII("p2p-poker/main-lobby/v2")
 relay namespace = ASCII("/libp2p/relay")          -- go-libp2p's own
 
 key(ns) = 0x12 || 0x20 || SHA-256(ns)             -- 34 bytes
@@ -1037,7 +1037,7 @@ The published values, and `the_lobby_rendezvous_key_is_the_published_one` pins
 them:
 
 ```
-lobby  12207e342925602a7c6558d6ac574207bcc56f7989e17ad52b7694f2c964d772c4b6
+lobby  122010ff86e6a7b7c62abd79a9c00a863630417d412bc0c5f1f124185730057de280   (protocol major 2, D-083; 12207e3429... under main-lobby/v1)
 relay  1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f3ef52c452a369e6ef7b610
 ```
 
@@ -1048,7 +1048,7 @@ others' addresses, after which table advertisements travel over GossipSub exactl
 as §6 describes.
 
 A lobby cut into slices (`S1-EX`) adds one key per slice it listens to,
-`p2p-poker/main-lobby/v1/<slice>`, derived the same way: the peers of a slice
+`p2p-poker/main-lobby/v2/<slice>`, derived the same way: the peers of a slice
 provide and look up that key, so the slice's GossipSub mesh has connected peers
 to form from. The slice strings and depths are `PROTOCOL.md` §1.1's; at depth
 zero there are no slices and only the lobby key above is used.
@@ -1056,7 +1056,7 @@ zero there are no slices and only the lobby key above is used.
 **And one key for every hour of the clock (`D-070`)**, derived the same way:
 
 ```
-hour namespace  = ASCII("p2p-poker/main-lobby/v1/hour/" || decimal(n))
+hour namespace  = ASCII("p2p-poker/main-lobby/v2/hour/" || decimal(n))
 n               = floor(Unix time in seconds / 3600)
 
 hour 494000  12203d1090829c32d410fe8d89a9e211ed600d696b9650ea4216739698e23ba923be
@@ -1195,7 +1195,7 @@ price §3.3 says is worth paying — but the user is the one paying it.
   addresses and asserts which reach the inner behaviour.
 
 * **The same connections announce what this software is.** `identify` sends
-  `protocol_version = "/p2p-poker/1"` and `agent_version = "p2p-poker/<version>"`
+  `protocol_version = "/p2p-poker/2"` and `agent_version = "p2p-poker/<version>"`
   to every peer it speaks to on the public DHT. Under Mainline the client was one
   more KRPC speaker among millions and looked like a BitTorrent node. Here it
   **says what it is, by name, to every stranger it meets**, whether or not that
@@ -1354,7 +1354,7 @@ price §3.3 says is worth paying — but the user is the one paying it.
 5. `SPEC_CS.md` §3's own words remain the test: *"Nic z toho není důvod k
    centrálnímu serveru, ale hráč to má vědět."*
 
-An epoch-rotating **namespace** (`"p2p-poker/main-lobby/v1" ‖ floor(day)`) is the
+An epoch-rotating **namespace** (`"p2p-poker/main-lobby/v2" ‖ floor(day)`) is the
 same trade as the epoch-rotating infohash was, plus one new cost this mechanism
 adds: with a 48-hour record TTL the previous day's key stays populated for two
 more days, so rotation blunts a historical crawl far less than it looks. Still
@@ -1613,7 +1613,7 @@ which is a case this project explicitly cares about.
 | Input | What actually happens | Cost | Handling |
 |---|---|---|---|
 | **A real BitTorrent client** squatting on the port, or any non-libp2p listener | **cannot happen any more.** The dial names a `PeerId` and the addresses come from a libp2p DHT record, so a non-libp2p listener is not in the candidate set at all | none | this row is kept because the *lobby key is still public* and anything may provide it — but what it provides is a libp2p peer, and that is the row below. |
-| **A libp2p node that is not a poker client** | the handshake succeeds and we get a proven `PeerId`, but `identify` reports a different protocol set | one connection | disconnect after `identify` unless the peer advertises `/p2p-poker/1`; never admit it to the D-002 relay admission set (§9.6). Both are decisions about *our own* sockets and uplink, not verdicts about the peer — no proof is involved, nothing is recorded against it, and it may reconnect (§0.2). |
+| **A libp2p node that is not a poker client** | the handshake succeeds and we get a proven `PeerId`, but `identify` reports a different protocol set | one connection | disconnect after `identify` unless the peer advertises `/p2p-poker/2`; never admit it to the D-002 relay admission set (§9.6). Both are decisions about *our own* sockets and uplink, not verdicts about the peer — no proof is involved, nothing is recorded against it, and it may reconnect (§0.2). |
 | **Stale entry** — the provider went offline (its record outlives it, §10.1), or the addresses it published no longer answer | a dial that fails, at once or at the handshake timeout | one dial slot | expected and normal. Bounded budget (§11.2); a provider that did not answer is tried again after a cooldown, never in a storm. |
 | ~~**Wrong-port entry** — a NATed peer announced a port that is not its external port~~ | **cannot happen any more**: a provider record carries addresses, not a chosen port (§4.4) | — | kept for the record. It was a Mainline row, self-healing on that peer's next announce cycle; the nearest case today is an address that went stale, which is the row above. |
 | **Attacker provides the lobby key with a third party's addresses** (reflection) | the dial names the attacker's `PeerId` and uses the addresses the attacker published, so we send a QUIC Initial / TCP SYN to an innocent host, whose handshake fails because it does not hold that key | small packet, no amplification beyond one handshake attempt per address per dial | bounded dial budget per answer, a cooldown before the same provider is dialled again, deduplication by `PeerId` (§4.3), and §4.5's filter, which refuses private and reserved addresses but not a public victim. No per-IP dial limit exists (§11.2). This is inherent to any DHT whose records carry self-asserted addresses — the provider record as much as the BEP 5 announce it replaced (§4.1). We reduce our contribution; we cannot remove it. |
@@ -1929,7 +1929,7 @@ Two behaviours, and only one of them runs:
 * **`ipfs_kad`** — the public Amino DHT, the same network Kubo and go-libp2p are
   on. It is what `start_providing` and `get_providers` are called against, and
   it is the lobby. §3 specifies the key.
-* **`kademlia`** — a private table under `/p2p-poker/kad/1` (`swarm::PokerBehaviour::kademlia`). It
+* **`kademlia`** — a private table under `/p2p-poker/kad/2` (`swarm::PokerBehaviour::kademlia`). It
   is constructed and **never driven**: no `set_mode`, no query, no record. It
   costs a behaviour slot and does nothing, and this document says so rather than
   leaving a reader to infer a design from a field name.
@@ -2051,7 +2051,7 @@ us into thousands of junk topics.
 > `0.49.5` (`src/subscription_filter.rs:169-170` in both); a peer over the cap has
 > its whole subscription message ignored. A whitelist over two names would now be
 > wrong as well as unbuilt: the lobby's slice topics (`S1-EX`,
-> `/p2p-poker/lobby/1/<slice>`) are topics of ours it would refuse.
+> `/p2p-poker/lobby/2/<slice>`) are topics of ours it would refuse.
 
 > Verification: [COMPILED+RUN] the whole builder chain plus `subscribe` on both
 > topics in `probe-netstack`; [RESEARCH+SOURCE] `LIBP2P.md` §6 for the defaults and
@@ -2238,7 +2238,7 @@ safety margin.
 ### 7.2 Who is asked, and how many
 
 * **K = 4** peers, with a floor of 2 usable responses to consider the snapshot done.
-* Chosen from peers that have completed `identify` and advertise `/p2p-poker/1`.
+* Chosen from peers that have completed `identify` and advertise `/p2p-poker/2`.
 * Prefer peers in **distinct IPv4 /24 prefixes** and, where known, discovered from
   **different DHT responders** — a cheap and partial defence against being handed
   four Sybils by one flooder. **Neither half is implemented, and the first can no
@@ -2390,7 +2390,7 @@ describe a transport that was never built.** `D-019` put a formed table's traffi
 a Tox group instead, and `PROTOCOL.md` §1.4 now names both carriers of the table
 mesh and their framing: the table's Tox group, with `table::fragment`'s 8-byte
 header under the signed envelope, and the table's own GossipSub topic
-`/p2p-poker/table/<table_id>/1`, which carries formation and, where a table has no
+`/p2p-poker/table/<table_id>/2`, which carries formation and, where a table has no
 group, its hands. `TABLE_PROTOCOL` is declared and has no reader, and
 `src/net/streams.rs` holds no code. Building the stream now would undo what `D-019`
 was bought for: a per-table libp2p mesh is `n(n−1)/2` circuits, each under a public
@@ -2983,7 +2983,7 @@ it: admit by **`identify` protocol name**, or by **lobby presence**?
 
 **Decision: admit by `identify` protocol name, with escalation by lobby presence.**
 
-* **Tier A — admitted.** The peer's `identify` response lists `/p2p-poker/1`. It
+* **Tier A — admitted.** The peer's `identify` response lists `/p2p-poker/2`. It
   gets a reservation and is refused a **third** concurrent live circuit, plus a
   per-peer byte ceiling well below the global one.
 * **Tier B — escalated.** The peer has additionally been seen publishing a
@@ -3041,7 +3041,7 @@ question — *can a never-before-seen CGNAT peer obtain a reservation at all?* �
 answered **yes**, deliberately.
 
 The trade-off, stated plainly: **an `identify` protocol name is self-asserted and
-free to forge.** Anyone can run a libp2p node that advertises `/p2p-poker/1` and be
+free to forge.** Anyone can run a libp2p node that advertises `/p2p-poker/2` and be
 relayed. So the ACL is **not a security boundary**; it is a *scope limiter*. What
 actually bounds abuse is the resource ceiling — total reservations, per-peer
 circuits, per-peer and global byte and bandwidth caps, and the default rate
@@ -3531,7 +3531,7 @@ A player pinned to client mode is still **findable**: a provider record is held
 by the `k` closest server nodes, not by the announcer. What client mode costs is
 this node's contribution to everyone else's lookups.
 
-The second, private behaviour (`/p2p-poker/kad/1`, `swarm::PokerBehaviour::kademlia`) is
+The second, private behaviour (`/p2p-poker/kad/2`, `swarm::PokerBehaviour::kademlia`) is
 constructed and never driven — no `set_mode`, no query — so it sits at the
 constructor default and does nothing at all.
 

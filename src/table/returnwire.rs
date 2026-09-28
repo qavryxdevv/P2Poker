@@ -86,14 +86,16 @@ impl ReturnVote {
 pub struct ReturnCert {
     #[cbor(n(0), with = "minicbor::bytes")]
     pub subject_digest: Hash,
-    /// The signed `RETURN_VOTE`s, one per voter, ascending by seat.
-    #[n(1)]
+    /// The signed `RETURN_VOTE`s, one per voter, ascending by seat. Byte
+    /// strings since protocol major 2, like every signed event another carries
+    /// (`S1-AO`), and so are the two below.
+    #[cbor(n(1), with = "crate::protocol::serialization::byte_strings")]
     pub votes: Vec<Vec<u8>>,
     /// The subject's signed `PLAYER_SIT_IN`, sealed in the boundary window.
-    #[n(2)]
+    #[cbor(n(2), with = "minicbor::bytes")]
     pub request: Vec<u8>,
     /// The subject's signed checkpoint-8 `STATE_HASH`.
-    #[n(3)]
+    #[cbor(n(3), with = "minicbor::bytes")]
     pub checkpoint: Vec<u8>,
 }
 

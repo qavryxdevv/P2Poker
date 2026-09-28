@@ -26,6 +26,9 @@ pub mod reannounce;
 pub mod relay;
 pub mod shard;
 pub mod run;
+/// `D-083`: the seating draw of one forming table, as one client runs it --
+/// and what a member refuses of the founder's rosters.
+pub mod seating;
 pub mod snapshot;
 pub mod streams;
 pub mod swarm;

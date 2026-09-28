@@ -306,6 +306,12 @@ param(
     # `-NoAnswerNodes <list>` (D-065 off, for a contrast run): those nodes answer no
     # vote with the frame it asks for. Node numbers, comma-separated, or `all`.
     [string]$NoAnswerNodes = '',
+    # `-NoLotNodes <list>` / `-NoOpeningNodes <list>` (D-083's bed): those joiners
+    # stay at the table and give the seating draw nothing -- never their sealed
+    # lot, or never its opening. Node numbers, comma-separated; the founder (n0)
+    # is never one. Needs `--features fault-harness`; the node's log says so.
+    [string]$NoLotNodes = '',
+    [string]$NoOpeningNodes = '',
     # `-DeafToNode <n> -DeafToSeat <seat> -DeafToAt <s> -DeafToFor <s>` (D-065's
     # bed): node n hears nothing the member at table seat <seat> delivers itself
     # for that window -- counted from the process's start -- and everything the
@@ -370,6 +376,9 @@ $stayList = @("$StayNodes" -split '[,\s]+' | Where-Object { $_ -ne '' })
 $noVoteList = @("$NoVoteNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 # Not `$noAnswerNodes` nor `$offlineNodes`: the same trap twice.
 $noAnswerList = @("$NoAnswerNodes" -split '[,\s]+' | Where-Object { $_ -ne '' })
+# And not `$noLotNodes` nor `$noOpeningNodes`.
+$noLotList = @("$NoLotNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+$noOpeningList = @("$NoOpeningNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 $offList = @("$OfflineNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 # Not `$hostSeats`: PowerShell variable names are case-insensitive and that
 # would BE the parameter.
@@ -560,16 +569,19 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
     $staysForNode = ($stayList -contains 'all') -or ($stayList -contains "$i")
     $noVoteForNode = ($noVoteList -contains $i)
+    # `D-083`: a joiner that gives the draw no lot, or no opening; never n0.
+    $withholdForNode = if ($i -eq 0) { '' } elseif ($noLotList -contains $i) { 'lot' } elseif ($noOpeningList -contains $i) { 'opening' } else { '' }
     # **A cast in argument mode is a string.** `-ArgumentList ..., [bool]$x` handed
     # the job the text "[bool]False", which is true: from S1-FY on every node got
     # P2P_POKER_STAYS, every mute was on-turn, every stranger flooded and every
     # return sat out (found by -NoVote reaching all five nodes, S1-AQ,
     # 2026-09-18). In parentheses it is an expression and a bool.
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode), ([bool]$noAnswerForNode), $deafToForNode -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote, $noAnswer, $deafTo)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode), ([bool]$noAnswerForNode), $deafToForNode, $withholdForNode -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote, $noAnswer, $deafTo, $withhold)
         if ($stays) { $env:P2P_POKER_STAYS = '1' }
         if ($noVote) { $env:P2P_POKER_NO_VOTE = '1' }
         if ($noAnswer) { $env:P2P_POKER_NO_ANSWER = '1' }
+        if ($withhold) { $env:P2P_POKER_NO_LOT = "$withhold" }
         if ($deafTo) {
             $deafParts = "$deafTo" -split ','
             $env:P2P_POKER_DEAF_TO_SEAT = $deafParts[0]
@@ -700,6 +712,12 @@ if ($noVoteList.Count -gt 0) {
 }
 if ($noAnswerList.Count -gt 0) {
     Write-Host "==> $(if ($noAnswerList -contains 'all') { 'every node' } else { 'n' + ($noAnswerList -join ', n') }) answer(s) no vote with the frame it lacks (D-065 off, a contrast run; needs --features fault-harness)"
+}
+if ($noLotList.Count -gt 0) {
+    Write-Host "==> n$($noLotList -join ', n') stay(s) at the table and give(s) the seating draw no sealed lot (D-083; needs --features fault-harness)"
+}
+if ($noOpeningList.Count -gt 0) {
+    Write-Host "==> n$($noOpeningList -join ', n') stay(s) at the table and never open(s) the sealed lot (D-083; needs --features fault-harness)"
 }
 if ($DeafToFor -gt 0) {
     Write-Host "==> n$DeafToNode hears nothing seat $DeafToSeat's member delivers itself from $DeafToAt s for $DeafToFor s, and what the others say again (D-065's bed; needs --features fault-harness)"

@@ -299,7 +299,9 @@ fn the_join_family_enforces_section_9_3s_own_caps() {
         ("JOIN_REQUEST", JOIN_REQUEST_MAX, 512usize),
         ("JOIN_ACCEPT", JOIN_ACCEPT_MAX, 8_192),
         ("JOIN_REJECT", JOIN_REJECT_MAX, 128),
-        ("PLAYER_LIST", PLAYER_LIST_MAX, 2_048),
+        // 2 048 until protocol major 2 put the seating draw in the roster
+        // (`D-083`); §9.3 says 12 288 and why.
+        ("PLAYER_LIST", PLAYER_LIST_MAX, 12_288),
         ("TABLE_READY", TABLE_READY_MAX, 1_536),
     ] {
         assert_eq!(code, published, "{name}'s cap is §9.3's");

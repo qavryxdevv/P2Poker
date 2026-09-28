@@ -635,6 +635,41 @@ impl Seat {
     pub fn playing(&self, now_ms: u64) -> bool {
         self.session.is_some() && !self.deaf(now_ms)
     }
+
+    /// `D-083`: the roster's keys as they are now, and where each seat's player
+    /// sits now when some player moved -- the seating draw re-seats a table
+    /// before it is set. `None` when nobody moved; a seat whose player is no
+    /// longer at the table maps to nowhere.
+    pub fn take_keys(
+        &mut self,
+        keys: std::collections::BTreeMap<u8, [u8; 32]>,
+    ) -> Option<std::collections::BTreeMap<u8, Option<u8>>> {
+        let old = std::mem::replace(&mut self.keys, keys);
+        let moved = old
+            .iter()
+            .any(|(seat, k)| self.keys.get(seat) != Some(k) && self.keys.values().any(|n| n == k));
+        moved.then(|| {
+            old.iter()
+                .map(|(seat, k)| (*seat, self.keys.iter().find(|(_, n)| *n == k).map(|(s, _)| *s)))
+                .collect()
+        })
+    }
+}
+
+/// `D-083`: the readings of a set of seats, moved with their players. A reading
+/// of a seat whose player left, or of a seat no player was known at, goes: kept
+/// at its number, it would be pinned on whoever the draw put there.
+fn reseat_set(from: &std::collections::BTreeSet<u8>, to: &std::collections::BTreeMap<u8, Option<u8>>) -> std::collections::BTreeSet<u8> {
+    from.iter().filter_map(|s| to.get(s).copied().flatten()).collect()
+}
+
+/// `D-083`: the readings kept by seat, moved with their players, on the same
+/// terms as [`reseat_set`].
+fn reseat_map<V: Clone>(
+    from: &std::collections::BTreeMap<u8, V>,
+    to: &std::collections::BTreeMap<u8, Option<u8>>,
+) -> std::collections::BTreeMap<u8, V> {
+    from.iter().filter_map(|(s, v)| to.get(s).copied().flatten().map(|n| (n, v.clone()))).collect()
 }
 
 /// Where this client is sitting, as the panes read it.
@@ -2144,7 +2179,30 @@ impl AppState {
                 }
             }
             NodeEvent::RosterKeys { key, keys } => {
-                self.table(key).keys = keys.into_iter().collect();
+                // `D-083`: where a player sits at another seat than before -- the
+                // seating draw's -- everything the window keeps by seat number
+                // moves with the player: a mute, a line of chat or a player's link
+                // would otherwise stay on the chair and be pinned on whoever sits
+                // in it now. A seat whose player left takes its readings with it.
+                if let Some(to) = self.table(key).take_keys(keys.into_iter().collect()) {
+                    self.muted = reseat_set(&self.muted, &to);
+                    self.certified = reseat_set(&self.certified, &to);
+                    self.gone = reseat_set(&self.gone, &to);
+                    self.left_for_good = reseat_set(&self.left_for_good, &to);
+                    self.away = reseat_set(&self.away, &to);
+                    self.links = reseat_map(&self.links, &to);
+                    self.waits = reseat_map(&self.waits, &to);
+                    // A line of a player that left goes with the player: its mute
+                    // went, and at its old number it would read as the new
+                    // occupant's.
+                    self.table_chat.retain_mut(|line| match to.get(&line.seat).copied().flatten() {
+                        Some(n) => {
+                            line.seat = n;
+                            true
+                        }
+                        None => false,
+                    });
+                }
             }
             NodeEvent::SeatActed {
                 hand_id,
@@ -3944,6 +4002,28 @@ mod tests {
         }
     }
 
+    /// `D-083`: the seating draw moves players between seat numbers before the
+    /// table is set, and what the window keeps by seat number goes with the
+    /// player, not with the chair -- a mute pinned on whoever sat down in it
+    /// next would silence the wrong player.
+    #[test]
+    fn a_player_the_draw_moves_takes_the_windows_readings_along() {
+        let mut s = AppState::new();
+        let key = [7u8; 32];
+        s.apply(NodeEvent::Hosting { key });
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        s.apply(NodeEvent::RosterKeys { key, keys: vec![(0, a), (1, b), (2, c)] });
+        s.muted.insert(1);
+        s.table_chat.push_back(TableLine { seat: 2, who: "c".into(), said: "hi".into() });
+        // The draw: b to seat 0, c to seat 1, a to seat 2.
+        s.apply(NodeEvent::RosterKeys { key, keys: vec![(0, b), (1, c), (2, a)] });
+        assert_eq!(s.muted, [0u8].into_iter().collect(), "the mute follows b to seat 0");
+        assert_eq!(s.table_chat.back().map(|l| l.seat), Some(1), "c's line follows c to seat 1");
+        // The same roster said again moves nothing.
+        s.apply(NodeEvent::RosterKeys { key, keys: vec![(0, b), (1, c), (2, a)] });
+        assert_eq!(s.muted, [0u8].into_iter().collect());
+    }
+
     /// A record for another table replaces this one rather than merging into
     /// it. Two tables' rosters in one record is two tables nobody is at.
     #[test]
@@ -4005,12 +4085,13 @@ mod tests {
     /// player nothing at all.
     #[test]
     fn every_reason_code_has_words() {
-        // `D-047`: code 9 is the seat out for good; `S1-GR`: 10, too soon.
-        for code in 1..=10u16 {
+        // `D-047`: code 9 is the seat out for good; `S1-GR`: 10, too soon;
+        // `D-083`: 11, the seating draw held up.
+        for code in 1..=11u16 {
             assert_ne!(refusal(code), "no reason this client understands");
         }
         assert_eq!(refusal(0), "no reason this client understands");
-        assert_eq!(refusal(11), "no reason this client understands");
+        assert_eq!(refusal(12), "no reason this client understands");
     }
 
     /// `S1-IY`: the count is the node's reading, whatever else arrives.

@@ -18,13 +18,12 @@
 //! function of the state before it (`PROTOCOL.md` §4.3), which is exactly why
 //! nobody has a veto over the hand starting.
 //!
-//! # What it does not do yet, said plainly
+//! # What it does not do, said plainly
 //!
-//! * The **RNG beacon** (`RNG_COMMIT` / `RNG_REVEAL`, §7.9) that decides the
-//!   seat permutation and the initial button. Until it exists,
-//!   [`provisional_button`] stands in: deterministic, agreed by everybody,
-//!   and **not** the normative rule. It is one function so the beacon replaces
-//!   it in one place.
+//! * Decide the first button. The seating draw of a forming table does
+//!   (`D-083`, [`crate::table::draw`]) and hands it over in
+//!   [`Opening::from_formation`]; the provisional button read off `session_id`,
+//!   which the last seat to ratify could steer (`S1-B`), is gone.
 //! * Everything after stage 0: the deck, the shuffle chain, the betting. The
 //!   slot for stage 1 is computed and handed back, which is where that work
 //!   starts.
@@ -164,11 +163,16 @@ pub enum Failed {
     /// that reason - a client that reported it as a peer's fault would be
     /// naming somebody who did nothing.
     Unsound { index: u8, what: &'static str },
+    /// `D-083`: a first hand opened with no button -- the seating draw decides
+    /// it, and a table is set only on a complete draw, so this is an opening
+    /// built by hand without one.
+    NoButton,
 }
 
 impl std::fmt::Display for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NoButton => f.write_str("the first hand has no button: the seating draw is not complete"),
             Self::Wire(e) => write!(f, "{e:?}"),
             Self::NotAtThisTable => f.write_str("that is not a seat at this table"),
             Self::NotInThisStage => f.write_str("that seat may not speak in this stage"),
@@ -326,12 +330,12 @@ pub struct Opening {
     /// `TIMEOUT_CERT` (D-015), so a seat that goes quiet in a betting stage is
     /// answered by its own client folding for it, and by nothing else.
     pub action_timeout_ms: u32,
-    /// Where the button sits, when a previous hand decided it.
+    /// Where the button sits.
     ///
-    /// `None` only for the **first** hand of a table, where nothing has decided
-    /// it yet and `provisional_button` stands in until the RNG beacon of §7.9
-    /// exists. From hand two onwards it is the dead-button rotation's answer,
-    /// and re-rolling it from `session_id` would move the button backwards.
+    /// For the **first** hand of a table it is the seating draw's (`D-083`),
+    /// from [`Opening::from_formation`]; from hand two onwards it is the
+    /// dead-button rotation's answer. `None` is an opening built without either,
+    /// and opens no hand ([`Failed::NoButton`]).
     pub button: Option<SeatIdx>,
 }
 
@@ -384,8 +388,11 @@ impl Opening {
             present_run: vec![0; usize::from(ad.max_players)],
             returns: vec![0; usize::from(ad.max_players)],
             out: Vec::new(),
-            // The first hand of a table: nothing has decided the button yet.
-            button: None,
+            // `D-083`: the first hand's button is the seating draw's, which
+            // nobody can choose -- it was read off `session_id`, which the last
+            // seat to ratify could re-sign until it came out as it liked
+            // (`S1-B`). A table is set only on a complete draw.
+            button: Some(f.first_button()?),
         })
     }
 
@@ -567,6 +574,9 @@ impl Opening {
         if f.my_seat().is_none() {
             return Some("this client holds no seat in the roster it has");
         }
+        if f.first_button().is_none() {
+            return Some("the table has no complete seating draw for the roster it has");
+        }
         None
     }
 }
@@ -647,10 +657,12 @@ pub const ENVELOPE_MAX: usize = 384;
 /// the catalogue later must be classified here rather than admitted at
 /// `FRAME_CAP` by an arm nobody revisited.
 ///
-/// **Four types fall back to `FRAME_CAP` and it is stated rather than hidden:**
-/// `RngCommit`, `RngReveal`, `Dispute` and `StateAck` publish no payload cap
-/// anywhere in this tree. They are charged what they are charged today, which is
-/// no worse, and the day one of them gets a cap this function is where it lands.
+/// **Two types fall back to `FRAME_CAP` and it is stated rather than hidden:**
+/// `Dispute` and `StateAck` publish no payload cap anywhere in this tree. They
+/// are charged what they are charged today, which is no worse, and the day one
+/// of them gets a cap this function is where it lands. `RngCommit` and
+/// `RngReveal` stood here too; since `D-083` they are a forming table's words,
+/// not chained, and never reach a hold queue.
 ///
 /// **The three `PLAYER_*` boundary types were the fifth and are not any more.**
 /// They stood here because `S1-BZ` recorded that the state machine answered them
@@ -685,11 +697,8 @@ pub fn frame_ceiling(kind: EventType) -> usize {
         EventType::PlayerSitOut | EventType::PlayerSitIn | EventType::PlayerLeave => {
             crate::table::seatwire::BOUNDARY_EVENT_CAP
         }
-        // The four with no published cap, and the reason is in the doc above.
-        EventType::RngCommit
-        | EventType::RngReveal
-        | EventType::Dispute
-        | EventType::StateAck => return FRAME_CAP,
+        // The two with no published cap, and the reason is in the doc above.
+        EventType::Dispute | EventType::StateAck => return FRAME_CAP,
         // Not chained, so they never reach a hold queue; and an unknown type
         // is refused by `check_envelope` long before this.
         EventType::Hello
@@ -709,6 +718,8 @@ pub fn frame_ceiling(kind: EventType) -> usize {
         | EventType::JoinAccept
         | EventType::JoinReject
         | EventType::PlayerList
+        | EventType::RngCommit
+        | EventType::RngReveal
         | EventType::TableReady => return FRAME_CAP,
     };
     // Never above what the frame decoder itself would accept: this may only
@@ -741,55 +752,6 @@ const STATE_HASH_CAP: usize = 512;
 /// every `open` still uses its own type's cap.
 const PEEK_CAP: usize = HAND_ABORT_CAP;
 const _: () = assert!(PEEK_CAP >= FRAME_CAP);
-
-/// Where the button sits, until the RNG beacon exists to decide it.
-///
-/// **Provisional and named as such.** `STATE_MACHINE.md` T10 gives this to the
-/// beacon of §7.9 — the seat permutation and the initial button are derived from
-/// a commit-and-reveal that no code in this project performs yet. Deriving it
-/// from `session_id` instead is deterministic and agreed by every peer, which is
-/// all stage 0 needs to complete, and it is **not** the rule: a beacon exists so
-/// that no single seat's contribution decides the button, and `session_id` is a
-/// hash of the ratifications, which is not the same guarantee.
-///
-/// # And it is biasable by whoever ratifies last, which is worse than provisional
-///
-/// `session_id` is a hash over the ratifications' `event_hash`es (§4.3), and an
-/// event hash covers the whole signed envelope — including `emitted_at_unix_ms`,
-/// a number its emitter picks. `TABLE_READY` also carries `capability_set`, a
-/// list of byte strings the emitter controls outright. So the last seat to
-/// ratify can re-sign its own with a different timestamp, recompute
-/// `session_id`, and stop when the button lands where it wants.
-///
-/// `the_last_seat_to_ratify_can_choose_the_button` measures it: **under a
-/// hundred hashes** to choose any seat at a six-handed table. The dead-button
-/// rule makes that worth doing — the initial button fixes who posts which blind
-/// in hand one and who acts last, and every later button is a rotation of it.
-///
-/// This is exactly what §4.4's commit-and-reveal beacon exists to stop, and the
-/// reason this function is documented as *not the rule* rather than as a
-/// simplification. **What blocks replacing it is not the beacon**: `RNG_COMMIT`,
-/// `RNG_REVEAL` and `seed` are fully specified. It is that no document says how
-/// to get a button out of the seed — `PROTOCOL.md` §4.4 says the rule is in
-/// `STATE_MACHINE.md`, §7.9 says the constructions are `PROTOCOL.md`'s and that
-/// the engine computes neither value, and T10 points at §7.9. A citation cycle
-/// with nothing at the centre.
-///
-/// One function, so replacing it is one change.
-pub fn provisional_button(session_id: &Hash, occupied: &[SeatIdx]) -> SeatIdx {
-    debug_assert!(!occupied.is_empty());
-    let pick = u64::from_be_bytes([
-        session_id[0],
-        session_id[1],
-        session_id[2],
-        session_id[3],
-        session_id[4],
-        session_id[5],
-        session_id[6],
-        session_id[7],
-    ]);
-    occupied[(pick % occupied.len() as u64) as usize]
-}
 
 /// The cap on a `DECK_INIT` body: a key and a proof, and nothing else.
 pub const DECK_INIT_CAP: usize = 256;
@@ -1198,9 +1160,10 @@ pub const TIMEOUT_VOTE_CAP: usize = 128;
 ///
 /// **It has to actually hold them, and at 4 096 it did not.** A sealed
 /// `TIMEOUT_VOTE` is 266 B, `MAX_SEATS - 1` of them are carried whole, and
-/// `TimeoutCert::votes` is a plain `Vec<Vec<u8>>` — no `minicbor::bytes`, so
-/// each vote encodes as a CBOR array of integers rather than a byte string and
-/// very nearly doubles. Nine votes plus the digest come to **4 699 B**.
+/// until protocol major 2 `TimeoutCert::votes` was a plain `Vec<Vec<u8>>` — no
+/// `minicbor::bytes`, so each vote encoded as a CBOR array of integers rather
+/// than a byte string and very nearly doubled. Nine votes plus the digest came
+/// to **4 699 B**.
 ///
 /// Nothing caught it because nothing ever built a large one:
 /// `tests/timeout_certificate.rs` is a thousand lines and every case in it
@@ -1222,20 +1185,24 @@ pub const TIMEOUT_VOTE_CAP: usize = 128;
 /// headroom. `tests/timeout_certificate_at_a_full_table.rs` pins the arithmetic
 /// at `MAX_SEATS - 1` so it cannot drift under again.
 ///
-/// The encoding itself is left alone deliberately. Annotating `votes` with
-/// `minicbor::bytes` would halve the certificate — worth having, because this
-/// message is sent precisely when the network is already struggling and a
-/// smaller body is fewer fragments to lose — but it changes the bytes on the
-/// wire, hence the event hash, hence everything chained from it. That is the
-/// owner's call, not a bug fix, and it is filed as one.
+/// The encoding was left alone then, deliberately, because it changes the
+/// bytes on the wire, hence the event hash, hence everything chained from it --
+/// the owner's call, filed as `S1-AO`. It was taken with protocol major 2
+/// (`D-083`): the votes and the leave words travel as byte strings
+/// (`serialization::byte_strings`), and the widest event a full table
+/// broadcasts -- nine votes and the digest -- measures **2 393 B**. This message
+/// is sent precisely when the network is already struggling, and a smaller body
+/// is fewer fragments to lose.
 ///
 /// D-036: a certificate names every seat quiet at one stage and carries a
 /// vote from every seat outside the set about each of them -- at its widest
 /// four named by six, twenty-four whole signed votes, 12 459 B as measured
-/// by `tests/timeout_certificate_at_a_full_table.rs`. `D-063`: with the seats
-/// that resigned needing no majority, five named by five is twenty-five votes
-/// and five signed words beside them. Under `FRAME_CAP` with the envelope
-/// beside it.
+/// by `tests/timeout_certificate_at_a_full_table.rs` before major 2 and about
+/// half that since. `D-063`: with the seats that resigned needing no majority,
+/// five named by five is twenty-five votes and five signed words beside them.
+/// The cap stays where it was: the widest certificate now fits it twice over,
+/// and lowering it would narrow what a receiver takes for nothing. Under
+/// `FRAME_CAP` with the envelope beside it.
 pub const TIMEOUT_CERT_CAP: usize = 15_360;
 
 pub use crate::protocol::constants::MAX_CONSECUTIVE_AUTO_ACTIONS;
@@ -2099,10 +2066,7 @@ impl Hand {
         let restoring = restore.is_some();
         let fold_only = matches!(restore, Some(None));
         let restored_secret = restore.flatten();
-        let occupied: Vec<SeatIdx> = o.seats.iter().map(|(s, _, _)| *s).collect();
-        let button = o
-            .button
-            .unwrap_or_else(|| provisional_button(&o.session_id, &occupied));
+        let button = o.button.ok_or(Failed::NoButton)?;
         // Keyed on **chips**, not on occupancy. A busted seat is still an
         // occupied seat, so "two seats at the table" and "two players with
         // chips" part company the moment somebody busts — and heads-up is a
@@ -11449,7 +11413,9 @@ mod tests {
             present_run: vec![0; 3],
             returns: vec![0; 3],
             out: Vec::new(),
-            button: None,
+            // `D-083`: the first button is the seating draw's; fixed here where the
+            // retired `provisional_button` put it, so the tests play as before.
+            button: Some(0),
         }
     }
 
@@ -11492,7 +11458,7 @@ mod tests {
             present_run: vec![0; 5],
             returns: vec![0; 5],
             out: Vec::new(),
-            button: None,
+            button: Some(1),
         }
     }
 
@@ -11588,7 +11554,7 @@ mod tests {
             present_run: vec![0; 3],
             returns: vec![0; 3],
             out: Vec::new(),
-            button: None,
+            button: Some(1),
         }
     }
 
@@ -11850,9 +11816,9 @@ mod tests {
     /// Two clients, heads-up, play the pre-flop round and the flop appears.
     ///
     /// The whole point of the loop is that it never says whose turn it is: it
-    /// asks. `provisional_button` picks the button from `session_id`, so which
-    /// seat is the small blind is not this test's business, and a test that
-    /// hard-coded it would pass for the wrong reason.
+    /// asks. The seating draw picks the button, so which seat is the small
+    /// blind is not this test's business, and a test that hard-coded it would
+    /// pass for the wrong reason.
     #[test]
     fn two_clients_bet_and_the_flop_opens() {
         let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
@@ -15367,91 +15333,6 @@ mod tests {
             wide[s] = true;
         }
         assert_eq!(at(8, wide, 3), (7, 0), "the ring wraps past the empty seats");
-    }
-
-    /// **The last seat to ratify can choose the button.**
-    ///
-    /// `provisional_button` reads `session_id`, and `session_id` is a hash over
-    /// the ratifications' `event_hash`es. An event hash covers the whole signed
-    /// envelope, and the envelope carries `emitted_at_unix_ms` — a number its
-    /// emitter picks. `TABLE_READY` also carries `capability_set`, a list of
-    /// byte strings the emitter controls outright.
-    ///
-    /// So a seat that ratifies last can re-sign its own `TABLE_READY` with a
-    /// different timestamp, recompute `session_id`, and stop when the button
-    /// lands where it wants. At a table of `m` seats it needs about `m`
-    /// attempts for a chosen seat, and a few hundred for a chosen seat with
-    /// confidence: milliseconds of work.
-    ///
-    /// This test does not attack the client — it computes the same function the
-    /// client does, over hashes an attacker can produce, and counts how few
-    /// tries it takes. What it demonstrates is that **the initial button is not
-    /// unbiased**, which is exactly what `PROTOCOL.md` §4.4's beacon exists to
-    /// fix and why `provisional_button` is documented as *not the rule*.
-    ///
-    /// The dead-button rule makes the initial button worth choosing: it fixes
-    /// who posts which blind in hand one and who acts last, and every later
-    /// button is a rotation of it.
-    #[test]
-    fn the_last_seat_to_ratify_can_choose_the_button() {
-        use crate::protocol::transcript::{session_id, Ratification};
-
-        let table_id = [1u8; 32];
-        let params = [2u8; 32];
-        let roster_zero = [3u8; 32];
-        let occupied: Vec<SeatIdx> = vec![0, 1, 2, 3, 4, 5];
-
-        // Two seats have ratified and their hashes are fixed. The third is the
-        // attacker's, and it varies only its own event hash - which is what
-        // re-signing with a different timestamp gives it.
-        let fixed = |seat: u8, b: u8| Ratification {
-            seat,
-            event_hash: [b; 32],
-        };
-
-        let tries_for = |want: SeatIdx| -> u32 {
-            for n in 0u32..10_000 {
-                let mut mine = [0u8; 32];
-                mine[..4].copy_from_slice(&n.to_be_bytes());
-                let rats = vec![fixed(0, 0xAA), fixed(1, 0xBB), Ratification { seat: 2, event_hash: mine }];
-                let sid = session_id(&table_id, &params, &roster_zero, &rats);
-                if provisional_button(&sid, &occupied) == want {
-                    return n + 1;
-                }
-            }
-            u32::MAX
-        };
-
-        // Every seat at the table is reachable, and cheaply.
-        for want in &occupied {
-            let tries = tries_for(*want);
-            assert!(
-                tries < 1_000,
-                "seat {want} took {tries} tries, which is still trivial but means \
-                 this test is measuring something other than what it thinks"
-            );
-        }
-
-        // And the cost of picking a specific one is what an attacker would
-        // actually pay: a handful of hashes.
-        let worst = occupied.iter().map(|w| tries_for(*w)).max().unwrap();
-        assert!(
-            worst < 100,
-            "choosing the button cost {worst} hashes, which is still nothing"
-        );
-    }
-
-    /// Every peer derives one button from one session, or stage 0 cannot
-    /// complete for anybody.
-    #[test]
-    fn the_provisional_button_is_the_same_for_everybody() {
-        let occupied = [0u8, 1, 2, 5];
-        let session = [7u8; 32];
-        assert_eq!(
-            provisional_button(&session, &occupied),
-            provisional_button(&session, &occupied)
-        );
-        assert!(occupied.contains(&provisional_button(&session, &occupied)));
     }
 
     /// An event for a stage this client has not reached is held, not refused —

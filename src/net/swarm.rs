@@ -982,7 +982,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<ShapedBehaviour>, Box<dyn std::
         .with_behaviour(|key, relay_client| {
             let gossipsub = build_gossipsub(key)?;
 
-            let mut kad_cfg = kad::Config::new(StreamProtocol::new("/p2p-poker/kad/1"));
+            let mut kad_cfg = kad::Config::new(StreamProtocol::new("/p2p-poker/kad/2"));
             kad_cfg.set_query_timeout(Duration::from_secs(60));
             let kademlia = kad::Behaviour::with_config(
                 local_peer_id,

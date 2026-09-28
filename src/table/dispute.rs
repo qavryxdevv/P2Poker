@@ -76,10 +76,10 @@ pub struct Dispute {
     /// position.
     #[n(2)]
     pub at_sequence: u64,
-    /// Each entry a complete `SignedEvent`. Plain, not `minicbor::bytes`: the
-    /// helper is for one byte string and this is a list of them, exactly as
-    /// `HAND_ABORT`'s own `evidence` is written.
-    #[n(3)]
+    /// Each entry a complete `SignedEvent`, carried as a byte string since
+    /// protocol major 2, exactly as `HAND_ABORT`'s own `evidence` is written
+    /// (`S1-AO`: one CBOR integer a byte had nearly doubled both).
+    #[cbor(n(3), with = "crate::protocol::serialization::byte_strings")]
     pub evidence: Vec<Vec<u8>>,
     /// Human text, never parsed.
     #[cbor(n(4), with = "minicbor::bytes")]

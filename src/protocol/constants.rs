@@ -24,23 +24,27 @@ use crate::poker::state::Chips;
 // Identity and protocol strings
 // ---------------------------------------------------------------------------
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const PROTOCOL_MAJOR: u16 = 1;
+/// `D-083`: 2 since the seating draw, which changed the field sets of
+/// `PLAYER_LIST`, `JOIN_ACCEPT` and `TABLE_READY` and the encoding of every
+/// carried signed event (`PROTOCOL.md` §1.1, §10.2). Every protocol string
+/// moved with it, so a client of version 1 and one of version 2 never meet.
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_MAJOR: u16 = 2;
 
 /// The libp2p identify protocol name.
 ///
 /// Held here and used from `net::swarm`, which defined its own copy of this
 /// string under the name `PROTOCOL_VERSION` — a third meaning for a name that
 /// already had two.
-pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/1";
-pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/1";
-pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/1";
+pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/2";
+pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/2";
+pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/2";
 /// `D-064`: the queue of clients searching for a game, beside the lobby and
 /// sliced like it (`PROTOCOL.md` §7.13).
-pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/1";
-pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/1";
-pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/1";
-pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/1";
+pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/2";
+pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/2";
+pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/2";
+pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/2";
 
 // **The two Mainline infohashes and their derivation strings are gone.**
 // `56b0b50` took BitTorrent out of the binary and the lobby became a libp2p
@@ -150,8 +154,14 @@ pub const JOIN_REQUEST_MAX: usize = 512;
 pub const JOIN_ACCEPT_MAX: usize = 8_192;
 /// §9.3: `JOIN_REJECT`, typical ~45.
 pub const JOIN_REJECT_MAX: usize = 128;
-/// §9.3: `PLAYER_LIST`, typical ~1 200 at a full roster.
-pub const PLAYER_LIST_MAX: usize = 2_048;
+/// §9.3: `PLAYER_LIST`, typical ~1 200 at a full roster without a draw.
+///
+/// **2 048 until protocol major 2**, which put the seating draw inside the
+/// roster (`D-083`): at ten seats every member's signed sealed lot and, once
+/// the draw is complete, its signed opening -- some 6 500 B beside the roster's
+/// 1 600. The cap is the next multiple of 4 096 above the widest list the test
+/// `the_widest_list_a_ten_seat_draw_says_fits_its_cap` builds.
+pub const PLAYER_LIST_MAX: usize = 12_288;
 /// §9.3: `TABLE_READY`, typical ~200.
 ///
 /// **1 024 until 2026-09-02, and 1 024 cannot hold a `TABLE_READY` the corpus

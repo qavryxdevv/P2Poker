@@ -182,6 +182,12 @@ impl Talk {
     pub fn forget(&mut self, carrier: &[u8; 32]) {
         self.by_carrier.remove(carrier);
     }
+
+    /// `D-083`: forget a seat's budget when the seating draw gives the seat to
+    /// another player, who does not inherit what the last one spent.
+    pub fn forget_seat(&mut self, seat: u8) {
+        self.by_seat.remove(&seat);
+    }
 }
 
 #[derive(Debug, minicbor::Encode, minicbor::Decode)]
@@ -649,6 +655,183 @@ pub fn receive_continues(
     Ok(Continues { seat, who, list_serial: body.list_serial, advert: body.advert, table_key, said_ms: envelope.emitted_at_unix_ms })
 }
 
+/// `D-083`, `PROTOCOL.md` §4.4: a member's sealed lot for the seating draw of a
+/// forming table -- `RNG_COMMIT`.
+#[derive(Debug, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+struct LotBody {
+    /// The table, so the lot cannot be carried to another.
+    #[cbor(n(0), with = "minicbor::bytes")]
+    table_id: [u8; 32],
+    /// The round: the serial of the roster whose members are drawn. A
+    /// membership can come round again; a round never does.
+    #[n(1)]
+    round: u64,
+    /// The membership the lot was drawn for (`draw::members_digest`).
+    #[cbor(n(2), with = "minicbor::bytes")]
+    members: [u8; 32],
+    #[cbor(n(3), with = "minicbor::bytes")]
+    commitment: [u8; 32],
+}
+
+/// `D-083`, `PROTOCOL.md` §4.4: a member's opened lot -- `RNG_REVEAL`.
+#[derive(Debug, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+struct OpeningBody {
+    #[cbor(n(0), with = "minicbor::bytes")]
+    table_id: [u8; 32],
+    #[n(1)]
+    round: u64,
+    /// The sealed lots this member opened under (`draw::lots_digest`): an
+    /// opening is good for that set of lots and no other.
+    #[cbor(n(2), with = "minicbor::bytes")]
+    lots: [u8; 32],
+    #[cbor(n(3), with = "minicbor::bytes")]
+    r: [u8; 32],
+    #[cbor(n(4), with = "minicbor::bytes")]
+    salt: [u8; 32],
+}
+
+/// Sign an unchained word of a forming table.
+fn signed_word(key: &SigningKey, kind: EventType, body_bytes: Vec<u8>, now_ms: u64) -> Result<Vec<u8>, &'static str> {
+    let envelope = EventBody::unchained(kind, key.verifying_key().to_bytes(), body_bytes, now_ms)
+        .ok_or("a forming table's word is an unchained event")?;
+    let envelope_bytes = to_canonical(&envelope).map_err(|_| "the envelope does not encode")?;
+    let signature = {
+        use ed25519_dalek::Signer;
+        key.sign(&to_be_signed(&envelope_bytes))
+    };
+    to_canonical(&SignedEvent { body: envelope_bytes, signature: signature.to_bytes() })
+        .map_err(|_| "the signed event does not encode")
+}
+
+/// A word off the wire, as far as its type, its signature and its envelope go.
+fn open_word(bytes: &[u8], want: EventType) -> Result<(EventBody, [u8; 32]), NotHeard> {
+    if bytes.len() > LOBBY_MSG_MAX {
+        return Err(NotHeard::TooLong("the message is over the cap"));
+    }
+    let signed: SignedEvent =
+        from_canonical(bytes, LOBBY_MSG_MAX).map_err(|_| NotHeard::Malformed("not a signed event"))?;
+    let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX)
+        .map_err(|_| NotHeard::Malformed("not an envelope"))?;
+    let kind = EventType::try_from(envelope.event_type)
+        .map_err(|_| NotHeard::Malformed("an event type this client does not know"))?;
+    if kind != want {
+        return Err(NotHeard::Malformed("not the word it was taken for"));
+    }
+    let who = envelope.sender_public_key;
+    verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
+    Ok((envelope, who))
+}
+
+/// `D-083`: this client's sealed lot for round `round` of the draw of the
+/// membership `members`.
+pub fn lot_word(
+    key: &SigningKey,
+    table_id: &[u8; 32],
+    round: u64,
+    members: &[u8; 32],
+    commitment: &[u8; 32],
+    now_ms: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let body = LotBody { table_id: *table_id, round, members: *members, commitment: *commitment };
+    signed_word(key, EventType::RngCommit, to_canonical(&body).map_err(|_| "the body does not encode")?, now_ms)
+}
+
+/// `D-083`: a sealed lot, checked as a word of `table_id` -- type, signature and
+/// table -- and nothing about when it was said or who holds which seat.
+///
+/// That is how a lot is checked **inside a roster**: the founder's roster
+/// carries every member's lot whole, the roster is fresh and signed by the
+/// table's key, and the lots in it were said earlier and by keys the draw
+/// itself names ([`crate::table::draw::check`]). A lot inside a roster is never
+/// held to a clock: a roster said minutes after the lots were sealed carries
+/// them still.
+pub fn open_lot(bytes: &[u8], table_id: &[u8; 32]) -> Result<crate::table::draw::SaidLot, NotHeard> {
+    open_lot_said(bytes, table_id).map(|(_, said)| said)
+}
+
+fn open_lot_said(bytes: &[u8], table_id: &[u8; 32]) -> Result<(u64, crate::table::draw::SaidLot), NotHeard> {
+    let (envelope, who) = open_word(bytes, EventType::RngCommit)?;
+    let body: LotBody = from_canonical(&envelope.payload, LOBBY_CHAT_MAX)
+        .map_err(|_| NotHeard::Malformed("not a sealed lot"))?;
+    if &body.table_id != table_id {
+        return Err(NotHeard::AnotherTable);
+    }
+    let said = crate::table::draw::SaidLot {
+        key: who,
+        round: body.round,
+        members: body.members,
+        commitment: body.commitment,
+    };
+    Ok((envelope.emitted_at_unix_ms, said))
+}
+
+/// `D-083`: a member's sealed lot as it arrives on its own -- also said within
+/// the clock's slack, by a key that holds a seat of the receiver's roster. The
+/// time it was said comes back with it: the founder takes a member's newest.
+pub fn receive_lot(
+    bytes: &[u8],
+    table_id: &[u8; 32],
+    seat_of: impl Fn(&[u8; 32]) -> Option<u8>,
+    now_ms: u64,
+) -> Result<(u8, crate::table::draw::SaidLot, u64), NotHeard> {
+    let (said_ms, said) = open_lot_said(bytes, table_id)?;
+    if said_ms.abs_diff(now_ms) > CLOCK_SLACK_MS {
+        return Err(NotHeard::Stale);
+    }
+    let seat = seat_of(&said.key).ok_or(NotHeard::NotASeat)?;
+    Ok((seat, said, said_ms))
+}
+
+/// `D-083`: this client's opened lot, once the founder's roster has sealed every
+/// member's lot with this client's own among them unchanged.
+pub fn opening_word(
+    key: &SigningKey,
+    table_id: &[u8; 32],
+    round: u64,
+    lots: &[u8; 32],
+    lot: &crate::table::draw::Lot,
+    now_ms: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let body = OpeningBody { table_id: *table_id, round, lots: *lots, r: lot.r, salt: lot.salt };
+    signed_word(key, EventType::RngReveal, to_canonical(&body).map_err(|_| "the body does not encode")?, now_ms)
+}
+
+/// `D-083`: an opening, checked as a word of `table_id` -- type, signature and
+/// table -- and, like a lot, never against a clock inside a roster. Whether it
+/// opens the member's lot is the draw's to check.
+pub fn open_opening(bytes: &[u8], table_id: &[u8; 32]) -> Result<crate::table::draw::SaidOpening, NotHeard> {
+    open_opening_said(bytes, table_id).map(|(_, said)| said)
+}
+
+fn open_opening_said(bytes: &[u8], table_id: &[u8; 32]) -> Result<(u64, crate::table::draw::SaidOpening), NotHeard> {
+    let (envelope, who) = open_word(bytes, EventType::RngReveal)?;
+    let body: OpeningBody = from_canonical(&envelope.payload, LOBBY_CHAT_MAX)
+        .map_err(|_| NotHeard::Malformed("not an opened lot"))?;
+    if &body.table_id != table_id {
+        return Err(NotHeard::AnotherTable);
+    }
+    let said = crate::table::draw::SaidOpening { key: who, round: body.round, lots: body.lots, r: body.r, salt: body.salt };
+    Ok((envelope.emitted_at_unix_ms, said))
+}
+
+/// `D-083`: a member's opening as it arrives on its own -- also said within the
+/// clock's slack, by a key that holds a seat of the receiver's roster.
+pub fn receive_opening(
+    bytes: &[u8],
+    table_id: &[u8; 32],
+    seat_of: impl Fn(&[u8; 32]) -> Option<u8>,
+    now_ms: u64,
+) -> Result<(u8, crate::table::draw::SaidOpening), NotHeard> {
+    let (said_ms, said) = open_opening_said(bytes, table_id)?;
+    if said_ms.abs_diff(now_ms) > CLOCK_SLACK_MS {
+        return Err(NotHeard::Stale);
+    }
+    let seat = seat_of(&said.key).ok_or(NotHeard::NotASeat)?;
+    Ok((seat, said))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,6 +1194,64 @@ mod tests {
             Err(NotHeard::NotPlain(NotPlain::Control)),
             "the name is text too, so a name cannot draw over the pane"
         );
+    }
+
+    /// `D-083`: a sealed lot is heard from its seat, for its table, within the
+    /// clock's slack -- and inside a roster it is checked for its table and its
+    /// signature alone, since the roster is what is fresh there.
+    #[test]
+    fn a_sealed_lot_is_heard_from_its_seat_and_opens_inside_a_roster() {
+        let members = [3u8; 32];
+        let commitment = [4u8; 32];
+        let word = lot_word(&key(2), &TABLE, 6, &members, &commitment, NOW).unwrap();
+        let (seat, said, said_ms) = receive_lot(&word, &TABLE, seat_of, NOW).expect("a seat's lot");
+        assert_eq!((seat, said_ms), (2, NOW));
+        assert_eq!(said.key, key(2).verifying_key().to_bytes());
+        assert_eq!((said.round, said.members, said.commitment), (6, members, commitment));
+        assert_eq!(open_lot(&word, &TABLE), Ok(said), "the same lot, read inside a roster");
+
+        let stranger = lot_word(&key(9), &TABLE, 6, &members, &commitment, NOW).unwrap();
+        assert_eq!(receive_lot(&stranger, &TABLE, seat_of, NOW).map(|x| x.0), Err(NotHeard::NotASeat));
+        assert!(open_lot(&stranger, &TABLE).is_ok(), "inside a roster the draw decides who is a member");
+        let elsewhere = lot_word(&key(2), &[8u8; 32], 6, &members, &commitment, NOW).unwrap();
+        assert_eq!(open_lot(&elsewhere, &TABLE), Err(NotHeard::AnotherTable));
+        let old = lot_word(&key(2), &TABLE, 6, &members, &commitment, NOW - CLOCK_SLACK_MS - 1).unwrap();
+        assert_eq!(receive_lot(&old, &TABLE, seat_of, NOW).map(|x| x.0), Err(NotHeard::Stale));
+        assert!(open_lot(&old, &TABLE).is_ok(), "a roster may carry a lot said minutes ago");
+        let mut forged = word.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert!(open_lot(&forged, &TABLE).is_err(), "one flipped bit of the signature");
+    }
+
+    /// `D-083`: an opened lot is heard from its seat for its table, naming its
+    /// round and the sealed lots it was opened under; and neither word is taken
+    /// for the other.
+    #[test]
+    fn an_opened_lot_is_heard_from_its_seat_and_is_not_a_sealed_one() {
+        let lot = crate::table::draw::Lot { r: [1u8; 32], salt: [2u8; 32] };
+        let lots = [3u8; 32];
+        let word = opening_word(&key(5), &TABLE, 6, &lots, &lot, NOW).unwrap();
+        let (seat, opened) = receive_opening(&word, &TABLE, seat_of, NOW).expect("a seat's opening");
+        assert_eq!(seat, 5);
+        assert_eq!(
+            opened,
+            crate::table::draw::SaidOpening { key: key(5).verifying_key().to_bytes(), round: 6, lots, r: [1u8; 32], salt: [2u8; 32] }
+        );
+        assert_eq!(open_opening(&word, &TABLE), Ok(opened), "the same opening, read inside a roster");
+        assert!(matches!(open_lot(&word, &TABLE), Err(NotHeard::Malformed(_))), "an opening is not a sealed lot");
+        let sealed = lot_word(&key(5), &TABLE, 6, &lots, &[4u8; 32], NOW).unwrap();
+        assert!(
+            matches!(receive_opening(&sealed, &TABLE, seat_of, NOW), Err(NotHeard::Malformed(_))),
+            "a sealed lot is not an opening"
+        );
+        let elsewhere = opening_word(&key(5), &[8u8; 32], 6, &lots, &lot, NOW).unwrap();
+        assert_eq!(receive_opening(&elsewhere, &TABLE, seat_of, NOW), Err(NotHeard::AnotherTable));
+        let stranger = opening_word(&key(9), &TABLE, 6, &lots, &lot, NOW).unwrap();
+        assert_eq!(receive_opening(&stranger, &TABLE, seat_of, NOW), Err(NotHeard::NotASeat));
+        let old = opening_word(&key(5), &TABLE, 6, &lots, &lot, NOW - CLOCK_SLACK_MS - 1).unwrap();
+        assert_eq!(receive_opening(&old, &TABLE, seat_of, NOW), Err(NotHeard::Stale));
+        assert!(open_opening(&old, &TABLE).is_ok(), "a roster may carry an opening said minutes ago");
     }
 
     /// `D-054`: what a refusal is worth against `D-051`'s meter -- an eager

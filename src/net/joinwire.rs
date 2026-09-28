@@ -250,7 +250,7 @@ pub struct JoinRequestBody {
     pub tox_key: Option<[u8; 32]>,
 }
 
-/// `0x0202 JOIN_ACCEPT`, four fields.
+/// `0x0202 JOIN_ACCEPT`, five fields since protocol major 2 (`D-083`).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
 pub struct JoinAcceptBody {
@@ -262,6 +262,9 @@ pub struct JoinAcceptBody {
     pub advert_event: Vec<u8>,
     #[n(3)]
     pub roster_so_far: Vec<SeatWire>,
+    /// The serial of the roster `roster_so_far` is.
+    #[n(4)]
+    pub list_serial: u64,
 }
 
 /// `0x0203 JOIN_REJECT`, three fields.
@@ -276,7 +279,7 @@ pub struct JoinRejectBody {
     pub retry_after_ms: u32,
 }
 
-/// `0x0204 PLAYER_LIST`, three fields.
+/// `0x0204 PLAYER_LIST`, five fields since protocol major 2 (`D-083`).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
 pub struct PlayerListBody {
@@ -286,9 +289,16 @@ pub struct PlayerListBody {
     pub table_params_hash: [u8; 32],
     #[n(2)]
     pub list_serial: u64,
+    /// `D-044`'s *set to start*, the founder's word.
+    #[n(3)]
+    pub started: bool,
+    /// The seating draw, absent until the founder seals the lots -- and then
+    /// not encoded at all, as a trailing absent field of an array.
+    #[n(4)]
+    pub draw: Option<crate::table::draw::DrawWire>,
 }
 
-/// `0x0205 TABLE_READY`, five fields.
+/// `0x0205 TABLE_READY`, six fields since protocol major 2 (`D-083`).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
 pub struct TableReadyBody {
@@ -302,6 +312,9 @@ pub struct TableReadyBody {
     pub my_seat: u8,
     #[cbor(n(4), with = "capability_bytes")]
     pub capability_set: Vec<Vec<u8>>,
+    /// The digest of the draw the ratified roster carried.
+    #[cbor(n(5), with = "minicbor::bytes")]
+    pub draw: [u8; 32],
 }
 
 /// `capability_set` as an array of CBOR **byte strings**, which is what the
@@ -587,6 +600,7 @@ pub fn publish_join_accept(
         seat: accept.seat,
         advert_event: accept.advert_event.clone(),
         roster_so_far: roster_out(&accept.roster_so_far),
+        list_serial: accept.list_serial,
     };
     seal_unchained(
         EventType::JoinAccept,
@@ -614,6 +628,7 @@ pub fn receive_join_accept(bytes: &[u8]) -> Result<(JoinAccept, [u8; 32]), WireE
             seat: b.seat,
             advert_event: b.advert_event,
             roster_so_far: roster_in(b.roster_so_far)?,
+            list_serial: b.list_serial,
         },
         o.sender,
     ))
@@ -674,14 +689,22 @@ pub fn publish_player_list(
         roster: roster_out(&list.roster),
         table_params_hash: list.table_params_hash,
         list_serial: list.list_serial,
+        started: list.started,
+        draw: list.draw.clone(),
     };
-    seal_unchained(
+    let bytes = seal_unchained(
         EventType::PlayerList,
         &body,
         table_key,
         now_ms,
         JOIN_RESP_MAX,
-    )
+    )?;
+    // A founder never says a list its own receivers would refuse for its size.
+    let payload = to_canonical(&body).map_err(|_| WireError::Unencodable("the roster"))?;
+    if payload.len() > PLAYER_LIST_MAX {
+        return Err(WireError::TooLong("the roster is over its cap"));
+    }
+    Ok(bytes)
 }
 
 pub fn receive_player_list(bytes: &[u8]) -> Result<(PlayerList, [u8; 32]), WireError> {
@@ -705,6 +728,8 @@ pub fn receive_player_list_at(
             roster: roster_in(b.roster)?,
             table_params_hash: b.table_params_hash,
             list_serial: b.list_serial,
+            started: b.started,
+            draw: b.draw,
         },
         o.sender,
         o.envelope.emitted_at_unix_ms,
@@ -735,6 +760,7 @@ pub fn publish_table_ready(
         table_params_hash: ready.table_params_hash,
         my_seat: ready.my_seat,
         capability_set: ready.capability_set.clone(),
+        draw: ready.draw,
     };
     seal_ready(
         &body,
@@ -780,6 +806,7 @@ pub fn receive_table_ready(
             table_params_hash: b.table_params_hash,
             my_seat: b.my_seat,
             capability_set: b.capability_set,
+            draw: b.draw,
         },
         o.sender,
         o.event_hash,
@@ -814,6 +841,7 @@ mod tests {
             table_params_hash: [0xbb; 32],
             my_seat: 0,
             capability_set: vec![b"deck/bs-bg12-secp256k1/1".to_vec()],
+            draw: [0xcc; 32],
         };
         let mut buf = Vec::new();
         minicbor::encode(&body, &mut buf).expect("encodes");
@@ -830,10 +858,15 @@ mod tests {
             .copied()
             .chain(b"deck/bs-bg12-secp256k1/1".iter().copied())
             .collect();
+        // Since protocol major 2 the draw's digest follows, as a byte string of
+        // 32 (`D-083`), so the capabilities end 34 bytes before the body does.
+        let draw_tail: Vec<u8> = [0x58u8, 0x20].iter().copied().chain([0xccu8; 32]).collect();
+        assert!(buf.ends_with(&draw_tail), "the body ends with the draw's digest");
+        let before = &buf[..buf.len() - draw_tail.len()];
         assert!(
-            buf.ends_with(&want),
+            before.ends_with(&want),
             "capability_set is not an array of byte strings; encoded tail was {}",
-            buf[buf.len().saturating_sub(60)..]
+            before[before.len().saturating_sub(60)..]
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
@@ -932,6 +965,8 @@ mod tests {
             roster: vec![],
             table_params_hash: [3; 32],
             list_serial: 7,
+            started: false,
+            draw: None,
         };
         let old = 1_700_000_000_000u64;
         let wire = publish_player_list(&list, &key, old).unwrap();
@@ -963,6 +998,7 @@ mod tests {
             seat: 2,
             advert_event: vec![1, 2, 3, 4],
             roster_so_far: vec![entry(0), entry(2)],
+            list_serial: 1,
         };
         let wire = publish_join_accept(&accept, &table, NOW).unwrap();
         let (back, sender) = receive_join_accept(&wire).unwrap();
@@ -979,6 +1015,8 @@ mod tests {
             roster: vec![entry(0), entry(1)],
             table_params_hash: [8u8; 32],
             list_serial: 4,
+            started: false,
+            draw: None,
         };
         let wire = publish_player_list(&list, &table, NOW).unwrap();
         let (back, sender) = receive_player_list(&wire).unwrap();
@@ -991,6 +1029,7 @@ mod tests {
             table_params_hash: [8u8; 32],
             my_seat: 1,
             capability_set: vec![b"deck/bs-bg12-secp256k1/1".to_vec()],
+            draw: [0x5d; 32],
         };
         let table_id = [6u8; 32];
         let genesis = [9u8; 32];
@@ -1037,6 +1076,8 @@ mod tests {
             roster: seats.clone(),
             table_params_hash: [7u8; 32],
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         let wire = publish_player_list(&list, &table, NOW).unwrap();
         let (back, _) = receive_player_list(&wire).unwrap();
@@ -1180,6 +1221,7 @@ mod tests {
             seat: 0,
             advert_event: vec![0u8; TABLE_AD_SIGNED_MAX + 1],
             roster_so_far: vec![],
+            list_serial: 1,
         };
         assert_eq!(
             publish_join_accept(&accept, &table, NOW),
@@ -1190,6 +1232,8 @@ mod tests {
             roster: (0..=MAX_SEATS).map(entry).collect(),
             table_params_hash: [0u8; 32],
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         assert_eq!(
             publish_player_list(&list, &table, NOW),
@@ -1202,11 +1246,91 @@ mod tests {
             table_params_hash: [0u8; 32],
             my_seat: 0,
             capability_set: vec![b"x".to_vec(); MAX_CAPABILITIES + 1],
+            draw: [0x5d; 32],
         };
         assert_eq!(
             publish_table_ready(&ready, &[0u8; 32], &[0u8; 32], &joiner, NOW, 0),
             Err(WireError::TooLong("capability_set"))
         );
+    }
+
+    /// `D-083`: the widest `PLAYER_LIST` a founder says -- ten seats, every field
+    /// at its longest, and a complete draw of ten signed lots and ten signed
+    /// openings at the largest round -- checks as a draw, is said and heard
+    /// under `PLAYER_LIST_MAX`, and the cap is the next multiple of 4 096 above
+    /// it: room for what the draw is, and none for a list no founder says.
+    #[test]
+    fn the_widest_list_a_ten_seat_draw_says_fits_its_cap() {
+        use crate::net::tabletalk;
+        use crate::table::draw::{self, DrawWire, Lot};
+
+        let table = key(11);
+        let table_id = table.verifying_key().to_bytes();
+        let mut keys: Vec<SigningKey> = (0..MAX_SEATS).map(|s| key(100 + s)).collect();
+        keys.sort_by_key(|k| k.verifying_key().to_bytes());
+        let members: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let round = u64::MAX;
+        let digest = draw::members_digest(&table_id, &members);
+        let lots: Vec<Lot> = (0..MAX_SEATS).map(|s| Lot { r: [s; 32], salt: [0xff; 32] }).collect();
+        let sealed: Vec<Vec<u8>> = keys
+            .iter()
+            .zip(&lots)
+            .map(|(k, lot)| {
+                let c = lot.commitment(&table_id, round, &digest, &k.verifying_key().to_bytes());
+                tabletalk::lot_word(k, &table_id, round, &digest, &c, u64::MAX).unwrap()
+            })
+            .collect();
+        let lots_hash = draw::lots_digest(&sealed);
+        let openings: Vec<Vec<u8>> = keys
+            .iter()
+            .zip(&lots)
+            .map(|(k, lot)| tabletalk::opening_word(k, &table_id, round, &lots_hash, lot, u64::MAX).unwrap())
+            .collect();
+        let wire = DrawWire { round, lots: sealed, openings };
+        let checked = draw::check(
+            &table_id,
+            &wire,
+            usize::from(MAX_SEATS),
+            |b| tabletalk::open_lot(b, &table_id).map_err(|_| "a lot"),
+            |b| tabletalk::open_opening(b, &table_id).map_err(|_| "an opening"),
+        )
+        .expect("a draw every member opened");
+        let drawn = checked.drawn.expect("complete");
+
+        let roster: Vec<SeatEntry> = (0..MAX_SEATS)
+            .map(|s| SeatEntry {
+                seat: s,
+                app_public_key: drawn.seating[usize::from(s)],
+                peer_id: vec![0xff; PEER_ID_MAX],
+                display_name: "W".repeat(DISPLAY_NAME_MAX),
+                buyin: u64::MAX,
+                tox_key: Some([0xff; 32]),
+            })
+            .collect();
+        let list = PlayerList {
+            roster,
+            table_params_hash: [0xff; 32],
+            list_serial: u64::MAX,
+            started: true,
+            draw: Some(wire),
+        };
+        let body = PlayerListBody {
+            roster: roster_out(&list.roster),
+            table_params_hash: list.table_params_hash,
+            list_serial: list.list_serial,
+            started: list.started,
+            draw: list.draw.clone(),
+        };
+        let widest = to_canonical(&body).unwrap().len();
+        assert!(widest <= PLAYER_LIST_MAX, "the widest list is {widest} B, over its cap");
+        assert_eq!(
+            PLAYER_LIST_MAX,
+            widest.div_ceil(4_096) * 4_096,
+            "the cap is the next multiple of 4 096 above the widest list, {widest} B"
+        );
+        let said = publish_player_list(&list, &table, NOW).expect("said");
+        let (heard, _) = receive_player_list(&said).expect("and heard");
+        assert_eq!(heard.draw, list.draw);
     }
 
     /// And a limit is enforced on **decode** too, against a sender that never
@@ -1222,6 +1346,8 @@ mod tests {
                 .collect(),
             table_params_hash: [0u8; 32],
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         let wire =
             seal_unchained(EventType::PlayerList, &body, &table, NOW, PLAYER_LIST_MAX).unwrap();
@@ -1233,6 +1359,8 @@ mod tests {
             roster: vec![SeatWire::from_entry(&e)],
             table_params_hash: [0u8; 32],
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         let wire =
             seal_unchained(EventType::PlayerList, &body, &table, NOW, PLAYER_LIST_MAX).unwrap();
@@ -1254,6 +1382,8 @@ mod tests {
             roster: vec![SeatWire::from_entry(&e)],
             table_params_hash: [0u8; 32],
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         let wire =
             seal_unchained(EventType::PlayerList, &body, &table, NOW, PLAYER_LIST_MAX).unwrap();
@@ -1275,6 +1405,7 @@ mod tests {
             table_params_hash: [8u8; 32],
             my_seat: 0,
             capability_set: vec![],
+            draw: [0x5d; 32],
         };
         let wire =
             publish_table_ready(&ready, &[6u8; 32], &[9u8; 32], &seat, NOW, 0).unwrap();
@@ -1306,6 +1437,7 @@ mod tests {
                     seat: 0,
                     advert_event: vec![],
                     roster_so_far: vec![],
+                    list_serial: 1,
                 },
                 &table,
                 NOW,
@@ -1317,6 +1449,8 @@ mod tests {
                     roster: vec![],
                     table_params_hash: [0u8; 32],
                     list_serial: 1,
+                    started: false,
+                    draw: None,
                 },
                 &table,
                 NOW,
@@ -1338,6 +1472,7 @@ mod tests {
                 table_params_hash: [8u8; 32],
                 my_seat: 0,
                 capability_set: vec![],
+                draw: [0x5d; 32],
             },
             &[6u8; 32],
             &[9u8; 32],
@@ -1400,6 +1535,8 @@ mod tests {
             roster: vec![entry(0)],
             table_params_hash: [8u8; 32],
             list_serial: 1,
+            started: false,
+            draw: None,
         };
         let honest = publish_player_list(&list, &table, NOW).unwrap();
         let forged = publish_player_list(&list, &impostor, NOW).unwrap();

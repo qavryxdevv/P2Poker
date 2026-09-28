@@ -1665,6 +1665,16 @@ violation. Nothing weaker, and nothing phrased as an absence.
 > also in `PROTOCOL.md` §4.4 and in the deviation register of `THREAT_MODEL.md` §9.1
 > (entry 2).
 
+> **Amended by `D-083` (protocol major 2, 2026-09-28): the beacon is the seating draw,
+> and it runs while the table forms, before `TABLE_READY`.** Major 1 placed it in the
+> setup chain after `TABLE_READY`, where no client ever built it; the seats were the
+> founder's arrival order and the first button was read off `session_id`, which the last
+> seat to ratify could grind (`S1-B`). Points 3 to 5 below are amended where the move
+> changes them, and the change that matters is in point 5: **a player that does not
+> open is given back and the round runs again without it**, because the owner's
+> requirement is that no player -- nor several -- can freeze a forming table. What keeps
+> that from becoming a free re-roll is written there.
+
 `SPEC_CS.md` §16 names `RNG_COMMIT` and `RNG_REVEAL`, and §7 asks for the mechanism.
 It is needed for the **non-deck** randomness: seat assignment at table start, and the
 initial button position. (Subsequent buttons rotate deterministically; only the first
@@ -1707,7 +1717,10 @@ finds the old string in an old branch learns where it came from and that it was 
    space.
 3. The commitment binds `table_id`, `session_id` and the committer's application public
    key, so a commitment cannot be lifted from another table, another session or another
-   player. **Those three parts are the whole of this point and the reason §4.4's
+   player. **Since `D-083`** it binds the table, the **round** (the serial of the roster
+   whose members are drawn) and the **membership digest** in place of `session_id`, which
+   does not exist yet while a table forms: a membership can come round again, a round
+   never does, so a lot is carried to no other table, round, membership or player. **Those three parts are the whole of this point and the reason §4.4's
    earlier two-part form `h(domain, [r_i, salt_i])` was insufficient**: it bound
    neither the table, nor the session, nor the committer, so a commitment observed at
    one table could be replayed at another by a peer who had not yet drawn. Which form
@@ -1716,7 +1729,13 @@ finds the old string in an old branch learns where it came from and that it was 
    tempted to shorten the part list needs to read first.
 4. **All** commitments must be published and accepted into the hash chain *before* any
    reveal is accepted. The ordering is enforced by the state machine and by
-   `previous_event_hash`, not by wall-clock timing.
+   `previous_event_hash`, not by wall-clock timing. **Since `D-083`** the fixing is the
+   founder's roster: it seals every member's signed lot with its own opening beside them
+   -- the founder opens first, since it sees every lot -- and a member opens only after
+   checking that the lot under its own key is the one it drew, naming the digest of the
+   sealed lots, so its opening is good for that set and no other. A founder that swapped
+   its own lot after seeing the openings would carry a lots digest no member opened under,
+   and every member refuses it.
 5. Failing to reveal after committing is a protocol failure attributable to that peer,
    handled exactly like a missing decryption share (§2.10): the table setup **stops
    neutrally** — no chips are at stake yet, since this beacon runs once per table in
@@ -1727,18 +1746,37 @@ finds the old string in an old branch learns where it came from and that it was 
    resamples the draw, and the rule that closes that is point 4's — every commitment is
    chained before any reveal is accepted — not a sanction.
 
+   **Replaced by `D-083`.** Stopping neutrally is a table frozen until
+   `join_deadline_ms` by any one player, which the owner ruled out. A member that owes
+   its lot or its opening for 30 s is given back by the founder before the table is set,
+   and the round begins again without it -- a new round, new lots, a new draw. That **is**
+   a re-run, and what bounds it is its price: a member refuses any new round that does
+   not leave out a player whose opening it never heard, and any once it holds every
+   opening, so **every re-run costs the table a player that did not open**, and the
+   founder cannot re-run a round by any other road. A member given back after it opened
+   keeps its lot in the draw: its leaving re-draws nothing.
+
 Point 5 matters. A "last revealer" who can stall and force a fresh beacon gets to
 resample the seat draw. Because this beacon decides only seating and the initial
 button — never cards — the value of that attack is small; and because the commit set is
 fixed in the chain before any reveal is seen, a re-run starts from the same committed
-values rather than from a free hand.
+values rather than from a free hand. **Since `D-083`** the last opener does resample the
+draw by declining to open -- and pays with its seat, every time; with a partner at the
+table it can veto an outcome for the partner once for each seat it gives up. Two players
+working together can therefore keep one of them away from the button or a neighbour at
+the price of the other's place at the table, which is the whole of what the draw leaves
+to a coalition; one player alone gains nothing it can keep.
 
 **D-012, checked here.** `seed` is a hashed value that decides seating and the initial
 button, so it is canonical state and may not be derived from a quantity that can differ
 between honest receivers. The rule that keeps it safe is point 4's, and it is worth
 naming as a D-012 rule and not only as an anti-grinding one: the combine step runs over
 the committer set fixed by the **chained** commit stage, in ascending seat order, and
-never over "the reveals this peer happened to receive". A partial or receiver-local
+never over "the reveals this peer happened to receive". **Since `D-083`** the fixed set
+is the lots the founder's roster sealed, and the combine runs in ascending order of the
+members' keys -- the seats are what it decides -- over the openings the complete roster
+carries whole: every receiver checks the draw from the roster alone, and a roster with
+a lot unopened decides nothing. A partial or receiver-local
 seed is not a permitted outcome — a missing reveal stops the setup neutrally (point 5)
 rather than producing a shorter list. Two honest peers therefore either compute the
 same `seed` or compute none, which is the only pair of outcomes D-012 allows.
@@ -1746,7 +1784,9 @@ same `seed` or compute none, which is the only pair of outcomes D-012 allows.
 Note honestly what is *not* closed: a peer that
 withholds its reveal denies the table its beacon, and under D-010 that costs it
 nothing. That is the same liveness/DoS trade as §2.10, at a point in the session where
-no chips are committed, so it is strictly cheaper than the in-hand case.
+no chips are committed, so it is strictly cheaper than the in-hand case. **Since
+`D-083` it costs the peer its seat and the table thirty seconds**, and a table never
+waits on it longer.
 
 `ziffle` provides none of this; it is ours (§5.2 item 3), and it is a plain hash
 commitment over a library hash, so §6 and §36 are satisfied.
