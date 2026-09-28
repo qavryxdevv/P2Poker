@@ -8237,12 +8237,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                     Err(e) => {
+                                        // `S1-JH`: a founding that fails gives its group up, as
+                                        // one whose group did not come up does: a group left
+                                        // open with no table was a live peer to a rejoin this
+                                        // slot still has, which then never gave up.
+                                        t.tox_sink.clear();
+                                        t.tox_group_said = false;
+                                        t.table_announces = 0;
                                         let _ = events.send(NodeEvent::Warning(
                                             format!("the table does not form: {e:?}"))).await;
                                     }
                                 }
                             }
                             Err(e) => {
+                                // `S1-JH`: and so does one whose advert does not publish.
+                                t.tox_sink.clear();
+                                t.tox_group_said = false;
+                                t.table_announces = 0;
                                 let _ = events.send(NodeEvent::Warning(
                                     format!("the advert does not publish: {e}"))).await;
                             }
@@ -20876,6 +20887,14 @@ mod a_joiner_before_the_first_hand {
         assert!(
             code[founded..the_slots].contains("end_the_rejoin_for_a_new_table(t);"),
             "a table founded ends the rejoin before it is the slot's"
+        );
+        // And a founding that fails after its group came up gives the group up:
+        // left open, it read as a live peer to the rejoin, which never gave up.
+        let next_arm = arm + code[arm..].find("NodeCommand::JoinTable {").expect("the next arm");
+        assert_eq!(
+            code[arm..next_arm].matches("t.tox_sink.clear();").count(),
+            3,
+            "given up when the group did not come up, when the table does not form, and when its advert does not publish"
         );
     }
 
