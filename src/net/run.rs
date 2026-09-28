@@ -7974,6 +7974,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         t.lost_key = None;
+                        // `S1-JH`: a slot that founds a table is not resuming any more.
+                        end_the_rejoin_for_a_new_table(t);
                         // A fresh key per table, and that freshness is the only
                         // thing making two tables with the same players and the
                         // same rules different games (§4.3's `session_id`).
@@ -14032,6 +14034,17 @@ fn gone_by_their_word(
 /// `S1-GX`: how long two members' timeouts of this client's group copy count as
 /// this client's own line.
 const OWN_LINE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `S1-JH`: a slot that founds a table is not resuming any more -- as `S1-DE`
+/// says of a seat that sits down at another table. A rejoin from the session
+/// record that found nobody left `resuming` set (`S1-CR`'s give-up runs only
+/// while the slot holds no table), and a founder with it set skipped `D-060`'s
+/// block, so it never said it was ready, and every road to hand 1: its new table
+/// never set, and waited until the player left it. The record itself stays until
+/// the new table's replaces it.
+fn end_the_rejoin_for_a_new_table(t: &mut TableRun) {
+    t.resuming = false;
+}
 
 /// `S1-GS`, `S1-GX`: whether this client's own line is the likelier reading of a
 /// silence, before the table is set: the library says offline, once a seat was on
@@ -20670,6 +20683,30 @@ mod a_joiner_before_the_first_hand {
         t.group_timeouts.clear();
         t.tox_down_at = Some(now);
         assert!(own_line_suspect(&t), "the library said offline a moment ago");
+    }
+
+    /// `S1-JH`: a rejoin from the session record that found nobody left the
+    /// slot `resuming`, and a table the player then founded in it never set --
+    /// its founder skipped `D-060`'s block and never said it was ready. Founding
+    /// ends the rejoin, before the table is founded; the record stays.
+    #[test]
+    fn founding_a_table_ends_a_rejoin_that_found_nobody() {
+        let dir = std::env::temp_dir();
+        let mut t = TableRun::new(0, &dir, None, super::super::toxsink::TableSink::none());
+        t.resuming = true;
+        end_the_rejoin_for_a_new_table(&mut t);
+        assert!(!t.resuming, "a founder derives its hands and says it is ready");
+
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let arm = code
+            .find("NodeCommand::CreateTable {\n                        kind, name, seats, min_players, buyin, password,\n                    } => {")
+            .expect("the founding arm");
+        let founds = arm + code[arm..].find("Formation::found(").expect("it founds");
+        assert!(
+            code[arm..founds].contains("end_the_rejoin_for_a_new_table(t);"),
+            "the founding arm ends a rejoin before it founds"
+        );
     }
 
     /// `S1-GR`: a key seated again at once after one end of its seat, and later and
