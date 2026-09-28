@@ -188,6 +188,13 @@ pub struct Formation {
     /// `Ok(())` on a byte-identical repeat and only a **differing** copy is
     /// `RatifiedTwice`.
     ///
+    /// **Cleared with `ratified`, wherever the serial moves** (`S1-JE`). A copy
+    /// names the roster it ratifies, and kept past it, it was worse than
+    /// useless: `ratify` says this seat's own copy, carried back after a
+    /// return (`D-060`), as its word -- so a seat back at its table whose
+    /// roster then changed said its word on the roster before, which every
+    /// receiver drops, and counted itself ready on the new one.
+    ///
     /// Cost is one `TABLE_READY` per seat — about two hundred bytes each — held
     /// only while the table has no session.
     ratified_bytes: BTreeMap<u8, Vec<u8>>,
@@ -932,6 +939,7 @@ impl Formation {
                 // serial that no longer describes this table.
                 self.serial += 1;
                 self.ratified.clear();
+                self.ratified_bytes.clear();
                 self.sent_ready = false;
                 self.session = None;
 
@@ -1087,10 +1095,11 @@ impl Formation {
             .map_err(|e| Failed::List(ListRefused::Roster(e)))?;
 
         // The roster changed, so every previous ratification named a serial that
-        // no longer describes this table. The same four lines the accept path
+        // no longer describes this table. The same five lines the accept path
         // runs, for the same reason.
         self.serial += 1;
         self.ratified.clear();
+        self.ratified_bytes.clear();
         self.sent_ready = false;
         self.session = None;
 
@@ -1254,6 +1263,7 @@ impl Formation {
         if list.list_serial != self.serial {
             self.serial = list.list_serial;
             self.ratified.clear();
+            self.ratified_bytes.clear();
             self.sent_ready = false;
             self.session = None;
         }
@@ -2824,6 +2834,145 @@ mod tests {
         assert!(back.ready_sent(), "its own ratification, carried back, is its word");
         assert_eq!(back.session(), Some(session), "the table's session, and no other");
         assert!(back.ratify_now(NOW + 11).unwrap().is_empty(), "never a second ratification");
+    }
+
+    /// `S1-JE`: a seat back at its table takes its own ratification, carried
+    /// back by another seat, as its word (`D-060`) -- and when the roster then
+    /// changes before the first hand, that copy names a roster that is gone.
+    /// Kept, it was said again as this seat's word on the new roster: a word
+    /// every receiver drops as stale, while the seat counted itself ready and
+    /// never ratified again, so the table waited on it until it was given back.
+    #[test]
+    fn a_seat_back_ratifies_a_changed_roster_anew() {
+        let (mut t, _, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (mut j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap();
+            let out = t.founder.on_join_request(&request, &peer(n), false, NOW).expect("seated");
+            deliver(&mut t, &mut j, out, table_id, NOW);
+            t.joiners.push(j);
+        }
+        assert!(t.founder.session().is_some(), "the table of three is set");
+
+        // The second joiner's client comes back with nothing of its own and
+        // takes its ratification from the founder's copy.
+        let (mut back, _) = Formation::join(
+            key(3),
+            a.clone(),
+            hash,
+            table_id,
+            peer(3),
+            "player 3".into(),
+            1_000,
+            None,
+            None,
+            [33u8; 32],
+            NOW + 10,
+            None,
+        )
+        .unwrap();
+        back.hold_ratification(true);
+        let said = t.founder.say_again(NOW + 10);
+        for bytes in said.iter().filter(|b| joinwire::receive_player_list(b).is_ok()) {
+            back.on_player_list(bytes, NOW + 10).expect("the list holds");
+        }
+        for bytes in said.iter().filter(|b| joinwire::receive_player_list(b).is_err()) {
+            back.on_table_ready(bytes).expect("a ratification holds");
+        }
+        assert!(back.ready_sent(), "its own ratification, carried back, is its word");
+
+        // The first joiner is given back before the first hand; the table was
+        // set to start and goes on with the two that remain (`D-044`).
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&peer(2), NOW + 20)
+            .expect("given back");
+        let broadcasts: Vec<Vec<u8>> = out
+            .into_iter()
+            .filter_map(|s| match s {
+                Send::Broadcast(b) => Some(b),
+                Send::Reply(_) => None,
+            })
+            .collect();
+        let list = broadcasts
+            .iter()
+            .find(|b| joinwire::receive_player_list(b).is_ok())
+            .expect("the new roster is said")
+            .clone();
+        back.on_player_list(&list, NOW + 20).expect("the new roster holds");
+        assert!(!back.ready_sent(), "a changed roster is not ratified yet");
+
+        let mine: Vec<Vec<u8>> = back
+            .ratify_now(NOW + 21)
+            .expect("it ratifies")
+            .into_iter()
+            .filter_map(|s| match s {
+                Send::Broadcast(b) => Some(b),
+                Send::Reply(_) => None,
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "one ratification of the roster it holds");
+        let (ready, _, _) = joinwire::receive_table_ready(&mine[0], &table_id, &back.genesis())
+            .expect("a ratification");
+        assert_eq!(
+            ready.list_serial,
+            back.serial(),
+            "its word is on the roster it holds, not on the one before"
+        );
+        t.founder.on_table_ready(&mine[0]).expect("the founder takes it");
+        for b in broadcasts.iter().filter(|b| joinwire::receive_player_list(b).is_err()) {
+            back.on_table_ready(b).expect("the founder's ratification holds");
+        }
+        assert!(t.founder.session().is_some(), "the table of two is set");
+        assert_eq!(back.session(), t.founder.session(), "on one session");
+    }
+
+    /// `S1-JE`: the ratifications a client carries for other seats (`S1-P`)
+    /// are those of the roster it holds, and a roster that changes takes them
+    /// with it -- none is carried again to receivers that can only drop it.
+    /// (The client's own copy is `said.ready`, said until it ratifies the new
+    /// roster; every receiver drops that one too, and it is not what this
+    /// row found.)
+    #[test]
+    fn no_other_seats_ratification_of_an_older_roster_is_carried_again() {
+        use crate::protocol::messages::EventType;
+        let (mut t, _, _) = form_three();
+        let table_id = t.founder.table_id();
+        let genesis = t.founder.genesis();
+        let founders_seat = t.founder.my_seat();
+        let carried = |f: &Formation, now: u64| -> Vec<Vec<u8>> {
+            f.say_again(now)
+                .into_iter()
+                .filter(|b| crate::net::chained::peek(b, 65_536).ok().map(|(k, _, _)| k) == Some(EventType::TableReady))
+                .filter(|b| {
+                    joinwire::receive_table_ready(b, &table_id, &genesis).is_ok_and(|(r, _, _)| Some(r.my_seat) != founders_seat)
+                })
+                .collect()
+        };
+        assert_eq!(carried(&t.founder, NOW).len(), 2, "the other two seats' ratifications of the set roster");
+        // The founder holds its own word, as it does on the wire (`D-060`).
+        t.founder.hold_ratification(true);
+        t.founder
+            .release_seat_before_the_first_hand(&peer(3), NOW + 1_000)
+            .expect("given back");
+        assert!(
+            carried(&t.founder, NOW + 1_001).is_empty(),
+            "a ratification of the roster before was carried again"
+        );
     }
 
     /// `D-044`, the owner's ruling: a table set to start goes on with the seats
