@@ -8110,11 +8110,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // publication is a second advert, and §7.2 rule 7 would
                         // read the pair as a founder changing the table.
                         //
-                        // A failure here is not a failure to found a table. The
-                        // table forms on the mesh exactly as it did before and
-                        // the advert names no group, which is what a build
-                        // without the feature always says.
-                        let ad = match t.tox_sink.start(
+                        // `S1-JG`, the owner's word (2026-09-28): a table whose
+                        // group does not come up is not founded. It used to form
+                        // on the mesh with an advert naming no group -- a
+                        // fall-back from before a hand was told never to travel
+                        // on libp2p (the owner, again that day: play at a table
+                        // goes, and must go, over Tox) -- and such a table was
+                        // advertised, sat at, and never dealt a hand. The group
+                        // is given up, the player is told, and tries again.
+                        let on_its_group: Result<TableAd, String> = match t.tox_sink.start(
                             &profile_dir,
                             super::toxsink::Role::Host,
                             &ad.table_name,
@@ -8143,34 +8147,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 short_hash(&chat)
                                             )))
                                             .await;
-                                        ad.on_tox(mine, chat)
+                                        Ok(ad.on_tox(mine, chat))
                                     }
-                                    None => {
-                                        // The group did not appear. Rather than
-                                        // advertise a table whose group nobody
-                                        // can check, the sink is given up and
-                                        // the table rides the mesh.
-                                        t.tox_sink.clear();
-                                        t.tox_group_said = false;
-                                        t.table_announces = 0;
-                                        let _ = events
-                                            .send(NodeEvent::Warning(
-                                                "the Tox group did not come up; this table stays on the mesh"
-                                                    .into(),
-                                            ))
-                                            .await;
-                                        ad
-                                    }
+                                    None => Err("its Tox group did not come up".to_string()),
                                 }
                             }
-                            Ok(None) => ad,
-                            Err(e) => {
+                            // A build without Tox, or a Tox with no key of its own
+                            // yet: no group an advert could name.
+                            Ok(None) => Err("this client has no Tox to carry its hands on".to_string()),
+                            Err(e) => Err(format!("there is no Tox for it ({e})")),
+                        };
+                        let ad = match on_its_group {
+                            Ok(ad) => ad,
+                            Err(why) => {
+                                t.tox_sink.clear();
+                                t.tox_group_said = false;
+                                t.table_announces = 0;
                                 let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "no Tox for this table ({e}); it stays on the mesh"
-                                    )))
+                                    .send(NodeEvent::Warning(format!("the table was not opened: {why}")))
                                     .await;
-                                ad
+                                // The player's own creation is answered in the
+                                // window; the search and a continuation try again
+                                // by their own clocks.
+                                if !for_search && t.continuing.is_none() {
+                                    let _ = events.send(NodeEvent::TableNotOpened { why }).await;
+                                }
+                                continue;
                             }
                         };
 
@@ -20972,6 +20974,35 @@ mod a_joiner_before_the_first_hand {
                 && read_back.contains("f = f.with_set_to_start();"),
             "read back for the table being joined, before the formation is used"
         );
+    }
+
+    /// `S1-JG`, the owner's word: a table whose Tox group does not come up is
+    /// not founded -- no road of the founding arm reaches the advert without a
+    /// group, and the player who asked is told. Before, such a table was
+    /// advertised on the mesh, sat at, and never dealt a hand.
+    #[test]
+    fn a_table_whose_group_does_not_come_up_is_not_founded() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert!(!code.contains("stays on the mesh"), "no table rides the mesh any more");
+        let arm = code
+            .find("NodeCommand::CreateTable {\n                        kind, name, seats, min_players, buyin, password,\n                    } => {")
+            .expect("the founding arm");
+        let publish = arm + code[arm..].find("match advert::publish(&ad, &table_key) {").expect("the advert");
+        let before = &code[arm..publish];
+        assert!(before.contains("Ok(ad.on_tox(mine, chat))"), "only a table on its group goes on");
+        for failed in [
+            "None => Err(\"its Tox group did not come up\".to_string()),",
+            "Ok(None) => Err(\"this client has no Tox to carry its hands on\".to_string()),",
+            "Err(e) => Err(format!(\"there is no Tox for it ({e})\")),",
+        ] {
+            assert!(before.contains(failed), "a way to fail that is not refused: {failed}");
+        }
+        let refused = before.find("Err(why) => {").expect("the refusal");
+        let refusal = &before[refused..];
+        assert!(refusal.contains("t.tox_sink.clear();"), "its group given up");
+        assert!(refusal.contains("if !for_search && t.continuing.is_none() {") && refusal.contains("NodeEvent::TableNotOpened { why }"));
+        assert!(refusal.contains("continue;"), "and nothing founded");
     }
 
     /// `S1-JL`: a seat that busted and stays to watch had its record written

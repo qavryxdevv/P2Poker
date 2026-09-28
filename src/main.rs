@@ -3241,6 +3241,7 @@ impl eframe::App for Client {
                     }
                     render::LobbyAction::AlreadyAt(key) => self.state.already_at = Some(key),
                     render::LobbyAction::DismissAlreadyAt => self.state.already_at = None,
+                    render::LobbyAction::DismissNotOpened => self.state.not_opened = None,
                     render::LobbyAction::ShowTable(slot) => {
                         self.state.already_at = None;
                         self.turn_to(slot);

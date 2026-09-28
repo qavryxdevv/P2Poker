@@ -87,6 +87,8 @@ pub enum LobbyAction {
     AlreadyAt([u8; 32]),
     /// `S1-FG`: the word taken down.
     DismissAlreadyAt,
+    /// `S1-JG`: the word that the table was not opened, taken down.
+    DismissNotOpened,
     /// `S1-FG`: taken down, and the table's window shown.
     ShowTable(u8),
     /// `S1-CR`: rejoin the unfinished game on record. The app state holds
@@ -606,6 +608,12 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
             asked = Some(what);
         }
     }
+    // `S1-JG`: the table the player asked for was not opened.
+    if let Some(why) = view.not_opened.as_ref() {
+        if let Some(what) = not_opened_window(ui.ctx(), why) {
+            asked = Some(what);
+        }
+    }
     // `D-064`: the search's window, over everything, while a search is on.
     if let Some(s) = view.search.as_ref() {
         if let Some(what) = search_modal(ui.ctx(), s) {
@@ -879,6 +887,29 @@ pub fn already_at_window(ctx: &egui::Context, a: &super::lobby::AlreadyAtView) -
                     action = Some(LobbyAction::DismissAlreadyAt);
                 }
             });
+        });
+    action
+}
+
+/// `S1-JG`: the table the player asked for was not opened -- its Tox group did
+/// not come up, and a hand travels only over Tox -- said, with the reason and
+/// what to do. Nothing else is asked: the player creates the table again.
+pub fn not_opened_window(ctx: &egui::Context, why: &str) -> Option<LobbyAction> {
+    let mut action = None;
+    egui::Window::new(RichText::new("The table was not opened").size(19.0).strong())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            // The window's ground is light, so the reason takes the label's
+            // own colour (`shots-de/r3`).
+            ui.label(RichText::new(format!("Your table could not be opened: {why}.")).color(theme::DANGER).strong());
+            ui.label("Try creating it again in a moment.");
+            ui.add_space(6.0);
+            if ui.button("OK").clicked() {
+                action = Some(LobbyAction::DismissNotOpened);
+            }
         });
     action
 }
@@ -4041,6 +4072,46 @@ mod tests {
         assert!(!asks(&from_store), "a copy from the Store does not: {from_store:?}");
         assert!(from_store.iter().any(|t| t == "Network details"), "and its strip is drawn all the same: {from_store:?}");
         assert!(asks_for_gifts(None) && asks_for_gifts(Some(&home(false))) && !asks_for_gifts(Some(&home(true))));
+    }
+
+    /// `S1-JG`: a table that was not opened is said in the lobby -- the reason,
+    /// what to do, and the one button that takes the word down.
+    #[test]
+    fn a_table_not_opened_is_said_with_its_reason() {
+        fn words(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.job.text.clone()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| words(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        install(&ctx);
+        style::install_fonts(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+        let mut found = Vec::new();
+        // A new window measures itself in its first pass and is painted from
+        // the next.
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let _ = not_opened_window(ui.ctx(), "its Tox group did not come up");
+            });
+            found.clear();
+            std::mem::take(&mut out.shapes).iter().for_each(|c| words(&c.shape, &mut found));
+            out.drop_without_applying_deltas();
+        }
+        for said in [
+            "The table was not opened",
+            "Your table could not be opened: its Tox group did not come up.",
+            "Try creating it again in a moment.",
+            "OK",
+        ] {
+            assert!(found.iter().any(|t| t == said), "{said:?} not painted: {found:?}");
+        }
     }
 
     /// `D-067`: the columns follow the width in points. Three on a wide

@@ -702,6 +702,9 @@ pub struct LobbyView {
     pub here: Vec<[u8; 32]>,
     /// `S1-FG`: the word that the table asked for is one this client is at.
     pub already_at: Option<AlreadyAtView>,
+    /// `S1-JG`: the word that the table the player asked for was not opened,
+    /// and why.
+    pub not_opened: Option<String>,
     /// `D-064`: the automatic search under way, for its modal window.
     pub search: Option<SearchView>,
     /// `D-064`: other clients searching for a game, as the queue topic says.
@@ -1086,6 +1089,7 @@ impl LobbyView {
             joining: None,
             here: Vec::new(),
             already_at: None,
+            not_opened: None,
             search: None,
             searching: 0,
             session_s: 0,

@@ -502,6 +502,10 @@ pub struct AppState {
     /// `S1-FG`: the lobby's word that a table asked for is one this client is at
     /// already. Shown only while that is still so (`view`).
     pub already_at: Option<[u8; 32]>,
+    /// `S1-JG`: the node's word that the table the player asked it to found was
+    /// not opened, and why -- said in a small window until the player closes it,
+    /// or a table is founded after all.
+    pub not_opened: Option<String>,
     /// `S1-CX`: the heads-up opponent this client cannot reach, if any.
     pub opponent_gone: Option<OpponentGone>,
     /// `S1-EC`: whether the opponent has been on the line once at this
@@ -2077,7 +2081,14 @@ impl AppState {
                 self.status.port_mapped = Some(how);
                 self.note(format!("{how} opened port {external}"));
             }
+            // `S1-JG`: the table asked for was not opened; the node has put the
+            // reason in the log, and a small window says it.
+            NodeEvent::TableNotOpened { why } => {
+                self.not_opened = Some(why);
+            }
             NodeEvent::Hosting { key } => {
+                // `S1-JG`: a table founded after all ends the word that one was not.
+                self.not_opened = None;
                 // `S1-FR`: a founder back from its record is on its way back.
                 let restarted = self.joining.as_ref().is_some_and(|j| j.key == key && j.rejoin);
                 self.forget_the_table();
@@ -3674,6 +3685,7 @@ impl AppState {
             .map(|s| s.key)
             .chain(self.joining.iter().filter(|j| j.failed.is_none()).map(|j| j.key))
             .collect();
+        v.not_opened = self.not_opened.clone();
         v.already_at = self.already_at.and_then(|key| {
             let here = self.at_table(&key)?;
             let name = self
@@ -5291,6 +5303,26 @@ mod tests {
         assert!(v.already_at.is_none(), "not stuck after leaving: {:?}", v.already_at);
         assert!(!v.here.contains(&a));
         assert!(matches!(s.sit_down(a, "first".into(), 1_000, None), Some(NodeCommand::JoinTable { .. })));
+    }
+
+    /// `S1-JG`: the node's word that the table the player asked for was not
+    /// opened is the lobby's small window, until the player takes it down or a
+    /// table is founded after all -- and it is no table's: a background slot's
+    /// state never carries it off.
+    #[test]
+    fn a_table_not_opened_is_said_until_taken_down() {
+        let mut s = AppState::new();
+        assert!(s.view().not_opened.is_none());
+        s.apply(NodeEvent::TableNotOpened { why: "its Tox group did not come up".into() });
+        assert_eq!(s.view().not_opened.as_deref(), Some("its Tox group did not come up"));
+        s.not_opened = None; // what `LobbyAction::DismissNotOpened` does
+        assert!(s.view().not_opened.is_none());
+
+        s.apply(NodeEvent::TableNotOpened { why: "its Tox group did not come up".into() });
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some([7u8; 32]) });
+        s.apply(NodeEvent::Hosting { key: [7u8; 32] });
+        assert!(s.view().not_opened.is_none(), "a table founded after all");
+        assert!(NodeEvent::TableNotOpened { why: String::new() }.changes_more_than_the_log(), "painted at once");
     }
 
     /// `S1-FG`: the node's word that it did not start a join ends the join

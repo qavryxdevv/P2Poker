@@ -245,6 +245,11 @@ pub enum NodeEvent {
     PortMapped { how: &'static str, external: u16 },
     /// This client is hosting a table under this key.
     Hosting { key: [u8; 32] },
+    /// `S1-JG`: the table the player asked this client to found was not
+    /// opened, and why -- its Tox group did not come up, and a hand travels
+    /// only over Tox. Said for the player's own creation; the search and a
+    /// continuation try again by their own clocks.
+    TableNotOpened { why: String },
     /// The parameters of the table this client is at.
     ///
     /// Carried rather than looked up. The obvious source is this client's own
@@ -748,6 +753,8 @@ impl NodeEvent {
             // The table, and everything a player watches while sitting at it.
             Self::AtTable { .. }
             | Self::Hosting { .. }
+            // `S1-JG`: a small window says the table was not opened.
+            | Self::TableNotOpened { .. }
             | Self::TableParams { .. }
             | Self::Seated { .. }
             | Self::Roster { .. }
