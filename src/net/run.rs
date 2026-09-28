@@ -1596,9 +1596,10 @@ struct TableRun {
     /// `S1-JF`: at the founder, when it last heard each seat of its forming
     /// table in its group; a seat it has not heard in this sitting has none.
     founder_heard_last: std::collections::BTreeMap<u8, tokio::time::Instant>,
-    /// `S1-JJ`: the table whose being set to start this client has kept on
-    /// disk, so that it is written once.
-    set_to_start_noted: Option<[u8; 32]>,
+    /// `S1-JJ`: the table whose being set to start this client has tried to
+    /// keep on disk, and whether that write went through -- written once, tried
+    /// again while it fails, and a failure said once.
+    set_to_start_noted: Option<([u8; 32], bool)>,
     /// `D-060`: when the founder last said the roster again to a seat that spoke
     /// of an older one.
     roster_resaid: Option<tokio::time::Instant>,
@@ -10244,6 +10245,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let gone_lines = t.tox_sink.take_gone_lines();
                         // How long each seat has been on the roster here.
                         let now_tick = tokio::time::Instant::now();
+                        let mut note_failed: Option<String> = None;
                         if let Some(f) = t.table.as_ref() {
                             let seats: Vec<u8> = f.roster().seats().iter().map(|e| e.seat).collect();
                             t.seat_since.retain(|s, _| seats.contains(s));
@@ -10262,10 +10264,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             // `S1-JJ`: the moment this client learns its table was set to
                             // start, it keeps that on disk -- restarted before the set, it
-                            // took a roster below the minimum as short.
-                            if f.set_to_start() && t.set_to_start_noted != Some(f.table_id()) {
-                                let _ = crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms);
-                                t.set_to_start_noted = Some(f.table_id());
+                            // took a roster below the minimum as short. Only where the
+                            // minimum is above two (at two, `D-044`'s floor is the minimum,
+                            // and the search's tables would crowd the few kept out); a write
+                            // that fails is tried again at the next tick, and said once.
+                            if f.set_to_start()
+                                && f.ad().min_players_to_start > 2
+                                && !t.set_to_start_noted.is_some_and(|(k, kept)| k == f.table_id() && kept)
+                            {
+                                match crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms) {
+                                    Ok(()) => t.set_to_start_noted = Some((f.table_id(), true)),
+                                    Err(e) => {
+                                        if t.set_to_start_noted.map(|(k, _)| k) != Some(f.table_id()) {
+                                            note_failed = Some(format!(
+                                                "could not keep on disk that this table was set to start ({e}); tried again at every tick"
+                                            ));
+                                        }
+                                        t.set_to_start_noted = Some((f.table_id(), false));
+                                    }
+                                }
                             }
                             // `D-062`: the table this seat first sat at, and every key its
                             // rosters seat -- what its continuations are read against.
@@ -10283,6 +10300,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     o.seats.insert(e.app_public_key, e.seat);
                                 }
                             }
+                        }
+                        if let Some(w) = note_failed {
+                            let _ = events.send(NodeEvent::Warning(w)).await;
                         }
                         // `D-061`: the seat that founded a table's continuation says so on
                         // the old table's topic, every `CONTINUES_SAY_EVERY` for
@@ -20969,9 +20989,10 @@ mod a_joiner_before_the_first_hand {
         let src = include_str!("run.rs");
         let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
         assert!(
-            code.contains("if f.set_to_start() && t.set_to_start_noted != Some(f.table_id()) {")
-                && code.contains("crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms)"),
-            "kept once, the moment it is known"
+            code.contains("if f.set_to_start()\n                                && f.ad().min_players_to_start > 2")
+                && code.contains("match crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms) {")
+                && code.contains("Ok(()) => t.set_to_start_noted = Some((f.table_id(), true)),"),
+            "kept the moment it is known, where the minimum is above two, and marked kept only once written"
         );
         let join = code.find("NodeCommand::JoinTable { key, buyin, seat, password } => {").expect("the join arm");
         let built = join + code[join..].find("Formation::join(").expect("it builds a formation");
