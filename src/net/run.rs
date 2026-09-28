@@ -13990,12 +13990,13 @@ fn note_founders_reading(
 
 /// `S1-JF`: how recently the founder must have heard a seat for the seat to be
 /// counted lost with its own line when that line becomes the suspect. A seat the
-/// founder stops hearing reads unheard `QUIET_LIMIT_S` later and is dropped by
-/// the library 58 s after its last packet; `S1-GX` names the line once two such
-/// drops are within `OWN_LINE_WINDOW` of each other -- so the first seat of the
-/// pair was last heard up to `OWN_LINE_WINDOW` + (58 s - `QUIET_LIMIT_S`) before,
-/// and a tick later.
-const LINE_LOSS_WINDOW: std::time::Duration = std::time::Duration::from_secs(100);
+/// founder stops hearing reads unheard `QUIET_LIMIT_S` later, at the driver's
+/// next five-second sweep, and is dropped by the library 58 s after its last
+/// packet; `S1-GX` names the line once two such drops are within
+/// `OWN_LINE_WINDOW` of each other, read a tick after the judgement -- so the
+/// first seat of the pair was last heard up to `OWN_LINE_WINDOW` + (58 s -
+/// `QUIET_LIMIT_S`) + a sweep + a tick before.
+const LINE_LOSS_WINDOW: std::time::Duration = std::time::Duration::from_secs(110);
 
 /// `S1-JF`: the seats a founder lost with its own line stay that line's until it
 /// hears them again. Every tick notes when it last heard each seat
@@ -14031,6 +14032,17 @@ fn note_founders_line(
         }
     } else {
         lost.retain(|s| unheard.contains(s));
+        // A lone seat left is told apart from the seat this rule is for by
+        // nothing the founder can read -- it hears every other seat, and the
+        // others hear that one, as with a seat whose way to the founder alone
+        // broke -- so it is the reading's again. Two or more still unheard
+        // after the founder's line was the suspect are that line's (found by
+        // refuting the rule's fourth shape: the seat this rule is for is
+        // usually one the founder heard as it joined, and a blip of its line
+        // while it waited kept it for good).
+        if lost.len() < 2 {
+            lost.clear();
+        }
     }
 }
 
@@ -20785,9 +20797,33 @@ mod a_joiner_before_the_first_hand {
         note_founders_line(&mut lost, &mut heard, false, &others, &[3, 4], s(151) + LINE_LOSS_WINDOW);
         assert!(lost.is_empty(), "seat 4 was lost before the line, seat 3 never heard");
 
+        // The seat this rule is for is usually one the founder heard as it
+        // joined -- it invites every seat -- and then lost alone. A blip of the
+        // founder's line while it waits takes it in with the seats heard, and
+        // once the line is sound again it is the only one left unheard: a lone
+        // seat is the reading's again, and judged.
+        let u = 400;
+        note_founders_line(&mut lost, &mut heard, false, &others, &[], s(u));
+        note_founders_line(&mut lost, &mut heard, false, &others, &[4], s(u + 25));
+        note_founders_line(&mut lost, &mut heard, true, &others, &[4], s(u + 70));
+        assert!(lost.contains(&4), "taken in by the blip");
+        note_founders_line(&mut lost, &mut heard, false, &others, &[4], s(u + 92));
+        assert!(lost.is_empty(), "alone once the line is sound");
+        assert_eq!(judged(&lost, vec![4]), vec![4]);
+        // Two seats lost with the line stay the line's -- until the founder
+        // hears one of them again, and the other is alone.
+        note_founders_line(&mut lost, &mut heard, false, &others, &[], s(u + 100));
+        note_founders_line(&mut lost, &mut heard, false, &others, &[1, 2], s(u + 125));
+        note_founders_line(&mut lost, &mut heard, true, &others, &[1, 2], s(u + 165));
+        note_founders_line(&mut lost, &mut heard, false, &others, &[1, 2], s(u + 230));
+        assert_eq!(lost.iter().copied().collect::<Vec<u8>>(), vec![1, 2], "two are the line's");
+        note_founders_line(&mut lost, &mut heard, false, &others, &[2], s(u + 240));
+        assert!(lost.is_empty(), "seat 2, alone, is the reading's again");
+
         // The window covers a pair of drops `OWN_LINE_WINDOW` apart: the first
-        // seat was last heard 58 s - `QUIET_LIMIT_S` before its drop.
-        assert!(LINE_LOSS_WINDOW.as_secs() >= OWN_LINE_WINDOW.as_secs() + (58 - QUIET_LIMIT_S) + 2);
+        // seat was last heard 58 s - `QUIET_LIMIT_S` before its drop, read at a
+        // five-second sweep and a two-second tick.
+        assert!(LINE_LOSS_WINDOW.as_secs() >= OWN_LINE_WINDOW.as_secs() + (58 - QUIET_LIMIT_S) + 5 + 2);
 
         // And the judgement reads its reading through the set.
         let src = include_str!("run.rs");
