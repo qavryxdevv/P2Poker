@@ -2275,11 +2275,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         };
         ($t:ident, $hand_id:expr, $terminal:expr, $stack:expr, $kept:expr) => {{
             let kept: Option<[u8; 32]> = $kept;
+            // `S1-JL`: never a record with no chips, whichever road writes it --
+            // a hand's boundary, the deck stage's card material (`D-033`), the
+            // set. A seat that busted has nothing to come back to, and one that
+            // stayed to watch had its record written back with 0 at the next
+            // hand's deck stage.
+            let with_chips = $stack > 0;
             // `D-037`: the founder's record too -- its own table, advert and
             // hash, with the table key's seed and its last signed roster, so
             // that it can come back as the founder. A seat that joined records
             // what it joined under.
-            let who = $t.table.as_ref().and_then(|f| {
+            let who = $t.table.as_ref().filter(|_| with_chips).and_then(|f| {
                 if f.is_founder() {
                     Some((f.table_id(), f.ad().clone(), f.advert_hash(), f))
                 } else {
@@ -12922,7 +12928,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // after an abort, and reading it here forgot the session at every
                     // aborted boundary (`run193358-3`).
                     let stack = h.stack_at_boundary(me);
-                    match at_the_boundary(stack, h.checkpoint8().is_some()) {
+                    // `S1-JL`: settled at checkpoint 8, or late -- a hand this client gave up
+                    // and the table then settled (`S1-BP`) is settled all the same.
+                    match at_the_boundary(stack, h.checkpoint8().is_some() || h.late_settled()) {
                         AtTheBoundary::Forget => {
                             // `S1-JK`: this table's record -- the key `remember_session!`
                             // files it under -- and not another slot's.
@@ -21024,7 +21032,15 @@ mod a_joiner_before_the_first_hand {
             1,
             "the boundary writes its record in one place"
         );
-        let at = code.find("match at_the_boundary(stack, h.checkpoint8().is_some()) {").expect("decided by the rule");
+        // Nor does any other road: the deck stage's card material (`D-033`)
+        // wrote the busted seat's record back with 0 until the macro refused it.
+        let mac = code.find("macro_rules! remember_session {").expect("the macro");
+        let body = &code[mac..mac + 3_000];
+        assert!(
+            body.contains("let with_chips = $stack > 0;") && body.contains(".filter(|_| with_chips)"),
+            "no road writes a record with no chips"
+        );
+        let at = code.find("match at_the_boundary(stack, h.checkpoint8().is_some() || h.late_settled()) {").expect("decided by the rule, late settlements settled");
         let write = code.find("remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);").expect("the write");
         assert!(at < write && write - at < 2_000, "and only on the rule's word");
     }
