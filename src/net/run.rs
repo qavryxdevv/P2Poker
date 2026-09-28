@@ -14156,12 +14156,13 @@ fn end_the_rejoin_for_a_new_table(t: &mut TableRun) {
 }
 
 /// `S1-JK`: forget the session record a slot resumes from -- that one, and not
-/// whatever another slot's table has written to the one file since.
+/// whatever another slot's table has written to the one file since. A slot that
+/// holds no record of its own (a seat that busted keeps resuming, and has none)
+/// has nothing to forget.
 fn forget_the_resumed_record(profile_dir: &std::path::Path, resume: Option<&crate::storage::session::Record>) {
-    let _ = match resume {
-        Some(r) => crate::storage::session::forget_the_record_of(profile_dir, &r.table_key),
-        None => crate::storage::session::forget(profile_dir),
-    };
+    if let Some(r) = resume {
+        let _ = crate::storage::session::forget_the_record_of(profile_dir, &r.table_key);
+    }
 }
 
 /// `S1-GS`, `S1-GX`: whether this client's own line is the likelier reading of a
