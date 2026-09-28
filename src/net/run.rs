@@ -7988,18 +7988,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // tables one client plays at, the command lands on the active
                         // slot, and founding there replaced the table being played.
                         // `S1-FY`: nor over a seat this slot asks for again.
+                        if t.table.is_some() || t.rejoin_key.is_some() {
+                            let why = format!(
+                                "this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before founding another"
+                            );
+                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                            // `S1-JG`: said in the window too, as any table not opened is.
+                            if !for_search && t.continuing.is_none() {
+                                let _ = events.send(NodeEvent::TableNotOpened { why }).await;
+                            }
+                            continue;
+                        }
                         // `D-062`: a table founded afresh is its own origin; a continuation
-                        // keeps the origin of the table it continues.
+                        // keeps the origin of the table it continues. Not before the
+                        // guard above: a founding refused at the most tables took the
+                        // origin of the table being played (`S1-JG`'s refutation).
                         if t.continuing.is_none() {
                             t.origin = None;
-                        }
-                        if t.table.is_some() || t.rejoin_key.is_some() {
-                            let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before founding another"
-                                )))
-                                .await;
-                            continue;
                         }
                         t.lost_key = None;
                         // A fresh key per table, and that freshness is the only
@@ -8159,8 +8164,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     None => Err("its Tox group did not come up".to_string()),
                                 }
                             }
-                            // A build without Tox, or a Tox with no key of its own
-                            // yet: no group an advert could name.
+                            // A build without Tox: no group an advert could name.
                             Ok(None) => Err("this client has no Tox to carry its hands on".to_string()),
                             Err(e) => Err(format!("there is no Tox for it ({e})")),
                         };
@@ -8173,11 +8177,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = events
                                     .send(NodeEvent::Warning(format!("the table was not opened: {why}")))
                                     .await;
-                                // The player's own creation is answered in the
-                                // window; the search and a continuation try again
-                                // by their own clocks.
-                                if !for_search && t.continuing.is_none() {
-                                    let _ = events.send(NodeEvent::TableNotOpened { why }).await;
+                                if let Some(c) = t.continuing.take() {
+                                    // A continuation not opened goes -- its word on the
+                                    // old topic, and the old group it held -- and the
+                                    // table's window is told: nothing founds it again,
+                                    // and its seats pass this one over and play on.
+                                    let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&c.topic);
+                                    let _ = events
+                                        .send(NodeEvent::TableLost {
+                                            why: format!("the table's continuation was not opened: {why}"),
+                                        })
+                                        .await;
+                                } else {
+                                    // The player's own creation is answered in the
+                                    // window; the search founds again by its own clock.
+                                    if !for_search {
+                                        let _ = events.send(NodeEvent::TableNotOpened { why }).await;
+                                    }
+                                    // A slot opened for this founding holds nothing:
+                                    // it goes at once, not after a minute in which
+                                    // three refusals left the fourth creation on the
+                                    // table being played.
+                                    t.opened_at = tokio::time::Instant::now()
+                                        .checked_sub(std::time::Duration::from_secs(60))
+                                        .unwrap_or(t.opened_at);
                                 }
                                 continue;
                             }
@@ -21030,7 +21053,18 @@ mod a_joiner_before_the_first_hand {
         let refused = before.find("Err(why) => {").expect("the refusal");
         let refusal = &before[refused..];
         assert!(refusal.contains("t.tox_sink.clear();"), "its group given up");
-        assert!(refusal.contains("if !for_search && t.continuing.is_none() {") && refusal.contains("NodeEvent::TableNotOpened { why }"));
+        assert!(refusal.contains("if !for_search {") && refusal.contains("NodeEvent::TableNotOpened { why }"), "the player told");
+        assert!(
+            refusal.contains("if let Some(c) = t.continuing.take() {") && refusal.contains("NodeEvent::TableLost {"),
+            "a continuation not opened goes, and its window is told"
+        );
+        assert!(refusal.contains("t.opened_at = tokio::time::Instant::now()"), "an empty slot goes at once");
+        // And a founding refused at the most tables keeps the played table's
+        // origin, and is said in the window too.
+        let guard = before.find("if t.table.is_some() || t.rejoin_key.is_some() {").expect("the guard");
+        let origin = before.find("t.origin = None;").expect("the origin reset");
+        assert!(guard < origin, "the origin is reset after the guard");
+        assert!(before[guard..origin].contains("NodeEvent::TableNotOpened { why }"));
         assert!(refusal.contains("continue;"), "and nothing founded");
     }
 

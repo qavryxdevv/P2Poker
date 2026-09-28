@@ -180,13 +180,38 @@ impl Default for TableSink {
     }
 }
 
+/// `S1-JG`: toxcore's longest group name, in bytes (`MAX_GC_GROUP_NAME_SIZE`
+/// in `group_common.h`). A table's name may run to 64 bytes (§7.2) and the
+/// dialog counts characters, so a Cyrillic name of twenty-six letters (49 bytes),
+/// a Chinese one of seventeen, or an empty name, was refused by `tox_group_new`,
+/// and the table's group never came up.
+const GROUP_NAME_MAX: usize = 48;
+
+/// `S1-JG`: the table's name as its group's -- cut at a character boundary to
+/// `GROUP_NAME_MAX` bytes, and never empty, which toxcore refuses too. The
+/// group's name is a label and nothing more: the chat id is what the advert
+/// names and what every member checks.
+pub fn group_name_for(table_name: &str) -> String {
+    let mut end = table_name.len().min(GROUP_NAME_MAX);
+    while !table_name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = table_name[..end].trim();
+    if cut.is_empty() {
+        "P2Poker table".to_string()
+    } else {
+        cut.to_string()
+    }
+}
+
 impl TableSink {
     /// How far this client got in reaching the Tox network.
     pub fn reach(&self) -> Reach {
         self.reach
     }
 
-    /// No Tox table. The node publishes to its GossipSub mesh as before.
+    /// No Tox table: a slot that holds no table, or whose group is still to
+    /// start. No table is founded without one (`S1-JG`).
     pub const fn none() -> Self {
         Self {
             #[cfg(feature = "tox")]
@@ -233,8 +258,8 @@ impl TableSink {
     ///
     /// Gives back **this client's own Tox public key**, which is what the
     /// advertisement's `founder_tox_key` and the join request's `tox_key`
-    /// carry. `Ok(None)` means the build has no Tox and the table rides the
-    /// mesh — not a failure, and the caller says nothing about it.
+    /// carry. `Ok(None)` means the build has no Tox: a founder then founds
+    /// nothing (`S1-JG`), since a hand travels only over Tox.
     ///
     /// The identity is the profile's, not a fresh one: a Tox key that changed
     /// on every start would take the table with it, because both ends add each
@@ -374,7 +399,7 @@ impl TableSink {
             };
             self.inner = Some(driver.open(table::Setup {
                 role,
-                group_name: group_name.to_string(),
+                group_name: group_name_for(group_name),
                 self_name: self_name.to_string(),
                 roster,
                 binder,
@@ -1124,6 +1149,24 @@ impl TableSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `S1-JG`: a group's name is at most 48 bytes, cut between characters,
+    /// and never empty -- toxcore refuses both, and the table was not opened.
+    #[test]
+    fn a_groups_name_fits_toxcore() {
+        let czech = "Žluťoučký kůň úpěl ďábelské ódy znovu"; // 49 bytes
+        assert!(czech.len() > GROUP_NAME_MAX);
+        let cut = group_name_for(czech);
+        assert!(cut.len() <= GROUP_NAME_MAX && czech.starts_with(&cut) && !cut.is_empty(), "{cut:?}");
+        let cyrillic = "Вечерний турнир для друзей"; // 49 bytes
+        assert!(group_name_for(cyrillic).len() <= GROUP_NAME_MAX);
+        assert!(group_name_for(cyrillic).chars().all(|c| cyrillic.contains(c)), "cut between characters");
+        assert_eq!(group_name_for("New table"), "New table", "a short name is its own");
+        assert_eq!(group_name_for(""), "P2Poker table", "never empty");
+        assert_eq!(group_name_for("   "), "P2Poker table");
+        let emoji = "🂡".repeat(13); // 52 bytes of four-byte characters
+        assert_eq!(group_name_for(&emoji).len(), 48);
+    }
 
     /// An empty sink says no to everything and never yields, in both builds.
     /// That is what lets `run.rs` carry the branch unconditionally.

@@ -60,6 +60,9 @@ fn node() -> Swarm<ShapedBehaviour> {
 ///
 /// A tournament's buy-in is its stack, both bounds (§6): everybody starts with
 /// the same chips, so there is nothing for a range to say.
+///
+/// `S1-JG`: and on its Tox group, which the advert names -- `receive` files no
+/// table without one, as a hand travels only over Tox.
 fn demo_ad(name: &str) -> TableAd {
     let (action, grace, crypto, delay) = (20_000u32, 5_000u32, 30_000u32, 7_000u32);
     let seats = 6u8;
@@ -106,8 +109,8 @@ fn demo_ad(name: &str) -> TableAd {
         founder_peer_id: Vec::new(),
         timestamp_unix_ms: NOW,
         expires_at_unix_ms: NOW + 90_000,
-        founder_tox_key: None,
-        tox_chat_id: None,
+        founder_tox_key: Some([0x70; 32]),
+        tox_chat_id: Some([0x71; 32]),
     }
 }
 

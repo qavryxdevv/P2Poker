@@ -28,10 +28,10 @@
     several hands: at ten seats formation alone can take a minute.
 
 .PARAMETER Exe
-    Which client to run. Tox or libp2p is a **build** choice, not a runtime one:
-    `cargo build --release` gives the Tox path (D-019, the default feature) and
-    `cargo build --release --no-default-features` gives libp2p. Both are worth a
-    curve and they are not the same shape, so point this at the one you built.
+    Which client to run: `cargo build --release` gives the Tox path (D-019, the
+    default feature). A build with `--no-default-features` has no Tox, and since
+    S1-JG its founder founds no table -- a hand travels only over Tox -- so it
+    measures nothing here.
 
 .EXAMPLE
     tools\table-run.ps1 -Seats 8 -Seconds 420
@@ -958,10 +958,10 @@ foreach ($n in $nodes) {
 # genesis column says. This is the check that catches what the genesis one
 # cannot.
 $deaf = @($nodes | Where-Object { $_.Opens.Count -gt 0 -and $_.Overs -eq 0 })
-# **A build with no Tox has no group, and that is not a fault.** Every node
-# reporting `never` means this is the libp2p path (`--no-default-features`),
-# which is a curve worth measuring against D-019's. One node missing a group
-# while others have one is the fault.
+# **A build with no Tox has no group.** Every node reporting `never` means a
+# build with `--no-default-features`, whose founder founds no table since S1-JG
+# (a hand travels only over Tox). One node missing a group while others have one
+# is the fault.
 $onTox = @($nodes | Where-Object { $null -ne $_.Group }).Count -gt 0
 $never = if ($onTox) { @($nodes | Where-Object { $null -eq $_.Group }) } else { @() }
 if (-not $onTox) { Write-Host 'path   libp2p (no node reported a Tox group)' }

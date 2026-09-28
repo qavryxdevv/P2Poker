@@ -5323,6 +5323,14 @@ mod tests {
         s.apply(NodeEvent::Hosting { key: [7u8; 32] });
         assert!(s.view().not_opened.is_none(), "a table founded after all");
         assert!(NodeEvent::TableNotOpened { why: String::new() }.changes_more_than_the_log(), "painted at once");
+
+        // A creation refused in a background slot lands on the lobby's word,
+        // not on that slot's state.
+        s.apply(NodeEvent::AtTable { slot: 1, key: None });
+        assert!(s.background.contains_key(&1), "a background slot");
+        s.apply(NodeEvent::TableNotOpened { why: "its Tox group did not come up".into() });
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some([7u8; 32]) });
+        assert_eq!(s.view().not_opened.as_deref(), Some("its Tox group did not come up"));
     }
 
     /// `S1-FG`: the node's word that it did not start a join ends the join

@@ -538,8 +538,14 @@ pub fn receive(
 /// this build was already seated at that table with those chips, and a hand in
 /// progress is not an offer to start one. `D-072` deactivates the cash game as
 /// something this client starts or sits down at.
+///
+/// `S1-JG`: **and the advert names the table's Tox group.** A hand travels
+/// only over Tox, so a table whose group did not come up -- founded on the
+/// mesh by a client before `S1-JG`, the Store's 0.1.5 among them -- never
+/// deals one; filed, it was listed, searched for and sat at, and its seats
+/// waited for ever.
 pub fn plays(ad: &TableAd) -> bool {
-    ad.mode == lobby::Mode::TournamentSngPlayMoney.code()
+    ad.mode == lobby::Mode::TournamentSngPlayMoney.code() && ad.tox_chat_id.is_some() && ad.founder_tox_key.is_some()
 }
 
 /// Re-verify an advertisement handed over **outside** the lobby.
@@ -663,8 +669,9 @@ mod tests {
             founder_peer_id: b"12D3KooWfake".to_vec(),
             timestamp_unix_ms: NOW,
             expires_at_unix_ms: NOW + 90_000,
-            founder_tox_key: None,
-            tox_chat_id: None,
+            // `S1-JG`: on its group, as every table this client files.
+            founder_tox_key: Some([0x70; 32]),
+            tox_chat_id: Some([0x71; 32]),
         };
         a.hand_deadline_ms = hand_deadline_min_ms(
             a.max_players,
@@ -675,6 +682,11 @@ mod tests {
         0,
         ) as u32;
         a
+    }
+
+    /// `S1-JG`: the same table, founded on the mesh -- its advert names no group.
+    fn ad_without_group() -> TableAd {
+        TableAd { founder_tox_key: None, tox_chat_id: None, ..ad() }
     }
 
     /// The whole loop, which is what D-003 needs and what did not exist: a table
@@ -787,6 +799,18 @@ mod tests {
         assert!(lobby::admit(&cash, NOW).is_ok(), "a cash advert is legal §7.2");
         assert!(!plays(&cash), "and this build does not deal it");
         assert!(plays(&ad()), "the Sit-and-Go is what it deals");
+        // `S1-JG`: nor one that names no Tox group -- founded on the mesh by an
+        // older client, it can never deal a hand.
+        let mut mesh = ad();
+        mesh.tox_chat_id = None;
+        assert!(!plays(&mesh), "a table with no group is not dealt");
+        mesh.founder_tox_key = None;
+        assert!(!plays(&mesh));
+        let mut half = ad();
+        half.founder_tox_key = None;
+        assert!(!plays(&half), "nor with half of it");
+        let refused_mesh = receive(&publish(&ad_without_group(), &table).unwrap(), [9u8; 32], NOW, &mut RateLimiter::new(), &mut LobbyStore::new());
+        assert!(matches!(refused_mesh, Err(NotAccepted::NotPlayed)), "{refused_mesh:?}");
 
         let wire = publish(&cash, &table).expect("an advert publishes");
         let mut store = LobbyStore::new();
@@ -972,7 +996,7 @@ mod tests {
     /// distinguishable from thirty-two zero bytes, which is a key.
     #[test]
     fn the_tox_fields_survive_the_wire_in_both_states() {
-        let plain = ad();
+        let plain = ad_without_group();
         assert_eq!(
             plain.founder_tox_key, None,
             "a table is not on Tox unless it says so"
@@ -1126,7 +1150,7 @@ mod tests {
     /// into well-formed nonsense.
     #[test]
     fn the_body_is_the_arrangement_the_protocol_specifies() {
-        let body = AdBody::from(&ad());
+        let body = AdBody::from(&ad_without_group());
         let bytes = to_canonical(&body).unwrap();
 
         // A CBOR array of 30 elements: major type 4, count in one extra byte.
