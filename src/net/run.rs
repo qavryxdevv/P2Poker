@@ -8626,6 +8626,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 Err(e) => {
                                     forget_the_resumed_record(&profile_dir, t.resume.as_ref());
                                     t.resume = None;
+                                    // `S1-JH`: and the group this rebuild started is given
+                                    // up with it, as a founding that fails gives up its own:
+                                    // left open, the slot's next table would ride the old
+                                    // table's group.
+                                    t.tox_sink.clear();
+                                    t.tox_group_said = false;
+                                    t.table_announces = 0;
                                     let _ = events
                                         .send(NodeEvent::SessionGaveUp { why: format!("the founder's record does not rebuild the table: {e:?}") })
                                         .await;
@@ -20933,6 +20940,12 @@ mod a_joiner_before_the_first_hand {
             3,
             "given up when the group did not come up, when the table does not form, and when its advert does not publish"
         );
+        // So does a founder's record that does not rebuild its table: the group
+        // its rebuild started would have carried the slot's next table.
+        let resume = code.find("NodeCommand::ResumeSession => {").expect("the resume arm");
+        let fails = resume + code[resume..].find("the founder's record does not rebuild the table").expect("its failure");
+        let its_arm = code[..fails].rfind("Err(e) => {").expect("the failing arm");
+        assert!(code[its_arm..fails].contains("t.tox_sink.clear();"), "the rebuild's group given up");
     }
 
     /// `S1-GR`: a key seated again at once after one end of its seat, and later and
