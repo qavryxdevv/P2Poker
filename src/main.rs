@@ -3287,7 +3287,9 @@ impl eframe::App for Client {
                     // `D-071`: the donation page, in the player's own browser. The
                     // address is said in the log either way: a player whose
                     // system opened nothing can still read where it is.
-                    render::LobbyAction::OpenDonationPage => {
+                    // `D-080`: never from a copy from the Store, which draws no
+                    // such button to press.
+                    render::LobbyAction::OpenDonationPage if render::asks_for_gifts(self.ui.home.as_ref()) => {
                         let opened = open_in_browser(render::DONATION_URL);
                         self.state.log.push_back(format!(
                             "the donation page {}: {}",
@@ -3295,6 +3297,7 @@ impl eframe::App for Client {
                             render::DONATION_URL
                         ));
                     }
+                    render::LobbyAction::OpenDonationPage => {}
                     // `D-072`: the issue tracker, in the player's own browser.
                     // Nothing of this client goes with it -- the address carries
                     // no query, and what the report says is what the player
@@ -3417,6 +3420,22 @@ mod tests {
         assert!(made < asked && asked < handed, "asked once the client exists, before the window has it");
         assert!(code.contains("render::LobbyAction::CheckForUpdate => self.check_for_update(&ctx, false),"));
         assert_eq!(code.matches("check_for_update(&cc.egui_ctx, true)").count(), 1, "one opening question");
+    }
+
+    /// **`D-080`, 2026-09-28: a copy from the Store opens no donation page**,
+    /// whatever asks it to: the one place the client opens it is behind
+    /// `render::asks_for_gifts`, which a copy from the Store answers no.
+    #[test]
+    fn a_copy_from_the_store_opens_no_donation_page() {
+        let whole = include_str!("main.rs").replace("\r\n", "\n");
+        let code = &whole[..whole.find("\n#[cfg(test)]\nmod tests").expect("the tests")];
+        assert_eq!(code.matches("open_in_browser(render::DONATION_URL)").count(), 1, "one place opens it");
+        let guard = code
+            .find("render::LobbyAction::OpenDonationPage if render::asks_for_gifts(self.ui.home.as_ref()) => {")
+            .expect("behind the question");
+        let opened = code.find("open_in_browser(render::DONATION_URL)").expect("opened");
+        assert!(guard < opened, "the question first");
+        assert!(!code[guard + 1..opened].contains("render::LobbyAction::"), "and the page opened inside its arm");
     }
 
     #[test]

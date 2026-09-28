@@ -154,6 +154,16 @@ pub enum LobbyAction {
 /// without a commit. `tests/donation_page.rs` holds this link to that file.
 pub const DONATION_URL: &str = "https://github.com/qavryxdevv/P2Poker/blob/master/DONATE.md";
 
+/// `D-080`, 2026-09-28: whether this copy asks for gifts. A copy from the
+/// Microsoft Store does not: the donation page takes Bitcoin and USDT, and the
+/// Store's certification sent the first package back for it -- a product that
+/// leads to payments in a cryptocurrency is published only from a company
+/// account (Store policy 10.2.6). A copy from GitHub asks as before, and so
+/// does a preview, which has no copy to speak of.
+pub fn asks_for_gifts(home: Option<&HomeView>) -> bool {
+    !home.is_some_and(|h| h.store)
+}
+
 /// `D-072`: where a player reports a bug -- the repository's issue tracker, with
 /// the form already open.
 ///
@@ -3510,12 +3520,11 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> bo
     let widths = DONATE_FORMS.map(|words| donate_width(ui, words));
     let mut donate = false;
     let mut word_ends = details.left() - STRIP_GAP;
-    if let Some((form, x)) = donate_place(
-        row.left() + light + word_width + STRIP_GAP,
-        details.left() - STRIP_GAP,
-        row.center().x,
-        &widths,
-    ) {
+    // `D-080`: a copy from the Store has no button here at all.
+    let place = asks_for_gifts(state.home.as_ref()).then(|| {
+        donate_place(row.left() + light + word_width + STRIP_GAP, details.left() - STRIP_GAP, row.center().x, &widths)
+    });
+    if let Some((form, x)) = place.flatten() {
         let rect = egui::Rect::from_center_size(
             egui::pos2(x, row.center().y),
             egui::vec2(widths[form], DONATE_HEIGHT - 2.0),
@@ -3914,7 +3923,7 @@ mod tests {
     #[test]
     fn the_about_page_says_the_build_and_where_a_bug_goes() {
         assert_eq!(RELEASE_STAGE, "beta", "this build is a beta and says so");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.4", "the number comes from Cargo.toml");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.5", "the number comes from Cargo.toml");
         assert!(BUG_REPORT_URL.starts_with("https://github.com/"), "{BUG_REPORT_URL}");
         assert!(BUG_REPORT_URL.ends_with("/issues/new"), "the issue form, already open");
         assert!(!BUG_REPORT_URL.contains('?'), "no query: the client sends nothing with it");
@@ -3977,6 +3986,61 @@ mod tests {
         assert!(DONATE_FORMS[0].len() > DONATE_FORMS[1].len() && DONATE_FORMS[2].is_empty());
         // And the page it opens is the project's own, over https.
         assert!(DONATION_URL.starts_with("https://github.com/") && DONATION_URL.ends_with("/DONATE.md"));
+    }
+
+    /// `D-080`, 2026-09-28: a copy from the Store draws no *Support the
+    /// project* button -- the Store's certification sent back a package whose
+    /// button led to gifts in cryptocurrency -- and a copy from GitHub, or a
+    /// preview, draws it as before. Read off a whole pass of the strip, as
+    /// painted.
+    #[test]
+    fn a_copy_from_the_store_asks_for_no_gifts() {
+        fn words(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.job.text.clone()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| words(s, out)),
+                _ => {}
+            }
+        }
+        let painted = |home: Option<HomeView>| {
+            let ctx = egui::Context::default();
+            install(&ctx);
+            // The button's words are in the table's Inter, which is bound at
+            // the start of the pass after the one that asks for it.
+            style::install_fonts(&ctx);
+            ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+            let view = LobbyView::default();
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+            let mut state = LobbyUi::new(Settings::defaults(&key));
+            state.home = home;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_200.0, 120.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let _ = network_strip(ui, &view, &mut state);
+            });
+            let mut found = Vec::new();
+            std::mem::take(&mut out.shapes).iter().for_each(|c| words(&c.shape, &mut found));
+            out.drop_without_applying_deltas();
+            found
+        };
+        let home = |store| HomeView {
+            folder: "C:/P2Poker".into(),
+            profile: "C:/P2Poker/profile".into(),
+            installed: false,
+            store,
+            can_install: !store,
+            busy: false,
+        };
+        let asks = |w: &[String]| w.iter().any(|t| t == DONATE_FORMS[0]);
+        let from_github = painted(Some(home(false)));
+        assert!(asks(&from_github), "a copy from GitHub asks: {from_github:?}");
+        assert!(asks(&painted(None)), "and so does a preview");
+        let from_store = painted(Some(home(true)));
+        assert!(!asks(&from_store), "a copy from the Store does not: {from_store:?}");
+        assert!(from_store.iter().any(|t| t == "Network details"), "and its strip is drawn all the same: {from_store:?}");
+        assert!(asks_for_gifts(None) && asks_for_gifts(Some(&home(false))) && !asks_for_gifts(Some(&home(true))));
     }
 
     /// `D-067`: the columns follow the width in points. Three on a wide

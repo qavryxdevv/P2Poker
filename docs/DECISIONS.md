@@ -6428,6 +6428,15 @@ the link and the tests already name the right place. That a phone's wallet scans
 are not a wallet, and the owner's scan of both is the last check. That the button brings a gift: it was built to be seen and to be honest, and
 what it earns is nobody's to promise.
 
+**Amended 2026-09-28 (`D-080`): a copy from the Microsoft Store has no such button.** The Store's certification sent
+the first package back under its policy 10.2.6: a product that leads to payments in a cryptocurrency is published
+only from a company account, with the authorisation of the exchange it uses -- and the only gifts this page takes are
+Bitcoin and USDT. A copy from the Store draws no *Support the project* button and opens no donation page
+(`render::asks_for_gifts`); a copy from GitHub, and a preview, ask exactly as above. **Guard.**
+`gui::render::tests::a_copy_from_the_store_asks_for_no_gifts` paints the strip in a pass of its own, as a copy from
+GitHub, as a preview and as a copy from the Store, and reads the button's words off what was painted;
+`a_copy_from_the_store_opens_no_donation_page` holds the one place the client opens the page behind the same question.
+
 ## D-072 — the cash game is deactivated, and the client says what it is and where a bug goes
 
 **Decided 2026-09-20 by the project owner:** *deactivate the cash game; add an About tab to the settings with the
@@ -7142,6 +7151,20 @@ submission are the owner's, and the listing, the answers and the package are pre
 preparation was carried through in his own signed-in browser -- properties, price, rating, package, listing and the
 `runFullTrust` justification are filled and saved, the package validated -- and what is left is the one thing that is
 his alone to do: sending it to certification.
+
+**The first certification, 2026-09-28: sent back for the donation page, and nothing else.** The owner sent the
+submission on 2026-09-23; the report of 2026-09-28 names one requirement, 10.2.6 *Security -- Cryptocurrency*: a
+product that performs financial transactions involving a cryptocurrency must be published from a company account,
+with the authorisation of the exchange or service it uses. The *Support* button opens `DONATE.md`, whose gifts are
+Bitcoin and USDT. Neither condition is one this project can meet or needs: the client performs no transaction of any
+kind, and its author is one person. So, as the paragraph above foresaw, **a copy from the Store asks for no gifts**:
+no button on its strip, and no page opened if anything asks (`render::asks_for_gifts`, `D-071` amended). Nothing else
+in the report objected -- not `runFullTrust`, not the rating, not the privacy policy -- and the package is sent again
+as **0.1.5**, which carries the connection limits of `S1-IY` and `S1-IZ`, the Linux listing of `S1-JA` and the clock
+of `S1-JB` besides. **0.1.5 is published on GitHub at once, on the owner's word, as the one exception to *a release
+waits for the Store*:** no copy from the Store exists yet to be locked out, and the Store's reviewers will run 0.1.5
+itself. The workflow still made the release a draft, `RELEASE_WAITS_FOR_STORE` being set, and the draft was published
+by hand; the variable stays set, so the next release waits again.
 
 
 ## D-081 -- a clock that is out, and the company it costs
