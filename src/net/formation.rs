@@ -400,7 +400,9 @@ impl Formation {
             recorded_refused: false,
             released: false,
             named_serial: None,
-            started: false,
+            // `S1-JI`: a record is kept only for a table that was set, and a set
+            // table was set to start (`D-044`).
+            started: true,
             hold_ready: false,
             admitted: false,
         };
@@ -1403,8 +1405,16 @@ impl Formation {
 
     /// `S1-CR`: give a formation built for a resume the ratification this
     /// client recorded, to be said again verbatim when the roster fits.
+    ///
+    /// `S1-JI`: and the table it names was set to start (`D-044`) -- a record is
+    /// kept only for a table that was set. Built afresh, a formation learnt that
+    /// only by adopting a roster at the advert's minimum; so a seat back from
+    /// its record at a table that went on below its minimum -- a Sit-and-Go
+    /// that gave a seat back before its first hand -- took the roster as short,
+    /// said nothing, refused every ratification, and never took up the game.
     pub fn with_recorded_ratification(mut self, bytes: Vec<u8>) -> Self {
         self.recorded_ready = Some(bytes);
+        self.started = true;
         self
     }
 
@@ -2975,6 +2985,91 @@ mod tests {
         );
     }
 
+    /// `S1-JI`: a table that starts at three, set with three, gives a seat back
+    /// before its first hand and goes on with two (`D-044`). A seat whose client
+    /// then comes back from its session record ratifies with its recorded
+    /// `TABLE_READY` and takes the table's session -- where, built afresh, its
+    /// formation took the roster of two as short and never did.
+    #[test]
+    fn a_seat_back_from_its_record_below_the_tables_minimum_takes_the_session() {
+        let (mut t, _, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (mut j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap();
+            let out = t.founder.on_join_request(&request, &peer(n), false, NOW).expect("seated");
+            deliver(&mut t, &mut j, out, table_id, NOW);
+            t.joiners.push(j);
+        }
+        assert!(t.founder.session().is_some(), "the table of three is set");
+
+        // Seat 3 is given back before the first hand; the two that remain set.
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&peer(3), NOW + 1_000)
+            .expect("given back");
+        for s in out {
+            let Send::Broadcast(b) = s else { continue };
+            if joinwire::receive_player_list(&b).is_ok() {
+                for s in t.joiners[0].on_player_list(&b, NOW + 1_000).expect("the roster of two holds") {
+                    if let Send::Broadcast(r) = s {
+                        t.founder.on_table_ready(&r).expect("its ratification holds");
+                    }
+                }
+            } else {
+                t.joiners[0].on_table_ready(&b).expect("the founder's ratification holds");
+            }
+        }
+        let session = t.founder.session().expect("the table of two is set");
+        assert_eq!(t.joiners[0].session(), Some(session));
+        let recorded = t.joiners[0].my_ratification().expect("its ratification").to_vec();
+
+        // Its client comes back, from the record.
+        let (back, _) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "player 2".into(),
+            1_000,
+            None,
+            None,
+            [22u8; 32],
+            NOW + 2_000,
+            None,
+        )
+        .unwrap();
+        let mut back = back.with_recorded_ratification(recorded.clone());
+        let said = t.founder.say_again(NOW + 2_000);
+        let mut its_word = vec![];
+        for bytes in said.iter().filter(|b| joinwire::receive_player_list(b).is_ok()) {
+            for s in back.on_player_list(bytes, NOW + 2_000).expect("the list holds") {
+                if let Send::Broadcast(b) = s {
+                    its_word.push(b);
+                }
+            }
+        }
+        assert_eq!(its_word, vec![recorded], "its recorded ratification, verbatim, below the minimum");
+        for bytes in said.iter().filter(|b| joinwire::receive_player_list(b).is_err()) {
+            back.on_table_ready(bytes).expect("a ratification holds");
+        }
+        assert_eq!(back.session(), Some(session), "the table's session, and no other");
+    }
+
     /// `D-044`, the owner's ruling: a table set to start goes on with the seats
     /// that remain, two at the least, when a seat is given back before the
     /// first hand. Three seats on a table that starts at three; one given
@@ -3546,6 +3641,56 @@ mod tests {
             back.serial(),
             out.iter().map(|s| match s { Send::Reply(b) => format!("reply {} B", b.len()), Send::Broadcast(b) => format!("broadcast {} B", b.len()) }).collect::<Vec<_>>()
         );
+    }
+
+    /// `S1-JI`: the same below the table's minimum. A table that starts at
+    /// three, set with three, gives a seat back before its first hand and goes
+    /// on with two (`D-044`); its founder, restarted, is rebuilt from its record
+    /// and says its recorded ratification -- where, built afresh, it took its
+    /// own roster of two as short and said nothing.
+    #[test]
+    fn the_founder_comes_back_from_its_record_below_the_tables_minimum() {
+        let (mut t, _, _) = form_three();
+        let table_id = t.founder.table_id();
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&peer(3), NOW + 1_000)
+            .expect("given back");
+        for s in out {
+            let Send::Broadcast(b) = s else { continue };
+            if joinwire::receive_player_list(&b).is_ok() {
+                for s in t.joiners[0].on_player_list(&b, NOW + 1_000).expect("the roster of two holds") {
+                    if let Send::Broadcast(r) = s {
+                        t.founder.on_table_ready(&r).expect("its ratification holds");
+                    }
+                }
+            } else {
+                t.joiners[0].on_table_ready(&b).expect("the founder's ratification holds");
+            }
+        }
+        let session = t.founder.session().expect("the table of two is set");
+        let seed = t.founder.table_seed().expect("the founder holds the table key");
+        let list = t.founder.my_list().expect("the roster of two").to_vec();
+        let recorded = t.founder.my_ratification().expect("and its ratification").to_vec();
+        let others = t.joiners[0].say_again(NOW + 2_000);
+
+        let (mut back, said) = Formation::found_back(
+            key(1),
+            seed,
+            t.founder.ad().clone(),
+            t.founder.advert_hash(),
+            &list,
+            Some(recorded.clone()),
+            NOW + 60_000,
+        )
+        .expect("rebuilt from the record");
+        assert_eq!(said, vec![Send::Broadcast(recorded)], "its recorded ratification, below the minimum");
+        for b in others {
+            if joinwire::receive_table_ready(&b, &table_id, &back.genesis()).is_ok() {
+                let _ = back.on_table_ready(&b);
+            }
+        }
+        assert_eq!(back.session(), Some(session), "the table's session, and no other");
     }
 
     /// `S1-CR`: a seat that restarts says the ratification it recorded,
