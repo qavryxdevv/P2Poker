@@ -1670,6 +1670,12 @@ It is needed for the **non-deck** randomness: seat assignment at table start, an
 initial button position. (Subsequent buttons rotate deterministically; only the first
 needs randomness.)
 
+> **Not produced in version 1 (`D-083`).** Version 1 seats players as the founder admits
+> them and reads the first button off `session_id` (`PROTOCOL.md` §4.4 says how), which
+> the last seat to ratify can steer; that is an accepted risk of version 1
+> (`THREAT_MODEL.md` X6), and the argument below is for the version that builds the
+> beacon -- when winning at a table means something to the other players.
+
 **Ownership, settled: `PROTOCOL.md` §4.4 owns `commitment_i` and `seed`, and this
 section owns the argument for why they are shaped that way.** This is the
 disposition of `K-6`. Until this pass **both** documents claimed to be the

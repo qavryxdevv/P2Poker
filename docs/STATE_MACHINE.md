@@ -3651,6 +3651,13 @@ the initial button position. **The engine does not compute either value** — it
 verdicts of T6–T11, and the commitment check in T9 and T11 is a verdict handed to it, not an
 expression it evaluates.
 
+> **Not produced in version 1 (`D-083`), and this is where `S1-B`'s citation cycle ends.** No
+> client of version 1 reaches T6–T11: the first hand init follows `TABLE_READY`, the seats are the
+> founder's admission order (a joiner's asked-for seat granted when free), and the first button is
+> `provisional_button` -- the rule is written out once, in `PROTOCOL.md` §4.4's box, which this
+> section points at rather than restates. The bias that rule carries is an accepted risk of version
+> 1 (`THREAT_MODEL.md` X6); T6–T11 stay as the specification of the version that builds the beacon.
+
 **The two constructions are `PROTOCOL.md`'s and are not reproduced here (H8, D-011 rule 1).**
 `commitment_i` and `seed` are defined in **`PROTOCOL.md` §4.4**, over the hash constructor and the
 domain-string register of **`PROTOCOL.md` §2.8**; the retired domain strings, including this

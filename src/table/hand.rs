@@ -742,17 +742,16 @@ const STATE_HASH_CAP: usize = 512;
 const PEEK_CAP: usize = HAND_ABORT_CAP;
 const _: () = assert!(PEEK_CAP >= FRAME_CAP);
 
-/// Where the button sits, until the RNG beacon exists to decide it.
+/// Where the first button sits: **the rule of version 1** (`D-083`).
 ///
-/// **Provisional and named as such.** `STATE_MACHINE.md` T10 gives this to the
-/// beacon of §7.9 — the seat permutation and the initial button are derived from
-/// a commit-and-reveal that no code in this project performs yet. Deriving it
-/// from `session_id` instead is deterministic and agreed by every peer, which is
-/// all stage 0 needs to complete, and it is **not** the rule: a beacon exists so
-/// that no single seat's contribution decides the button, and `session_id` is a
-/// hash of the ratifications, which is not the same guarantee.
+/// `STATE_MACHINE.md` T10 gives the initial button to the beacon of §7.9, a
+/// commit-and-reveal that version 1 defines and does not produce (`PROTOCOL.md`
+/// §4.4's box, which writes this rule out). Deriving it from `session_id` is
+/// deterministic and agreed by every peer, which is all stage 0 needs to
+/// complete; that no single seat's contribution decides it is what a beacon
+/// would add, and version 1 accepts going without (below).
 ///
-/// # And it is biasable by whoever ratifies last, which is worse than provisional
+/// # And it is biasable by whoever ratifies last -- an accepted risk of version 1
 ///
 /// `session_id` is a hash over the ratifications' `event_hash`es (§4.3), and an
 /// event hash covers the whole signed envelope — including `emitted_at_unix_ms`,
@@ -766,14 +765,13 @@ const _: () = assert!(PEEK_CAP >= FRAME_CAP);
 /// rule makes that worth doing — the initial button fixes who posts which blind
 /// in hand one and who acts last, and every later button is a rotation of it.
 ///
-/// This is exactly what §4.4's commit-and-reveal beacon exists to stop, and the
-/// reason this function is documented as *not the rule* rather than as a
-/// simplification. **What blocks replacing it is not the beacon**: `RNG_COMMIT`,
-/// `RNG_REVEAL` and `seed` are fully specified. It is that no document says how
-/// to get a button out of the seed — `PROTOCOL.md` §4.4 says the rule is in
-/// `STATE_MACHINE.md`, §7.9 says the constructions are `PROTOCOL.md`'s and that
-/// the engine computes neither value, and T10 points at §7.9. A citation cycle
-/// with nothing at the centre.
+/// This is exactly what §4.4's commit-and-reveal beacon exists to stop. The owner
+/// accepted it for version 1 (`D-083`, 2026-09-28): the game is for play money and
+/// has no ranking, and it is the position of one hand. A beacon is built when
+/// winning at a table means something to the other players (`THREAT_MODEL.md`
+/// X6); a seating draw built for it was withdrawn the same day for its risk of
+/// regressions. `S1-B`'s citation cycle -- §4.4 pointing at `STATE_MACHINE.md`,
+/// §7.9 pointing back -- ends at §4.4's box.
 ///
 /// One function, so replacing it is one change.
 pub fn provisional_button(session_id: &Hash, occupied: &[SeatIdx]) -> SeatIdx {

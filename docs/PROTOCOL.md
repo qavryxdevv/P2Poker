@@ -975,7 +975,9 @@ claim for it.
 
 A **chain** is the ordered sequence of events for one `(table_id, hand_id)`.
 `hand_id = 0` is the *setup chain*, covering everything from `JOIN_REQUEST` to
-`TABLE_READY` plus the seating beacon. `hand_id = 1, 2, …` are the hands.
+`TABLE_READY` -- and the seating beacon of §4.4, which is defined and not produced in
+version 1 (`D-083`), so the setup chain of a version-1 table ends at `TABLE_READY`.
+`hand_id = 1, 2, …` are the hands.
 
 Chains are linked end to end, so the whole table session is one hash chain:
 
@@ -2633,6 +2635,30 @@ towards. [MENTAL §6] A per-hand commit/reveal beacon would add two stages of
 latency per hand and buy nothing. The commit/reveal construction is still needed
 for the non-deck randomness, which is exactly what it is used for.
 
+> **Normative -- defined, not produced in version 1 (`D-083`).** No client of
+> version 1 says `RNG_COMMIT` or `RNG_REVEAL`: the setup chain ends at `TABLE_READY`,
+> and a table's first hand follows it. What version 1 does instead, which is the
+> rule of version 1 and not a placeholder:
+>
+> * **Seats.** The founder seats a player as it admits it: the seat its
+>   `JOIN_REQUEST` names (§4.3 `n(4) requested_seat`) when that seat is free, and
+>   the lowest free seat otherwise.
+> * **The first button.** The occupied seats in ascending order, and the seat at
+>   place `u64_be(session_id[0..8]) mod n` of them (`provisional_button`). From the
+>   second hand the dead-button rule moves it (§4.4 `HAND_INIT`).
+>
+> **Two risks come with it, accepted for version 1 and classified in
+> `THREAT_MODEL.md` X6.** `session_id` is a hash over the ratifications and a
+> ratification's hash covers a timestamp its author picks, so the last seat to
+> ratify -- at a table with a group the founder (`S1-HE`) -- can re-sign its own
+> until the first button lands where it likes: under a hundred tries at six seats
+> (`S1-B`), and worth the position of one hand. And two players can ask for seats
+> side by side and keep them for a whole game (`S1-AD`). The game is for play money
+> and has no ranking: what either buys is play chips, never another player's
+> standing. The beacon below is kept, as `D-015` kept the timeout certificate, for the version
+> that builds it -- when winning at a table means something to the other players,
+> the condition `S1-CH` waits on too.
+
 ---
 
 **`0x0301 RNG_COMMIT`**
@@ -2763,7 +2789,9 @@ events are bound to `GENESIS(0)` by the chain.
 
 The seed determines the seat permutation and the initial button position, by a
 deterministic rule specified in `STATE_MACHINE.md`. Nothing else. It is not used
-for cards.
+for cards. **No such rule is specified anywhere, and version 1 needs none**: it
+produces no beacon, and the box at the head of this section says what it does
+instead (`D-083`, which closes `S1-B`'s citation cycle).
 
 ---
 
@@ -5001,8 +5029,8 @@ means it does not and never can be.
 | `0x0203` | `JOIN_REJECT` | join RPC | 0 | — | table key |
 | `0x0204` | `PLAYER_LIST` | table mesh | 0 | — | table key |
 | `0x0205` | `TABLE_READY` | table mesh | 1 | collective | every seat of the `PLAYER_LIST` roster; its signers **are** `P(0)` |
-| `0x0301` | `RNG_COMMIT` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers |
-| `0x0302` | `RNG_REVEAL` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers |
+| `0x0301` | `RNG_COMMIT` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers; not produced in version 1 (`D-083`) |
+| `0x0302` | `RNG_REVEAL` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers; not produced in version 1 (`D-083`) |
 | `0x0303` | `HAND_INIT` | table mesh | 1 | collective | `P(k-1)` — §3.2, §4.4. §4.9's readmission set `A` widens the **accepted** emitter set to `P(k-1) ∪ A` and leaves the required set alone (`P2`); it is the second stage in the document whose accepted set is wider than its required one, the first being checkpoint 8 |
 | `0x0304` | `DECK_INIT` | table mesh | 1 | collective | dealt-in seats |
 | `0x0305` | `SHUFFLE_STEP` | table mesh | 1 | single | shuffler `j` |
@@ -7265,9 +7293,9 @@ deterministic function of the table parameters and the kind of the next stage:
 | any cryptographic contribution (`DECK_INIT`, `SHUFFLE_*`, `DECK_COMMIT`, `DEAL_PRIVATE`, `BOARD_REVEAL`, `SHOWDOWN_*`) | `crypto_step_timeout_ms` |
 | `STATE_HASH` / `STATE_ACK` | `crypto_step_timeout_ms` |
 | a hand boundary (`HAND_INIT` after `hand_delay_ms`) | `hand_delay_ms + crypto_step_timeout_ms` |
-| the seat-order beacon (`RNG_COMMIT`, `RNG_REVEAL`) | `crypto_step_timeout_ms` |
+| the seat-order beacon (`RNG_COMMIT`, `RNG_REVEAL`) -- not produced in version 1 (`D-083`) | `crypto_step_timeout_ms` |
 | **anything in table formation** — `CAPABILITIES`, `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST` | `0`, meaning *this event arms no deadline* |
-| `TABLE_READY` | `crypto_step_timeout_ms`, because the next stage is the beacon |
+| `TABLE_READY` | `crypto_step_timeout_ms`, because the next stage is the beacon. Version 1 produces no beacon (`D-083`) and writes the advert's `join_deadline_ms` here; no receiver reads it |
 
 A peer that writes a different value emits an invalid event. There is nothing to
 negotiate and nothing to game.
@@ -7290,6 +7318,8 @@ paragraph exists to prevent.
 `TABLE_READY` is the exception because it is the one formation message that *is*
 a chained stage, and what follows it is `RNG_COMMIT` — a cryptographic
 contribution, and now a row of its own rather than a type absent from the list.
+(In version 1 what follows it is the first hand's `HAND_INIT`: the beacon is not
+produced, `D-083`.)
 
 **The whole-hand limit `hand_deadline_ms` runs on the same relative basis from
 `TERMINAL(k-1)` — normative, and this is R-1's disposition.** The timer for hand

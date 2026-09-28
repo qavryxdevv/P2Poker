@@ -182,14 +182,14 @@ And `handwire::disagreement` returns **which field** differs. The symptom of
 getting this wrong is a table that does not move; "seat 3 says the button is at
 2 and I say 1" is something a person can act on.
 
-### The one thing that is provisional, and it is named
+### The first button: version 1's rule, and a named risk (`D-083`)
 
 `provisional_button` decides where the button sits from `session_id`.
-Deterministic, agreed by everybody, and **not the rule**: `STATE_MACHINE.md` T10
-gives it to the RNG beacon of §7.9, which no code here performs. A beacon exists
-so no single seat's contribution decides the button, and a hash of the
-ratifications is not that guarantee. One function, so the beacon replaces it in
-one change.
+Deterministic, agreed by everybody, and since `D-083` **the rule of version 1**,
+written out in `PROTOCOL.md` §4.4: the beacon of `STATE_MACHINE.md` §7.9 is defined
+and not produced. The bias it carries -- the last seat to ratify can steer it -- is
+an accepted risk while the game is play money with no ranking. One function, so a
+beacon replaces it in one change when one is built.
 
 ### The hand now reaches hole cards
 
@@ -526,12 +526,12 @@ advertising a shorter deadline than any preset offers.
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
    settled hand.
-3. The RNG beacon, replacing `provisional_button`. **Blocked on one paragraph
-   nobody has written, and the gap now has a measured cost** - the last seat to
-   ratify can choose the button in under a hundred hashes. See the section
-   below: the beacon's messages, commitment and seed are fully specified, and no
-   document says how a seed becomes a button. Every one of them names another as
-   the owner.
+3. ~~The RNG beacon, replacing `provisional_button`.~~ **Decided by the owner,
+   2026-09-28 (`D-083`, variant A): not in version 1.** The button's bias and
+   asked-for seats are accepted risks of version 1 (`THREAT_MODEL.md` X6); a draw
+   is built when winning means something to the other players (a ranking). A
+   seating draw was built and withdrawn the same day for its risk of
+   regressions (`3e94820`, `242f594`).
 4. **The Tox transport (D-019).** The relay is why: a hand carried over a
    libp2p circuit dies at 128 KiB, measured. c-toxcore builds and links here
    now; see the D-019 section below for what it found and what is left.
@@ -1444,6 +1444,11 @@ moving off GossipSub is to leave that loop behind.
 
 
 ### The initial button is biasable, and the beacon that would fix it is blocked on a citation cycle
+
+**Resolved by `D-083` (2026-09-28): the bias is an accepted risk of version 1, the
+beacon is defined and not produced, and `PROTOCOL.md` §4.4 now owns the rule
+version 1 uses -- which ends the cycle below.** The two findings are kept as the
+record of why.
 
 Two findings from picking up the RNG beacon, and the second is why the first is
 still there.
