@@ -14,13 +14,20 @@
     at six, seven, eight and nine — so a ten-seat table that still fails is a
     ten-seat problem, and one that works was an instances-per-box problem.
 
+    Five and five was the first split, and `S1-AY` measured it as the far box
+    starving: it has four cores, and its five seats opened 11 to 14 hands where
+    two seats there opened 33 and 34, level with the local ones. So the defaults
+    are eight here and two there (2026-09-28), and a run that asks for more than
+    two there says so in its header.
+
     The far end needs the Windows binary and this script; both are copied.
 
 .PARAMETER Here
-    Seats started on this machine, the founder among them.
+    Seats started on this machine, the founder among them. Eight by default.
 
 .PARAMETER There
-    Seats started on the far machine. `Here + There` is the table's size.
+    Seats started on the far machine. `Here + There` is the table's size. Two by
+    default, because the far box has four cores (`S1-AY`).
 
 .NOTES
     **Discovery across the boundary is the DHT lobby, not mDNS.** The two
@@ -47,8 +54,8 @@
 
 [CmdletBinding()]
 param(
-    [ValidateRange(1, 9)][int]$Here = 5,
-    [ValidateRange(1, 9)][int]$There = 5,
+    [ValidateRange(1, 9)][int]$Here = 8,
+    [ValidateRange(1, 9)][int]$There = 2,
     # **420 covers everything a run is read for. Longer is habit, not method.**
     #
     # Measured over five ten-seat runs on 2026-09-04: the founder sealed the
@@ -500,8 +507,8 @@ $header | Out-File -FilePath (Join-Path $work 'run.txt') -Encoding utf8
 #
 # **Said and not enforced, deliberately.** The lossy two-machine rig is the
 # only place packet loss is reproducible here and it must not be "fixed"; which
-# split to run is the experiment's design and the owner's (`S1-AY`, and this
-# script's parameter defaults are still 5 and 5). What an instrument may do is
+# split to run is the experiment's design and the owner's (`S1-AY`: the defaults
+# are eight and two since 2026-09-28, on his word). What an instrument may do is
 # refuse to be silent about a condition it has already measured, so a run that
 # will not be comparable says so in its own header rather than in the reading
 # of it a week later.

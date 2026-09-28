@@ -371,7 +371,7 @@ identifier, and the framing, which is ours and survives a change of crate.
 | **Search queue broadcast** | `/p2p-poker/search-queue/1` and its slices (§7.13) | one `SignedEvent` per broadcast message |
 | **Lobby RPC** | `/p2p-poker/lobby-snapshot/1` | the RPC codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
 | **Join RPC** | `/p2p-poker/join/1` | the RPC codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
-| **Table mesh** | `/p2p-poker/table/1` | `u32` big-endian length prefix, then exactly that many bytes of `SignedEvent`. Nothing else. |
+| **Table mesh** | the table's Tox group (`D-019`), named by the advert's `n(31) tox_chat_id` (§7.2); and the table's own GossipSub topic `/p2p-poker/table/<table_id>/1`, `<table_id>` in 64 lowercase hex digits | on the group, `table::fragment`: an 8-byte header -- `message_id` `u32`, `index` `u16`, `total` `u16`, all big-endian -- then at most 492 bytes of one `SignedEvent`, the message reassembled whole before §4.0 and a claimed `total` above `MAX_FRAGMENTS` refused before anything is allocated; on the topic, one `SignedEvent` per message |
 
 **Which message is legal on which channel.** This is a table rather than prose so
 that adding a channel or a message type cannot leave it stale. §4.11 repeats it
@@ -379,7 +379,7 @@ per message code.
 
 | Message | Channel |
 |---|---|
-| `HELLO`, `CAPABILITIES` | table mesh (`/p2p-poker/table/1`), before anything else on that stream |
+| `HELLO`, `CAPABILITIES` | the table stream `/p2p-poker/table/1`, before anything else on it -- **not built in version 1**: the stream has no implementation, and neither message has an emitter or a receiver (`S1-A`) |
 | `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE` | lobby broadcast |
 | `LOBBY_CHAT` | lobby chat broadcast |
 | `TABLE_CHAT` | table mesh: the table's group, or its topic where there is no group (§7.8) |
@@ -389,7 +389,8 @@ per message code.
 | `SEARCH_PRESENCE` | search queue broadcast (§7.13) |
 | `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
-| everything else (`PLAYER_LIST`, `TABLE_READY`, and all of groups 3–8) | table mesh |
+| `PLAYER_LIST`, `TABLE_READY` | table mesh: the table's topic, and its group as well once the seat is in it (`D-019`'s amendment of 2026-09-02, additive) |
+| all of groups 3–8 | table mesh: the table's group; its topic only where the table has no group (a build without Tox) |
 
 **The one requirement this document places on the transport**, stated as a
 requirement rather than as a crate choice: the table channel must be long-lived
@@ -397,6 +398,19 @@ and bidirectional, because both sides push and no message type is a response to
 another. Which crate provides that, and whether it is semver-exempt, is
 `NETWORK_STACK.md`'s. The framing above is ours, so replacing the crate does not
 change the wire.
+
+**Amended 2026-09-28 (`S1-A`, the owner's word): the table mesh is what `D-019`
+built, and this section now says so.** The rows above described a length-prefixed
+`/p2p-poker/table/1` stream between every pair of seats, which was specified and
+never built: `TABLE_PROTOCOL` is declared and read nowhere, and `NETWORK_STACK.md`
+§8 carries the same correction. `D-019`, an accepted decision -- and a numbered
+decision beats a specification document (`CONTRIBUTING.md`) -- put a formed table's
+traffic on a Tox group, where every channel caps a packet at about 1.4 KB, so the
+protocol fragments. The fragment header sits under the signed envelope: it is
+transport framing and not protocol, and both ends of one table run one build. The
+requirement stated above -- long-lived, bidirectional, both sides push -- is what
+the group gives. What does not change is validity: the signature, the chain and
+§4.0 decide exactly as before, whichever carrier a message arrived on.
 
 **A transport-layer message signature is never the application signature.** A
 transport that authenticates the peer identity owning the connection
@@ -411,6 +425,11 @@ transport already authenticated the sender has accepted a forged action.
 Every seated participant holds a `/p2p-poker/table/1` stream to every other
 seated participant. There is no forwarding node, no host, and no star topology.
 For 10 seats that is 45 connections, which is unremarkable.
+
+**Amended 2026-09-28 (`S1-A`).** In version 1 the mesh is the table's Tox group
+(§1.4): toxcore keeps a connection to every other member of the group, directly
+or through its TCP relays, and there is still no forwarding node and no host. The
+pairwise streams of the paragraph above are the table stream, which is not built.
 
 A participant **may** forward a `SignedEvent` it received to any other
 participant of the same table. Forwarding cannot forge anything — the signature
@@ -1168,22 +1187,29 @@ this box by number and reproduce no part of it (D-011 rule 2).
 >     u16_be(button_rule),             //                 n(20)
 >     u16_be(odd_chip_rule),           //                 n(21)
 >     u16_be(showdown_policy),         //                 n(22)
->     deck_suite                       //                 n(24)  payload bytes, verbatim
+>     deck_suite,                      //                 n(24)  payload bytes, verbatim
+>     u32_be(time_bank_ms)             //                 n(29)
 > ])
 > ```
 >
-> **Twenty-five parts, in exactly that order**, under §2.8's constructor — each part
+> **Twenty-six parts, in exactly that order**, under §2.8's constructor — each part
 > length-prefixed, `preset_id` and `deck_suite` as their raw payload bytes and every
 > other part in the fixed-width big-endian form shown. The order is part of the
 > protocol: it is §7.2's ascending `LOBBY_TABLE_AD` field order, with `BlindSchedule`
-> expanded in place at its own field's position.
+> expanded in place at its own field's position -- and `n(29) time_bank_ms` last,
+> because it joined the table's parameters after that order was fixed (`D-022`'s
+> thinking reserve). **Amended 2026-09-28 (`S1-JC`):** this box said twenty-five
+> parts while every client since the reserve has hashed it as the twenty-sixth; the
+> box now says what the wire does.
 >
 > **Nothing else may enter it**, and each exclusion is named because a future editor
 > will be tempted by one of them. `n(3) table_name` and `n(10) players` are display
 > and advisory. `n(23) password_required` is an admission gate, spent at
 > `JOIN_REQUEST` and irrelevant once a seat is held. `n(25) founder_app_key` and
 > `n(26) founder_peer_id` are identity and routing, and the founder's special
-> position ends at `TABLE_READY`. `n(27) timestamp_unix_ms` and
+> position ends at `TABLE_READY`; `n(30) founder_tox_key` and `n(31) tox_chat_id` are
+> routing as well (`D-019`), and a founder that restarts comes back with new ones.
+> `n(27) timestamp_unix_ms` and
 > `n(28) expires_at_unix_ms` are **the two fields that made `advert_hash`
 > per-receiver in the first place**, since §7.2 rule 6 obliges every re-broadcast to
 > carry a strictly greater timestamp. `protocol_version` and `table_id` are excluded
@@ -2323,6 +2349,7 @@ slot and can never appear in an `EquivocationProof` (§5.2).
 | `n(6) buyin` | `u64` | within `[min_buyin, max_buyin]` of the advert |
 | `n(7) join_nonce` | `bytes[32]` | fresh; the anti-replay for this RPC, since the envelope's `sequence` is a sentinel |
 | `n(8) table_id` | `bytes[32]` | the table being joined; must equal the `table_public_key` of the advert named by `advert_hash` |
+| `n(9) tox_key` | `Option<bytes[32]>` | the joiner's Tox public key (`D-019`): how the founder reaches it to invite it into the table's group, since Tox invites a friend and a public key makes the friendship without a request. Absent when the joiner has no Tox. A transport address and not an identity: `n(1)` is who the player is, and this authorises nothing |
 
 `password_proof = h("p2p-poker v1 session", [ password_utf8, table_id,
 join_nonce ])`. This is a possession proof, not a secret transfer, and it is
@@ -2355,7 +2382,13 @@ unchained sentinel `ZERO32`, so the table's identity here is the signing key).
 | `n(3) roster_so_far` | `Vec<SeatEntry>` | ≤ `MAX_SEATS` entries |
 
 `SeatEntry` = `#[cbor(array)] { n(0) seat: u8, n(1) app_public_key: bytes[32],
-n(2) peer_id: bytes(≤42), n(3) display_name: bytes(≤32), n(4) buyin: u64 }`.
+n(2) peer_id: bytes(≤42), n(3) display_name: bytes(≤32), n(4) buyin: u64,
+n(5) tox_key: Option<bytes[32]> }`. `n(5)` is the seat's own `JOIN_REQUEST` `n(9)`,
+carried unchanged (`D-019`), and it is **not** in `roster_hash`, which covers the seat,
+the application key and the stack: a transport address is not part of who is
+playing. **Amended 2026-09-28 (`S1-AE`):** `n(5)` here and `n(9)` above, with §7.2's
+`n(30)` and `n(31)`, have been on the wire since `D-019`; this document now carries
+them, and nothing on the wire moved.
 
 *Receiver must validate:* `sender_public_key` equals the `table_public_key` of
 the advert it asked to join; the signature; that
@@ -3831,6 +3864,21 @@ bytes[32]` where `checkpoint_hash` is the `stage_hash` of the `STATE_HASH` stage
 ---
 
 #### Checkpoint 8, the boundary checkpoint — normative, and this is the wire half of `K-3` (L1, L3)
+
+**Amended 2026-09-28 (`S1-R`, the owner's word): in version 1 checkpoint 8 is
+emitted on the settled path only, and on the aborted path nothing is.** What this
+box says about the aborted path stays as a definition with no emitter behind it --
+`transcript_head := ABORT_TERMINAL(k)` included -- because the one reason given for
+comparing there does not hold there: after an abort, the transcript head, the
+roster with its stacks, the deck commitment and the board are each a constant or a
+function of `GENESIS(k)`, so the comparison could find nothing but a disagreement
+§6.3 cannot heal. The only checkpoint answer that decides anything is §6.3's
+freeze, and it is one-way while `S1-Q`'s transcript exchange is not built: a new
+trigger for it is a new way to lose a table for good, and it has never executed on
+a real table. The cost is recorded rather than dressed up: nothing is compared at
+an aborted boundary, and a client that lost its place in an aborted hand comes back
+through `D-038`, which rejoins it from the table's copies whichever way its last
+hand ended.
 
 `STATE_MACHINE.md` §5.2 places **checkpoint `8`** at every hand boundary, on every
 hand and on both terminal paths, emitting it the moment `TERMINAL(k)` is fixed at
@@ -6034,7 +6082,7 @@ than a number of its own:
 | `5` | after the turn betting round closes |
 | `6` | after the river betting round closes |
 | `7` | immediately before `SHOWDOWN_REVEAL` |
-| `8` | **the boundary checkpoint** — the moment `TERMINAL(k)` is fixed at this peer, on **every** hand and on both terminal paths. Its chain, parent, `sequence`, total order, required emitter set and the wider set it is *compared* over are §4.9's checkpoint-8 box; what it covers is `STATE_MACHINE.md` §5.2's |
+| `8` | **the boundary checkpoint** — the moment `TERMINAL(k)` is fixed at this peer, on every hand that **settled** (T45); on the aborted path none is emitted in version 1 (§4.9's box, amended 2026-09-28, `S1-R`). Its chain, parent, `sequence`, total order, required emitter set and the wider set it is *compared* over are §4.9's checkpoint-8 box; what it covers is `STATE_MACHINE.md` §5.2's |
 
 **Row 8 is new and it is the wire half of `K-3` (L2).** The table read `1`–`7`
 under the words *"at these points and no others"*, which made a conforming
@@ -6551,6 +6599,8 @@ unambiguous before the first card exists.
 | `n(26) founder_peer_id` | `bytes` | ≤ 42 B; where to send `JOIN_REQUEST` |
 | `n(27) timestamp_unix_ms` | `u64` | |
 | `n(28) expires_at_unix_ms` | `u64` | `> timestamp_unix_ms` |
+| `n(30) founder_tox_key` | `Option<bytes[32]>` | the founder's Tox public key (`D-019`): how a joiner is reached for the invitation into the table's group. Absent when the table is not on Tox. **Outside `table_params_hash`** (§3.1): routing, like `n(26)` |
+| `n(31) tox_chat_id` | `Option<bytes[32]>` | the chat id of the table's group (`D-019`). Nobody joins by it: a joiner compares the group it was invited into against it, so a table's traffic cannot sit on a group nobody advertised. Absent when the table is not on Tox. **Outside `table_params_hash`**: a founder that restarts comes back with a new Tox identity and a new group, which is legitimate |
 
 `BlindSchedule` = `#[cbor(array)] { n(0) mode: u16, n(1) every_n_hands: u16,
 n(2) first_small_blind: u64, n(3) small_blind_cap: u64 }` with `mode = 1` meaning
@@ -8736,7 +8786,7 @@ MAX_TRACKED_SEARCHERS           = 2 048         (local, D-064)
 HANDSHAKE_DEADLINE_MS           = 15 000
 MAX_CONSECUTIVE_AUTO_ACTIONS    = 3
 
-RATED_SNG_POKERTH_V1 — all twenty-five parts of table_params_hash (§3.1), in
+RATED_SNG_POKERTH_V1 — all twenty-six parts of table_params_hash (§3.1), in
 that box's order, so this block can be diffed against it field by field:
   n(0)    game                  = 1     NLHE                  sole legal value §7.2
   n(1)    mode                  = 2     TOURNAMENT_SNG_PLAY_MONEY      (G7-S3)
@@ -8768,6 +8818,7 @@ that box's order, so this block can be diffed against it field by field:
   n(21)   odd_chip_rule         = 1     FIRST_SEAT_LEFT_OF_BUTTON  sole legal value §7.2
   n(22)   showdown_policy       = 1     MANDATORY_REVEAL      (pending Q-01)
   n(24)   deck_suite            = "bs-bg12-secp256k1/1"       sole legal value §7.2
+  n(29)   time_bank_ms          = 0     no thinking reserve: n(17) is fixed to the millisecond
   not a part of table_params_hash, and stated only so its absence is not read
   as an omission: n(23) password_required = false (no password)
 ```
@@ -8785,7 +8836,7 @@ which §7.2 admits in tournament modes only; and a Sit-and-Go's buy-in **is** it
 starting stack, every entrant getting an equal stack, so `n(7) = n(8) = n(9)` —
 §7.2 rule 2 now enforces that in tournament modes rather than leaving it to be
 restated per configuration. The remedy for the class is the indexing: a named
-configuration is audited by diffing its block against §3.1's twenty-five parts,
+configuration is audited by diffing its block against §3.1's twenty-six parts,
 and a part with no line is visible at a glance. **Every part carries a line**,
 including the ones §7.2 admits a single legal value for in version 1: those are
 pinned by the range itself and are marked *sole legal value* rather than omitted,
@@ -8852,7 +8903,7 @@ exactly two `preset_id` values, so a table built from these values advertises
 
 ```
 the heads-up reference configuration — advertised as CUSTOM.
-All twenty-five parts of table_params_hash (§3.1), in that box's order:
+All twenty-six parts of table_params_hash (§3.1), in that box's order:
   n(0)    game                  = 1     NLHE                  sole legal value §7.2
   n(1)    mode                  = 2     TOURNAMENT_SNG_PLAY_MONEY
   n(2)    preset_id             = "CUSTOM"
@@ -8878,6 +8929,7 @@ All twenty-five parts of table_params_hash (§3.1), in that box's order:
   n(21)   odd_chip_rule         = 1     FIRST_SEAT_LEFT_OF_BUTTON  sole legal value §7.2
   n(22)   showdown_policy       = 1     MANDATORY_REVEAL      (pending Q-01)
   n(24)   deck_suite            = "bs-bg12-secp256k1/1"       sole legal value §7.2
+  n(29)   time_bank_ms          = 0     no thinking reserve, as on every table this client hosts
   not a part of table_params_hash: n(23) password_required = false (no password)
 ```
 
@@ -8931,18 +8983,18 @@ lines.** `G6-R6`'s two lines have landed: `src/poker/tournament.rs` renamed the
 constant to `HEADS_UP_CUSTOM_2P`, its `id` is `"CUSTOM"`, and the doc comment that
 claimed two clients agree on the table *by its name* is gone. What replaces the
 name is a **complete advert**, and that is the part the code does not have yet.
-A `Preset` carries **fourteen** of §3.1's twenty-five parts. The eleven it does not
+A `Preset` carries **fourteen** of §3.1's twenty-six parts. The twelve it does not
 carry are `n(0) game`, `n(1) mode`, `n(4) small_blind`, `n(5) big_blind`,
 `n(7) min_buyin`, `n(8) max_buyin`, `n(13.0) blind_schedule.mode`,
-`n(20) button_rule`, `n(21) odd_chip_rule`, `n(22) showdown_policy` and
-`n(24) deck_suite` — and every one of them is hashed, so a client that defaults
+`n(20) button_rule`, `n(21) odd_chip_rule`, `n(22) showdown_policy`,
+`n(24) deck_suite` and `n(29) time_bank_ms` — and every one of them is hashed, so a client that defaults
 any of them while building the advert computes a `table_params_hash` no other
 client reproduces. That is `G7-S3` in the code rather than in a document, and it
 is the same defect wearing the same disguise: a **missing** field reads as an
 omission, never as a contradiction. Three things follow, and none is a value:
 
-* **The advert type owns the twenty-five parts, not `Preset`.** `Preset` may stay
-  as the convenience that fills the fourteen it knows; the eleven above have to be
+* **The advert type owns the twenty-six parts, not `Preset`.** `Preset` may stay
+  as the convenience that fills the fourteen it knows; the twelve above have to be
   filled explicitly at the one place a `LOBBY_TABLE_AD` payload is built, and the
   fields §7.2 admits exactly one legal value for are *still* filled explicitly,
   because a part that nobody writes is a part nobody notices is wrong.

@@ -361,7 +361,7 @@ pub fn admit(ad: &TableAd, now_unix_ms: u64) -> Result<(), AdRejected> {
 fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
     // Every part of `table_params_hash` that §13 pins and rule 2 leaves free.
     //
-    // **Twenty-five parts, and this list plus rule 2 must cover all of them.**
+    // **Twenty-six parts, and this list plus rule 2 must cover all of them.**
     // Two did not: `join_deadline_ms` (n(18)) and `showdown_policy` (n(22)) are
     // both parts of the hash, both fixed by §13's block, and rule 2 gives each
     // only a range — so two clients both correctly implementing this preset
@@ -370,11 +370,17 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
     // table with **neither of them wrong**. That is `G7-S3` exactly, a fourth
     // time, and this time in the code rather than in the document.
     //
+    // A third went the same way (`S1-JC`): `time_bank_ms` (n(29)) joined the
+    // hash with `D-022`, §7.2 says §13's preset carries `0`, and rule 2a bounds
+    // it only by what the deadline pays for -- so a rated advert offering a
+    // reserve was admitted, because every count of the parts, this one's
+    // included, still said twenty-five.
+    //
     // The audit is the same one §13 prescribes for itself: diff this list
-    // against §3.1's twenty-five parts and require every part to be pinned
+    // against §3.1's twenty-six parts and require every part to be pinned
     // either here or by rule 2.
     // `every_part_of_the_hash_is_pinned_by_the_rated_name` does it.
-    let expected: [(&'static str, u64, u64); 13] = [
+    let expected: [(&'static str, u64, u64); 14] = [
         ("mode", ad.mode as u64, Mode::TournamentSngPlayMoney.code() as u64),
         ("max_players", ad.max_players as u64, RATED_SEATS as u64),
         (
@@ -404,6 +410,7 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
         ),
         ("join_deadline_ms", ad.join_deadline_ms as u64, 120_000),
         ("showdown_policy", ad.showdown_policy as u64, 1),
+        ("time_bank_ms", ad.time_bank_ms as u64, 0),
     ];
     for (name, got, want) in expected {
         if got != want {
@@ -420,6 +427,7 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
                 "action_grace_ms" => "the rated preset gives 5 s of grace",
                 "join_deadline_ms" => "the rated preset gives 120 s to form",
                 "showdown_policy" => "the rated preset reveals at showdown",
+                "time_bank_ms" => "the rated preset has no thinking reserve",
                 _ => "the rated preset's whole-hand deadline is 3 300 000 ms",
             }));
         }
@@ -438,7 +446,7 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
     // is one anybody may sit down at, and a password is the opposite of that.
     //
     // **This is the only rated check on a field that is not part of
-    // `table_params_hash`**, so unlike the other thirteen it cannot make two
+    // `table_params_hash`**, so unlike every other check here it cannot make two
     // honest clients derive different digests. It is a policy check, and it is
     // here because a password-gated table calling itself rated is a claim about
     // what it is that happens not to be true.
@@ -562,7 +570,7 @@ impl TableAd {
 
     /// The rated Sit-and-Go, exactly as `PROTOCOL.md` §13 fixes it.
     ///
-    /// Every one of `table_params_hash`'s twenty-five parts is settled here and
+    /// Every one of `table_params_hash`'s twenty-six parts is settled here and
     /// **none of them is a choice**: a `preset_id` is a claim about values, and
     /// §7.2 rule 3 rejects an advert carrying this name with any other value in
     /// it. A founder who wants different numbers wants a `CUSTOM` table.
@@ -1267,7 +1275,7 @@ mod tests {
         ad
     }
 
-    /// **Every one of `table_params_hash`'s twenty-five parts is pinned by the
+    /// **Every one of `table_params_hash`'s twenty-six parts is pinned by the
     /// rated preset**, and this test is the audit §13 prescribes for itself.
     ///
     /// A `preset_id` is a claim about values: two clients that both implement
@@ -1280,7 +1288,9 @@ mod tests {
     /// Two were free when this was written — `join_deadline_ms` and
     /// `showdown_policy`, both parts of the hash and both fixed by §13 — and
     /// rule 2 gave each only a range. That is `G7-S3` a fourth time, in the code
-    /// instead of the document.
+    /// instead of the document. A third, `time_bank_ms`, became a part with
+    /// `D-022` and was free until `S1-JC`, because this audit's own count had
+    /// not moved with the box.
     ///
     /// The test mutates each part in turn and requires the advert to be
     /// **refused**. A part that survives its mutation is a part nothing pins.
@@ -1394,16 +1404,20 @@ mod tests {
                 "n(24) deck_suite",
                 Box::new(|a: &mut TableAd| a.deck_suite = "bs-bg12-secp256k1/2".into()),
             ),
+            (
+                "n(29) time_bank_ms",
+                Box::new(|a: &mut TableAd| a.time_bank_ms = 30_000),
+            ),
         ];
 
-        // Twenty-four mutations for twenty-five parts, because `n(2) preset_id`
+        // Twenty-five mutations for twenty-six parts, because `n(2) preset_id`
         // is not pinned by a **rule** — it is pinned by being the name. It is
         // itself a part of the hash, so an advert carrying a different name is a
         // different game by construction and there is nothing for a receiver to
         // check. Changing it to `CUSTOM` produces a perfectly legal custom
         // table, which is the right answer and not a hole; what must hold is
         // that the hash moves with it, and the assertion below is that.
-        assert_eq!(parts.len(), 24, "twenty-four rules for twenty-five parts");
+        assert_eq!(parts.len(), 25, "twenty-five rules for twenty-six parts");
 
         let mut renamed = base.clone();
         renamed.preset_id = "CUSTOM".into();
@@ -1428,6 +1442,19 @@ mod tests {
                  fail to join each other with neither of them wrong"
             );
         }
+
+        // The part every count missed (`S1-JC`), and its mutation is legal on
+        // its own terms: rule 2a's floor pays for the reserve, so the same
+        // advert under `CUSTOM` is admitted and only the name refuses it.
+        let mut reserve = base.clone();
+        reserve.preset_id = "CUSTOM".into();
+        reserve.time_bank_ms = 30_000;
+        assert_eq!(admit(&reserve, NOW), Ok(()), "a reserve is legal on a custom table");
+        reserve.preset_id = base.preset_id.clone();
+        assert_eq!(
+            admit(&reserve, NOW),
+            Err(AdRejected::Preset("the rated preset has no thinking reserve"))
+        );
     }
 
     /// A Sit-and-Go of any size is a legal table, and the same game with a

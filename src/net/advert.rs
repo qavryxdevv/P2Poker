@@ -279,19 +279,21 @@ impl TryFrom<AdBody> for TableAd {
 
 /// `table_params_hash`, exactly as `PROTOCOL.md` §3.1's normative box writes it.
 ///
-/// **Twenty-five parts, in that order**, each length-prefixed by §2.8's
+/// **Twenty-six parts, in that order**, each length-prefixed by §2.8's
 /// constructor: `preset_id` and `deck_suite` as their raw payload bytes, and
 /// every other part in the fixed-width big-endian form. The order is §7.2's
-/// ascending field order with `BlindSchedule` expanded in place.
+/// ascending field order with `BlindSchedule` expanded in place, and
+/// `time_bank_ms` last, which joined the parameters after that order was fixed
+/// (`D-022`; the box said so only from `S1-JC`).
 ///
 /// # What is excluded, and why the first version of this function was a live bug
 ///
 /// The first version hashed the **encoded body** with three fields zeroed, on
 /// the reasoning that a field-by-field enumeration is a second copy of the list
 /// and those drift. The spec rejects that position outright — §13 publishes both
-/// preset blocks as twenty-five indexed lines *so that they can be diffed field
-/// by field* — and the shortcut was wrong in five independent ways at once: one
-/// length prefix instead of twenty-five, CBOR shortest-form integers instead of
+/// preset blocks as indexed lines, one per part, *so that they can be diffed
+/// field by field* — and the shortcut was wrong in five independent ways at once:
+/// one length prefix instead of one per part, CBOR shortest-form integers instead of
 /// fixed-width, CBOR type headers in the preimage, and four fields §3.1 excludes
 /// **by name** hashed live.
 ///
@@ -1067,7 +1069,7 @@ mod tests {
 
     /// And every part that IS in the box moves it, one at a time.
     ///
-    /// Twenty-five parts means twenty-five ways for two clients to be playing
+    /// Twenty-six parts means twenty-six ways for two clients to be playing
     /// different games, and a part that silently failed to enter would be a rule
     /// nobody was comparing.
     #[test]

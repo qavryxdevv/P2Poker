@@ -306,85 +306,102 @@ fn the_join_family_enforces_section_9_3s_own_caps() {
     }
 }
 
-/// **Every wire field this client emits that the corpus does not define.**
+/// **The four wire fields `D-019` added are in the corpus, each in the table
+/// that owns it, and nothing has grown past them.**
 ///
-/// `S1-AE`. Four fields carry D-019's Tox addresses and no specification names
-/// one: `grep -ci tox` over `PROTOCOL.md`, `SPEC_CS.md`, `STATE_MACHINE.md`,
-/// `NETWORK_STACK.md` and `CRYPTOGRAPHY.md` returns zero, five times.
+/// `S1-AE`. Four fields carry D-019's Tox addresses, and until 2026-09-28 no
+/// specification named one: `grep -ci tox` over `PROTOCOL.md`, `SPEC_CS.md`,
+/// `STATE_MACHINE.md`, `NETWORK_STACK.md` and `CRYPTOGRAPHY.md` returned zero,
+/// five times.
 ///
 /// # Why a test rather than a note
 ///
-/// §10.2 makes this the kind of divergence that cannot be tolerated at the far
+/// §10.2 makes that the kind of divergence that cannot be tolerated at the far
 /// end: *"An old client re-encoding a new struct produces different bytes, the
 /// gate fires, and the event is rejected. There is **no** 'ignore unknown
 /// trailing fields' behaviour and there **cannot** be one, because tolerating
 /// trailing data is precisely the equivocation hole the gate exists to close."*
-/// So a conforming second implementation refuses every message carrying one of
-/// these, and `SeatEntry` sits inside both `JOIN_ACCEPT` and `PLAYER_LIST`, so
-/// four message types are affected and formation cannot complete.
+/// So a second implementation built to the documents refused every message
+/// carrying one of them, and `SeatEntry` sits inside both `JOIN_ACCEPT` and
+/// `PLAYER_LIST`, so four message types were affected and formation could not
+/// complete.
 ///
-/// This test does not fix that — the repair is a corpus edit and it is the
-/// owner's. What it does is **hold the count still**. A fifth field added
-/// quietly is a fifth message type a second implementation refuses, and the
+/// The owner's word wrote them in: §4.3 carries `JOIN_REQUEST` `n(9)` and
+/// `SeatEntry` `n(5)`, §7.2 carries the advert's `n(30)` and `n(31)`. Until then
+/// this test held the undefined count at four; now it holds **both sides**. Each
+/// field is looked for next to the field before it, in the document and in the
+/// code, so a row that drifts into another table breaks it, and so does a field
+/// added past them -- which is a field the corpus does not define again, and the
 /// only thing that noticed the first four was a person reading two documents
 /// side by side.
 ///
-/// **It is a ratchet, not a check against the corpus.** Parsing §4.3's field
-/// tables out of prose would be a second thing to keep in step with the first.
-/// The numbers here are written down with the table each must match, and a
-/// change to either side breaks the build and demands the note be rewritten.
+/// **It is a ratchet, not a parser.** Reading §4.3's field tables out of prose
+/// would be a second thing to keep in step with the first. The lines are written
+/// down here, and a change to either side breaks the build and demands the note
+/// be rewritten.
 #[test]
-fn the_wire_fields_the_corpus_does_not_define_are_still_exactly_four() {
+fn the_tox_fields_are_in_the_corpus_and_nothing_has_grown_past_them() {
     let root = root();
     let read = |rel: &str| -> String {
         std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
     };
 
-    // Zero mentions of the transport whose keys these fields carry.
-    for doc in [
-        "docs/PROTOCOL.md",
-        "docs/SPEC_CS.md",
-        "docs/STATE_MACHINE.md",
-        "docs/NETWORK_STACK.md",
-        "docs/CRYPTOGRAPHY.md",
+    // The four in the document, each on the line after the field before it,
+    // once, and the advert's two outside the parameter hash.
+    let protocol = read("docs/PROTOCOL.md");
+    let lines: Vec<&str> = protocol.lines().collect();
+    for (before, field, table) in [
+        ("| `n(8) table_id` |", "| `n(9) tox_key` | `Option<bytes[32]>` |", "§4.3's JOIN_REQUEST table"),
+        ("n(4) buyin: u64,", "n(5) tox_key: Option<bytes[32]> }", "§4.3's SeatEntry"),
+        ("| `n(28) expires_at_unix_ms` |", "| `n(30) founder_tox_key` | `Option<bytes[32]>` |", "§7.2's advert table"),
+        ("| `n(30) founder_tox_key` |", "| `n(31) tox_chat_id` | `Option<bytes[32]>` |", "§7.2's advert table"),
     ] {
-        let text = read(doc).to_lowercase();
-        assert!(
-            !text.contains("tox"),
-            "{doc} now mentions Tox. If D-019's fields have been written into the \
-             specification, this test and `S1-AE` are both out of date — rewrite them \
-             rather than deleting the assertion."
+        let at: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].contains(field)).collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "{table}: `{field}` should be written exactly once, and `S1-AE` put it there"
         );
+        assert!(
+            at[0] > 0 && lines[at[0] - 1].contains(before),
+            "{table}: `{field}` is no longer on the line after `{before}`"
+        );
+        if field.contains("n(30)") || field.contains("n(31)") {
+            assert!(
+                lines[at[0]].contains("**Outside `table_params_hash`**"),
+                "{table}: `{field}` must say it is outside table_params_hash, as the code keeps it"
+            );
+        }
     }
 
-    // The four, each against the table that stops one index short of it.
+    // The four in the code, each against the field the corpus now puts before it.
     let joinwire = read("src/net/joinwire.rs");
     let advert = read("src/net/advert.rs");
     for (file, text, field, corpus) in [
-        ("joinwire.rs", &joinwire, "n(9), with = \"minicbor::bytes\")]\n    pub tox_key", "§4.3's JOIN_REQUEST table ends at n(8) table_id"),
-        ("joinwire.rs", &joinwire, "n(5), with = \"minicbor::bytes\")]\n    pub tox_key", "§4.3 spells SeatEntry out in one line and ends at n(4) buyin"),
-        ("advert.rs", &advert, "n(30), with = \"minicbor::bytes\")]\n    pub founder_tox_key", "§7.2 ends at n(29) time_bank_ms"),
-        ("advert.rs", &advert, "n(31), with = \"minicbor::bytes\")]\n    pub tox_chat_id", "§7.2 ends at n(29) time_bank_ms"),
+        ("joinwire.rs", &joinwire, "n(9), with = \"minicbor::bytes\")]\n    pub tox_key", "§4.3's JOIN_REQUEST n(9), after n(8) table_id"),
+        ("joinwire.rs", &joinwire, "n(5), with = \"minicbor::bytes\")]\n    pub tox_key", "§4.3's SeatEntry n(5), after n(4) buyin"),
+        ("advert.rs", &advert, "n(30), with = \"minicbor::bytes\")]\n    pub founder_tox_key", "§7.2's n(30), after n(29) time_bank_ms"),
+        ("advert.rs", &advert, "n(31), with = \"minicbor::bytes\")]\n    pub tox_chat_id", "§7.2's n(31), the advert's last field"),
     ] {
         assert!(
             text.contains(field),
             "{file} no longer carries the field this test pins ({corpus}). If it was \
-             removed, or renamed, say so in `S1-AE` and here."
+             removed, or renamed, the corpus and `S1-AE` say otherwise: change all three."
         );
     }
 
-    // And nothing has grown past them. `n(10)` on a join body or `n(32)` on an
-    // advert would be a fifth undefined field.
+    // And nothing has grown past them: each of these would be a field the corpus
+    // does not define, which is where `S1-AE` started.
     assert!(
         !joinwire.contains("n(10)"),
-        "a tenth JOIN_REQUEST field: §4.3 defines nine and `S1-AE` counts the tenth"
+        "an n(10) on a join body: §4.3's JOIN_REQUEST ends at n(9) tox_key"
     );
     assert!(
         !joinwire.contains("n(6), with = \"minicbor::bytes\")]\n    pub tox"),
-        "a seventh SeatEntry field"
+        "an n(6) on SeatEntry: §4.3 ends it at n(5) tox_key"
     );
     assert!(
         !advert.contains("n(32)"),
-        "a thirty-third advert field: §7.2 defines thirty and `S1-AE` counts the rest"
+        "an n(32) on the advert: §7.2 ends at n(31) tox_chat_id"
     );
 }

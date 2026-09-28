@@ -2385,6 +2385,20 @@ that table, over direct libp2p streams, never over the Mainline DHT.* The DHT th
 assignment names is history (the note at the head of this document); the rule
 binds the public Kademlia that replaced it, and §8.3 applies it.
 
+**Amended 2026-09-28 (`S1-A`, the owner's word): §8.1 and the framing bullet of §8.4
+describe a transport that was never built.** `D-019` put a formed table's traffic on
+a Tox group instead, and `PROTOCOL.md` §1.4 now names both carriers of the table
+mesh and their framing: the table's Tox group, with `table::fragment`'s 8-byte
+header under the signed envelope, and the table's own GossipSub topic
+`/p2p-poker/table/<table_id>/1`, which carries formation and, where a table has no
+group, its hands. `TABLE_PROTOCOL` is declared and has no reader, and
+`src/net/streams.rs` holds no code. Building the stream now would undo what `D-019`
+was bought for: a per-table libp2p mesh is `n(n−1)/2` circuits, each under a public
+relay's 128 KiB cap. §8.2's argument holds for the group as it did for the streams --
+every member receives each event from its signer, and nothing passes through the
+founder -- and §8.3 is unchanged: the table's topic is no lobby topic, and only the
+table's own seats subscribe to it.
+
 ### 8.1 Mechanism
 
 `libp2p-stream` on `TABLE_PROTOCOL` (`PROTOCOL.md` §13): long-lived, bidirectional, both
