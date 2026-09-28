@@ -7984,8 +7984,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         t.lost_key = None;
-                        // `S1-JH`: a slot that founds a table is not resuming any more.
-                        end_the_rejoin_for_a_new_table(t);
                         // A fresh key per table, and that freshness is the only
                         // thing making two tables with the same players and the
                         // same rules different games (§4.3's `session_id`).
@@ -8180,6 +8178,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     buyin,
                                 ) {
                                     Ok(mut f) => {
+                                        // `S1-JH`: a slot that has founded a table is not
+                                        // resuming any more -- once it has: a founding that
+                                        // fails leaves a rejoin as it was.
+                                        end_the_rejoin_for_a_new_table(t);
                                         // `D-060`: this founder says it is ready once it
                                         // hears every seat, on a table whose hands ride a
                                         // group.
@@ -20765,8 +20767,9 @@ mod a_joiner_before_the_first_hand {
 
     /// `S1-JH`: a rejoin from the session record that found nobody left the
     /// slot `resuming`, and a table the player then founded in it never set --
-    /// its founder skipped `D-060`'s block and never said it was ready. Founding
-    /// ends the rejoin, before the table is founded; the record stays.
+    /// its founder skipped `D-060`'s block and never said it was ready. A table
+    /// founded ends the rejoin before its formation is the slot's; a founding
+    /// that fails leaves the rejoin as it was. The record stays.
     #[test]
     fn founding_a_table_ends_a_rejoin_that_found_nobody() {
         let dir = std::env::temp_dir();
@@ -20781,9 +20784,15 @@ mod a_joiner_before_the_first_hand {
             .find("NodeCommand::CreateTable {\n                        kind, name, seats, min_players, buyin, password,\n                    } => {")
             .expect("the founding arm");
         let founds = arm + code[arm..].find("Formation::found(").expect("it founds");
+        let founded = founds + code[founds..].find("Ok(mut f) => {").expect("a table founded");
+        let the_slots = founded + code[founded..].find("t.table = Some(f);").expect("and made the slot's");
         assert!(
-            code[arm..founds].contains("end_the_rejoin_for_a_new_table(t);"),
-            "the founding arm ends a rejoin before it founds"
+            !code[arm..founded].contains("end_the_rejoin_for_a_new_table(t);"),
+            "not before the table is founded: a founding that fails leaves the rejoin"
+        );
+        assert!(
+            code[founded..the_slots].contains("end_the_rejoin_for_a_new_table(t);"),
+            "a table founded ends the rejoin before it is the slot's"
         );
     }
 
