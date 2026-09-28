@@ -155,6 +155,18 @@ pub fn forget(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// `S1-JK`: remove the record only if it is the record of `table_key` -- or
+/// one this version cannot read. The one file is every slot's, and a slot that
+/// gives up a rejoin holds its record in memory from when it was read: another
+/// slot's table may have written the file since, and forgetting it blind lost
+/// that table's record, so that a crash before its next boundary lost the seat.
+pub fn forget_the_record_of(dir: &Path, table_key: &[u8; 32]) -> io::Result<()> {
+    match load(dir) {
+        Some(r) if r.table_key != *table_key => Ok(()),
+        _ => forget(dir),
+    }
+}
+
 /// Whether a rejoin should stop trying: the advertisement is gone AND no peer
 /// of the session has been reachable for `RESUME_GIVE_UP_MS`, counted from the
 /// later of the last time one was seen and the moment the attempt began.
@@ -254,6 +266,24 @@ mod tests {
         forget(&dir).unwrap();
         assert_eq!(load(&dir), None);
         forget(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `S1-JK`: a slot giving up its rejoin forgets the record of its own
+    /// table, and leaves the record another slot's table wrote since.
+    #[test]
+    fn a_slot_forgets_only_the_record_of_its_own_table() {
+        let dir = scratch("forget-own");
+        let theirs = a_record();
+        save(&dir, &theirs).unwrap();
+        forget_the_record_of(&dir, &[4; 32]).unwrap();
+        assert_eq!(load(&dir), Some(theirs.clone()), "another table's record stays");
+        forget_the_record_of(&dir, &theirs.table_key).unwrap();
+        assert_eq!(load(&dir), None, "its own goes");
+        forget_the_record_of(&dir, &theirs.table_key).unwrap();
+        std::fs::write(session_path(&dir), b"not cbor at all").unwrap();
+        forget_the_record_of(&dir, &[4; 32]).unwrap();
+        assert!(!session_path(&dir).exists(), "one this version cannot read goes, as it did");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

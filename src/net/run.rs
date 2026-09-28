@@ -5707,7 +5707,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         if t.resuming
                                             && reason != crate::table::join::RejectReason::AlreadySeated.code()
                                         {
-                                            let _ = crate::storage::session::forget(&profile_dir);
+                                            forget_the_resumed_record(&profile_dir, t.resume.as_ref());
                                             t.resume = None;
                                             t.resuming = false;
                                             let _ = events
@@ -8530,7 +8530,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let ad = match super::advert::from_body_bytes(&r.advert) {
                                 Ok(ad) => ad,
                                 Err(e) => {
-                                    let _ = crate::storage::session::forget(&profile_dir);
+                                    forget_the_resumed_record(&profile_dir, t.resume.as_ref());
                                     t.resume = None;
                                     let _ = events
                                         .send(NodeEvent::SessionGaveUp { why: format!("the recorded advert does not read: {e:?}") })
@@ -8607,7 +8607,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = crate::storage::session::forget(&profile_dir);
+                                    forget_the_resumed_record(&profile_dir, t.resume.as_ref());
                                     t.resume = None;
                                     let _ = events
                                         .send(NodeEvent::SessionGaveUp { why: format!("the founder's record does not rebuild the table: {e:?}") })
@@ -8645,7 +8645,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .await;
                             }
                             Err(e) => {
-                                let _ = crate::storage::session::forget(&profile_dir);
+                                forget_the_resumed_record(&profile_dir, t.resume.as_ref());
                                 t.resume = None;
                                 let _ = events
                                     .send(NodeEvent::SessionGaveUp { why: format!("the recorded advert does not read: {e:?}") })
@@ -11140,7 +11140,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .get(&r.table_key)
                                 .is_some_and(|h| h.advert_hash != r.advert_hash && h.received_at_ms >= t.resume_since_ms);
                             if crate::storage::session::give_up(now, advert_seen, t.resume_last_peer_ms, t.resume_since_ms) {
-                                let _ = crate::storage::session::forget(&profile_dir);
+                                // `S1-JK`: its own record, and not one another slot's
+                                // table wrote in the ten minutes this took.
+                                forget_the_resumed_record(&profile_dir, t.resume.as_ref());
                                 t.resume = None;
                                 t.resuming = false;
                                 let _ = events
@@ -12870,7 +12872,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // aborted boundary (`run193358-3`).
                     let stack = h.stack_at_boundary(me);
                     if stack == 0 && h.checkpoint8().is_some() {
-                        let _ = crate::storage::session::forget(&profile_dir);
+                        // `S1-JK`: this table's record -- the key `remember_session!`
+                        // files it under -- and not another slot's.
+                        let own_key = t.table.as_ref().and_then(|f| if f.is_founder() { Some(f.table_id()) } else { t.joined_key });
+                        let _ = match own_key {
+                            Some(k) => crate::storage::session::forget_the_record_of(&profile_dir, &k),
+                            None => crate::storage::session::forget(&profile_dir),
+                        };
                         t.resume = None;
                         let _ = events
                             .send(NodeEvent::Warning(format!("hand #{}: seat {me} busted; the session record is forgotten", h.hand_id())))
@@ -14096,6 +14104,15 @@ const OWN_LINE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 /// the new table's replaces it.
 fn end_the_rejoin_for_a_new_table(t: &mut TableRun) {
     t.resuming = false;
+}
+
+/// `S1-JK`: forget the session record a slot resumes from -- that one, and not
+/// whatever another slot's table has written to the one file since.
+fn forget_the_resumed_record(profile_dir: &std::path::Path, resume: Option<&crate::storage::session::Record>) {
+    let _ = match resume {
+        Some(r) => crate::storage::session::forget_the_record_of(profile_dir, &r.table_key),
+        None => crate::storage::session::forget(profile_dir),
+    };
 }
 
 /// `S1-GS`, `S1-GX`: whether this client's own line is the likelier reading of a
