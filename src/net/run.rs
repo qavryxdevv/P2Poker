@@ -4578,14 +4578,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     .continues_heard
                     .iter()
                     .find(|(s, _)| **s <= successor)
-                    .map(|(_, c)| c.clone())
-                    // `S1-JG`: a word naming a table this build does not deal -- an
-                    // older client's continuation founded with no group, which never
-                    // deals a hand -- is no word: the seat waits, and passes that
-                    // successor over as it does one that says nothing. Checked from
-                    // the advert's own bytes, every tick alike: `advert::receive` counts
-                    // against the sender's rate, and its second answer was a rate limit.
-                    .filter(|c| advert::verify_echoed(&c.advert).is_ok_and(|(ad, _)| advert::plays(&ad)));
+                    .map(|(_, c)| c.clone());
                 if let Some((key, players, rank)) = offered {
                     let why = format!(
                         "the founder is gone: the table goes on at the table the lobby offers for it -- seat {rank}'s, {players} seated (D-062)"
@@ -6054,7 +6047,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 });
                             let verdict = match heard {
                                 Some((me, Ok(c))) => {
-                                    if Some(c.seat) != me && !t.continues_heard.contains_key(&c.seat) {
+                                    if Some(c.seat) != me && !t.continues_heard.contains_key(&c.seat) && continuation_is_dealt(&c) {
                                         let _ = events
                                             .send(NodeEvent::Warning(format!(
                                                 "seat {} founded this table's continuation (D-061)",
@@ -9245,7 +9238,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let me = f.my_seat();
                         match super::tabletalk::receive_continues(&item.bytes, &f.table_id(), f.advert(), |k| f.roster().seat_of(k).or_else(|| seen.get(k).copied()), now) {
                             Ok(c) => {
-                                if Some(c.seat) != me && !t.continues_heard.contains_key(&c.seat) {
+                                if Some(c.seat) != me && !t.continues_heard.contains_key(&c.seat) && continuation_is_dealt(&c) {
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
                                             "seat {} founded this table's continuation, said in the table's group (D-061, S1-IA)",
@@ -14296,6 +14289,17 @@ fn at_the_boundary(stack: crate::poker::state::Chips, settled: bool) -> AtTheBou
         (0, false) => AtTheBoundary::Nothing,
         _ => AtTheBoundary::Write,
     }
+}
+
+/// `S1-JG`: whether a `D-061` word names a table this build deals -- a
+/// Sit-and-Go on its Tox group (`advert::plays`), read from the advert's own
+/// bytes. A word naming one an older client founded with no group, which never
+/// deals a hand, is not kept, and the seat passes that successor over as it does
+/// one that says nothing. Tested where it was used, it masked every word from a
+/// higher seat, and a seat passed over a successor that had founded a table it
+/// could play at.
+fn continuation_is_dealt(c: &super::tabletalk::Continues) -> bool {
+    advert::verify_echoed(&c.advert).is_ok_and(|(ad, _)| advert::plays(&ad))
 }
 
 /// `S1-JK`: forget the session record a slot resumes from -- that one, and not
@@ -21088,10 +21092,16 @@ mod a_joiner_before_the_first_hand {
         assert!(refusal.contains("t.opened_at = tokio::time::Instant::now()"), "an empty slot goes at once");
         // And a founding refused at the most tables keeps the played table's
         // origin, and is said in the window too.
-        // A `D-061` word naming a table this build does not deal is no word --
-        // read from the advert's own bytes, not through `receive`, whose second
-        // answer for the same sender is a rate limit.
-        assert!(code.contains(".filter(|c| advert::verify_echoed(&c.advert).is_ok_and(|(ad, _)| advert::plays(&ad)));"));
+        // A `D-061` word naming a table this build does not deal is not kept, at
+        // both places a word is heard -- read from the advert's own bytes, not
+        // through `receive`, whose second answer for the same sender is a rate
+        // limit -- so it can mask no word from a higher seat.
+        assert_eq!(
+            code.matches("!t.continues_heard.contains_key(&c.seat) && continuation_is_dealt(&c) {").count(),
+            2,
+            "only a dealt word is kept, wherever it is heard"
+        );
+        assert!(code.contains("advert::verify_echoed(&c.advert).is_ok_and(|(ad, _)| advert::plays(&ad))"));
         let guard = before.find("if t.table.is_some() || t.rejoin_key.is_some() {").expect("the guard");
         let origin = before.find("t.origin = None;").expect("the origin reset");
         assert!(guard < origin, "the origin is reset after the guard");
