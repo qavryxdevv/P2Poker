@@ -436,10 +436,14 @@ jobs:
     permissions:
       contents: write          # to publish the release
     steps:
+      # The two systems' builds and nothing else. D-080's package for the Store stays with the run, as its own step
+      # says: unsigned, it installs for nobody. Taken without a pattern, every artifact of the run was merged into
+      # dist, and 0.1.5's draft carried P2Poker-0.1.5-x64.msix among the files a player downloads.
       - name: The two builds
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
+          pattern: p2p-poker-*-x64
           merge-multiple: true
 
       - name: Publish the release

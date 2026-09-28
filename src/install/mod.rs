@@ -443,6 +443,38 @@ mod tests {
         assert!(!packaged());
     }
 
+    /// **`D-080`: the Store's package stays with the run and never reaches the
+    /// release.** Unsigned, it installs for nobody -- and 0.1.5's draft carried
+    /// it all the same, because the release took every artifact of the run.
+    /// Read from the workflow: the release takes the artifacts its pattern
+    /// names, and the pattern names the two systems' builds and not the
+    /// Store's package.
+    #[test]
+    fn the_release_carries_the_two_builds_and_not_the_stores_package() {
+        let flow = include_str!("../../.github/workflows/release.yml").replace("\r\n", "\n");
+        let job = &flow[flow.find("\n  release:\n").expect("the release job")..];
+        let step = &job[job.find("uses: actions/download-artifact@").expect("its download")..];
+        let step = &step[..step.find("\n      - name:").expect("the step after it")];
+        let pattern = step
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("pattern: "))
+            .expect("the download names what it takes");
+        let (head, tail) = pattern.split_once('*').expect("one wildcard");
+        let taken = |name: &str| name.starts_with(head) && name.ends_with(tail) && name.len() >= head.len() + tail.len();
+        let uploaded: Vec<&str> = flow
+            .split("uses: actions/upload-artifact@")
+            .skip(1)
+            .filter_map(|s| s.lines().find_map(|l| l.trim().strip_prefix("name: ")))
+            .collect();
+        assert!(uploaded.contains(&"p2p-poker-msix"), "the Store's package is an artifact: {uploaded:?}");
+        for build in ["p2p-poker-windows-x64", "p2p-poker-linux-x64"] {
+            assert!(uploaded.contains(&build) && taken(build), "{build} goes to the release");
+        }
+        for kept in ["p2p-poker-msix", "p2p-poker-unsigned"] {
+            assert!(!taken(kept), "{kept} stays with the run");
+        }
+    }
+
     /// **`D-073`: who is asked, and who is never interrupted.** The table in
     /// `decide`'s own words, one line each.
     ///

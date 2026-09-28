@@ -7164,7 +7164,13 @@ as **0.1.5**, which carries the connection limits of `S1-IY` and `S1-IZ`, the Li
 of `S1-JB` besides. **0.1.5 is published on GitHub at once, on the owner's word, as the one exception to *a release
 waits for the Store*:** no copy from the Store exists yet to be locked out, and the Store's reviewers will run 0.1.5
 itself. The workflow still made the release a draft, `RELEASE_WAITS_FOR_STORE` being set, and the draft was published
-by hand; the variable stays set, so the next release waits again.
+by hand; the variable stays set, so the next release waits again. **The draft also carried the Store's package among
+a player's downloads**, which the workflow's own comment says it never is: the release job took every artifact of
+the run, and since the identity values were set on 2026-09-23 one of them is the MSIX. It takes the two systems'
+builds alone now (`pattern: p2p-poker-*-x64`, held by
+`install::tests::the_release_carries_the_two_builds_and_not_the_stores_package`), and the stray file was taken off
+the draft before it was published. The package for Partner Center is the run's own, and the program inside it is
+the attested `p2p-poker.exe` byte for byte.
 
 
 ## D-081 -- a clock that is out, and the company it costs
