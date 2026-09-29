@@ -3551,16 +3551,22 @@ distinct bodies in one capacity-one slot — §5.2's predicate satisfied against
 honest key by behaviour this document describes as ordinary. With the subject in
 the key they are two events in two slots and there is no proof to build.
 
-Once the subject is in the key the slot is back to capacity one, because every
-remaining field of a vote is a function of `(subject_sequence, subject_seat)`:
+Once the subject and the cause are in the key the slot is back to capacity one, because
+every remaining field of a vote is a function of `(subject_sequence, subject_seat,
+cause)`. The cause is in it because an honest voter says two votes about one seat at one
+stage that differ in nothing else: `D-066`'s re-vote with `cause = 3` and `S1-JS`'s early
+question with `cause = 4` beside the vote at the deadline -- two bodies in one
+capacity-one slot without it, which is `D-009` rule 1's failure:
 `n(2) subject_event_type` is what the stage's emitter set owed that seat,
 `n(3) parent_event_hash` is `stage_hash(subject_sequence - 1)`, `n(4) deadline_ms`
 is the parent's `next_deadline_ms`, and `n(5) kind` is fixed by the stage — a
 stage is either a betting stage or a cryptographic stage, never both, so one
 voter can never legitimately hold both kinds against one subject at one stage.
 `n(6) cause` (D-051) is fixed by the voter with its first vote about that seat at
-that stage: a client votes once about one seat at one stage, and a seat it cut off
-after voting is voted about with the cause at its next stage.
+that stage: a client votes once about one seat at one stage with one cause, and a
+seat it cut off after voting is voted about with the cause at its next stage. `D-066`'s
+re-vote with `cause = 3` and `S1-JS`'s early question with `cause = 4` are other
+subjects in other slots (§5.2.1).
 
 **`cause = 2` and when it is said (D-065).** A voter votes about another voter of
 the round at a stage with `cause = 2` one stage deadline after its own last vote
@@ -5134,7 +5140,7 @@ when some key component changes with it.
 | 24 | `SHOWDOWN_REVEAL` | one per showdown seat | — | **Clean** |
 | 25 | `SHOWDOWN_MUCK` | one per showdown seat, mutually exclusive with row 24 by `showdown_policy` (§4.6) | `event_type`, if a seat emits both | **Clean.** Since `event_type` entered the key the pair is two slots, so a seat emitting both is a **stage violation** under §4.0 step 12, not an equivocation. §4.6's exclusivity stays normative and is what rejects the second (§5.2.1) |
 | 26–30 | `ACTION_CHECK`, `ACTION_CALL`, `ACTION_BET`, `ACTION_RAISE`, `ACTION_FOLD` | one per turn, single-writer | `event_type`, if a seat claims two actions for one turn | **Clean.** Same change as row 25 and the same price: two *different* action types at one `sequence` are a stage violation, not a proof; two bodies of the **same** type — two `ACTION_RAISE` with different amounts — are still an equivocation (§5.2.1) |
-| 31 | `TIMEOUT_VOTE` | **none in version 1 (D-015)**; the defined emission is one per subject per stage, and two simultaneous subjects are **normal** (§8.4) | `subject_seat` | **Vacuously clean in version 1** — an honest peer emits none, so it emits no pair. **Clean since M2 for the defined behaviour**, by the subject axis in the key; the verdict is retained because the axis is retained (D-015 point 3) |
+| 31 | `TIMEOUT_VOTE` | **none in version 1 (D-015)**; the defined emission is one per subject per stage, and two simultaneous subjects are **normal** (§8.4) | `subject_seat`, `cause` (`S1-JS`) | **Vacuously clean in version 1** — an honest peer emits none, so it emits no pair. **Clean since M2 for the defined behaviour**, by the subject axis in the key; the verdict is retained because the axis is retained (D-015 point 3) |
 | 32 | `TIMEOUT_CERT` | **none in version 1 (D-015)**; the defined emission is one per `subject_digest` per stage | `subject_digest` | **Vacuously clean in version 1**, same reason. **Clean since M2 for the defined behaviour**, by the subject axis; its one variable field `n(1) votes` is pinned by the receiver check §4.8 defines |
 | 33 | `STATE_HASH` | one per checkpoint, **plus one per reconciliation round** — a required re-emission with *changed* content, the only one in the corpus — plus, at **checkpoint 8**, one from a seat outside the required set, which §4.9 admits | `sequence`, and only because §4.9 gives each reconciliation round its own — `s_ckpt + r` inside a hand, `BOUNDARY_CHECKPOINT_BASE + 2r` at checkpoint 8 | **Clean since P1, and clean by that rule alone.** Not by the stage rule: an editor who deletes §4.9's normative boxes reopens P1 the same day. The checkpoint-8 admission does not touch this verdict — the key contains `sender_public_key`, so an out-of-set emitter fills **its own** slot at that `sequence` and one honest peer still emits one body per slot |
 | 34 | `STATE_ACK` | one per checkpoint and one per reconciliation round; **not** widened at checkpoint 8 | `sequence`, same rule | **Clean since P1**, same reason |
@@ -5233,7 +5239,7 @@ references that one.** §4.0 step 10a, §5.3 and §4.11 are annotated accordingl
 >           )
 >
 > subject(E) = ()                             when E.event_class == 0
->            = ( payload n(1) subject_seat )   when E.event_class == 1  (0x0601)
+>            = ( payload n(1) subject_seat, payload n(6) cause )   when E.event_class == 1  (0x0601)
 >            = ( payload n(0) subject_digest ) when E.event_class == 2  (0x0602)
 > ```
 >

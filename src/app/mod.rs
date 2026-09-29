@@ -373,6 +373,7 @@ pub struct TableApp {
     pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, Option<u64>, std::time::Instant)>,
     pub opponent_gone: Option<OpponentGone>,
     pub opponent_was_reachable: bool,
+    pub opponent_offline_at: Option<std::time::Instant>,
     pub out_for_good: Option<String>,
     pub ever_on_line: bool,
     pub certified: std::collections::BTreeSet<u8>,
@@ -513,6 +514,11 @@ pub struct AppState {
     /// group, not an absence: a game used to begin with a return spent and
     /// the question asked while the other seat was handshaking.
     pub opponent_was_reachable: bool,
+    /// `S1-JR`: the last reading of the opponent out of reach -- a hand that
+    /// stood on its part of the cards is timed from after it, since an
+    /// opponent (or a line of this client's own) coming back is no opponent
+    /// holding anything back.
+    pub opponent_offline_at: Option<std::time::Instant>,
     /// `D-047`: this seat is out of the table for good, and why; the window
     /// says so and holds the table until the player closes it.
     pub out_for_good: Option<String>,
@@ -1033,6 +1039,7 @@ impl AppState {
         std::mem::swap(&mut self.links, &mut other.links);
         std::mem::swap(&mut self.opponent_gone, &mut other.opponent_gone);
         std::mem::swap(&mut self.opponent_was_reachable, &mut other.opponent_was_reachable);
+        std::mem::swap(&mut self.opponent_offline_at, &mut other.opponent_offline_at);
         std::mem::swap(&mut self.out_for_good, &mut other.out_for_good);
         std::mem::swap(&mut self.ever_on_line, &mut other.ever_on_line);
         std::mem::swap(&mut self.certified, &mut other.certified);
@@ -2488,6 +2495,7 @@ impl AppState {
     fn forget_the_table(&mut self) {
         self.opponent_gone = None;
         self.opponent_was_reachable = false;
+        self.opponent_offline_at = None;
         self.out_for_good = None;
         self.ever_on_line = false;
         self.certified.clear();
@@ -2654,7 +2662,17 @@ impl AppState {
         // `S1-EJ`: or any seat was -- the opponent may have become the opponent
         // only when the others left for good, having been on the line before
         // it was one (S1-EC's guard is against a group still forming).
-        } else if self.opponent_gone.is_none() && (self.opponent_was_reachable || self.ever_on_line) {
+        } else {
+            // `S1-JR`: the last moment the opponent was read out of reach.
+            self.opponent_offline_at = Some(std::time::Instant::now());
+        }
+        // `S1-JR`: out of reach is the reading, whatever the cards were waiting
+        // on -- it replaces a question about a part held back, and counts as
+        // the absence it is (`D-032`).
+        if !reachable
+            && self.opponent_gone.as_ref().is_none_or(|g| g.step)
+            && (self.opponent_was_reachable || self.ever_on_line)
+        {
             // `S1-EC`: only an opponent that has been on the line can be out of
             // reach; before that the seat is still joining (S1-CX said so for
             // the group's count, and this reading needed the same rule).
@@ -3267,12 +3285,15 @@ impl AppState {
         // every hand up (D-007). The same question; withdrawn when the stage
         // moves off it.
         if let Some(opponent) = self.heads_up_opponent() {
+            // Timed from the later of the stand and the last reading of the
+            // opponent out of reach: a seat back on the line -- or this
+            // client's own line back -- has its whole step from there.
             let stood = self.stands.1.contains(&opponent)
                 && self.turn_seat != Some(opponent)
-                && self
-                    .waits
-                    .get(&opponent)
-                    .is_some_and(|w| w.since.elapsed().as_millis() as u64 >= OPPONENT_STEP_MS);
+                && self.waits.get(&opponent).is_some_and(|w| {
+                    let from = self.opponent_offline_at.map_or(w.since, |off| off.max(w.since));
+                    from.elapsed().as_millis() as u64 >= OPPONENT_STEP_MS
+                });
             if stood && self.opponent_gone.is_none() && !self.opponent_out {
                 self.opponent_gone = Some(OpponentGone {
                     since: std::time::Instant::now()
@@ -3631,6 +3652,20 @@ impl AppState {
         self.swap_slot(slot);
         self.log_table(crate::gui::table::LogKind::Normal, text);
         self.swap_slot(slot);
+    }
+
+    /// `S1-JR`, the owner's rule -- nothing over a hand being played: whether one
+    /// is, at this table: dealt, not over, and stood on no seat for a minute. A
+    /// hand stood on that long is no hand being played, and a window about a
+    /// table that cannot go on belongs over it.
+    pub fn hand_being_played(&self) -> bool {
+        let live = self.hand.as_ref().is_some_and(|h| !h.over);
+        let stuck = self
+            .stands
+            .1
+            .iter()
+            .any(|s| self.waits.get(s).is_some_and(|w| w.since.elapsed() >= std::time::Duration::from_secs(60)));
+        live && !stuck
     }
 
     /// `D-068`: whether a hand is being played at any of this client's tables.
@@ -5807,6 +5842,58 @@ mod tests {
         s.apply(NodeEvent::StageStands { hand_id: 3, seats: Vec::new() });
         s.tick_opponent();
         assert!(s.opponent_gone.is_none(), "the cards moved: withdrawn");
+    }
+
+    /// `S1-JR`, the owner's rule: the window about a table that is not safe
+    /// never covers a hand being played -- it is shown between hands, or over a
+    /// hand that has stood on a seat for a minute.
+    #[test]
+    fn a_table_not_safe_is_not_said_over_a_hand_being_played() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000), (2, "b".into(), 1_000)],
+        });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 0, dealt_in: vec![0, 1, 2], small_blind: 50, big_blind: 100 });
+        s.apply(NodeEvent::TableUnsafe { why: Some("seat 1 sent a shuffle proof that does not hold".into()) });
+        assert!(s.table_view().unsafe_note.is_none(), "not over a hand being played");
+        s.apply(NodeEvent::NotYourTurn { hand_id: 4, seat: None, elapsed_ms: 0 });
+        s.apply(NodeEvent::StageStands { hand_id: 4, seats: vec![1] });
+        assert!(s.table_view().unsafe_note.is_none(), "a stage stood on briefly is a hand being played");
+        s.waits.get_mut(&1).expect("waited on").since = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        assert!(s.table_view().unsafe_note.is_some(), "a hand stood on a seat for a minute is not");
+        s.apply(NodeEvent::StageStands { hand_id: 4, seats: Vec::new() });
+        assert!(s.table_view().unsafe_note.is_none(), "played again");
+        s.apply(NodeEvent::HandEnded { hand_id: 4, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
+        assert!(s.table_view().unsafe_note.is_some(), "said between hands");
+    }
+
+    /// `S1-JR`: an opponent read out of reach while the hand stood on its part of
+    /// the cards is an absence (`D-032`), not a part held back; back on the line,
+    /// it has its whole step from there before it is asked about again.
+    #[test]
+    fn a_heads_up_opponent_out_of_reach_is_no_part_held_back() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1], small_blind: 50, big_blind: 100 });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 3, seat: None, elapsed_ms: 0 });
+        s.apply(NodeEvent::StageStands { hand_id: 3, seats: vec![1] });
+        s.waits.get_mut(&1).expect("waited on").since =
+            std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_STEP_MS + 1_000);
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.step), "asked about its part");
+        // Out of reach: the absence replaces the question about its part.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(22), away: false });
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.step && !g.slow), "an absence, not a part held back");
+        // Back: the absence ends, and the stand is timed from the reading.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none(), "back on the line, its whole step from here");
     }
 
     /// `D-034`: a present heads-up opponent long past their time to decide is

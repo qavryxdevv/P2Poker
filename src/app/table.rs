@@ -199,7 +199,9 @@ impl AppState {
             out_for_good: self.out_for_good.clone(),
             out_flooded: self.out_flooded,
             lost: self.lost.clone(),
-            unsafe_note: self.unsafe_note.clone(),
+            // `S1-JR`: never over a hand being played -- said at the boundary, or
+            // over a hand that stands.
+            unsafe_note: self.unsafe_note.clone().filter(|_| !self.hand_being_played()),
             // `S1-IX`: the seats by the names the window shows.
             stopped: self.stopped.as_ref().map(|(s, serial)| crate::gui::table::StoppedView {
                 hand_id: s.hand_id,

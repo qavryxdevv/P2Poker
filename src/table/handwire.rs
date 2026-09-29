@@ -772,7 +772,9 @@ pub struct TimeoutVote {
     /// certificate completes only with the cause every voter signed, and a
     /// voter that says both to two peers completes neither alone. A voter
     /// votes once about one seat at one stage, so the cause is fixed with its
-    /// first vote there.
+    /// first vote there -- save `D-066`'s re-vote with [`CAUSE_LONG_GONE`] and
+    /// the early question with [`CAUSE_QUESTION`] (`S1-JS`), each another
+    /// subject in another slot (`PROTOCOL.md` §5.2.1).
     #[n(6)]
     pub cause: Option<u16>,
 }

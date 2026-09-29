@@ -9988,6 +9988,16 @@ impl Hand {
         std::time::Duration::from_millis(u64::from(self.bank_left_ms))
     }
 
+    /// `S1-JR`: the most one turn may take at this table by its own clock --
+    /// the time to act, the transport's grace and the whole thinking reserve.
+    pub fn turn_allowance(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            u64::from(self.open.action_timeout_ms)
+                .saturating_add(u64::from(self.open.action_grace_ms))
+                .saturating_add(u64::from(self.open.time_bank_ms)),
+        )
+    }
+
     /// What the player sees: their own clock, without the transport's share.
     pub fn action_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(u64::from(self.open.action_timeout_ms))
@@ -11494,6 +11504,14 @@ pub fn certificate_names(
         if voter == named.subject_seat {
             return None;
         }
+        // `S1-JS`: a vote whose cause this catalogue does not define -- the
+        // early question's `CAUSE_QUESTION` among them -- is no vote, and bytes
+        // carrying one are no certificate, here as in the hand's own check. A
+        // rogue could wrap an honest seat's question and its own into a
+        // lobby answer (`S1-JT`).
+        if !named.cause_is_known() {
+            return None;
+        }
         if !subjects.contains(&named.subject_seat) {
             subjects.push(named.subject_seat);
         }
@@ -11523,6 +11541,25 @@ pub fn certificate_cause(raw: &[u8], table_id: &[u8; 32], hand_id: u64, seat: Se
         }
     }
     cause.flatten()
+}
+
+/// `S1-JT`: the cause of every vote about `seat` in a certificate's bytes, one
+/// per vote -- `certificate_cause` answers `None` both when every vote says no
+/// cause and when the votes disagree, and a reader that must tell the two
+/// apart reads this. `None` when the bytes do not open. Read after
+/// `certificate_names` has accepted them.
+pub fn certificate_causes(raw: &[u8], table_id: &[u8; 32], hand_id: u64, seat: SeatIdx) -> Option<Vec<Option<u16>>> {
+    let opened = chained::open_in_hand(raw, FRAME_CAP, EventType::TimeoutCert, table_id, hand_id).ok()?;
+    let body: TimeoutCert = chained::payload(&opened, TIMEOUT_CERT_CAP).ok()?;
+    let mut causes = Vec::new();
+    for vote in &body.votes {
+        let v = chained::open_in_hand(vote, FRAME_CAP, EventType::TimeoutVote, table_id, hand_id).ok()?;
+        let named: TimeoutVote = chained::payload(&v, TIMEOUT_VOTE_CAP).ok()?;
+        if named.subject_seat == seat {
+            causes.push(named.cause);
+        }
+    }
+    Some(causes)
 }
 
 #[cfg(test)]
