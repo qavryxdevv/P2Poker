@@ -10707,7 +10707,8 @@ impl Hand {
     /// numbers (`D-044`) -- the list read as it stood gave seats the wrong
     /// stacks: heads-up on seats 0 and 2, the first abort gave seat 2 none and
     /// ended the tournament, and every settlement's deltas and busts were off.
-    /// The wire's lists stay one per occupied seat, as §4.4 and §4.10 say.
+    /// `HAND_INIT`'s and `HAND_ABORT`'s lists stay one per occupied seat (§4.4,
+    /// §4.10); `HAND_COMPLETE`'s were by seat number all along (`S1-JO`).
     fn start_stacks_by_seat(&self) -> Vec<Chips> {
         let mut by_seat = vec![0 as Chips; usize::from(self.open.max_players)];
         for ((seat, _, _), stack) in self.open.seats.iter().zip(self.mine.stacks.iter()) {
@@ -17449,6 +17450,88 @@ mod tests {
         assert_eq!(next.genesis, foreseen, "and the give-up opened where it was foreseen");
         let (over, finishes) = a.finishes_at_boundary();
         assert!(!over && finishes.is_empty(), "nobody finished: {finishes:?}");
+    }
+
+    /// Heads-up at a table of `max_players`, on the seat numbers and stacks
+    /// given -- `seats[0]` is key 10's, `seats[1]` key 11's -- played to the
+    /// settlement by checking and calling. Both hands, and each seat's
+    /// `HAND_COMPLETE` body as it went out.
+    fn a_heads_up_hand_at(seats: [(SeatIdx, Chips); 2], max_players: u8) -> (Hand, Hand, Vec<HandComplete>) {
+        let keys = [key(10), key(11)];
+        let at_seat = |my_seat| {
+            let mut o = opening(my_seat);
+            o.seats = vec![
+                (seats[0].0, keys[0].verifying_key().to_bytes(), seats[0].1),
+                (seats[1].0, keys[1].verifying_key().to_bytes(), seats[1].1),
+            ];
+            o.required = vec![seats[0].0, seats[1].0];
+            o.max_players = max_players;
+            o
+        };
+        let (mut a, from_a) = Hand::open(at_seat(seats[0].0), &keys[0], NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(at_seat(seats[1].0), &keys[1], NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &keys[1]);
+        let a_deck = deliver(&mut a, &from_b, &keys[0]);
+        // 0 is `a`, the first seat's hand; 1 is `b`.
+        let mut queue: Vec<(usize, Vec<Send>)> =
+            vec![(1, deliver(&mut b, &a_deck, &keys[1])), (0, deliver(&mut a, &b_deck, &keys[0]))];
+        let mut complete: [Option<HandComplete>; 2] = [None, None];
+        for _ in 0..1024 {
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                // Each seat's settlement, opened at whichever of the two slots
+                // it was sealed at: the sender's may have moved on already.
+                let slots = [a.slot(), b.slot()];
+                for Send::Broadcast(bytes) in &sends {
+                    for at in &slots {
+                        if let Ok(opened) = chained::open(bytes, FRAME_CAP, EventType::HandComplete, at) {
+                            complete[from] = Some(chained::payload(&opened, HAND_COMPLETE_CAP).unwrap());
+                        }
+                    }
+                }
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[to]);
+                queue.push((to, out));
+                continue;
+            }
+            if a.over() && b.over() {
+                break;
+            }
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                break;
+            };
+            let i = usize::from(turn.seat != seats[0].0);
+            let hand: &mut Hand = if i == 0 { &mut a } else { &mut b };
+            let action = if hand.turn().expect("that hand agrees").legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[i], NOW).unwrap();
+            queue.push((i, out));
+        }
+        assert!(a.over() && b.over(), "the hand was played out");
+        let [x, y] = complete;
+        (a, b, vec![x.expect("the first seat's settlement went out"), y.expect("the second's")])
+    }
+
+    /// `S1-JO`: `HAND_COMPLETE` lists every seat by its number, `max_players`
+    /// long, an empty seat's entries zero -- as every release has sent it, and
+    /// not one per occupied seat, as the corpus read. A client that "fixed"
+    /// this would part from every other at every table not full.
+    #[test]
+    fn a_settlement_lists_every_seat_by_its_number() {
+        let (_, _, complete) = a_heads_up_hand_at([(0, 10_000), (1, 10_000)], 3);
+        assert_eq!(complete[0], complete[1], "one settlement, said by both seats");
+        for c in &complete {
+            assert_eq!((c.deltas.len(), c.final_stacks.len()), (3, 3), "a table of three, two seated: {c:?}");
+            assert_eq!((c.deltas[2], c.final_stacks[2]), (0, 0), "the empty seat's entries: {c:?}");
+            assert_eq!(c.deltas.iter().sum::<i64>(), 0);
+            assert_eq!(c.final_stacks.iter().sum::<u64>(), 20_000);
+        }
     }
 
     /// The two-seat fixture with the roster hash its seats and stacks really

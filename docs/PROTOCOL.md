@@ -4440,8 +4440,8 @@ outside every `R`.
 |---|---|---|
 | `n(0) pots` | `Vec<PotAward>` | ≤ `MAX_SEATS` |
 | `n(1) refunds` | `Vec<(u8, u64)>` | ≤ `MAX_SEATS`, uncalled excess returned before pots are awarded |
-| `n(2) deltas` | `Vec<i64>` | one per occupied seat ascending; must sum to 0 |
-| `n(3) final_stacks` | `Vec<u64>` | one per occupied seat ascending |
+| `n(2) deltas` | `Vec<i64>` | one per seat **number**, `0..max_players`, an empty seat's entry 0; must sum to 0. Corrected 2026-09-29 (`S1-JO`): this row read *one per occupied seat ascending*, which no release ever sent -- `HAND_INIT`'s `stacks` and `HAND_ABORT`'s lists are the ones laid out so |
+| `n(3) final_stacks` | `Vec<u64>` | one per seat number, `0..max_players`, an empty seat's entry 0 (`S1-JO`, as `n(2)`) |
 | `n(4) busted` | `Vec<u8>` | seats reaching 0, ascending |
 | `n(5) state_hash` | `bytes[32]` | the end-of-hand state hash |
 
@@ -8239,7 +8239,8 @@ processed.
 | roster / `SeatEntry` lists | `MAX_SEATS` | sorted by seat, unique seats, unique keys |
 | `board` | 5 | and length ∈ {0,3,4,5} at street boundaries [RULES A2] |
 | `dealt_in` | `MAX_SEATS` | ascending, unique |
-| `stacks`, `deltas`, `final_stacks`, `committed_*`, boolean vectors | `MAX_SEATS` | length must equal the occupied-seat count exactly |
+| `HAND_INIT`'s `stacks`; `HAND_ABORT`'s `deltas`, `final_stacks` | `MAX_SEATS` | length must equal the occupied-seat count exactly |
+| `HAND_COMPLETE`'s `deltas`, `final_stacks`; `PublicTableState`'s `committed_*` and boolean vectors | `MAX_SEATS` | length `max_players`, indexed by seat number, an empty seat's entry zero. Corrected 2026-09-29 (`S1-JO`): one row held all of these to *the occupied-seat count*, which no release ever sent for this half |
 | `pots` | `MAX_SEATS` | at most one side pot per all-in level |
 | `RevealEntry` per message | 25 | `2 × MAX_SEATS + 5` |
 | `deck_index` | < 52 | |

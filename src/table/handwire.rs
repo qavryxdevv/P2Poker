@@ -469,10 +469,15 @@ pub struct HandComplete {
     /// Uncalled excess, returned **before** the pots are awarded.
     #[n(1)]
     pub refunds: Vec<Refund>,
-    /// One per occupied seat ascending. Must sum to zero — chips are conserved
-    /// and a hand that created or destroyed one is a hand nobody may accept.
+    /// One per seat **number**, `0..max_players`, an empty seat's zero -- not
+    /// one per occupied seat, which is `HAND_INIT`'s list: every release has
+    /// sent it so, and a client that "aligned" it with the corpus as it read
+    /// would part from all of them at every table not full (`S1-JO`). Must sum
+    /// to zero — chips are conserved and a hand that created or destroyed one
+    /// is a hand nobody may accept.
     #[n(2)]
     pub deltas: Vec<i64>,
+    /// By seat number, as `deltas`.
     #[n(3)]
     pub final_stacks: Vec<u64>,
     /// Seats reaching zero, ascending.
