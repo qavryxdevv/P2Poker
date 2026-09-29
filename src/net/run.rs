@@ -11492,15 +11492,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let occupied = f.roster().len();
                             // `S1-JX`: counted by the others' copies, as the pick is.
                             let mine = app_key.verifying_key().to_bytes();
-                            let newer = t.resume_inits.iter().any(|(hid, copies)| {
-                                *hid > current
-                                    && copies
-                                        .iter()
-                                        .filter(|b| crate::net::chained::sender_of(b, crate::table::hand::FRAME_CAP) != Some(mine))
-                                        .count()
-                                        * 2
-                                        > occupied.saturating_sub(1)
-                            });
+                            let newer = t
+                                .resume_inits
+                                .iter()
+                                .any(|(hid, copies)| *hid > current && others_signed(copies, f, *hid, &mine) * 2 > occupied.saturating_sub(1));
                             if newer {
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
@@ -11715,20 +11710,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // the table went back hands, the stacks never looked at --
                                 // and a majority counted as the adoption counts it, by the
                                 // others' copies alone.
-                                let floor = adoption_floor(t.rejoin_floor, t.resume.as_ref());
+                                // The record only where it is this table's: a record of
+                                // another table left in the slot put its hand here.
+                                let own_key = if f.is_founder() { Some(f.table_id()) } else { t.joined_key };
+                                let record = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key);
+                                let floor = adoption_floor(t.rejoin_floor, record);
                                 let mine = app_key.verifying_key().to_bytes();
                                 let pick = t.resume_inits
                                     .iter()
                                     .rev()
                                     .filter(|(h, _)| floor.map_or(true, |f| **h > f))
-                                    .find(|(_, copies)| {
-                                        copies
-                                            .iter()
-                                            .filter(|b| crate::net::chained::sender_of(b, crate::table::hand::FRAME_CAP) != Some(mine))
-                                            .count()
-                                            * 2
-                                            > occupied.saturating_sub(1)
-                                    })
+                                    .find(|(h, copies)| others_signed(copies, f, **h, &mine) * 2 > occupied.saturating_sub(1))
                                     .map(|(h, c)| (*h, c.clone()));
                                 if let Some((hid, copies)) = pick {
                                     // `D-039`: whether the set that signed is exact is asked
@@ -17815,6 +17807,32 @@ fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>, others: &[u
     (saying.len() * 2 > others.len()).then_some((furthest, mine))
 }
 
+/// `S1-JX`: how many roster seats other than this client signed the copies of
+/// hand `hand_id`'s opening among `copies` -- each copy opened and its
+/// signature checked, as the adoption checks it, and each seat counted once. A
+/// count of the copies by the sender they claim let one seat's forged copies of
+/// a hand far ahead make a majority, and keep a client coming back from ever
+/// taking the table's hand up.
+fn others_signed(copies: &[Vec<u8>], f: &Formation, hand_id: u64, mine: &[u8; 32]) -> usize {
+    let table_id = f.table_id();
+    copies
+        .iter()
+        .filter_map(|b| {
+            crate::net::chained::open_in_hand(
+                b,
+                crate::table::hand::FRAME_CAP,
+                crate::protocol::messages::EventType::HandInit,
+                &table_id,
+                hand_id,
+            )
+            .ok()
+        })
+        .filter(|o| o.sender != *mine)
+        .filter_map(|o| f.roster().seat_of(&o.sender))
+        .collect::<std::collections::BTreeSet<u8>>()
+        .len()
+}
+
 /// `S1-JX`: the highest hand a client coming back may not adopt -- the one it
 /// dropped to rejoin or abandoned (`rejoin`), or the one its session record
 /// names: the hand that ended there, or the hand before the one whose card
@@ -20676,9 +20694,14 @@ mod tests {
         // recorded, and a majority by the others' copies alone.
         assert!(code[rejoin..dropped].contains("$t.rejoin_floor = $t.rejoin_floor.max(Some(dead));"), "the dropped hand is the floor");
         assert!(code[abandon..taken].contains("t.rejoin_floor = t.rejoin_floor.max(Some(current));"), "and the abandoned one");
-        let pick = code.find("let floor = adoption_floor(t.rejoin_floor, t.resume.as_ref());").expect("the floor read");
+        let pick = code.find("let floor = adoption_floor(t.rejoin_floor, record);").expect("the floor read");
+        assert!(
+            code[pick - 400..pick].contains("let record = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key);"),
+            "the record only where it is this table's"
+        );
         assert!(code[pick..pick + 900].contains(".filter(|(h, _)| floor.map_or(true, |f| **h > f))"), "above the floor only");
-        assert!(code[pick..pick + 900].contains("!= Some(mine)"), "the others' copies counted");
+        assert!(code[pick..pick + 900].contains("others_signed(copies, f, **h, &mine) * 2"), "the others' signatures counted, verified");
+        assert!(code.contains("*hid > current && others_signed(copies, f, *hid, &mine) * 2"), "and so at the abandon");
         let foreign = code.find("let foreign = heads_up").expect("the check");
         assert!(code[foreign..foreign + 300].contains("&& !signed_before"), "not for a hand this seat signed itself");
         assert!(code[foreign..foreign + 600].contains("!known.iter().any(|k| stacks_agree(&o.seats, k))"), "against what the hand holds");
