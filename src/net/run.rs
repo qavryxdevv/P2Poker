@@ -1457,6 +1457,10 @@ struct TableRun {
     /// `S1-JX`: the highest hand this client dropped to rejoin, or abandoned
     /// for a newer one -- none at or below it is adopted again. Only rises.
     rejoin_floor: Option<u64>,
+    /// `S1-JY`: the hand in which this client refused a certificate only half
+    /// the table carried, naming it, and when -- until a later hand is played
+    /// with it (`HALF_REFUSED_LIMIT`).
+    half_refused: Option<(u64, std::time::Instant)>,
     /// `S1-JT`: since when this client has heard no other seat of the table --
     /// out of its group, or cut off -- the only time a word in a lobby answer
     /// about it being out for good is taken.
@@ -1936,6 +1940,7 @@ impl TableRun {
             rejoin_stacks: None,
             stacks_refused: false,
             rejoin_floor: None,
+            half_refused: None,
             ever_on_line: false,
             nobody_said: false,
             readmitted: Vec::new(),
@@ -4313,6 +4318,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.rejoin_stacks = None;
             $t.stacks_refused = false;
             $t.rejoin_floor = None;
+            $t.half_refused = None;
             $t.ever_on_line = false;
             $t.nobody_said = false;
             $t.taught.clear();
@@ -9409,7 +9415,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // `S1-CR`: the running table's hand traffic, kept for the
                     // adoption at the stall tick. The formation handler below
                     // refuses it quietly either way.
-                    if t.resuming {
+                    // `S1-JX`: only a frame of this table signed by a seat of its
+                    // roster -- kept unchecked, two frames that merely parsed as
+                    // openings of hands far ahead evicted the table's own copies
+                    // for good, and a client coming back never took its hand up.
+                    if t.resuming && t.table.as_ref().is_some_and(|f| a_seats_own_frame(&item.bytes, f)) {
                         let _ = stash_for_resume(&item.bytes, &mut t.resume_inits, &mut t.resume_early);
                     }
                     // `S1-DX`: a ratification or a roster over the group teaches who
@@ -15039,6 +15049,11 @@ const ALONE_ASKED: std::time::Duration = std::time::Duration::from_secs(15);
 /// `S1-JR`: a client resuming that has held no hand of the table's this long
 /// is not safe -- the copies of the running hand it adopts from do not come.
 const RESUME_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `S1-JY`: how long after refusing a certificate that only half the table
+/// carried, and naming this client, the table has to go on with it before the
+/// player is told it may have split.
+const HALF_REFUSED_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 /// `S1-JR`: a table with players enough to start and no hand dealt this long
 /// is not safe. An honest table sets within a minute or two: the group joined
 /// within `GROUP_JOIN_GRACE`, every seat ready within `READY_GRACE` after.
@@ -15134,6 +15149,16 @@ fn stood_too_long(stood: std::time::Duration, turn_allowance: Option<std::time::
 /// boundary instead, where a hand is seen whole before the next replaces it.
 fn watch_progress(t: &mut TableRun) {
     let now = std::time::Instant::now();
+    // `S1-JY`: a certificate only half the table carried named this client, and
+    // it did not take it -- noted once a hand; forgotten once a later hand is
+    // being played with it.
+    if let Some(h) = t.hand.as_ref() {
+        if h.refused_half_certificate() && t.half_refused.map_or(true, |(k, _)| k != h.hand_id()) {
+            t.half_refused = Some((h.hand_id(), now));
+        } else if t.half_refused.is_some_and(|(k, _)| h.hand_id() > k && h.street().is_some()) {
+            t.half_refused = None;
+        }
+    }
     t.stands = match t.hand.as_ref().filter(|h| !h.over()) {
         Some(h) => {
             let at = (h.hand_id(), h.slot().sequence);
@@ -15280,6 +15305,15 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             "{} sent {what} that does not hold: its client does not play by the rules. Every hand it spoils is called off, and nothing here puts it out of the game.",
             seat_called(t, *seat)
         ));
+    }
+    // `S1-JY`: a certificate only half the table carried named this client,
+    // which was here and did not take it, and the table has not gone on with it
+    // since.
+    if t.half_refused.is_some_and(|(_, at)| now.duration_since(at) >= HALF_REFUSED_LIMIT) {
+        return Some(
+            "a certificate that only half the players or fewer signed named you, and your client, which was here, did not take it; the table has not gone on with you since: the players may have split in two, or two of them act together."
+                .to_string(),
+        );
     }
     // `S1-JX`: heads-up included -- the other player's copy of the hand this
     // client would come back to names stacks its own last hand does not hold,
@@ -17805,6 +17839,18 @@ fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>, others: &[u
         .collect();
     let furthest = saying.iter().copied().max()?;
     (saying.len() * 2 > others.len()).then_some((furthest, mine))
+}
+
+/// `S1-JX`: whether a frame a client with no hand keeps for its return is one
+/// of this table's, signed by a seat of its roster -- opened as the hand it
+/// names would open it.
+fn a_seats_own_frame(bytes: &[u8], f: &Formation) -> bool {
+    let Ok((kind, hand_id, _)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
+        return false;
+    };
+    crate::net::chained::open_in_hand(bytes, crate::table::hand::FRAME_CAP, kind, &f.table_id(), hand_id)
+        .ok()
+        .is_some_and(|o| f.roster().seat_of(&o.sender).is_some())
 }
 
 /// `S1-JX`: how many roster seats other than this client signed the copies of
@@ -20709,6 +20755,29 @@ mod tests {
         assert!(code[reason..reason + 3_000].contains("if t.stacks_refused {"), "the table not safe while refused");
         let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
         assert!(code[leave..].contains("$t.rejoin_stacks = None;") && code[leave..].contains("$t.stacks_refused = false;"));
+    }
+
+    /// `S1-JY`: a client that refused a certificate only half the table
+    /// carried, naming it, is told when the table does not go on with it -- the
+    /// strict rule forks an honest voter whose vote was lost; and `S1-JX`: a
+    /// client with no hand keeps only its table's signed frames for its return.
+    #[test]
+    fn a_refused_half_certificate_is_told_and_the_resume_stash_is_signed() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let watch = code.find("fn watch_progress(t: &mut TableRun) {").expect("the watch");
+        assert!(code[watch..watch + 900].contains("h.refused_half_certificate()"), "noted where progress is watched");
+        let reason = code.find("fn no_progress_reason(").expect("the reasons");
+        assert!(
+            code[reason..reason + 4_000].contains("    if t.half_refused.is_some_and(|(_, at)| now.duration_since(at) >= HALF_REFUSED_LIMIT) {\n        return Some("),
+            "said after the limit"
+        );
+        let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
+        assert!(code[leave..].contains("$t.half_refused = None;"), "forgotten with the table");
+        assert!(
+            code.contains("if t.resuming && t.table.as_ref().is_some_and(|f| a_seats_own_frame(&item.bytes, f)) {"),
+            "the stash takes signed frames only"
+        );
     }
 
     /// `S1-JX`: the floor a client coming back adopts above -- the hand it

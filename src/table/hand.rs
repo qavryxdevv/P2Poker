@@ -1830,6 +1830,10 @@ pub struct Hand {
     cheat_named: BTreeSet<SeatIdx>,
     /// `D-084`: the evidence kept while the certificate is sought.
     pending_cheat: Option<PendingCheat>,
+    /// `S1-JY`: this client refused a certificate that only half the table or
+    /// fewer carry, naming it -- the table may go on without it. Read by the
+    /// node, which tells the player if nothing moves for it afterwards.
+    half_refused: bool,
     /// `D-084`: set by a handler that took a frame and did nothing with it --
     /// a further proof from a seat whose proof failed here -- and read once
     /// where frames are kept, so that frame is not kept either: each re-signed
@@ -2394,6 +2398,7 @@ impl Hand {
                 cheaters: BTreeSet::new(),
                 cheat_named: BTreeSet::new(),
                 pending_cheat: None,
+                half_refused: false,
                 unkept: false,
                 proven_cheat: None,
                 cert_ended: false,
@@ -6095,6 +6100,13 @@ impl Hand {
         Ok(Vec::new())
     }
 
+    /// `S1-JY`: whether this client refused, in this hand, a certificate that
+    /// only half the table or fewer carry and that names it -- see
+    /// `on_timeout_cert`. The table may go on without it.
+    pub fn refused_half_certificate(&self) -> bool {
+        self.half_refused
+    }
+
     /// `S1-JR`: the seat whose proof voided this hand, the cause (2 a shuffle,
     /// 3 a reveal share), and whether this client's own check found it or it
     /// checked another seat's evidence -- `None` for any other hand.
@@ -6677,13 +6689,7 @@ impl Hand {
     /// certificate's own `CAUSE_LONG_GONE`). Neither is ever taken by a seat it
     /// names as waited-on (`on_timeout_cert`), so a lying half or minority
     /// forks away alone.
-    ///
-    /// `S1-JY`: **and under the long-gone relaxation the voters outnumber the
-    /// seats named silent** (`silent`, resigned seats not counted). Any number
-    /// named silent let two rogues, beside a seat really long gone, name every
-    /// honest voter of the table silent: each had voted the same about the gone
-    /// seat and took it, lost its veto, and was then certified by the two alone.
-    fn floor_holds_for(voters: &[SeatIdx], named: &[SeatIdx], resigned: &[SeatIdx], relaxed: bool, silent: usize) -> bool {
+    fn floor_holds_for(voters: &[SeatIdx], named: &[SeatIdx], resigned: &[SeatIdx], relaxed: bool) -> bool {
         let quiet: Vec<SeatIdx> = named.iter().copied().filter(|s| !resigned.contains(s)).collect();
         let v = voters.len();
         if v == 0 {
@@ -6698,7 +6704,7 @@ impl Hand {
         if v < 2 {
             return false;
         }
-        if relaxed && v > silent {
+        if relaxed {
             return true;
         }
         v == quiet.len() && voters.iter().chain(quiet.iter()).min().is_some_and(|m| voters.contains(m))
@@ -6729,8 +6735,7 @@ impl Hand {
             .filter(|s| !silent.contains(s) && !resigned.contains(s))
             .collect();
         let relaxed = !waited.is_empty() && waited.iter().all(|s| self.long_gone.contains(s));
-        let silent_named = silent.iter().filter(|s| !resigned.contains(s)).count();
-        Self::floor_holds_for(voters, named, &resigned, relaxed, silent_named)
+        Self::floor_holds_for(voters, named, &resigned, relaxed)
     }
 
     /// The floor, told to the player once per hand when it is what holds
@@ -8387,7 +8392,6 @@ impl Hand {
             &subject.subject_seats,
             &resigned,
             Self::relaxed_by_causes(&subject, &resigned),
-            subject.subject_seats.iter().filter(|s| subject.names_silent(**s) && !resigned.contains(s)).count(),
         ) {
             return Err(Failed::Elsewhere {
                 seat: emitter,
@@ -8583,7 +8587,6 @@ impl Hand {
                 &c.subject.subject_seats,
                 &resigned,
                 Self::relaxed_by_causes(&c.subject, &resigned),
-                c.subject.subject_seats.iter().filter(|s| c.subject.names_silent(**s) && !resigned.contains(s)).count(),
             )
         {
             return Ok(Vec::new());
@@ -8608,26 +8611,19 @@ impl Hand {
         // both honest seats took it -- the first certified out, the second's
         // veto gone.
         //
-        // **A voter named silent takes it only where it signed the same itself**:
-        // its own vote about every seat the certificate waited on, the very
-        // subject, cause and all, is among its votes -- its vote was late in
-        // reaching the others, not withheld. Nothing else the seat holds is
-        // agreement: a stage that has just opened waits on every seat, a clock
-        // the writer before it started late runs out early, and a cause it never
-        // measured -- long gone, flood, cheat -- is the voters' word alone; each
-        // let two rogues strip honest seats' vetoes and then certify them one by
-        // one. One exception, for `D-066`'s own healing: a seat named long gone
-        // that this client reads out of the table's group itself -- its own
-        // five minutes not yet run, or cleared by a blink of its line -- is one
-        // it agrees about. Where it has not voted yet, at that stage or behind
-        // it, the certificate is held and judged again after its own vote. A
-        // certificate that names no seat waited on but resigned ones has nothing
-        // to agree with. (The floor itself now keeps two rogues from naming more
-        // seats silent than they are, `floor_holds_for`.)
+        // **A voter named silent never takes it**: it knows whether it voted.
+        // Every way this was tried of letting it agree -- its own wait, its
+        // stage's deadline, its reading of the table's group, even its own
+        // identical vote beside a seat really gone -- let two rogues name honest
+        // voters silent, strip their vetoes, and then certify them one by one
+        // (five refutations, `D-086`). An honest voter whose vote was lost on the
+        // way pays for it with a fork at that hand, and is told the table may
+        // have split (`refused_half_certificate`, `S1-JR`).
         //
-        // **And a seat named waited on takes it on its own line's word never to
-        // be put out for good** (flood, cheat): two rogues waited for an honest
-        // seat's line to blip and named it a flooder.
+        // **A seat named waited on takes it on its own line's word** -- it may
+        // really have been gone -- **never to be put out for good** (flood,
+        // cheat): two rogues waited for an honest seat's line to blip and named
+        // it a flooder.
         let named: Vec<SeatIdx> = c
             .subject
             .subject_seats
@@ -8636,29 +8632,10 @@ impl Hand {
             .filter(|s| !resigned.contains(s))
             .collect();
         let me = self.open.my_seat;
-        let named_silent = c.subject.names_silent(me);
-        let waited: Vec<SeatIdx> = c.subject.quiet_seats().into_iter().filter(|s| !resigned.contains(s)).collect();
-        let agrees = named_silent
-            && !waited.is_empty()
-            && waited.iter().all(|s| {
-                self.voted.contains(&c.subject.vote_about(*s).subject_digest())
-                    || (c.subject.cause_of(*s) == Some(CAUSE_LONG_GONE)
-                        && (self.gone_from_group.contains(s) || self.long_gone.contains(s)))
-            });
         let for_good = matches!(c.subject.cause_of(me), Some(CAUSE_FLOOD) | Some(CAUSE_CHEAT));
-        let takes = if named_silent { agrees } else { self.line_down_recently && !for_good };
+        let takes = !c.subject.names_silent(me) && self.line_down_recently && !for_good;
         if !Self::admissible(voter_seats.len(), named.len()) && named.contains(&me) && !takes {
-            // Named silent at the certificate's own stage or behind it, every
-            // seat named waited on still unheard here and no vote of its own
-            // about it yet: held, and judged again after its vote -- a late
-            // voter's clock started late, or it has not reached the stage.
-            let behind = self.slot.sequence < c.subject.subject_sequence;
-            let at_it = self.slot.sequence == c.subject.subject_sequence
-                && waited.iter().all(|s| self.waiting_for().contains(s) && !self.voted_about.contains(s));
-            let held = named_silent && !waited.is_empty() && !self.over() && (behind || at_it);
-            if held {
-                return Err(Failed::NotYet);
-            }
+            self.half_refused = true;
             if self.shortfall_said.insert(c.subject.digest()) {
                 self.cert_note.push(format!(
                     "cert: from seat {seat} about {}, carried by {} voter(s) -- half the table or fewer -- names this client, which is here: not taken (D-066)",
@@ -17805,88 +17782,27 @@ mod tests {
             let _ = two.on_event(c, &key(12), t1 + 1_000);
         }
         assert!(two.aborted().is_none() && two.took_part(2), "seat 2 keeps its table");
-        // A seat 3 that did not hear seat 2 either votes about it itself at its
-        // own deadline -- without a cause: long gone is a reading it never made.
-        // Its vote is not the certificate's, and it does not take it.
+        assert!(hands[2].refused_half_certificate() && two.refused_half_certificate(), "and each knows it refused one");
+        // A voter named silent never takes it, whatever it holds itself: its
+        // own vote without a cause, a blink of its own line, even its own vote
+        // identical to the certificate's beside a seat really gone -- each way of
+        // letting it agree let two rogues strip honest vetoes and then certify
+        // those seats one by one.
         let (mut late, _) = with_present(4, &[0, 1, 3]);
         assert_eq!(bytes_of_sends(late[2].vote_on_timeouts(&keys[2], t1, 0).unwrap()).len(), 1, "its own vote");
-        // Its own line blinked too: a voter named silent takes nothing on its
-        // line's word -- the claim is about another seat.
         late[2].note_line_down_recently(true);
         for c in &copies {
             let _ = late[2].on_event(c, &keys[2], t1 + 1_000);
         }
-        assert!(late[2].aborted().is_none(), "a cause it never measured is the voters' word alone");
-        // One that holds seat 2 long gone too signed the very same vote: its
-        // own was late in reaching the others, and it takes the certificate as
-        // it always did -- `D-065`'s silent voter, which the guard must not fork.
-        let (mut agreeing, _) = with_present(4, &[0, 1, 3]);
-        agreeing[2].note_long_gone(&[2]);
-        assert_eq!(bytes_of_sends(agreeing[2].vote_on_timeouts(&keys[2], t1, 0).unwrap()).len(), 1, "the same vote");
+        assert!(late[2].aborted().is_none(), "not on its line's word");
+        let (mut same, _) = with_present(4, &[0, 1, 3]);
+        same[2].note_long_gone(&[2]);
+        assert_eq!(bytes_of_sends(same[2].vote_on_timeouts(&keys[2], t1, 0).unwrap()).len(), 1, "the same vote");
         for c in &copies {
-            let _ = agreeing[2].on_event(c, &keys[2], t1 + 1_000);
+            let _ = same[2].on_event(c, &keys[2], t1 + 1_000);
         }
-        assert!(agreeing[2].aborted().is_some(), "a silent voter that signed the same takes it");
-        // Reaching it before its own vote -- a stage that has just opened waits
-        // on every seat -- it is held, and judged again after that vote.
-        let (mut early, _) = with_present(4, &[0, 1, 3]);
-        for c in &copies {
-            assert!(matches!(early[2].on_event(c, &keys[2], NOW + 5_000), Err(Failed::NotYet)), "held");
-            let _ = early[2].hold(c.clone());
-        }
-        assert!(early[2].aborted().is_none(), "the wait alone agrees with nothing");
-        early[2].note_long_gone(&[2]);
-        let _ = early[2].vote_on_timeouts(&keys[2], t1, 0).unwrap();
-        let _ = early[2].replay_early(&keys[2], t1 + 1_000);
-        assert!(early[2].aborted().is_some(), "after its own, same vote: a late voter, and it takes it");
-        let (mut heard, _) = with_present(4, &[0, 1, 3]);
-        for c in &copies {
-            let _ = heard[2].on_event(c, &keys[2], NOW + 5_000);
-            let _ = heard[2].hold(c.clone());
-        }
-        let (_, from_two_again) = Hand::open(opening_n(4, 2), &key(12), NOW, 30_000).unwrap();
-        let _ = deliver(&mut heard[2], &from_two_again, &keys[2]);
-        let _ = heard[2].replay_early(&keys[2], t1 + 1_000);
-        assert!(heard[2].aborted().is_none(), "seat 2 heard meanwhile: not taken");
-    }
-
-    /// `S1-JY`: under the long-gone relaxation the voters outnumber the seats
-    /// named silent -- two rogues beside a seat really long gone named every
-    /// honest voter of the table silent, and each took it, having voted the
-    /// same about the gone seat, and lost its veto.
-    #[test]
-    fn under_the_long_gone_relaxation_the_voters_outnumber_the_silent() {
-        assert!(!Hand::floor_holds_for(&[0, 1], &[2, 3, 4], &[], true, 2), "two voters naming two seats silent");
-        assert!(Hand::floor_holds_for(&[0, 1], &[2, 3], &[], true, 1), "two voters naming one silent");
-        assert!(Hand::floor_holds_for(&[3, 4], &[0, 1, 2], &[], true, 0), "`D-066`'s three gone for five minutes, as before");
-        assert!(!Hand::floor_holds_for(&[0, 1], &[2, 3, 4], &[], false, 2), "no relaxation, no exact half: nothing");
-    }
-
-    /// `S1-JY`, `D-066`'s healing: seats 0, 1 and 2 of six gone; seats 3 and 4
-    /// hold them long gone, seat 5 only out of the group -- its five minutes not
-    /// yet run -- and it has cast no vote. Named silent beside them, it agrees:
-    /// the seats named long gone are ones it reads gone itself.
-    #[test]
-    fn a_voter_whose_long_gone_reading_lags_still_agrees() {
-        let (mut hands, keys) = with_present(6, &[3, 4, 5]);
-        for i in 0..2 {
-            hands[i].note_long_gone(&[0, 1, 2]);
-            hands[i].note_gone_from_group(&[5]);
-        }
-        hands[2].note_gone_from_group(&[0, 1, 2]);
-        let t1 = NOW + 30_000;
-        let votes: Vec<Vec<Vec<u8>>> = (0..2)
-            .map(|i| bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()))
-            .collect();
-        let copies: Vec<Vec<u8>> = cross(&mut hands[..2], &keys[..2], &[0, 1], &votes, t1 + 500)
-            .into_iter()
-            .flat_map(certs_of)
-            .collect();
-        assert!(!copies.is_empty(), "seats 3 and 4 seal the three gone and seat 5 silent");
-        for c in &copies {
-            let _ = hands[2].on_event(c, &keys[2], t1 + 1_000);
-        }
-        assert!(hands[2].aborted().is_some(), "seat 5 agrees and takes it");
+        assert!(same[2].aborted().is_none(), "nor on its own identical vote: it knows it voted");
+        assert!(same[2].refused_half_certificate(), "and it is told the table may have split");
     }
 
     /// `S1-JY`: a betting certificate acts for the seat to act and for no other

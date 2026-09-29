@@ -3682,17 +3682,13 @@ of a seat of `S`, one per seat (`D-063`); `|V(S)| >= 1`, and with `Q` the seats 
 `|V(S)| > |Q|` — a seat that said it left counts for nothing against the floor,
 its own word being its consent — or, `D-066`, `|V(S)| >= 2` and either
 `|V(S)| = |Q|` with the lowest seat of `V(S) ∪ Q` in `V(S)`, or every seat of `Q`
-not named `cause = 2` named `cause = 3` and `|V(S)|` greater than the seats of `Q`
-named `cause = 2` (`D-086`); a receiver that is itself a seat of `Q`
+not named `cause = 2` named `cause = 3`; a receiver that is itself a seat of `Q`
 -- named waited on or named `cause = 2` alike (`D-086`) -- does not take a
 certificate that clears the floor only by `D-066` while its own line was sound for
 the last `LONG_GONE_S` — it was here, which such a certificate may not overrule —
 and a seat named waited on takes it when its line was down within that time, since
 then it may really have been gone -- unless it names that seat with `cause = 1` or
-`5`; a seat named `cause = 2` takes it only where its own vote about every seat the
-certificate waited on is the certificate's, subject and cause alike, or it reads a
-seat named `cause = 3` out of the table's group itself, and one that reaches it before
-its own vote, at that stage or behind it, is held and judged again after it; a `kind = 1` certificate acts only for the seat to act;
+`5`; a seat named `cause = 2` never takes it; a `kind = 1` certificate acts only for the seat to act;
 every certificate names at least one seat
 without `cause = 2` -- a seat its stage waits on -- and a `kind = 1` certificate
 names exactly one, the seat to act, with any voters named `cause = 2` beside it
