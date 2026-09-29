@@ -890,6 +890,14 @@ impl Boundaries {
             .collect()
     }
 
+    /// `S1-JW` (`D-085`): whether this peer was alone in `P(k)` -- the one
+    /// case in which a value differing from its own at checkpoint 8 still
+    /// freezes it (`N1`): nobody shared the hand to compare it for it. `false`
+    /// for a boundary this peer does not hold.
+    pub fn solitary(&self, hand_id: u64) -> bool {
+        self.open.get(&hand_id).is_some_and(|b| b.participants.len() == 1)
+    }
+
     /// `W`, this peer's contradiction set for hand `k`.
     pub fn contradicted(&self, hand_id: u64) -> Vec<SeatIdx> {
         self.open
@@ -1142,6 +1150,26 @@ mod tests {
             b.agreed(4).is_none(),
             "nothing is agreed at a checkpoint that carries a dissent"
         );
+    }
+
+    /// `S1-JW`: a boundary says whether this peer was alone in `P(k)`, and a
+    /// differing copy says the same -- the one case a freeze is kept for.
+    #[test]
+    fn a_boundary_says_whether_this_peer_was_alone_in_the_hand() {
+        let mut alone = Boundaries::new();
+        alone.open(4, TABLE, TERMINAL, STATE, &[0], &[0, 1]).expect("opens");
+        assert!(alone.solitary(4), "alone in P(4)");
+        assert!(!alone.solitary(5), "no boundary held");
+        assert_eq!(
+            alone.on_state_hash(4, 1, ev(1), [1u8; 32]),
+            Took::Diverged { solitary_contradicted: true },
+            "and a differing copy says so"
+        );
+        let mut shared = Boundaries::new();
+        shared.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1]).expect("opens");
+        assert!(!shared.solitary(4), "P(4) was two seats");
+        shared.on_state_hash(4, 0, ev(0), STATE);
+        assert_eq!(shared.on_state_hash(4, 1, ev(1), [1u8; 32]), Took::Diverged { solitary_contradicted: false });
     }
 
     /// The acknowledgement stage sets `agreed` when it **completes**, and not on

@@ -1446,6 +1446,14 @@ struct TableRun {
     /// `S1-JR`: since when this client, resuming, has held no hand of the
     /// table's.
     resuming_since: Option<std::time::Instant>,
+    /// `S1-JX`: the stacks the hand this client dropped to rejoin the table
+    /// from its copies held, by its own derivation (`D-038`) -- what a heads-up
+    /// adoption must agree with, the one other seat's copy naming them alone.
+    /// Kept until a hand is taken up.
+    rejoin_stacks: Option<Vec<Vec<u64>>>,
+    /// `S1-JX`: a heads-up adoption was refused because the other seat's copy
+    /// named stacks that hand does not hold -- the table is not safe.
+    stacks_refused: bool,
     /// `S1-JT`: since when this client has heard no other seat of the table --
     /// out of its group, or cut off -- the only time a word in a lobby answer
     /// about it being out for good is taken.
@@ -1922,6 +1930,8 @@ impl TableRun {
             voided_pending: (0, 0),
             alone_hand: None,
             resuming_since: None,
+            rejoin_stacks: None,
+            stacks_refused: false,
             ever_on_line: false,
             nobody_said: false,
             readmitted: Vec::new(),
@@ -4091,6 +4101,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $theirs
                 )))
                 .await;
+            // `S1-JX`: what the dropped hand holds, by this client's own
+            // derivation, for the adoption to agree with where the one other
+            // seat's copy names the stacks alone -- heads-up, where one signed
+            // frame of a later hand sent this client adrift and its copy
+            // named any stacks it liked.
+            if let Some(h) = $t.hand.as_ref() {
+                $t.rejoin_stacks = Some(h.stacks_this_client_holds());
+            }
             $t.previous = None;
             $t.hand = None;
             $t.pending_repair = None;
@@ -4273,6 +4291,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.voided_pending = (0, 0);
             $t.alone_hand = None;
             $t.resuming_since = None;
+            $t.rejoin_stacks = None;
+            $t.stacks_refused = false;
             $t.ever_on_line = false;
             $t.nobody_said = false;
             $t.taught.clear();
@@ -11701,7 +11721,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 // A member's opening goes out; a bystander's
                                                 // `open` says nothing the table may hear.
                                                 let member = o.required.contains(&seat);
-                                                let opened = if !member && !exact {
+                                                // `S1-JX`: heads-up the one other seat's copy names
+                                                // the stacks alone. A client back from a hand of its
+                                                // own takes them only where that hand holds the
+                                                // same -- at its boundary, or by a settlement it
+                                                // signed -- unless it signed this hand itself.
+                                                let foreign = heads_up
+                                                    && !signed_before
+                                                    && t.rejoin_stacks
+                                                        .as_ref()
+                                                        .is_some_and(|known| !known.iter().any(|k| stacks_agree(&o.seats, k)));
+                                                if foreign {
+                                                    t.stacks_refused = true;
+                                                }
+                                                let opened = if foreign {
+                                                    Err(crate::table::hand::Failed::Elsewhere {
+                                                        seat,
+                                                        what: "the other seat's copy named the stacks this client's own last hand holds",
+                                                    })
+                                                } else if !member && !exact {
                                                     Err(crate::table::hand::Failed::NotYet)
                                                 } else if signed_before {
                                                     crate::table::hand::Hand::open_restoring(o, &app_key, now, deadline, kept.as_ref())
@@ -11798,6 +11836,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             )))
                                                             .await;
                                                         let _ = events.send(NodeEvent::SessionResumed { hand_id: hid, member }).await;
+                                                        // `S1-JX`: a hand taken up is what this client holds now.
+                                                        t.rejoin_stacks = None;
+                                                        t.stacks_refused = false;
                                                         t.hand = Some(h);
                                                         t.resume_inits.retain(|k, _| *k > hid);
                                                         t.resume_early.retain(|(k, _)| *k > hid);
@@ -11831,6 +11872,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                             Err(crate::table::hand::Failed::NotYet) => {}
                                             Err(e) => {
+                                                // `S1-JX`: heads-up that copy is the other seat's
+                                                // alone, and it does not add up -- stacks off its
+                                                // own roster hash, blinds off the schedule, more
+                                                // chips than the table was bought in with.
+                                                if heads_up && matches!(e, crate::table::hand::Failed::Elsewhere { .. }) {
+                                                    t.stacks_refused = true;
+                                                }
                                                 if t.resume_said != Some(hid) {
                                                     t.resume_said = Some(hid);
                                                     let _ = events
@@ -15146,6 +15194,9 @@ fn watch_progress(t: &mut TableRun) {
 /// * a seat of the running hand sent a proof that does not hold, by this
 ///   client's own check (`Hand::proven_cheat`); every hand it spoils is called
 ///   off, and nothing puts it out of the game yet;
+/// * `S1-JX`: heads-up, the other seat's copy of the hand this client would
+///   come back to named stacks its own last hand does not hold, or did not add
+///   up, and the client took none of them;
 /// * a seat of the running hand sent two different copies of one stage in
 ///   `EQUIVOCATION_HANDS` hands within the last `EQUIVOCATION_WITHIN`;
 /// * `VOIDED_LIMIT` of the last five hands of three seats or more were called
@@ -15167,7 +15218,7 @@ fn watch_progress(t: &mut TableRun) {
 ///
 /// Heads-up the hands and turns are the window's own question to the player
 /// -- wait for the opponent, or leave (`D-007`, `D-034`) -- and only a proven
-/// cheat, the forming table and the returns are read here.
+/// cheat, the stacks refused, the forming table and the returns are read here.
 fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
     if t.done_here {
         return None;
@@ -15184,6 +15235,15 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             "{} sent {what} that does not hold: its client does not play by the rules. Every hand it spoils is called off, and nothing here puts it out of the game.",
             seat_called(t, *seat)
         ));
+    }
+    // `S1-JX`: heads-up included -- the other player's copy of the hand this
+    // client would come back to names stacks its own last hand does not hold,
+    // and it takes none of them.
+    if t.stacks_refused {
+        return Some(
+            "the other player's client names chips for this table that your client's own last hand does not hold, and your client will not take chips it cannot check: that client may not play by the rules."
+                .to_string(),
+        );
     }
     let hand_now = t.hand.as_ref().map(|h| h.hand_id()).unwrap_or(0);
     let recently = |hands: &std::collections::BTreeSet<u64>| {
@@ -17702,6 +17762,12 @@ fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>, others: &[u
     (saying.len() * 2 > others.len()).then_some((furthest, mine))
 }
 
+/// `S1-JX`: whether an adopted opening's stacks are the ones `known` holds,
+/// seat by seat -- `known` indexed by seat, as a hand keeps them.
+fn stacks_agree(seats: &[(u8, [u8; 32], u64)], known: &[u64]) -> bool {
+    seats.iter().all(|(s, _, st)| known.get(usize::from(*s)).copied().unwrap_or(0) == *st)
+}
+
 /// `S1-IX`: whether the game at a frozen table is over, and why -- the decision
 /// alone, so a test can reach it.
 ///
@@ -17949,15 +18015,25 @@ async fn dispute_event(
         return true;
     };
     let fresh = boundaries.contradiction_from_a_dispute(hand_id, seat);
-    if frozen.is_none() {
+    // `S1-JW` (`D-085`): a dispute freezes only a peer alone in `P(k)`, as a
+    // copy does -- one rogue's dispute froze every seat its evidence reached.
+    let solitary = boundaries.solitary(hand_id);
+    if solitary && frozen.is_none() {
         *frozen = Some((hand_id, opened.envelope.sequence));
     }
     if fresh {
         let _ = events
-            .send(NodeEvent::Warning(format!(
-                "a dispute from {} carries seat {seat}'s end-of-hand state for hand {hand_id}, and it differs from this client's own: FROZEN at section 6.3 step 1, and seat {seat} joins the contradiction set",
-                short_hash(&sender)
-            )))
+            .send(NodeEvent::Warning(if solitary {
+                format!(
+                    "a dispute from {} carries seat {seat}'s end-of-hand state for hand {hand_id}, and it differs from this client's own: FROZEN at section 6.3 step 1, and seat {seat} joins the contradiction set",
+                    short_hash(&sender)
+                )
+            } else {
+                format!(
+                    "a dispute from {} carries seat {seat}'s end-of-hand state for hand {hand_id}, and it differs from this client's own; this client shared the hand with another seat, so it does not freeze (S1-JW, D-085), and seat {seat} joins the contradiction set",
+                    short_hash(&sender)
+                )
+            }))
             .await;
     }
     true
@@ -18718,8 +18794,30 @@ async fn checkpoint_event(
                 return Some(out);
             }
         }
+        // `S1-JW` (`D-085`): **a peer that shared the hand does not freeze.**
+        // One seat's wrong value froze every honest seat of the table, and the
+        // game ended at the hand deadline (`S1-IX`) -- one rogue's switch:
+        // `run205313-4`, four seats stood at hand 3 for the rest of the run over
+        // one node's value. The value is the `state_hash` of a seat's own
+        // `HAND_COMPLETE`, which the settlement already compared; every copy
+        // compared here shares `TERMINAL(k)` (`S1-CK`); and hand `k+1`'s stacks
+        // are compared whole at its stage 0, whose genesis hangs off them -- a
+        // seat on another state opens a hand nobody else holds, and the table's
+        // certificate removes it (`D-036`), or it rejoins from the copies
+        // (`D-038`), or heads-up the window asks. `W` is kept all the same.
         Took::Diverged {
-            solitary_contradicted,
+            solitary_contradicted: false,
+        } => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} holds a different end-of-hand state for hand {hand_id}; this client shared the hand with another seat, so it does not freeze and deals on: the next hand's opening compares the stacks again (S1-JW, D-085)"
+                )))
+                .await;
+        }
+        // A peer alone in `P(k)` freezes as before (`N1`): nobody shared the
+        // hand to compare it for it.
+        Took::Diverged {
+            solitary_contradicted: true,
         } => {
             let already = frozen.is_some();
             // **The latch.** Set on the first observation and not moved by a
@@ -18731,12 +18829,7 @@ async fn checkpoint_event(
             }
             let _ = events
                 .send(NodeEvent::Warning(format!(
-                    "seat {seat} holds a different end-of-hand state for hand {hand_id}: FROZEN at section 6.3 step 1 — no hand event is accepted or emitted from here{}",
-                    if solitary_contradicted {
-                        ", and this peer is alone in P(k), which is N1's second half"
-                    } else {
-                        ""
-                    }
+                    "seat {seat} holds a different end-of-hand state for hand {hand_id}: FROZEN at section 6.3 step 1 — no hand event is accepted or emitted from here, and this peer is alone in P(k), which is N1's second half"
                 )))
                 .await;
             if !already {
@@ -20452,6 +20545,64 @@ mod tests {
             3,
             "the table stopped or ended, said in one place; its end, in the two"
         );
+    }
+
+    /// `S1-JW` (`D-085`): only a peer alone in `P(k)` freezes on a value that
+    /// differs from its own at checkpoint 8 -- a copy, or a dispute carrying
+    /// one. One seat's wrong value froze every honest seat of a table
+    /// (`run205313-4`: four seats stood at hand 3 for the rest of the run).
+    ///
+    /// The breaks that must make this fail: latch the freeze on the shared
+    /// arm, or on a dispute without the solitary test.
+    #[test]
+    fn only_a_peer_alone_in_the_hand_freezes_on_a_differing_end_state() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let shared = code
+            .find("Took::Diverged {\n            solitary_contradicted: false,\n        } => {")
+            .expect("the shared arm");
+        let alone = code
+            .find("Took::Diverged {\n            solitary_contradicted: true,\n        } => {")
+            .expect("the solitary arm");
+        assert!(shared < alone && !code[shared..alone].contains("*frozen = Some"), "a peer that shared the hand does not freeze");
+        assert!(code[alone..alone + 1_200].contains("*frozen = Some((hand_id, sequence));"), "one alone in it does");
+        let dispute = code.find("async fn dispute_event(").expect("the dispute");
+        let body = &code[dispute..dispute + 6_000];
+        assert!(body.contains("let solitary = boundaries.solitary(hand_id);\n    if solitary && frozen.is_none() {"), "a dispute freezes only a peer alone in the hand");
+        assert_eq!(code.matches("*frozen = Some(").count(), 2, "and nothing else latches it");
+    }
+
+    /// `S1-JX`: heads-up the one other seat's copy names the stacks of the hand
+    /// a client rejoins, alone -- and a rogue's named any it liked: one signed
+    /// frame of a later hand sent the client adrift, and it adopted the rogue's
+    /// stacks. Taken only where the client's own last hand holds the same, seat
+    /// by seat.
+    ///
+    /// The breaks that must make this fail: compare nothing, keep nothing
+    /// before the hand is dropped, or check a hand this seat signed itself.
+    #[test]
+    fn heads_up_a_rejoin_takes_only_the_stacks_its_own_hand_holds() {
+        let seats = |a: u64, b: u64| vec![(0u8, [0u8; 32], a), (1u8, [1u8; 32], b)];
+        let known: Vec<u64> = vec![1_500, 500];
+        assert!(stacks_agree(&seats(1_500, 500), &known));
+        assert!(!stacks_agree(&seats(1_999, 1), &known), "the other seat's copy took this seat's chips");
+        assert!(!stacks_agree(&seats(1_500, 500), &[1_500]), "a seat the hand does not hold reads as none");
+        // The wiring: the dropped hand's stacks kept before it goes, the check
+        // heads-up only and not for a hand this seat signed itself, the table
+        // not safe while refused, and all of it forgotten with the table.
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let rejoin = code.find("macro_rules! rejoin_from_copies {").expect("the rejoin");
+        let kept = rejoin + code[rejoin..].find("$t.rejoin_stacks = Some(h.stacks_this_client_holds());").expect("kept");
+        let dropped = rejoin + code[rejoin..].find("$t.hand = None;").expect("dropped");
+        assert!(kept < dropped, "kept before the hand goes");
+        let foreign = code.find("let foreign = heads_up").expect("the check");
+        assert!(code[foreign..foreign + 300].contains("&& !signed_before"), "not for a hand this seat signed itself");
+        assert!(code[foreign..foreign + 600].contains("!known.iter().any(|k| stacks_agree(&o.seats, k))"), "against what the hand holds");
+        let reason = code.find("fn no_progress_reason(").expect("the reasons");
+        assert!(code[reason..reason + 3_000].contains("if t.stacks_refused {"), "the table not safe while refused");
+        let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
+        assert!(code[leave..].contains("$t.rejoin_stacks = None;") && code[leave..].contains("$t.stacks_refused = false;"));
     }
 
     /// **`D-038`: two seats are not the table, a strict majority of the seats

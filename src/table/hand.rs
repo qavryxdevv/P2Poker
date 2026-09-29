@@ -511,6 +511,18 @@ impl Opening {
                 what: "the copies' stacks hashed to the roster hash they name",
             });
         }
+        // `S1-JX`: chips come to the table with its players and leave with a
+        // seat out for good, and nothing else makes any -- so no copy names more
+        // than the table was bought in with. Heads-up the one other seat is the
+        // majority, and its copy named any stacks it liked.
+        let named: u128 = body.stacks.iter().map(|s| u128::from(*s)).sum();
+        let bought: u128 = base.seats.iter().map(|(_, _, b)| u128::from(*b)).sum();
+        if named > bought {
+            return Err(Failed::Elsewhere {
+                seat: base.my_seat,
+                what: "the copies' stacks held no more chips than the table was bought in with",
+            });
+        }
         let small_blind = crate::poker::tournament::small_blind_at(
             u32::try_from(base.hand_id).unwrap_or(u32::MAX),
             u32::from(base.every_n_hands),
@@ -8532,14 +8544,24 @@ impl Hand {
         // players at one end lost their line together. The voters take their
         // own certificate; a majority's is taken by its subject as before
         // (D-036 point 4).
-        let waited: Vec<SeatIdx> = c
+        //
+        // `S1-JY` (`D-086`): **counted as the floor counts, and refused by every
+        // seat it names so.** Every seat named but the resigned -- the voters
+        // named silent too -- and whether this client is named waited on or
+        // silent. Two rogues of four named an honest seat long gone and the
+        // other honest seat silent: the floor held on the long-gone relaxation,
+        // this guard counted the one seat waited on against two voters, and
+        // both honest seats took it -- the first certified out, the second's
+        // veto gone. A voter named silent that is here says so by refusing.
+        let named: Vec<SeatIdx> = c
             .subject
-            .quiet_seats()
-            .into_iter()
+            .subject_seats
+            .iter()
+            .copied()
             .filter(|s| !resigned.contains(s))
             .collect();
-        if !Self::admissible(voter_seats.len(), waited.len())
-            && waited.contains(&self.open.my_seat)
+        if !Self::admissible(voter_seats.len(), named.len())
+            && named.contains(&self.open.my_seat)
             && !self.line_down_recently
         {
             if self.shortfall_said.insert(c.subject.digest()) {
@@ -11097,6 +11119,28 @@ impl Hand {
     /// (`run193358-3`).
     pub fn stack_at_boundary(&self, seat: SeatIdx) -> Chips {
         self.boundary_stack_of(seat)
+    }
+
+    /// `S1-JX`: the stacks this client's own derivation holds for the table at
+    /// this hand's end, indexed by seat -- what a rejoin from the table's copies
+    /// may adopt heads-up, where the one other seat's copy alone names them: the
+    /// stacks at this boundary (settled, restored by an abort, or the hand's own
+    /// start while it runs), and this client's own settlement where it signed
+    /// one the table may have closed without it.
+    pub fn stacks_this_client_holds(&self) -> Vec<Vec<Chips>> {
+        let mut out = vec![self.boundary_stacks()];
+        let signed = match &self.phase {
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Settling { mine, .. } => Some(mine.final_stacks.clone()),
+                _ => None,
+            },
+            Phase::Aborted(_) => self.late.as_ref().filter(|l| l.own).map(|l| l.body.final_stacks.clone()),
+            _ => None,
+        };
+        if let Some(s) = signed.filter(|s| !out.contains(s)) {
+            out.push(s);
+        }
+        out
     }
 
     fn boundary_stack_of(&self, seat: SeatIdx) -> Chips {
@@ -16744,6 +16788,106 @@ mod tests {
             .map(|m| chained::seal(EventType::HandInit, &slot, &rich, &keys[m], NOW, 30_000, HAND_INIT_CAP).unwrap())
             .collect();
         assert!(matches!(Opening::adopt(adopter_base(), &cooked), Err(Failed::Elsewhere { .. })), "blinds off the schedule");
+        // `S1-JX`: stacks that do hash to the roster hash they name, and hold
+        // more chips than the table was bought in with. Chips moved from one
+        // seat to another add up, and only the seat's own last hand can say
+        // they are wrong (`run.rs`, heads-up).
+        let base = adopter_base();
+        let signed = |stacks: Vec<u64>| -> Vec<Vec<u8>> {
+            let mut b = body.clone();
+            let roster: Vec<crate::protocol::transcript::RosterSeat> = base
+                .seats
+                .iter()
+                .zip(stacks.iter())
+                .map(|((seat, key, _), stack)| crate::protocol::transcript::RosterSeat {
+                    seat: *seat,
+                    app_public_key: *key,
+                    stack_at_hand_start: *stack,
+                })
+                .collect();
+            b.roster_hash = crate::protocol::transcript::roster_hash(&roster);
+            b.stacks = stacks;
+            (0..3usize)
+                .map(|m| chained::seal(EventType::HandInit, &slot, &b, &keys[m], NOW, 30_000, HAND_INIT_CAP).unwrap())
+                .collect()
+        };
+        let mut more = body.stacks.clone();
+        more[0] += 1_000;
+        assert!(
+            matches!(Opening::adopt(adopter_base(), &signed(more)), Err(Failed::Elsewhere { what, .. }) if what.contains("bought in")),
+            "more chips than the table was bought in with"
+        );
+        let mut moved = body.stacks.clone();
+        moved[0] += 500;
+        moved[3] -= 500;
+        assert!(Opening::adopt(adopter_base(), &signed(moved)).is_ok(), "chips moved between seats add up");
+    }
+
+    /// `S1-JX`: a client that signed its settlement and did not hear every copy
+    /// holds two readings -- the hand's start, and its own settlement, which the
+    /// table may have closed without it -- and both still once it gave the hand
+    /// up. A heads-up rejoin takes the other seat's stacks only if they are one
+    /// of these.
+    #[test]
+    fn a_signed_settlement_is_one_of_the_stacks_a_client_holds() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let keys = [key(10), key(11)];
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> =
+            vec![(1, deliver(&mut b, &a_deck, &keys[1])), (0, deliver(&mut a, &b_deck, &keys[0]))];
+        for _ in 0..256 {
+            if let Some((from, sends)) = queue.pop() {
+                // Seat 0's settlement never reaches seat 1.
+                let sends: Vec<Send> = sends
+                    .into_iter()
+                    .filter(|Send::Broadcast(bytes)| {
+                        from != 0 || !chained::peek(bytes, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::HandComplete)
+                    })
+                    .collect();
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                if !out.is_empty() {
+                    queue.push((to, out));
+                }
+                continue;
+            }
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                break;
+            };
+            let hand: &mut Hand = if turn.seat == 0 { &mut a } else { &mut b };
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let out = hand.act(action, &keys[usize::from(turn.seat)], NOW).unwrap();
+            queue.push((turn.seat, out));
+        }
+        let signed = match &b.phase {
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Settling { mine, .. } => mine.final_stacks.clone(),
+                _ => panic!("seat 1 is not settling"),
+            },
+            _ => panic!("seat 1 is not playing"),
+        };
+        let held = b.stacks_this_client_holds();
+        assert!(held.contains(&b.start_stacks_by_seat()), "the hand's start: {held:?}");
+        assert!(held.contains(&signed), "and its own settlement: {held:?}");
+        let _ = b.abort_now(Abort::Deadline, &keys[1], NOW + 3_600_000).unwrap();
+        assert!(b.aborted().is_some());
+        assert_eq!(b.stacks_this_client_holds(), held, "both, still, once it gave the hand up");
+    }
+
+    /// `S1-JX`: what a settled hand holds is its settled stacks -- the next
+    /// hand's own -- and nothing else.
+    #[test]
+    fn a_settled_hand_holds_the_stacks_it_settled() {
+        let (hands, _) = a_table_after_hand_one();
+        let held = hands[0].stacks_this_client_holds();
+        assert_eq!(held.len(), 1, "settled: one reading");
+        let next = hands[0].next_hand().expect("hand 2");
+        for (seat, _, stack) in &next.seats {
+            assert_eq!(held[0].get(usize::from(*seat)).copied(), Some(*stack), "seat {seat}");
+        }
     }
 
     /// The decisive test: the adopter opens hand 2 from the copies, follows
@@ -17475,6 +17619,50 @@ mod tests {
         }
         assert!(one.aborted().is_some(), "a seat named whose line was down takes it");
         assert!(!one.took_part(1), "and is out of the next hand, as the table has it");
+    }
+
+    /// `S1-JY` (`D-086`): two seats of four -- rogues -- name a third long gone
+    /// and the fourth silent at once, and the floor holds on the long-gone
+    /// relaxation. Both seats it names are here, and neither takes it: counted
+    /// as the floor counts, two voters for two seats named is half the table.
+    /// Before, the guard counted the one seat waited on, and both took it --
+    /// seat 2 certified out of the table, seat 3's veto gone.
+    #[test]
+    fn two_seats_cannot_certify_a_third_by_naming_the_fourth_silent() {
+        let (mut hands, keys) = with_present(4, &[0, 1, 3]);
+        // The two rogues, seats 0 and 1: seat 2 long gone, seat 3 out of the group.
+        for i in 0..2 {
+            hands[i].note_long_gone(&[2]);
+            hands[i].note_gone_from_group(&[3]);
+        }
+        let t1 = NOW + 30_000;
+        let votes: Vec<Vec<Vec<u8>>> = (0..2)
+            .map(|i| bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()))
+            .collect();
+        let copies: Vec<Vec<u8>> = cross(&mut hands[..2], &keys[..2], &[0, 1], &votes, t1 + 500)
+            .into_iter()
+            .flat_map(certs_of)
+            .collect();
+        assert!(!copies.is_empty(), "the two seal it");
+        assert_eq!(
+            certificate_cause(&copies[0], &hands[0].open.table_id, hands[0].open.hand_id, 2),
+            Some(CAUSE_LONG_GONE),
+            "seat 2 named long gone"
+        );
+        // Seat 3, here all along and named silent: not taken.
+        for c in &copies {
+            let _ = hands[2].on_event(c, &keys[2], t1 + 1_000);
+        }
+        assert!(hands[2].aborted().is_none(), "seat 3 takes nothing");
+        assert!(hands[2].took_part(2), "and seat 2 keeps its seat at seat 3's table");
+        let note = hands[2].take_cert_note().expect("said");
+        assert!(note.contains("names this client, which is here"), "{note}");
+        // Seat 2, here all along and named long gone: not taken either.
+        let (mut two, _) = Hand::open(opening_n(4, 2), &key(12), NOW, 30_000).unwrap();
+        for c in &copies {
+            let _ = two.on_event(c, &key(12), t1 + 1_000);
+        }
+        assert!(two.aborted().is_none() && two.took_part(2), "seat 2 keeps its table");
     }
 
     /// `D-065`'s early question: seat 0 never received seat 4's opening, while

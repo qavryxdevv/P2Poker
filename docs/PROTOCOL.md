@@ -3680,10 +3680,11 @@ of a seat of `S`, one per seat (`D-063`); `|V(S)| >= 1`, and with `Q` the seats 
 its own word being its consent — or, `D-066`, `|V(S)| >= 2` and either
 `|V(S)| = |Q|` with the lowest seat of `V(S) ∪ Q` in `V(S)`, or every seat of `Q`
 not named `cause = 2` named `cause = 3`; a receiver that is itself a seat of `Q`
-named without `cause = 2` does not take a certificate that clears the floor only by
-`D-066` while its own line was sound for the last `LONG_GONE_S` — it was here, which
-such a certificate may not overrule — and takes it when its line was down within
-that time, since then it may really have been gone; every certificate names at least one seat
+-- named waited on or named `cause = 2` alike (`D-086`) -- does not take a
+certificate that clears the floor only by `D-066` while its own line was sound for
+the last `LONG_GONE_S` — it was here, which such a certificate may not overrule —
+and takes it when its line was down within that time, since then it may really have
+been gone; every certificate names at least one seat
 without `cause = 2` -- a seat its stage waits on -- and a `kind = 1` certificate
 names exactly one, the seat to act, with any voters named `cause = 2` beside it
 (D-065); every vote about one seat names one `cause`, and a defined one (D-051);
@@ -6265,6 +6266,22 @@ host. The procedure is:
 values at one checkpoint, it stops accepting and stops emitting hand events. No
 card opens, no action is applied, no chips move. Silently continuing is what §15
 forbids.
+
+**At checkpoint 8 a peer that shared the hand does not freeze (`D-085`).** A peer
+whose `P(k)` holds another seat, and which observes a value differing from its own
+at the boundary checkpoint -- in a copy, or carried by a dispute -- records the
+signer in its contradiction set `W`, says so, and deals on; it sends no dispute and
+opens no round. One seat's wrong value otherwise froze every honest seat of a table
+and ended its game (§6.4) -- one rogue's switch. Nothing is lost by it: the value is
+the `state_hash` of the seat's own `HAND_COMPLETE`, which the settlement stage
+already compared; every copy compared here shares `TERMINAL(k)` (§4.9's parent
+rule); and hand `k+1`'s stacks are compared whole at its stage 0, since `GENESIS(k+1)`
+hangs off them. A seat that really holds another state opens a hand nobody else
+holds, and the table's certificate removes it (§4.8) or it rejoins from the others'
+copies; heads-up no hand opens and the players are asked. A peer **alone** in `P(k)`
+still freezes here, as below (`N1`): nobody shared the hand to compare it for it.
+This overrides the paragraph above at checkpoint 8 only, by the project owner's word
+(2026-09-29).
 
 **There is a second entry condition and it is normative (K1).** A peer that
 **was** in the **solitary regime** for hand `k` (§3.2) — every collective stage of
