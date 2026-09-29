@@ -4552,13 +4552,16 @@ takes a peer's abort, and that is unchanged: a `cause = 2` or `3` abort whose ev
 accepted at once. What changes is when a peer *sends* a `cause = 2` one. A client whose own check
 finds a shuffle proof failing, at a hand dealt to three seats or more where the floor holds for the
 shuffler, keeps the evidence and votes about the shuffler at once with `TIMEOUT_VOTE` `cause = 5`
-(§4.8): the stage waits on it for ever, its one attempt spent (C-6 rule 4). Every client that found
-the same proof failing builds the same subject, and the certificate, `kind = 2`, ends the hand by
-the certified-subject path above and takes the seat out of the table for good. The abort with the
-evidence goes -- and the hand ends as it ended before -- `CHEAT_CERT_MS` (10 s) after the finding
-if no certificate has completed; at once when another seat's frame of a later stage, or a second
-proof from the shuffler, shows that some seat took a good proof and went on; and in place of any
-bare abort this client would send or take meanwhile. A `cause = 3` abort goes at once as before: a
+(§4.8): the stage waits on it for ever, its one attempt spent (C-6 rule 4). With that first vote it
+says the shuffler's own step and proof again, so that a seat the shuffler sent nothing to checks
+them on its own chain and votes too. Every client that found the same proof failing builds the
+same subject, and the certificate, `kind = 2`, ends the hand by the certified-subject path above
+and takes the seat out of the table for good. The abort with the evidence goes -- and the hand
+ends as it ended before -- `CHEAT_CERT_MS` (10 s) after the finding if no certificate has
+completed; on the next tick when another seat's frame of a later stage, or a second proof from the
+shuffler that holds or is of another step, shows that some seat took a good proof and went on (a
+second proof that fails too, or the failing one said again, is nothing new); and in place of any
+bare abort this client would send, or would take -- never on the shuffler's own word -- meanwhile. A `cause = 3` abort goes at once as before: a
 reveal stage closes at a seat the rogue sent a good share to, and a client that stood on it could
 be certified out by that seat and the rogue. Heads-up both go at once: two seats certify nobody.
 
