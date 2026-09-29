@@ -3686,13 +3686,13 @@ not named `cause = 2` named `cause = 3`; a receiver that is itself a seat of `Q`
 -- named waited on or named `cause = 2` alike (`D-086`) -- does not take a
 certificate that clears the floor only by `D-066` while its own line was sound for
 the last `LONG_GONE_S` — it was here, which such a certificate may not overrule —
-and takes it when its line was down within that time, since then it may really have
-been gone, unless it names that receiver with `cause = 1` or `5`, which such a
-certificate never does to a seat that takes it; a seat named `cause = 2` that holds
-every seat the certificate waited on as quiet itself -- past that stage's deadline
-at its own stage, or by its reading of the table's group -- and every `cause = 1` or
-`5` it names, takes it, and one that reaches it at that stage before the deadline is
-held and judged again then; every certificate names at least one seat
+and a seat named waited on takes it when its line was down within that time, at a
+stage it has not passed, since then it may really have been gone -- unless it names
+that seat with `cause = 1` or `5`; a seat named `cause = 2` takes it only where its
+own vote about every seat the certificate waited on is the certificate's, subject and
+cause alike, and one that reaches it at that stage before its own vote is held and
+judged again after it; a `kind = 1` certificate acts only for the seat to act;
+every certificate names at least one seat
 without `cause = 2` -- a seat its stage waits on -- and a `kind = 1` certificate
 names exactly one, the seat to act, with any voters named `cause = 2` beside it
 (D-065); every vote about one seat names one `cause`, and a defined one (D-051);

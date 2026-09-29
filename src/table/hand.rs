@@ -8597,16 +8597,26 @@ impl Hand {
         // other honest seat silent: the floor held on the long-gone relaxation,
         // this guard counted the one seat waited on against two voters, and
         // both honest seats took it -- the first certified out, the second's
-        // veto gone. A voter named silent that is here says so by refusing --
-        // unless it holds every seat waited on as quiet itself, past the stage's
-        // own deadline here or by its reading of the table's group, and holds
-        // every flood or cheat cause the certificate names as well: then its
-        // vote was late, not withheld, and it takes the certificate as it always
-        // did. A stage that has just opened waits on every seat, so the wait
-        // alone agreed with anything two rogues sent early. And a seat the
-        // certificate would put out for good -- a flooder, a proven cheat --
-        // takes it on no reading of its own line: two rogues waited for an
-        // honest seat's line to blip and named it a flooder.
+        // veto gone.
+        //
+        // **A voter named silent takes it only where it signed the same itself**:
+        // its own vote about every seat the certificate waited on, the very
+        // subject, cause and all, is among its votes -- its vote was late in
+        // reaching the others, not withheld. Nothing else the seat holds is
+        // agreement: a stage that has just opened waits on every seat, a clock
+        // the writer before it started late runs out early, and a cause it never
+        // measured -- long gone, flood, cheat -- is the voters' word alone; each
+        // let two rogues strip honest seats' vetoes and then certify them one by
+        // one. Where it has not voted yet, still waiting at that stage on every
+        // seat named, the certificate is held and judged again after its own
+        // vote. A certificate that names no seat waited on but resigned ones has
+        // nothing to agree with.
+        //
+        // **And a seat named waited on takes it on its own line's word only at a
+        // stage it has not passed** -- one it may really have missed -- and never
+        // to be put out for good (flood, cheat): two rogues waited for an honest
+        // seat's line to blip and named it a flooder, or voided a hand it had
+        // played on through with a certificate about a stage behind it.
         let named: Vec<SeatIdx> = c
             .subject
             .subject_seats
@@ -8615,35 +8625,26 @@ impl Hand {
             .filter(|s| !resigned.contains(s))
             .collect();
         let me = self.open.my_seat;
-        // Its own stage's wait counts only at the certificate's own stage -- a
-        // client that moved on heard every seat there -- and only once that
-        // stage is past its deadline here.
-        let at_the_stage = self.slot.sequence == c.subject.subject_sequence;
-        let waited_out = at_the_stage && self.past_stage_deadline(now_ms);
-        let quiet_here = if waited_out { self.waiting_for() } else { Vec::new() };
-        let agrees = c.subject.names_silent(me)
-            && c.subject.quiet_seats().iter().filter(|s| !resigned.contains(s)).all(|s| {
-                (quiet_here.contains(s) || self.gone_from_group.contains(s) || self.long_gone.contains(s))
-                    && match c.subject.cause_of(*s) {
-                        Some(CAUSE_FLOOD) => self.flooders.contains(s),
-                        Some(CAUSE_CHEAT) => self.disproved.contains(s),
-                        _ => true,
-                    }
-            });
+        let named_silent = c.subject.names_silent(me);
+        let waited: Vec<SeatIdx> = c.subject.quiet_seats().into_iter().filter(|s| !resigned.contains(s)).collect();
+        let agrees = named_silent
+            && !waited.is_empty()
+            && waited.iter().all(|s| self.voted.contains(&c.subject.vote_about(*s).subject_digest()));
         let for_good = matches!(c.subject.cause_of(me), Some(CAUSE_FLOOD) | Some(CAUSE_CHEAT));
-        if !Self::admissible(voter_seats.len(), named.len())
-            && named.contains(&me)
-            && !agrees
-            && (!self.line_down_recently || for_good)
-        {
-            // Named silent at its own stage with every seat waited on still
-            // quiet here, and the stage not yet past its deadline: held, and
-            // judged again when it is -- a late voter's clock started late, and
-            // by then a seat that is here has been heard.
-            let held = c.subject.names_silent(me)
-                && at_the_stage
-                && !waited_out
-                && c.subject.quiet_seats().iter().filter(|s| !resigned.contains(s)).all(|s| self.waiting_for().contains(s));
+        let may_have_missed = self.slot.sequence <= c.subject.subject_sequence;
+        let takes = if named_silent {
+            agrees
+        } else {
+            self.line_down_recently && !for_good && may_have_missed
+        };
+        if !Self::admissible(voter_seats.len(), named.len()) && named.contains(&me) && !takes {
+            // Named silent at the certificate's own stage, every seat named
+            // waited on still unheard here and no vote of its own yet: held, and
+            // judged again after its vote -- a late voter's clock started late.
+            let held = named_silent
+                && !waited.is_empty()
+                && self.slot.sequence == c.subject.subject_sequence
+                && waited.iter().all(|s| self.waiting_for().contains(s) && !self.voted_about.contains(s));
             if held {
                 return Err(Failed::NotYet);
             }
@@ -8905,6 +8906,16 @@ impl Hand {
                     let Phase::Playing { play, .. } = &self.phase else {
                         return Err(Failed::NothingFurther);
                     };
+                    // `S1-JY`: and it is the seat to act. `BettingRound::apply`
+                    // checks legality and never turn order, so a certificate
+                    // about another seat folded it out of turn wherever it was
+                    // taken -- two rogues and a seat whose line had blinked.
+                    if !matches!(play.step, Step::Acting { to_act } if to_act == seat) {
+                        return Err(Failed::Illegal {
+                            seat,
+                            what: Illegal::NotToAct,
+                        });
+                    }
                     if play.round.to_call(seat) == 0 {
                         Action::Check
                     } else {
@@ -17783,26 +17794,53 @@ mod tests {
             let _ = two.on_event(c, &key(12), t1 + 1_000);
         }
         assert!(two.aborted().is_none() && two.took_part(2), "seat 2 keeps its table");
-        // A seat 3 that did not hear seat 2 either, by its own stage's deadline,
-        // holds it quiet itself: its vote was late, not withheld, and it takes
-        // the certificate as it always did -- `D-065`'s silent voter, which the
-        // guard must not fork.
+        // A seat 3 that did not hear seat 2 either votes about it itself at its
+        // own deadline -- without a cause: long gone is a reading it never made.
+        // Its vote is not the certificate's, and it does not take it.
         let (mut late, _) = with_present(4, &[0, 1, 3]);
+        assert_eq!(bytes_of_sends(late[2].vote_on_timeouts(&keys[2], t1, 0).unwrap()).len(), 1, "its own vote");
+        // Its own line blinked too: a voter named silent takes nothing on its
+        // line's word -- the claim is about another seat.
+        late[2].note_line_down_recently(true);
         for c in &copies {
             let _ = late[2].on_event(c, &keys[2], t1 + 1_000);
         }
-        assert!(late[2].aborted().is_some(), "a silent voter that agrees takes it");
-        // Before its own deadline it has merely not heard seat 2 yet -- a stage
-        // that has just opened waits on every seat: held, not taken, and judged
-        // again at its deadline. Where seat 2 is heard meanwhile, not taken.
+        assert!(late[2].aborted().is_none(), "a cause it never measured is the voters' word alone");
+        // One that holds seat 2 long gone too signed the very same vote: its
+        // own was late in reaching the others, and it takes the certificate as
+        // it always did -- `D-065`'s silent voter, which the guard must not fork.
+        let (mut agreeing, _) = with_present(4, &[0, 1, 3]);
+        agreeing[2].note_long_gone(&[2]);
+        assert_eq!(bytes_of_sends(agreeing[2].vote_on_timeouts(&keys[2], t1, 0).unwrap()).len(), 1, "the same vote");
+        for c in &copies {
+            let _ = agreeing[2].on_event(c, &keys[2], t1 + 1_000);
+        }
+        assert!(agreeing[2].aborted().is_some(), "a silent voter that signed the same takes it");
+        // Reaching it before its own vote -- a stage that has just opened waits
+        // on every seat -- it is held, and judged again after that vote.
         let (mut early, _) = with_present(4, &[0, 1, 3]);
         for c in &copies {
             assert!(matches!(early[2].on_event(c, &keys[2], NOW + 5_000), Err(Failed::NotYet)), "held");
             let _ = early[2].hold(c.clone());
         }
         assert!(early[2].aborted().is_none(), "the wait alone agrees with nothing");
+        early[2].note_long_gone(&[2]);
+        let _ = early[2].vote_on_timeouts(&keys[2], t1, 0).unwrap();
         let _ = early[2].replay_early(&keys[2], t1 + 1_000);
-        assert!(early[2].aborted().is_some(), "at its deadline, still not heard: a late voter, and it takes it");
+        assert!(early[2].aborted().is_some(), "after its own, same vote: a late voter, and it takes it");
+        // A seat 2 whose line blinked, past the stage the certificate is about:
+        // it cannot have missed a stage it played through, and does not take it.
+        let (mut past, _) = Hand::open(opening_n(4, 2), &key(12), NOW, 30_000).unwrap();
+        for s in [0u8, 1, 3] {
+            let (_, from) = Hand::open(opening_n(4, s), &key(10 + s), NOW, 30_000).unwrap();
+            let _ = deliver(&mut past, &from, &key(12));
+        }
+        assert!(past.slot().sequence > 0, "seat 2 played through stage 0");
+        past.note_line_down_recently(true);
+        for c in &copies {
+            let _ = past.on_event(c, &key(12), t1 + 1_000);
+        }
+        assert!(past.aborted().is_none(), "a stage it passed: not taken on its line's word");
         let (mut heard, _) = with_present(4, &[0, 1, 3]);
         for c in &copies {
             let _ = heard[2].on_event(c, &keys[2], NOW + 5_000);
@@ -17812,6 +17850,21 @@ mod tests {
         let _ = deliver(&mut heard[2], &from_two_again, &keys[2]);
         let _ = heard[2].replay_early(&keys[2], t1 + 1_000);
         assert!(heard[2].aborted().is_none(), "seat 2 heard meanwhile: not taken");
+    }
+
+    /// `S1-JY`: a betting certificate acts for the seat to act and for no other
+    /// -- `BettingRound::apply` checks legality, never turn order, so one about
+    /// another seat folded it out of turn wherever it was taken.
+    #[test]
+    fn a_betting_certificate_acts_only_for_the_seat_to_act() {
+        let src = include_str!("hand.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let check = code.find("// `S1-JY`: and it is the seat to act.").expect("the check");
+        let apply = check + code[check..].find("play.round\n                        .apply(seat, action)").expect("the action applied");
+        assert!(
+            code[check..apply].contains("if !matches!(play.step, Step::Acting { to_act } if to_act == seat) {"),
+            "checked before it is applied"
+        );
     }
 
     /// `S1-JY` (`D-086`): a certificate half the table carries puts no seat out

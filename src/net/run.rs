@@ -1454,6 +1454,9 @@ struct TableRun {
     /// `S1-JX`: a heads-up adoption was refused because the other seat's copy
     /// named stacks that hand does not hold -- the table is not safe.
     stacks_refused: bool,
+    /// `S1-JX`: the highest hand this client dropped to rejoin, or abandoned
+    /// for a newer one -- none at or below it is adopted again. Only rises.
+    rejoin_floor: Option<u64>,
     /// `S1-JT`: since when this client has heard no other seat of the table --
     /// out of its group, or cut off -- the only time a word in a lobby answer
     /// about it being out for good is taken.
@@ -1932,6 +1935,7 @@ impl TableRun {
             resuming_since: None,
             rejoin_stacks: None,
             stacks_refused: false,
+            rejoin_floor: None,
             ever_on_line: false,
             nobody_said: false,
             readmitted: Vec::new(),
@@ -4122,6 +4126,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             if !held.is_empty() {
                 $t.rejoin_stacks = Some(held);
             }
+            // And never back to the hand it dropped, or one before it.
+            $t.rejoin_floor = $t.rejoin_floor.max(Some(dead));
             $t.previous = None;
             $t.hand = None;
             $t.pending_repair = None;
@@ -4306,6 +4312,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.resuming_since = None;
             $t.rejoin_stacks = None;
             $t.stacks_refused = false;
+            $t.rejoin_floor = None;
             $t.ever_on_line = false;
             $t.nobody_said = false;
             $t.taught.clear();
@@ -11483,9 +11490,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         });
                         if let (Some(current), Some(f)) = (stuck, t.table.as_ref()) {
                             let occupied = f.roster().len();
-                            let newer = t.resume_inits
-                                .iter()
-                                .any(|(hid, copies)| *hid > current && copies.len() * 2 > occupied.saturating_sub(1));
+                            // `S1-JX`: counted by the others' copies, as the pick is.
+                            let mine = app_key.verifying_key().to_bytes();
+                            let newer = t.resume_inits.iter().any(|(hid, copies)| {
+                                *hid > current
+                                    && copies
+                                        .iter()
+                                        .filter(|b| crate::net::chained::sender_of(b, crate::table::hand::FRAME_CAP) != Some(mine))
+                                        .count()
+                                        * 2
+                                        > occupied.saturating_sub(1)
+                            });
                             if newer {
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
@@ -11500,6 +11515,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(h) = t.hand.as_ref() {
                                     t.rejoin_stacks = Some(h.stacks_this_client_holds());
                                 }
+                                t.rejoin_floor = t.rejoin_floor.max(Some(current));
                                 t.previous = t.hand.take();
                             }
                         }
@@ -11693,10 +11709,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // Before this, only a hand the survivor had already given up
                                 // could be adopted (`run085603-2`).
                                 let heads_up = occupied == 2;
+                                // `S1-JX`: never a hand at or below the one this client
+                                // dropped, abandoned or recorded -- the other seat said an
+                                // old opening of this client's own again, with its own, and
+                                // the table went back hands, the stacks never looked at --
+                                // and a majority counted as the adoption counts it, by the
+                                // others' copies alone.
+                                let floor = adoption_floor(t.rejoin_floor, t.resume.as_ref());
+                                let mine = app_key.verifying_key().to_bytes();
                                 let pick = t.resume_inits
                                     .iter()
                                     .rev()
-                                    .find(|(_, copies)| copies.len() * 2 > occupied.saturating_sub(1))
+                                    .filter(|(h, _)| floor.map_or(true, |f| **h > f))
+                                    .find(|(_, copies)| {
+                                        copies
+                                            .iter()
+                                            .filter(|b| crate::net::chained::sender_of(b, crate::table::hand::FRAME_CAP) != Some(mine))
+                                            .count()
+                                            * 2
+                                            > occupied.saturating_sub(1)
+                                    })
                                     .map(|(h, c)| (*h, c.clone()));
                                 if let Some((hid, copies)) = pick {
                                     // `D-039`: whether the set that signed is exact is asked
@@ -17783,6 +17815,21 @@ fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>, others: &[u
     (saying.len() * 2 > others.len()).then_some((furthest, mine))
 }
 
+/// `S1-JX`: the highest hand a client coming back may not adopt -- the one it
+/// dropped to rejoin or abandoned (`rejoin`), or the one its session record
+/// names: the hand that ended there, or the hand before the one whose card
+/// material it kept, which it takes up where it stood (`D-033`).
+fn adoption_floor(rejoin: Option<u64>, record: Option<&crate::storage::session::Record>) -> Option<u64> {
+    let recorded = record.map(|r| {
+        if r.secret_hand_id == r.hand_id && r.hand_id > 0 {
+            r.hand_id - 1
+        } else {
+            r.hand_id
+        }
+    });
+    rejoin.max(recorded)
+}
+
 /// `S1-JX`: whether an adopted opening's stacks are the ones `known` holds,
 /// seat by seat -- `known` indexed by seat, as a hand keeps them.
 fn stacks_agree(seats: &[(u8, [u8; 32], u64)], known: &[u64]) -> bool {
@@ -20625,6 +20672,13 @@ mod tests {
         let again = abandon + code[abandon..].find("t.rejoin_stacks = Some(h.stacks_this_client_holds());").expect("held again");
         let taken = abandon + code[abandon..].find("t.previous = t.hand.take();").expect("taken");
         assert!(again < taken, "before the hand goes");
+        // Never back to a hand at or below the one dropped, abandoned or
+        // recorded, and a majority by the others' copies alone.
+        assert!(code[rejoin..dropped].contains("$t.rejoin_floor = $t.rejoin_floor.max(Some(dead));"), "the dropped hand is the floor");
+        assert!(code[abandon..taken].contains("t.rejoin_floor = t.rejoin_floor.max(Some(current));"), "and the abandoned one");
+        let pick = code.find("let floor = adoption_floor(t.rejoin_floor, t.resume.as_ref());").expect("the floor read");
+        assert!(code[pick..pick + 900].contains(".filter(|(h, _)| floor.map_or(true, |f| **h > f))"), "above the floor only");
+        assert!(code[pick..pick + 900].contains("!= Some(mine)"), "the others' copies counted");
         let foreign = code.find("let foreign = heads_up").expect("the check");
         assert!(code[foreign..foreign + 300].contains("&& !signed_before"), "not for a hand this seat signed itself");
         assert!(code[foreign..foreign + 600].contains("!known.iter().any(|k| stacks_agree(&o.seats, k))"), "against what the hand holds");
@@ -20632,6 +20686,38 @@ mod tests {
         assert!(code[reason..reason + 3_000].contains("if t.stacks_refused {"), "the table not safe while refused");
         let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
         assert!(code[leave..].contains("$t.rejoin_stacks = None;") && code[leave..].contains("$t.stacks_refused = false;"));
+    }
+
+    /// `S1-JX`: the floor a client coming back adopts above -- the hand it
+    /// dropped, or its record's: the hand that ended there, or the one before
+    /// the hand whose card material it kept (`D-033`, taken up where it stood).
+    #[test]
+    fn a_client_coming_back_adopts_no_hand_it_already_had() {
+        let record = |hand_id: u64, secret_hand_id: u64| crate::storage::session::Record {
+            version: crate::storage::session::RECORD_VERSION,
+            table_id: [0; 32],
+            session_id: [0; 32],
+            table_key: [0; 32],
+            founder_peer_id: Vec::new(),
+            table_name: String::new(),
+            my_seat: 0,
+            hand_id,
+            terminal: [0; 32],
+            my_stack: 1_000,
+            written_unix_ms: 0,
+            advert: Vec::new(),
+            advert_hash: [0; 32],
+            ratification: Vec::new(),
+            hand_secret: [0; 32],
+            secret_hand_id,
+            founder_seed: [0; 32],
+            roster_list: Vec::new(),
+        };
+        assert_eq!(adoption_floor(None, None), None);
+        assert_eq!(adoption_floor(None, Some(&record(7, 0))), Some(7), "hand 7 ended: 8 on");
+        assert_eq!(adoption_floor(None, Some(&record(7, 7))), Some(6), "hand 7 kept to be taken up: 7 on");
+        assert_eq!(adoption_floor(None, Some(&record(0, 0))), Some(0), "the table set: hand 1 on");
+        assert_eq!(adoption_floor(Some(9), Some(&record(7, 0))), Some(9), "the higher of the two");
     }
 
     /// **`D-038`: two seats are not the table, a strict majority of the seats
