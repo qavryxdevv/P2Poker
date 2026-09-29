@@ -3565,8 +3565,11 @@ voter can never legitimately hold both kinds against one subject at one stage.
 `n(6) cause` (D-051) is fixed by the voter with its first vote about that seat at
 that stage: a client votes once about one seat at one stage with one cause, and a
 seat it cut off after voting is voted about with the cause at its next stage. `D-066`'s
-re-vote with `cause = 3` and `S1-JS`'s early question with `cause = 4` are other
-subjects in other slots (§5.2.1).
+re-vote with `cause = 3`, `S1-JS`'s early question with `cause = 4` and `D-084`'s
+re-vote with `cause = 5` -- a seat voted about without a cause at the deadline whose
+proof then fails -- are other subjects in other slots (§5.2.1). A seat whose proof
+failed at the voter's own check is voted about with `cause = 5` whatever else the
+voter holds against it (`D-084`).
 
 **`cause = 2` and when it is said (D-065).** A voter votes about another voter of
 the round at a stage with `cause = 2` one stage deadline after its own last vote
@@ -4543,19 +4546,20 @@ receiver's own state**:
 |---|---|---|
 | `1`, certified-subject path (`cert_hash = Some`) — **reachable from D-023**, which restored the decision clock and with it the certificate this row was always written for. D-015's *unreachable, therefore reject* disposition is superseded and does not survive anywhere: a `kind = 2` certificate is produced whenever `\|V\| >= 2` and a cryptographic deadline passes, and the emitter of the abort **must** populate `cert_hash` with that `TIMEOUT_CERT`'s `event_hash` whenever it names a subject. `attributed` and `cert_hash` travel together or not at all — a named subject without the certificate that named it is one peer's accusation on its own word, and §4.10's shape rules refuse it in both directions | it holds, or `n(3) evidence` carries, the named `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2`. *Holds* means it verified that certificate itself — opened every carried vote, checked each against the voter set, and found unanimity — and never that it took the hash on trust | **buffer, do not reject**: the mesh does not order two messages, so an abort whose certificate has not arrived yet is ordinary weather and not a fault |
 | `1`, uncertified path (`attributed = []`, `cert_hash = None`) — the hand-deadline path and §6.3 case (b) are **one row**, see below | its **own** `hand_deadline_ms` has expired (§8.2), **or** it has itself reached §6.3 case (b) | **buffer, do not reject** |
-| `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once |
+| `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once -- but not a `cause = 2` whose emitter is the seat it accuses, at a hand of three seats or more (D-084, below) |
 | `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
 | `6`, tier 1 (D-014) | `n(3) evidence` carries exactly one `SignedEvent` signed by the seat named in `n(1) attributed`, and **this receiver's own** run of §4.0 over that event returns a tier-1 illegality — a signature that does not verify, a non-canonical encoding, a malformed message, an out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that is not a permutation, a signer who is not a party to this table. **The list is closed and every member is decidable from the offending event's own bytes**; *a parent that does not exist* stood here and is deleted, because it is decidable only against this receiver's own store (§4.0's box, `THREAT_MODEL.md` §5.1) | accept at once |
 | `6`, tier 2 (D-014) | as above, **and** this receiver holds a completed `STATE_ACK` stage for a checkpoint of the same chain **whose §6.2 checkpoint number is at or after the number of the checkpoint the illegality was fixed at** (`G7-S8`; the clause read *at or before the offending event's `sequence`*, and the box below says why the number replaces it), whose emitter set contained both the accused and this receiver, **and** the event is illegal against the `PublicTableState` that checkpoint fixed | reject |
 
 **`cause = 2` at a hand of three seats or more (D-084).** The table above says how a *receiver*
-takes a peer's abort, and that is unchanged: a `cause = 2` or `3` abort whose evidence verifies is
-accepted at once. What changes is when a peer *sends* a `cause = 2` one. A client whose own check
-finds a shuffle proof failing, at a hand dealt to three seats or more where the floor holds for the
-shuffler, keeps the evidence and votes about the shuffler at once with `TIMEOUT_VOTE` `cause = 5`
-(§4.8): the stage waits on it for ever, its one attempt spent (C-6 rule 4). With that first vote it
-says the shuffler's own step and proof again, so that a seat the shuffler sent nothing to checks
-them on its own chain and votes too. Every client that found the same proof failing builds the
+takes a peer's abort: a `cause = 2` or `3` abort whose evidence verifies is accepted at once, from
+any seat but the one a `cause = 2` accuses. What changes most is when a peer *sends* a `cause = 2`
+one. A client whose own check finds a shuffle proof failing, at a hand dealt to three seats or more
+where the floor holds for the shuffler, keeps the evidence and votes about the shuffler at once with
+`TIMEOUT_VOTE` `cause = 5` (§4.8): the stage waits on it for ever, its one attempt spent (C-6 rule
+4). With that first vote it says again every frame of the shuffler's own it kept in the hand, the
+step and proof last, so that a seat the shuffler sent nothing to -- or kept its deck share from --
+catches up, checks them on its own chain and votes too. Every client that found the same proof failing builds the
 same subject, and the certificate, `kind = 2`, ends the hand by the certified-subject path above
 and takes the seat out of the table for good. The abort with the evidence goes -- and the hand
 ends as it ended before -- `CHEAT_CERT_MS` (10 s) after the finding if no certificate has

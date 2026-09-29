@@ -1804,7 +1804,8 @@ pub struct Hand {
     line_down_recently: bool,
     /// `D-051`: the seats this client has voted about at the stage now open,
     /// whatever the cause -- one vote about one seat at one stage, so a
-    /// cause is fixed with the first.
+    /// cause is fixed with the first; `D-066`'s long-gone and `D-084`'s cheat
+    /// cause excepted.
     voted_about: BTreeSet<SeatIdx>,
     /// `D-051`: the seats a banked certificate named with `CAUSE_FLOOD`: every
     /// voter's client cut them off for flooding the group.
@@ -5943,6 +5944,12 @@ impl Hand {
                     || (self.long_past_stage(now_ms)
                         && (!self.crypto_stage() || self.round_has_had_air(now_ms)))
                     || (self.past_deadline(now_ms) && !self.party_to_vote());
+                // `D-084`: the proven seat's own bare abort is nothing while its
+                // evidence is held -- taken once admitted, it ended the hand with
+                // the evidence never sent.
+                if self.pending_cheat.as_ref().is_some_and(|p| p.seat == seat) {
+                    return Ok(Vec::new());
+                }
                 // `D-084`: taken over the evidence of a proven cheat this client
                 // holds -- never on the proven seat's own word: the abort is held,
                 // and the evidence goes on the next tick (`cheat_fallback`).
@@ -5991,8 +5998,18 @@ impl Hand {
             // as any finder judges them -- so the certificate comes all the
             // same.
             2 if self.cheat_by_certificate() && body.attributed.first() == Some(&opened.sender) => {
-                for frame in &body.evidence {
-                    let _ = self.hold(frame.clone());
+                // Its own step and proof and nothing else, as §4.10's evidence
+                // is: any other frame held here would take a place in the queue
+                // of early frames a genuine one needs.
+                let own = |b: &[u8], kind: EventType| {
+                    chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == kind)
+                        && chained::sender_of(b, FRAME_CAP) == Some(opened.sender)
+                };
+                if let [step, proof] = body.evidence.as_slice() {
+                    if own(step, EventType::ShuffleStep) && own(proof, EventType::ShuffleProof) {
+                        let _ = self.hold(step.clone());
+                        let _ = self.hold(proof.clone());
+                    }
                 }
                 return Ok(Vec::new());
             }
@@ -6991,11 +7008,14 @@ impl Hand {
             // with the cause, and only votes with the same cause count with
             // this client's. `D-066`: a seat long gone from the table's group,
             // with that cause -- by the same rule, a claim only unanimity makes.
-            cause: if self.flooders.contains(&seat) {
-                Some(CAUSE_FLOOD)
-            } else if self.disproved.contains(&seat) {
-                // `D-084`: its proof failed at this stage, by this client's own check.
+            // `D-084`: a proven cheat first -- a seat that once flooded one voter
+            // was voted about with the flood cause by that voter for ever after,
+            // and no cheat certificate could complete at the table.
+            cause: if self.disproved.contains(&seat) {
+                // Its proof failed at this stage, by this client's own check.
                 Some(CAUSE_CHEAT)
+            } else if self.flooders.contains(&seat) {
+                Some(CAUSE_FLOOD)
             } else if self.long_gone.contains(&seat) {
                 Some(CAUSE_LONG_GONE)
             } else {
@@ -7382,11 +7402,29 @@ impl Hand {
                 digest,
             ));
             out.push(Send::Broadcast(bytes));
-            // `D-084`: and, with the first vote about a proven cheat, its own
-            // step and proof -- every seat at this stage checks them itself.
-            if let Some(p) = self.pending_cheat.as_mut().filter(|p| p.seat == seat && !p.said) {
-                p.said = true;
-                out.extend(p.evidence.iter().map(|b| Send::Broadcast(b.clone())));
+            // `D-084`: and, with the first vote about a proven cheat, every
+            // frame of its own this client kept in the hand, its step and proof
+            // last -- every seat checks them itself. Its step and proof alone
+            // left a seat it kept its deck share from a stage behind, holding
+            // them as frames it could not reach, and unable to vote.
+            let first = self
+                .pending_cheat
+                .as_mut()
+                .filter(|p| p.seat == seat && !p.said)
+                .map(|p| {
+                    p.said = true;
+                    p.evidence.clone()
+                });
+            if let Some(evidence) = first {
+                let theirs = self.key_of(seat);
+                let mut said: Vec<Vec<u8>> = self
+                    .transcript
+                    .iter()
+                    .filter(|b| theirs.is_some() && chained::sender_of(b, FRAME_CAP) == theirs && !evidence.contains(b))
+                    .cloned()
+                    .collect();
+                said.extend(evidence);
+                out.extend(said.into_iter().map(Send::Broadcast));
             }
             out.append(&mut self.certify_if_unanimous(key, now_ms)?);
         }
@@ -17951,6 +17989,12 @@ mod tests {
     /// `D-084`: three seats up to seat 0's shuffle, its step and proof held
     /// back -- the three hands, their keys, and seat 0's two frames.
     fn three_to_the_first_shuffle() -> ([Hand; 3], [SigningKey; 3], Vec<Vec<u8>>) {
+        to_the_first_shuffle(false)
+    }
+
+    /// [`three_to_the_first_shuffle`], and with `deck_kept_from_2` seat 0's
+    /// deck share never reaches seat 2, which stands a stage behind.
+    fn to_the_first_shuffle(deck_kept_from_2: bool) -> ([Hand; 3], [SigningKey; 3], Vec<Vec<u8>>) {
         let keys = [key(10), key(11), key(12)];
         let (a, from_a) = Hand::open(opening3(0), &keys[0], NOW, 30_000).unwrap();
         let (b, from_b) = Hand::open(opening3(1), &keys[1], NOW, 30_000).unwrap();
@@ -17978,7 +18022,17 @@ mod tests {
                     if to == from {
                         continue;
                     }
-                    let out = deliver(&mut hands[to], &kept, &keys[to]);
+                    let for_it: Vec<Send> = kept
+                        .iter()
+                        .filter(|Send::Broadcast(b)| {
+                            !(deck_kept_from_2
+                                && from == 0
+                                && to == 2
+                                && chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::DeckInit))
+                        })
+                        .cloned()
+                        .collect();
+                    let out = deliver(&mut hands[to], &for_it, &keys[to]);
                     if !out.is_empty() {
                         next.push((to, out));
                     }
@@ -17988,6 +18042,16 @@ mod tests {
         }
         assert_eq!(held.len(), 2, "seat 0's step and proof");
         (hands, keys, held)
+    }
+
+    /// `D-084`: a vote about a proven cheat -- the vote first, the shuffler's
+    /// own frames of the hand after it, its step and proof last.
+    fn is_a_cheat_vote(sends: &[Vec<u8>]) -> bool {
+        let kind = |b: &Vec<u8>| chained::peek(b, PEEK_CAP).map(|(k, _, _)| k).ok();
+        sends.len() >= 3
+            && kind(&sends[0]) == Some(EventType::TimeoutVote)
+            && kind(&sends[sends.len() - 2]) == Some(EventType::ShuffleStep)
+            && kind(&sends[sends.len() - 1]) == Some(EventType::ShuffleProof)
     }
 
     /// `D-084`: seat 0's shuffle step, and a proof of it broken -- delivered to
@@ -18027,7 +18091,7 @@ mod tests {
         let mut votes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 3];
         for i in [1usize, 2] {
             votes[i] = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap());
-            assert_eq!(votes[i].len(), 3, "seat {i} votes about seat 0 at once, its step and proof with it");
+            assert!(is_a_cheat_vote(&votes[i]), "seat {i} votes about seat 0 at once, its step and proof with it");
         }
         let sealed = cross(&mut hands, &keys, &[1, 2], &votes, t1 + 500);
         let copies: Vec<Vec<u8>> = sealed
@@ -18064,7 +18128,7 @@ mod tests {
         let (mut hands, keys, held) = three_to_the_first_shuffle();
         let _ = a_broken_proof_to(&mut hands, &keys, &held, &[1]);
         let v1 = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 2_000, 0).unwrap());
-        assert_eq!(v1.len(), 3, "seat 1 votes at once, the step and the proof with it");
+        assert!(is_a_cheat_vote(&v1), "seat 1 votes at once, the step and the proof with it");
         assert!(bytes_of_sends(hands[2].vote_on_timeouts(&keys[2], NOW + 2_000, 0).unwrap()).is_empty(), "seat 2 saw nothing fail");
         assert!(hands[1].cheat_fallback(&keys[1], NOW + CHEAT_CERT_MS - 1).unwrap().is_empty(), "inside the wait");
         let sends = hands[1].cheat_fallback(&keys[1], NOW + CHEAT_CERT_MS).unwrap();
@@ -18121,6 +18185,66 @@ mod tests {
         assert_eq!(hands[1].aborted(), Some(Abort::BadShuffle { seat: 0 }));
     }
 
+    /// `D-084`, after its fourth refutation: a rogue that shuffles first kept
+    /// its deck share from seat 2, which stands a stage behind and could hold
+    /// the step and proof only as frames it cannot reach. The finder's first
+    /// vote carries every frame of the rogue's own it kept, the deck share too:
+    /// seat 2 catches up, finds the proof failing itself, and votes -- and the
+    /// certificate forms.
+    #[test]
+    fn a_seat_kept_a_stage_behind_catches_up_on_the_finders_vote() {
+        let (mut hands, keys, held) = to_the_first_shuffle(true);
+        assert!(hands[2].waiting_for().contains(&0), "seat 2 waits on seat 0's deck share");
+        let _ = a_broken_proof_to(&mut hands, &keys, &held, &[1]);
+        let v1 = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 2_000, 0).unwrap());
+        assert!(is_a_cheat_vote(&v1));
+        assert!(
+            v1.iter().any(|b| chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::DeckInit)),
+            "the rogue's deck share rides with the vote"
+        );
+        let mut v2 = Vec::new();
+        for f in &v1 {
+            match hands[2].on_event(f, &keys[2], NOW + 2_100) {
+                Ok(o) => v2.extend(bytes_of_sends(o)),
+                Err(Failed::NotYet) => {
+                    let _ = hands[2].hold(f.clone());
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let (more, _) = hands[2].replay_early(&keys[2], NOW + 2_100);
+        v2.extend(bytes_of_sends(more));
+        assert_eq!(hands[2].proven_cheat(), Some((0, 2, true)), "seat 2 caught up and found it failing itself");
+        v2.extend(bytes_of_sends(hands[2].vote_on_timeouts(&keys[2], NOW + 2_200, 0).unwrap()));
+        let mut out: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 3];
+        out[2] = v2;
+        let sealed = cross(&mut hands, &keys, &[1], &out, NOW + 2_300);
+        let _ = cross(&mut hands, &keys, &[2], &sealed, NOW + 2_400);
+        for i in [1usize, 2] {
+            assert!(hands[i].named_for_cheating(0), "seat {i}: certified out with the cheat cause");
+        }
+    }
+
+    /// `D-084`: a seat that once flooded a voter is voted about with the cheat
+    /// cause when its proof fails -- the flood cause first kept every cheat
+    /// certificate off the table for good. And its own bare abort, while the
+    /// evidence is held, is nothing.
+    #[test]
+    fn a_proven_cheat_is_voted_as_one_whatever_else_it_did() {
+        let (mut hands, keys, held) = three_to_the_first_shuffle();
+        hands[1].note_flooders(&[0]);
+        let _ = a_broken_proof_to(&mut hands, &keys, &held, &[1]);
+        let v1 = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 2_000, 0).unwrap());
+        let v = chained::open_in_hand(&v1[0], FRAME_CAP, EventType::TimeoutVote, &hands[1].open.table_id, hands[1].open.hand_id)
+            .expect("a vote");
+        let body: TimeoutVote = chained::payload(&v, TIMEOUT_VOTE_CAP).expect("its body");
+        assert_eq!(body.cause, Some(CAUSE_CHEAT), "the cheat cause, not the flood cause");
+        // Its own bare abort, long past every deadline: nothing.
+        let bare = bytes_of_sends(hands[0].abort_now(Abort::Deadline, &keys[0], NOW + 3_600_000).unwrap());
+        assert!(hands[1].on_event(&bare[0], &keys[1], NOW + 3_600_000).unwrap().is_empty());
+        assert!(hands[1].aborted().is_none(), "the hand stands on the evidence");
+    }
+
     /// `D-084`: a seat's own cause-2 abort accusing itself is not taken at three
     /// seats -- an honest client never accuses itself, and taken at once it
     /// ended every hand before any vote could go. Its two frames are judged here
@@ -18139,7 +18263,17 @@ mod tests {
         let _ = hands[1].replay_early(&keys[1], NOW + 600);
         assert_eq!(hands[1].proven_cheat(), Some((0, 2, true)), "seat 1 found the proof failing itself");
         let votes = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 2_000, 0).unwrap());
-        assert_eq!(votes.len(), 3, "and votes with the cheat cause, the step and the proof with it");
+        assert!(is_a_cheat_vote(&votes), "and votes with the cheat cause, the step and the proof with it");
+        // Anything but its own step and proof, in that order, is not even held.
+        let (mut hands, keys, held) = three_to_the_first_shuffle();
+        let swapped = bytes_of_sends(
+            hands[0]
+                .abort_bad_shuffle(0, [held[1].clone(), held[0].clone()], &keys[0], NOW + 500)
+                .unwrap(),
+        );
+        let before = hands[1].held();
+        assert!(hands[1].on_event(&swapped[0], &keys[1], NOW + 500).unwrap().is_empty(), "not taken");
+        assert_eq!(hands[1].held(), before, "and nothing of it held");
     }
 
     /// `D-084`: a proof that fails a second after the stage's deadline, when
@@ -18160,7 +18294,7 @@ mod tests {
         assert!(hands[1].on_event(&broken, &keys[1], NOW + 61_000).unwrap().is_empty());
         assert_eq!(hands[1].proven_cheat(), Some((0, 2, true)));
         let second = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 62_000, 0).unwrap());
-        assert_eq!(second.len(), 3, "voted about again, the step and the proof with it");
+        assert!(is_a_cheat_vote(&second), "voted about again, the step and the proof with it");
         let v = chained::open_in_hand(&second[0], FRAME_CAP, EventType::TimeoutVote, &hands[1].open.table_id, hands[1].open.hand_id)
             .expect("a vote");
         let body: TimeoutVote = chained::payload(&v, TIMEOUT_VOTE_CAP).expect("its body");
@@ -18199,7 +18333,7 @@ mod tests {
         assert!(hands[1].on_event(&again, &keys[1], NOW + 100).unwrap().is_empty(), "another failing proof: nothing");
         assert!(hands[1].aborted().is_none());
         let v1 = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 2_000, 0).unwrap());
-        assert_eq!(v1.len(), 3, "the vote, the step and the proof");
+        assert!(is_a_cheat_vote(&v1), "the vote, the step and the proof");
         let mut v2 = Vec::new();
         for f in &v1 {
             match hands[2].on_event(f, &keys[2], NOW + 2_100) {
