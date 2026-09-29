@@ -4952,8 +4952,11 @@ impl Hand {
         let mut final_stacks = Vec::with_capacity(n);
         let mut deltas = Vec::with_capacity(n);
         let mut busted = Vec::new();
+        // `S1-JN`: by seat, as `seat` below is -- `HAND_INIT`'s list is one per
+        // occupied seat.
+        let starts = self.start_stacks_by_seat();
         for seat in 0..n {
-            let start = self.mine.stacks.get(seat).copied().unwrap_or(0);
+            let start = starts.get(seat).copied().unwrap_or(0);
             let end = play.round.stack.get(seat).copied().unwrap_or(0) + won[seat] + back[seat];
             if end == 0 && start > 0 {
                 busted.push(seat as u8);
@@ -9360,7 +9363,7 @@ impl Hand {
             // An abort moves no chips: every seat ends the hand with what it
             // started it with (D-010, I27), and those are the values already
             // bound into `roster_hash(k)`.
-            Phase::Aborted(_) => self.mine.stacks.clone(),
+            Phase::Aborted(_) => self.start_stacks_by_seat(),
             // Unreachable: `terminal()` above returns `None` on every other
             // phase and this function has already left. Kept so the match is
             // exhaustive without a wildcard that could swallow a new phase.
@@ -9416,7 +9419,7 @@ impl Hand {
         let end = self.end_stacks_at_boundary();
         let occupied: Vec<SeatIdx> = self.open.seats.iter().map(|(s, _, _)| *s).collect();
         let playing_on = self.required_next(&end);
-        place_seats(&occupied, &self.mine.stacks, &end, &playing_on)
+        place_seats(&occupied, &self.start_stacks_by_seat(), &end, &playing_on)
     }
 
     /// `S1-FM`: whether the table's first hand is still opening inside the
@@ -9546,7 +9549,7 @@ impl Hand {
             self.open.hand_id,
             &self.open.genesis,
         );
-        self.next_hand_with(terminal, self.mine.stacks.clone()).map(|o| o.genesis)
+        self.next_hand_with(terminal, self.start_stacks_by_seat()).map(|o| o.genesis)
     }
 
     /// Hand `k+1` from a terminal and the stacks everybody holds at it.
@@ -10694,6 +10697,27 @@ impl Hand {
     }
 
     /// The stacks at this boundary, which are what `next_hand` opens `k+1` on.
+    /// `S1-JN`: the stacks this hand began with, laid out by seat number.
+    ///
+    /// `mine.stacks` is `HAND_INIT`'s `n(9) stacks` -- one per **occupied** seat,
+    /// ascending (§4.4), paired with `open.seats` by position -- and every reader
+    /// of a starting stack indexes by seat number, as the engine's own arrays
+    /// are. At a table with no hole in its seat numbers the two agree. At one
+    /// with a hole -- a seat given back before the first hand keeps the others'
+    /// numbers (`D-044`) -- the list read as it stood gave seats the wrong
+    /// stacks: heads-up on seats 0 and 2, the first abort gave seat 2 none and
+    /// ended the tournament, and every settlement's deltas and busts were off.
+    /// The wire's lists stay one per occupied seat, as §4.4 and §4.10 say.
+    fn start_stacks_by_seat(&self) -> Vec<Chips> {
+        let mut by_seat = vec![0 as Chips; usize::from(self.open.max_players)];
+        for ((seat, _, _), stack) in self.open.seats.iter().zip(self.mine.stacks.iter()) {
+            if let Some(s) = by_seat.get_mut(usize::from(*seat)) {
+                *s = *stack;
+            }
+        }
+        by_seat
+    }
+
     fn boundary_stacks(&self) -> Vec<Chips> {
         match &self.phase {
             Phase::Playing { play, .. } if matches!(play.step, Step::Ended) => {
@@ -10704,8 +10728,8 @@ impl Hand {
                 .as_ref()
                 .and_then(|l| l.closed.as_ref())
                 .map(|(_, s)| s.clone())
-                .unwrap_or_else(|| self.mine.stacks.clone()),
-            _ => self.mine.stacks.clone(),
+                .unwrap_or_else(|| self.start_stacks_by_seat()),
+            _ => self.start_stacks_by_seat(),
         }
     }
 
@@ -17389,6 +17413,42 @@ mod tests {
         assert_eq!(next.required, vec![0, 1], "the seat that stopped is still waited for");
         assert_eq!(next.genesis, foreseen, "and the give-up opened exactly where it was foreseen");
         assert!(a.genesis_if_given_up().is_none(), "nothing to foresee once the hand is over");
+    }
+
+    /// `S1-JN`: a table with a hole in its seat numbers -- three seats, seat 1
+    /// given back before the first hand (`D-044`), heads-up on seats 0 and 2.
+    /// `HAND_INIT`'s stacks are one per occupied seat, and they were read by
+    /// seat number: the first abort gave seat 2 the entry at index 2 -- none --
+    /// so the next hand had one seat with chips and the tournament ended.
+    #[test]
+    fn a_table_with_a_hole_in_its_seats_reads_each_seats_own_stack() {
+        let keys = [key(10), key(11)];
+        let mut o = opening(0);
+        o.seats = vec![
+            (0, keys[0].verifying_key().to_bytes(), 10_000),
+            (2, keys[1].verifying_key().to_bytes(), 7_000),
+        ];
+        o.required = vec![0, 2];
+        o.max_players = 3;
+        let (mut a, _) = Hand::open(o, &keys[0], NOW, 30_000).unwrap();
+        assert_eq!(a.start_stacks_by_seat(), vec![10_000, 0, 7_000], "each seat's own, by number");
+        let foreseen = a.genesis_if_given_up().expect("a hand not yet over can say");
+
+        // Seat 2 says nothing; the hand is given up.
+        assert!(a.abort_now(Abort::Deadline, &keys[0], NOW + 30_000).is_ok());
+        assert_eq!(a.stack_at_boundary(0), 10_000);
+        assert_eq!(a.stack_at_boundary(2), 7_000, "restored, not read from seat 1's place");
+        assert_eq!(a.stack_at_boundary(1), 0, "the hole holds nothing");
+        let next = a.next_hand().expect("two seats with chips go on");
+        assert_eq!(next.required, vec![0, 2]);
+        assert_eq!(
+            next.seats.iter().map(|(s, _, stack)| (*s, *stack)).collect::<Vec<_>>(),
+            vec![(0, 10_000), (2, 7_000)],
+            "the next hand's roster keeps each seat's chips"
+        );
+        assert_eq!(next.genesis, foreseen, "and the give-up opened where it was foreseen");
+        let (over, finishes) = a.finishes_at_boundary();
+        assert!(!over && finishes.is_empty(), "nobody finished: {finishes:?}");
     }
 
     /// The two-seat fixture with the roster hash its seats and stacks really
