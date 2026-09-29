@@ -2028,6 +2028,7 @@ fn preview_table(args: &[String]) {
             "2 of the 4 players flooded the table's connection with junk traffic. They are cut off here, but too few other players are left to put them out of the game.".into(),
             1,
         ));
+        view.unsafe_may_show = true;
     }
     // `S1-IX`: the table stopped on a disagreement about a hand's result, and
     // the game ended on it.

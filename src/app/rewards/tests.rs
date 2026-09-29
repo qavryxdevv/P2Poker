@@ -237,7 +237,7 @@ fn leaving_a_running_game_costs_manners_and_says_the_way_back() {
 fn nothing_but_a_deliberate_leave_is_penalised() {
     type Setup = fn(&mut Rewards, &Game, Now);
     let cases: [(&str, Setup); 9] = [
-        ("an unsafe table", |r, _, now| r.on_event(&NodeEvent::TableUnsafe { why: Some("flooders".into()) }, now)),
+        ("an unsafe table", |r, _, now| r.on_event(&NodeEvent::TableUnsafe { why: Some("flooders".into()), stuck: false }, now)),
         // `S1-IX`: a table stopped on a disagreement about a hand's result.
         ("a table stopped on a disagreement", |r, g, now| {
             let stop = crate::net::node::TableStop { hand_id: g.hand, seats: vec![2], ended: None };

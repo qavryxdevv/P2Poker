@@ -563,9 +563,11 @@ pub enum NodeEvent {
     /// `D-051`: this client cut a seat off for flooding the table's group.
     SeatFlooded { seat: u8 },
     /// `D-051`: this table is not safe, and why -- flooders the table cannot put
-    /// out, or strangers let in again and again -- or `None` once it is safe
-    /// again. The window recommends leaving.
-    TableUnsafe { why: Option<String> },
+    /// out, or strangers let in again and again; `S1-JR`: or a table that
+    /// cannot go on -- or `None` once it is safe again. The window recommends
+    /// leaving. `stuck`: the running hand stands, so the window may cover it;
+    /// otherwise it waits for a hand not being played (the owner's rule).
+    TableUnsafe { why: Option<String>, stuck: bool },
     /// `S1-IX`, `PROTOCOL.md` §6.3 and §6.4: this table has stopped at a
     /// hand's boundary, because other seats finished that hand with a
     /// different result from this client's own -- and, once it has, the game

@@ -199,9 +199,10 @@ impl AppState {
             out_for_good: self.out_for_good.clone(),
             out_flooded: self.out_flooded,
             lost: self.lost.clone(),
-            // `S1-JR`: never over a hand being played -- said at the boundary, or
-            // over a hand that stands.
-            unsafe_note: self.unsafe_note.clone().filter(|_| !self.hand_being_played()),
+            // `S1-JR`: never over a hand being played -- said at the boundary,
+            // before the hand's cards are out, or over a hand that stands.
+            unsafe_note: self.unsafe_note.clone(),
+            unsafe_may_show: self.unsafe_may_show(),
             // `S1-IX`: the seats by the names the window shows.
             stopped: self.stopped.as_ref().map(|(s, serial)| crate::gui::table::StoppedView {
                 hand_id: s.hand_id,
@@ -1052,13 +1053,14 @@ mod tests {
             s.table_view().log.iter().any(|l| l.text.contains("flooded the table's connection")),
             "the table's log says who flooded it"
         );
-        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()) });
+        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()), stuck: false });
         let (why, first) = s.table_view().unsafe_note.expect("said");
         assert!(why.contains("flooded"));
-        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()) });
+        assert!(s.table_view().unsafe_may_show, "no hand being played");
+        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()), stuck: false });
         let (_, second) = s.table_view().unsafe_note.expect("said again");
         assert!(second > first, "asked again");
-        s.apply(NodeEvent::TableUnsafe { why: None });
+        s.apply(NodeEvent::TableUnsafe { why: None, stuck: false });
         assert_eq!(s.table_view().unsafe_note, None, "safe again");
         s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for flooding".into(), flooded: true });
         let v = s.table_view();

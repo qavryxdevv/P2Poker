@@ -291,6 +291,9 @@ pub struct TableView {
     /// `D-051`: why this table is not safe, with the serial the window is
     /// closed by -- the question comes back when the node says it again.
     pub unsafe_note: Option<(String, u64)>,
+    /// `S1-JR`, the owner's rule: whether that window may be drawn now -- no
+    /// hand being played at this table (`AppState::unsafe_may_show`).
+    pub unsafe_may_show: bool,
     /// `S1-IX`: the table stopped on a disagreement about a hand's result, or
     /// the game ended on it.
     pub stopped: Option<StoppedView>,
@@ -1672,6 +1675,20 @@ fn window_heading(ui: &mut egui::Ui, title: &str, closable: bool) -> bool {
 }
 
 /// The table's windows: the questions of `S1-CX` and `D-047` as before, and
+/// `D-051`: the question about a table that is not safe, if it is to be asked
+/// now -- its words and its serial. Not once *Stay* closed that serial; and
+/// `S1-JR`, the owner's rule: never over a hand being played, and never over
+/// another question the player is asked about the table -- one at a time.
+fn unsafe_question(view: &TableView, closed: u64) -> Option<(&String, &u64)> {
+    view.unsafe_note.as_ref().map(|(why, serial)| (why, serial)).filter(|(_, n)| {
+        view.unsafe_may_show
+            && **n != closed
+            && view.out_for_good.is_none()
+            && view.lost.is_none()
+            && view.opponent_gone_s.is_none()
+    })
+}
+
 /// PokerTH's settings, table ranking and note about a player.
 fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Settings) -> Option<TableAction> {
     let ctx = ui.ctx().clone();
@@ -1797,11 +1814,7 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
     // `D-051`, the owner: where the table cannot put out what floods it, the
     // honest players are told it is not safe and that leaving is recommended.
     // Stay closes the question until the node says it again.
-    if let Some((why, serial)) = view
-        .unsafe_note
-        .as_ref()
-        .filter(|(_, n)| *n != state.unsafe_closed && view.out_for_good.is_none())
-    {
+    if let Some((why, serial)) = unsafe_question(view, state.unsafe_closed) {
         egui::Window::new("Not safe")
             .id(egui::Id::new("table-not-safe"))
             .title_bar(false)
@@ -2218,6 +2231,7 @@ impl TableView {
             out_flooded: false,
             lost: None,
             unsafe_note: None,
+            unsafe_may_show: false,
             stopped: None,
             line: None,
             absent: Vec::new(),
@@ -2266,6 +2280,29 @@ mod tests {
         let v = TableView::sample();
         assert!(v.preview, "a sample hand that does not say so is a lie");
         assert!(v.board.iter().all(|f| !matches!(f, Facing::Empty)));
+    }
+
+    /// `S1-JR`: the question about a table that is not safe is asked only where
+    /// it may be -- no hand being played, no other question up, the player at
+    /// the table -- and not again once *Stay* closed its serial.
+    #[test]
+    fn the_not_safe_question_is_asked_only_where_it_may_be() {
+        let mut v = TableView::waiting("Riverside".into(), 6);
+        assert!(unsafe_question(&v, 0).is_none(), "nothing said");
+        v.unsafe_note = Some(("seat 2 sent a shuffle proof that does not hold".into(), 3));
+        assert!(unsafe_question(&v, 0).is_none(), "a hand being played");
+        v.unsafe_may_show = true;
+        assert_eq!(unsafe_question(&v, 0).map(|(_, n)| *n), Some(3), "asked");
+        assert!(unsafe_question(&v, 3).is_none(), "Stay closed it");
+        assert!(unsafe_question(&v, 2).is_some(), "an older Stay closes no newer word");
+        v.opponent_gone_s = Some(40);
+        assert!(unsafe_question(&v, 0).is_none(), "the question about the opponent is up");
+        v.opponent_gone_s = None;
+        v.lost = Some("gone".into());
+        assert!(unsafe_question(&v, 0).is_none(), "not at the table any more");
+        v.lost = None;
+        v.out_for_good = Some("out".into());
+        assert!(unsafe_question(&v, 0).is_none(), "out of the game");
     }
 
     /// A table with nobody at it says what it is waiting for rather than

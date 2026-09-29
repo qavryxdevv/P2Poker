@@ -1005,7 +1005,7 @@ impl Rewards {
             NodeEvent::SeatLeft { seat, .. } | NodeEvent::SeatLeftTable { seat } => {
                 self.slot().off_line.insert(*seat);
             }
-            NodeEvent::TableUnsafe { why } => {
+            NodeEvent::TableUnsafe { why, .. } => {
                 if why.is_some() {
                     self.slot().unsafe_ever = true;
                 }

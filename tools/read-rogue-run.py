@@ -10,7 +10,8 @@ asked whether to leave. A run with `tools/table-run.ps1 -Rogue <kinds>
     card share that does not hold, found here or proven by another seat; the
     deadline; anything else);
   * the first time the node said the table is not safe, how long after its
-    first hand, and why;
+    first hand, and why; how often it said so, and how often with the running
+    hand standing (the window may cover that hand, and no other);
   * the seats certified out and put out for good;
   * the genesis of every hand at every node: a hand with two values is a fork
     between honest seats, the worst outcome there is.
@@ -46,7 +47,7 @@ def lines(path):
 def read_node(path):
     node = {
         'opened': [], 'over': [], 'voided': {}, 'not_safe': None, 'certified': 0,
-        'first_hand_at': None, 'genesis': {},
+        'first_hand_at': None, 'genesis': {}, 'said': 0, 'stands': [],
     }
     current = None
     counted = set()
@@ -72,8 +73,12 @@ def read_node(path):
             node['over'].append(int(m.group(1)))
             continue
         m = NOT_SAFE.search(text)
-        if m and node['not_safe'] is None:
-            node['not_safe'] = (secs, m.group(1))
+        if m:
+            node['said'] += 1
+            if '[the running hand stands]' in text:
+                node['stands'].append(secs)
+            if node['not_safe'] is None:
+                node['not_safe'] = (secs, m.group(1))
         if CERTIFIED.search(text):
             node['certified'] += 1
     return node
@@ -107,6 +112,9 @@ def main():
             secs, why = n['not_safe']
             after = '' if n['first_hand_at'] is None else ', %.0f s after its first hand' % (secs - n['first_hand_at'])
             print('         NOT SAFE at %.1f s%s: %s' % (secs, after, why[:200]))
+            print('         said %d times; with the running hand standing %d times%s' % (
+                n['said'], len(n['stands']),
+                '' if not n['stands'] else ', first at %.1f s' % n['stands'][0]))
         else:
             print('         never said the table is not safe')
         if n['certified']:

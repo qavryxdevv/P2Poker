@@ -390,6 +390,7 @@ pub struct TableApp {
     pub show_choice: Option<(u64, std::time::Instant)>,
     pub out_flooded: bool,
     pub unsafe_note: Option<(String, u64)>,
+    pub unsafe_stuck: bool,
     pub stopped: Option<(crate::net::node::TableStop, u64)>,
     pub rejoin: Option<Rejoin>,
     pub waits: std::collections::BTreeMap<u8, SeatWait>,
@@ -564,6 +565,13 @@ pub struct AppState {
     /// serial the window closes by -- the question comes back when the node
     /// says it again.
     pub unsafe_note: Option<(String, u64)>,
+    /// `S1-JR`: the node's word that the running hand stands, so the window may
+    /// cover it (`unsafe_may_show`).
+    pub unsafe_stuck: bool,
+    /// `S1-JR`: the last serial given to a not-safe word, at any table -- never
+    /// given twice, so a *Stay* holds for its own word and no other. Not a
+    /// table's: not swapped with a slot, not reset with one.
+    pub unsafe_serials: u64,
     /// `S1-IX`: the table stopped on a disagreement about a hand's result, or
     /// the game ended on it, as the node last said it -- with a serial the
     /// window's *Wait* closes the question by, until the node says it again.
@@ -1056,6 +1064,7 @@ impl AppState {
         std::mem::swap(&mut self.show_choice, &mut other.show_choice);
         std::mem::swap(&mut self.out_flooded, &mut other.out_flooded);
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
+        std::mem::swap(&mut self.unsafe_stuck, &mut other.unsafe_stuck);
         std::mem::swap(&mut self.stopped, &mut other.stopped);
         std::mem::swap(&mut self.rejoin, &mut other.rejoin);
         std::mem::swap(&mut self.waits, &mut other.waits);
@@ -2285,15 +2294,28 @@ impl AppState {
                 self.note(line);
             }
             // `D-051`: the table is not safe, or safe again.
-            NodeEvent::TableUnsafe { why } => {
-                self.unsafe_note = why.map(|w| {
-                    let serial = self.unsafe_note.as_ref().map_or(1, |(_, n)| n + 1);
-                    (w, serial)
-                });
-                if let Some((w, _)) = self.unsafe_note.as_ref() {
-                    let line = format!("This table is not safe: {w}");
-                    self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
-                    self.note(line);
+            NodeEvent::TableUnsafe { why, stuck } => {
+                // `S1-JR`: the same word with only `stuck` changed is the
+                // running hand standing, or moving again, under it -- where the
+                // window may be drawn changes, and nothing else: a *Stay* holds,
+                // and the log is not told again. The same word with nothing
+                // changed is the node asking again.
+                let stood = stuck != self.unsafe_stuck
+                    && matches!((&why, &self.unsafe_note), (Some(w), Some((said, _))) if w == said);
+                self.unsafe_stuck = stuck;
+                if !stood {
+                    // `S1-JR`: a serial that never repeats, at any table: it
+                    // restarted at one after the table was safe again, and a
+                    // *Stay* given to the first word silenced the next one.
+                    self.unsafe_note = why.map(|w| {
+                        self.unsafe_serials = self.unsafe_serials.wrapping_add(1).max(1);
+                        (w, self.unsafe_serials)
+                    });
+                    if let Some((w, _)) = self.unsafe_note.as_ref() {
+                        let line = format!("This table is not safe: {w}");
+                        self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
+                        self.note(line);
+                    }
                 }
             }
             // `S1-IX`, section 6.4: the table stopped on a disagreement about a
@@ -2524,6 +2546,7 @@ impl AppState {
         self.show_choice = None;
         self.out_flooded = false;
         self.unsafe_note = None;
+        self.unsafe_stuck = false;
         self.stopped = None;
         self.rejoin = None;
         self.waits.clear();
@@ -2633,7 +2656,21 @@ impl AppState {
         }
         if reachable {
             self.opponent_was_reachable = true;
-            let episode = self.opponent_gone.take();
+            // `S1-JR`: a reading of the line ends an absence, never a question
+            // about a present opponent -- slow at its turn, or holding back its
+            // part of the cards: those end when the hand moves, and a *Wait*
+            // given to them holds (the node re-says the line every few
+            // seconds, and each reading re-opened the question).
+            let episode = if self.opponent_gone.as_ref().is_some_and(|g| !g.slow) {
+                self.opponent_gone.take()
+            } else {
+                None
+            };
+            // `S1-JR`: back from an absence worth asking about, it has its
+            // whole step from here; a blip shorter than that moves nothing.
+            if episode.as_ref().is_some_and(|g| g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS) {
+                self.opponent_offline_at = Some(std::time::Instant::now());
+            }
             // `D-032`: an absence worth asking about that ended is a return.
             if episode
                 .as_ref()
@@ -2662,9 +2699,6 @@ impl AppState {
         // `S1-EJ`: or any seat was -- the opponent may have become the opponent
         // only when the others left for good, having been on the line before
         // it was one (S1-EC's guard is against a group still forming).
-        } else {
-            // `S1-JR`: the last moment the opponent was read out of reach.
-            self.opponent_offline_at = Some(std::time::Instant::now());
         }
         // `S1-JR`: out of reach is the reading, whatever the cards were waiting
         // on -- it replaces a question about a part held back, and counts as
@@ -3285,9 +3319,10 @@ impl AppState {
         // every hand up (D-007). The same question; withdrawn when the stage
         // moves off it.
         if let Some(opponent) = self.heads_up_opponent() {
-            // Timed from the later of the stand and the last reading of the
-            // opponent out of reach: a seat back on the line -- or this
-            // client's own line back -- has its whole step from there.
+            // Timed from the later of the stand and the end of the last
+            // absence worth asking about: a seat back on the line from one --
+            // or this client's own line back from one -- has its whole step
+            // from there; a blip off the line buys no time.
             let stood = self.stands.1.contains(&opponent)
                 && self.turn_seat != Some(opponent)
                 && self.waits.get(&opponent).is_some_and(|w| {
@@ -3654,18 +3689,16 @@ impl AppState {
         self.swap_slot(slot);
     }
 
-    /// `S1-JR`, the owner's rule -- nothing over a hand being played: whether one
-    /// is, at this table: dealt, not over, and stood on no seat for a minute. A
-    /// hand stood on that long is no hand being played, and a window about a
-    /// table that cannot go on belongs over it.
-    pub fn hand_being_played(&self) -> bool {
-        let live = self.hand.as_ref().is_some_and(|h| !h.over);
-        let stuck = self
-            .stands
-            .1
-            .iter()
-            .any(|s| self.waits.get(s).is_some_and(|w| w.since.elapsed() >= std::time::Duration::from_secs(60)));
-        live && !stuck
+    /// `S1-JR`, the owner's rule -- nothing over a hand being played: whether the
+    /// window about a table that is not safe may be shown now. A hand is being
+    /// played from the moment its cards are out until it is over; before that
+    /// nothing on the felt moves (the deck is being shuffled), and a hand called
+    /// off at its shuffle -- a rogue's, every time -- never had its cards out, so
+    /// the window does not blink off and on with each. And when the node says
+    /// the running hand stands (its own reading of the stage,
+    /// `TableUnsafe::stuck`): a hand that stands is no hand being played.
+    pub fn unsafe_may_show(&self) -> bool {
+        self.unsafe_stuck || !self.hand.as_ref().is_some_and(|h| !h.over && !h.holding.is_empty())
     }
 
     /// `D-068`: whether a hand is being played at any of this client's tables.
@@ -5845,10 +5878,18 @@ mod tests {
     }
 
     /// `S1-JR`, the owner's rule: the window about a table that is not safe
-    /// never covers a hand being played -- it is shown between hands, or over a
-    /// hand that has stood on a seat for a minute.
+    /// never covers a hand being played -- a hand's cards out and the hand not
+    /// over. It may be drawn while the deck is being shuffled (a hand a rogue
+    /// calls off at its shuffle never has its cards out, so the window does not
+    /// blink with each), between hands, and over a hand the node says stands.
+    /// The node's `stuck` moving under the same word is no new question: a
+    /// *Stay* holds through it, and the log is not told again; the same word
+    /// said again as it stood is the node asking again.
     #[test]
     fn a_table_not_safe_is_not_said_over_a_hand_being_played() {
+        let why = "seat 1 sent a shuffle proof that does not hold";
+        let said = |s: &AppState| s.log.iter().filter(|l| l.contains("This table is not safe")).count();
+        let serial = |s: &AppState| s.table_view().unsafe_note.map(|(_, n)| n);
         let mut s = AppState::new();
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster {
@@ -5857,17 +5898,27 @@ mod tests {
         });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
         s.apply(NodeEvent::HandBegan { hand_id: 4, button: 0, dealt_in: vec![0, 1, 2], small_blind: 50, big_blind: 100 });
-        s.apply(NodeEvent::TableUnsafe { why: Some("seat 1 sent a shuffle proof that does not hold".into()) });
-        assert!(s.table_view().unsafe_note.is_none(), "not over a hand being played");
-        s.apply(NodeEvent::NotYourTurn { hand_id: 4, seat: None, elapsed_ms: 0 });
-        s.apply(NodeEvent::StageStands { hand_id: 4, seats: vec![1] });
-        assert!(s.table_view().unsafe_note.is_none(), "a stage stood on briefly is a hand being played");
-        s.waits.get_mut(&1).expect("waited on").since = std::time::Instant::now() - std::time::Duration::from_secs(61);
-        assert!(s.table_view().unsafe_note.is_some(), "a hand stood on a seat for a minute is not");
-        s.apply(NodeEvent::StageStands { hand_id: 4, seats: Vec::new() });
-        assert!(s.table_view().unsafe_note.is_none(), "played again");
+        s.apply(NodeEvent::TableUnsafe { why: Some(why.into()), stuck: false });
+        let first = serial(&s).expect("the word is kept");
+        assert_eq!(said(&s), 1);
+        assert!(s.table_view().unsafe_may_show, "the deck is being shuffled: nothing on the felt moves");
+        s.apply(NodeEvent::CardsDealt { hand_id: 4, seats: vec![0, 1, 2] });
+        assert!(!s.table_view().unsafe_may_show, "the cards are out: a hand being played");
+        assert_eq!(serial(&s), Some(first), "the word is kept under the hand");
+        s.apply(NodeEvent::TableUnsafe { why: Some(why.into()), stuck: true });
+        assert!(s.table_view().unsafe_may_show, "the node says the hand stands");
+        assert_eq!(serial(&s), Some(first), "the same question: a Stay holds through it");
+        assert_eq!(said(&s), 1, "and the log is not told again");
+        s.apply(NodeEvent::TableUnsafe { why: Some(why.into()), stuck: false });
+        assert!(!s.table_view().unsafe_may_show, "played again");
+        assert_eq!(serial(&s), Some(first));
         s.apply(NodeEvent::HandEnded { hand_id: 4, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
-        assert!(s.table_view().unsafe_note.is_some(), "said between hands");
+        assert!(s.table_view().unsafe_may_show, "between hands");
+        s.apply(NodeEvent::TableUnsafe { why: Some(why.into()), stuck: false });
+        assert!(serial(&s).is_some_and(|n| n > first), "the node asking again is a new question");
+        assert_eq!(said(&s), 2);
+        s.apply(NodeEvent::HandBegan { hand_id: 5, button: 1, dealt_in: vec![0, 1, 2], small_blind: 50, big_blind: 100 });
+        assert!(s.table_view().unsafe_may_show, "the next hand's deck being shuffled: still no hand being played");
     }
 
     /// `S1-JR`: an opponent read out of reach while the hand stood on its part of
@@ -5887,11 +5938,31 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_STEP_MS + 1_000);
         s.tick_opponent();
         assert!(s.opponent_gone.as_ref().is_some_and(|g| g.step), "asked about its part");
+        // A *Wait* holds while the opponent is read on the line: a reading is no
+        // answer to a part held back.
+        s.dismiss_opponent_gone();
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(3), away: false });
+        s.tick_opponent();
+        assert!(
+            s.opponent_gone.as_ref().is_some_and(|g| g.step && g.dismissed_at.is_some()),
+            "the Wait holds through the node's readings"
+        );
         // Out of reach: the absence replaces the question about its part.
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(22), away: false });
         assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.step && !g.slow), "an absence, not a part held back");
-        // Back: the absence ends, and the stand is timed from the reading.
+        // Back at once: a blip buys no time -- still holding its part back, it
+        // is asked about again.
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.step), "a blip off the line buys no time");
+        assert_eq!(s.opponent_returns, 0, "and was no return");
+        // Out of reach long enough to be asked about: back, it has its whole
+        // step from there.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(22), away: false });
+        s.opponent_gone.as_mut().expect("the absence").since =
+            std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        assert_eq!(s.opponent_returns, 1, "an absence worth asking about is a return");
         s.tick_opponent();
         assert!(s.opponent_gone.is_none(), "back on the line, its whole step from here");
     }
@@ -5929,14 +6000,24 @@ mod tests {
         s.clock_for(Some(0), 0);
         assert!(s.opponent_gone.is_none(), "the slow opponent acted");
         assert_eq!(s.opponent_returns, 0, "no absence, no return");
-        // A ping while the slow question stands changes nothing either.
+        // `S1-JR`: a ping while the slow question stands changes nothing either:
+        // the node says the line again every few seconds, and each reading
+        // re-opened the question -- a *Wait* held for a few seconds.
         s.clock_for(Some(1), 0);
         s.turn_since = Some(std::time::Instant::now() - std::time::Duration::from_millis(30_000 + OPPONENT_GONE_MS + 1_000));
         s.tick_opponent();
         assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow));
+        s.dismiss_opponent_gone();
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None, away: false });
-        assert!(s.opponent_gone.is_none(), "a reading that reaches them ends any episode");
-        assert_eq!(s.opponent_returns, 0, "but a slow one was no absence");
+        s.tick_opponent();
+        assert!(
+            s.opponent_gone.as_ref().is_some_and(|g| g.slow && g.dismissed_at.is_some()),
+            "a reading that reaches them is no answer to a slow opponent, and the Wait holds"
+        );
+        assert!(s.opponent_gone_for_s().is_none(), "not asked again");
+        assert_eq!(s.opponent_returns, 0, "and a slow one was no absence");
+        s.clock_for(Some(0), 0);
+        assert!(s.opponent_gone.is_none(), "their action ends it");
     }
 
     /// `S1-FX`, the owner (2026-09-16, with a screenshot): an opponent back on
