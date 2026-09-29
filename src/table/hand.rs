@@ -473,16 +473,23 @@ impl Opening {
                 .or_insert_with(|| (BTreeSet::new(), body));
             entry.0.insert(seat);
         }
-        let Some(((genesis, _), (signers, body))) = groups.into_iter().max_by_key(|(_, (s, _))| s.len())
+        // `S1-JX`: the others' signatures decide, in the choice and in the count
+        // below -- the adopter's own copy of a previous life (`D-033`) says
+        // nothing the table agreed to.
+        let others_in = |s: &BTreeSet<SeatIdx>| s.iter().filter(|x| **x != base.my_seat).count();
+        let Some(((genesis, _), (signers, body))) = groups.into_iter().max_by_key(|(_, (s, _))| others_in(s))
         else {
             return Err(Failed::NotYet);
         };
         // A strict majority of the occupied seats **other than the adopter's**:
-        // the adopter has signed nothing, so it is not a seat that could have
-        // agreed. Heads-up that is the one other seat, which is what lets a
-        // restarted client come back to a two-seat table at all (`S1-CX`).
+        // the adopter is not a seat that could have agreed. Heads-up that is the
+        // one other seat, which is what lets a restarted client come back to a
+        // two-seat table at all (`S1-CX`). Its own signature among the copies is
+        // not counted (`S1-JX`): counted, the other seat said an old opening of
+        // this client's own again and it was adopted on nothing but that, with no
+        // look at its stacks.
         let others = occupied.iter().filter(|s| **s != base.my_seat).count();
-        if signers.len() * 2 <= others {
+        if others_in(&signers) * 2 <= others {
             return Err(Failed::NotYet);
         }
         if body.stacks.len() != base.seats.len() {
@@ -8591,11 +8598,15 @@ impl Hand {
         // this guard counted the one seat waited on against two voters, and
         // both honest seats took it -- the first certified out, the second's
         // veto gone. A voter named silent that is here says so by refusing --
-        // unless it holds every seat waited on as quiet itself: then its vote
-        // was late, not withheld, and it takes the certificate as it always did.
-        // And a seat the certificate would put out for good -- a flooder, a
-        // proven cheat -- takes it on no reading of its own line: two rogues
-        // waited for an honest seat's line to blip and named it a flooder.
+        // unless it holds every seat waited on as quiet itself, past the stage's
+        // own deadline here or by its reading of the table's group, and holds
+        // every flood or cheat cause the certificate names as well: then its
+        // vote was late, not withheld, and it takes the certificate as it always
+        // did. A stage that has just opened waits on every seat, so the wait
+        // alone agreed with anything two rogues sent early. And a seat the
+        // certificate would put out for good -- a flooder, a proven cheat --
+        // takes it on no reading of its own line: two rogues waited for an
+        // honest seat's line to blip and named it a flooder.
         let named: Vec<SeatIdx> = c
             .subject
             .subject_seats
@@ -8604,16 +8615,20 @@ impl Hand {
             .filter(|s| !resigned.contains(s))
             .collect();
         let me = self.open.my_seat;
-        // Its own stage's wait counts only at the certificate's own stage: a
-        // client that moved on heard every seat there.
+        // Its own stage's wait counts only at the certificate's own stage -- a
+        // client that moved on heard every seat there -- and only once that
+        // stage is past its deadline here.
         let at_the_stage = self.slot.sequence == c.subject.subject_sequence;
-        let quiet_here = if at_the_stage { self.waiting_for() } else { Vec::new() };
+        let waited_out = at_the_stage && self.past_stage_deadline(now_ms);
+        let quiet_here = if waited_out { self.waiting_for() } else { Vec::new() };
         let agrees = c.subject.names_silent(me)
             && c.subject.quiet_seats().iter().filter(|s| !resigned.contains(s)).all(|s| {
-                quiet_here.contains(s)
-                    || (at_the_stage && self.voted_about.contains(s))
-                    || self.gone_from_group.contains(s)
-                    || self.long_gone.contains(s)
+                (quiet_here.contains(s) || self.gone_from_group.contains(s) || self.long_gone.contains(s))
+                    && match c.subject.cause_of(*s) {
+                        Some(CAUSE_FLOOD) => self.flooders.contains(s),
+                        Some(CAUSE_CHEAT) => self.disproved.contains(s),
+                        _ => true,
+                    }
             });
         let for_good = matches!(c.subject.cause_of(me), Some(CAUSE_FLOOD) | Some(CAUSE_CHEAT));
         if !Self::admissible(voter_seats.len(), named.len())
@@ -8621,6 +8636,17 @@ impl Hand {
             && !agrees
             && (!self.line_down_recently || for_good)
         {
+            // Named silent at its own stage with every seat waited on still
+            // quiet here, and the stage not yet past its deadline: held, and
+            // judged again when it is -- a late voter's clock started late, and
+            // by then a seat that is here has been heard.
+            let held = c.subject.names_silent(me)
+                && at_the_stage
+                && !waited_out
+                && c.subject.quiet_seats().iter().filter(|s| !resigned.contains(s)).all(|s| self.waiting_for().contains(s));
+            if held {
+                return Err(Failed::NotYet);
+            }
             if self.shortfall_said.insert(c.subject.digest()) {
                 self.cert_note.push(format!(
                     "cert: from seat {seat} about {}, carried by {} voter(s) -- half the table or fewer -- names this client, which is here: not taken (D-066)",
@@ -16825,6 +16851,35 @@ mod tests {
         assert!(Opening::adopt(adopter_base(), &with_stranger).is_ok(), "the three roster copies still carry it");
     }
 
+    /// `S1-JX`: the adopter's own copy -- a previous life's, said again by
+    /// another seat -- is not a seat that agreed: alone, or beside fewer than a
+    /// strict majority of the others, it carries nothing. Counted, the other
+    /// seat said an old opening of the client's own again and it was adopted,
+    /// its stacks never looked at.
+    #[test]
+    fn an_adopters_own_copy_is_not_a_seat_that_agreed() {
+        let keys: Vec<SigningKey> = (10..14).map(key).collect();
+        let mut hands = Vec::new();
+        let mut first = Vec::new();
+        for seat in 0..4u8 {
+            let mut o = opening4(seat);
+            o.required = vec![0, 1, 2, 3];
+            let (h, sends) = Hand::open(o, &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            first.push((usize::from(seat), sends));
+        }
+        play_out(&mut hands, &keys, &[0, 1, 2, 3], first);
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        let (_, mine) = Hand::open(hands[3].next_hand().expect("seat 3 derives hand 2"), &keys[3], NOW, 30_000).unwrap();
+        let own = bytes_of(&mine).remove(0);
+        assert!(matches!(Opening::adopt(adopter_base(), std::slice::from_ref(&own)), Err(Failed::NotYet)), "its own copy alone: nothing");
+        assert!(
+            matches!(Opening::adopt(adopter_base(), &[own.clone(), copies[0].clone()]), Err(Failed::NotYet)),
+            "its own and one of three others: no majority of the others"
+        );
+        assert!(Opening::adopt(adopter_base(), &[own, copies[0].clone(), copies[1].clone()]).is_ok(), "two of three others: taken");
+    }
+
     /// A majority that names stacks its own roster hash does not cover, or
     /// blinds that are not the schedule's for this hand, is refused rather
     /// than followed.
@@ -17728,14 +17783,35 @@ mod tests {
             let _ = two.on_event(c, &key(12), t1 + 1_000);
         }
         assert!(two.aborted().is_none() && two.took_part(2), "seat 2 keeps its table");
-        // A seat 3 that did not hear seat 2 either holds it quiet itself: its
-        // vote was late, not withheld, and it takes the certificate as it always
-        // did -- `D-065`'s silent voter, which the guard must not fork.
+        // A seat 3 that did not hear seat 2 either, by its own stage's deadline,
+        // holds it quiet itself: its vote was late, not withheld, and it takes
+        // the certificate as it always did -- `D-065`'s silent voter, which the
+        // guard must not fork.
         let (mut late, _) = with_present(4, &[0, 1, 3]);
         for c in &copies {
             let _ = late[2].on_event(c, &keys[2], t1 + 1_000);
         }
         assert!(late[2].aborted().is_some(), "a silent voter that agrees takes it");
+        // Before its own deadline it has merely not heard seat 2 yet -- a stage
+        // that has just opened waits on every seat: held, not taken, and judged
+        // again at its deadline. Where seat 2 is heard meanwhile, not taken.
+        let (mut early, _) = with_present(4, &[0, 1, 3]);
+        for c in &copies {
+            assert!(matches!(early[2].on_event(c, &keys[2], NOW + 5_000), Err(Failed::NotYet)), "held");
+            let _ = early[2].hold(c.clone());
+        }
+        assert!(early[2].aborted().is_none(), "the wait alone agrees with nothing");
+        let _ = early[2].replay_early(&keys[2], t1 + 1_000);
+        assert!(early[2].aborted().is_some(), "at its deadline, still not heard: a late voter, and it takes it");
+        let (mut heard, _) = with_present(4, &[0, 1, 3]);
+        for c in &copies {
+            let _ = heard[2].on_event(c, &keys[2], NOW + 5_000);
+            let _ = heard[2].hold(c.clone());
+        }
+        let (_, from_two_again) = Hand::open(opening_n(4, 2), &key(12), NOW, 30_000).unwrap();
+        let _ = deliver(&mut heard[2], &from_two_again, &keys[2]);
+        let _ = heard[2].replay_early(&keys[2], t1 + 1_000);
+        assert!(heard[2].aborted().is_none(), "seat 2 heard meanwhile: not taken");
     }
 
     /// `S1-JY` (`D-086`): a certificate half the table carries puts no seat out
@@ -17769,6 +17845,14 @@ mod tests {
             let _ = two.on_event(c, &key(12), t1 + 1_000);
         }
         assert!(two.aborted().is_none() && !two.named_for_flooding(2), "seat 2 is not put out for good");
+        // Nor does a seat 3 that never heard seat 2 take it: it holds seat 2
+        // quiet, not a flooder, and a silent voter agrees only with what it
+        // holds itself.
+        let (mut quiet, _) = with_present(4, &[0, 1, 3]);
+        for c in &copies {
+            let _ = quiet[2].on_event(c, &keys[2], t1 + 1_000);
+        }
+        assert!(quiet[2].aborted().is_none() && !quiet[2].named_for_flooding(2), "seat 3 does not put seat 2 out for good");
     }
 
     /// `D-065`'s early question: seat 0 never received seat 4's opening, while
