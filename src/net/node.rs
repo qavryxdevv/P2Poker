@@ -567,7 +567,10 @@ pub enum NodeEvent {
     /// cannot go on -- or `None` once it is safe again. The window recommends
     /// leaving. `stuck`: the running hand stands, so the window may cover it;
     /// otherwise it waits for a hand not being played (the owner's rule).
-    TableUnsafe { why: Option<String>, stuck: bool },
+    /// `ask`: the node asks -- a new word, or the same one again after
+    /// `UNSAFE_ASK_AGAIN` -- and a *Stay* given to the last word no longer
+    /// holds; without it only `stuck` moved under the word.
+    TableUnsafe { why: Option<String>, stuck: bool, ask: bool },
     /// `S1-IX`, `PROTOCOL.md` §6.3 and §6.4: this table has stopped at a
     /// hand's boundary, because other seats finished that hand with a
     /// different result from this client's own -- and, once it has, the game

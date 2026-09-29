@@ -1053,14 +1053,14 @@ mod tests {
             s.table_view().log.iter().any(|l| l.text.contains("flooded the table's connection")),
             "the table's log says who flooded it"
         );
-        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()), stuck: false });
+        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()), stuck: false, ask: true });
         let (why, first) = s.table_view().unsafe_note.expect("said");
         assert!(why.contains("flooded"));
         assert!(s.table_view().unsafe_may_show, "no hand being played");
-        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()), stuck: false });
+        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()), stuck: false, ask: true });
         let (_, second) = s.table_view().unsafe_note.expect("said again");
         assert!(second > first, "asked again");
-        s.apply(NodeEvent::TableUnsafe { why: None, stuck: false });
+        s.apply(NodeEvent::TableUnsafe { why: None, stuck: false, ask: false });
         assert_eq!(s.table_view().unsafe_note, None, "safe again");
         s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for flooding".into(), flooded: true });
         let v = s.table_view();

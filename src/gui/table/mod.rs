@@ -1678,14 +1678,20 @@ fn window_heading(ui: &mut egui::Ui, title: &str, closable: bool) -> bool {
 /// `D-051`: the question about a table that is not safe, if it is to be asked
 /// now -- its words and its serial. Not once *Stay* closed that serial; and
 /// `S1-JR`, the owner's rule: never over a hand being played, and never over
-/// another question the player is asked about the table -- one at a time.
-fn unsafe_question(view: &TableView, closed: u64) -> Option<(&String, &u64)> {
+/// another question the player is asked about the table -- the opponent's, or
+/// the table stopped (`S1-IX`) -- one at a time.
+fn unsafe_question<'a>(view: &'a TableView, state: &TableUi) -> Option<(&'a String, &'a u64)> {
+    let stopped_asked = view
+        .stopped
+        .as_ref()
+        .is_some_and(|s| s.ended.is_some() || s.serial != state.stopped_closed);
     view.unsafe_note.as_ref().map(|(why, serial)| (why, serial)).filter(|(_, n)| {
         view.unsafe_may_show
-            && **n != closed
+            && **n != state.unsafe_closed
             && view.out_for_good.is_none()
             && view.lost.is_none()
             && view.opponent_gone_s.is_none()
+            && !stopped_asked
     })
 }
 
@@ -1814,7 +1820,7 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
     // `D-051`, the owner: where the table cannot put out what floods it, the
     // honest players are told it is not safe and that leaving is recommended.
     // Stay closes the question until the node says it again.
-    if let Some((why, serial)) = unsafe_question(view, state.unsafe_closed) {
+    if let Some((why, serial)) = unsafe_question(view, state) {
         egui::Window::new("Not safe")
             .id(egui::Id::new("table-not-safe"))
             .title_bar(false)
@@ -2287,22 +2293,28 @@ mod tests {
     /// the table -- and not again once *Stay* closed its serial.
     #[test]
     fn the_not_safe_question_is_asked_only_where_it_may_be() {
+        let closed = |n: u64| TableUi { unsafe_closed: n, ..TableUi::default() };
         let mut v = TableView::waiting("Riverside".into(), 6);
-        assert!(unsafe_question(&v, 0).is_none(), "nothing said");
+        assert!(unsafe_question(&v, &closed(0)).is_none(), "nothing said");
         v.unsafe_note = Some(("seat 2 sent a shuffle proof that does not hold".into(), 3));
-        assert!(unsafe_question(&v, 0).is_none(), "a hand being played");
+        assert!(unsafe_question(&v, &closed(0)).is_none(), "a hand being played");
         v.unsafe_may_show = true;
-        assert_eq!(unsafe_question(&v, 0).map(|(_, n)| *n), Some(3), "asked");
-        assert!(unsafe_question(&v, 3).is_none(), "Stay closed it");
-        assert!(unsafe_question(&v, 2).is_some(), "an older Stay closes no newer word");
+        assert_eq!(unsafe_question(&v, &closed(0)).map(|(_, n)| *n), Some(3), "asked");
+        assert!(unsafe_question(&v, &closed(3)).is_none(), "Stay closed it");
+        assert!(unsafe_question(&v, &closed(2)).is_some(), "an older Stay closes no newer word");
         v.opponent_gone_s = Some(40);
-        assert!(unsafe_question(&v, 0).is_none(), "the question about the opponent is up");
+        assert!(unsafe_question(&v, &closed(0)).is_none(), "the question about the opponent is up");
         v.opponent_gone_s = None;
+        v.stopped = Some(StoppedView { hand_id: 9, seats: vec!["Carol".into()], ended: None, serial: 1 });
+        assert!(unsafe_question(&v, &closed(0)).is_none(), "the table stopped is asked about first");
+        let waited = TableUi { stopped_closed: 1, ..TableUi::default() };
+        assert!(unsafe_question(&v, &waited).is_some(), "and once the player waits on it, this one");
+        v.stopped = None;
         v.lost = Some("gone".into());
-        assert!(unsafe_question(&v, 0).is_none(), "not at the table any more");
+        assert!(unsafe_question(&v, &closed(0)).is_none(), "not at the table any more");
         v.lost = None;
         v.out_for_good = Some("out".into());
-        assert!(unsafe_question(&v, 0).is_none(), "out of the game");
+        assert!(unsafe_question(&v, &closed(0)).is_none(), "out of the game");
     }
 
     /// A table with nobody at it says what it is waiting for rather than

@@ -1777,6 +1777,10 @@ pub struct Hand {
     /// and nothing else (`D-010`): it moves no chip and unseats nobody; the
     /// node reads it to tell the player the table is not safe.
     proven_cheat: Option<(SeatIdx, u16, bool)>,
+    /// `S1-JR`: this hand was ended by a certificate -- this client's own abort
+    /// naming the seats a certificate named, or a peer's carrying one. The
+    /// table settled it, and no count of hands called off takes it.
+    cert_ended: bool,
     /// `S1-JS`: the (stage, seat) pairs this client has asked about early --
     /// `D-065`'s question, once each.
     questions: BTreeSet<(u64, SeatIdx)>,
@@ -2322,6 +2326,7 @@ impl Hand {
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
                 proven_cheat: None,
+                cert_ended: false,
                 questions: BTreeSet::new(),
                 settled_pots: Vec::new(),
                 settled_gain: Vec::new(),
@@ -5875,6 +5880,8 @@ impl Hand {
         }
 
         self.give_up(Abort::Told { cause: body.cause });
+        // `S1-JR`: ended by the certificate that named its seats.
+        self.cert_ended = body.cause == 1 && !body.attributed.is_empty();
         // `S1-JR`: another seat's evidence, which this client's own check just
         // confirmed (causes 2 and 3 are accepted on nothing less).
         if matches!(body.cause, 2 | 3) && self.proven_cheat.is_none() {
@@ -6746,6 +6753,26 @@ impl Hand {
     /// that was not aborted at all.
     pub fn late_settled(&self) -> bool {
         self.late.as_ref().is_some_and(|l| l.closed.is_some())
+    }
+
+    /// `S1-JR`: whether a certificate ended this hand -- the table settled it.
+    /// A hand in which some seat was acted for, then given up at a stage's
+    /// budget, was not.
+    pub fn ended_by_certificate(&self) -> bool {
+        self.cert_ended && matches!(self.phase, Phase::Aborted(_))
+    }
+
+    /// `S1-JR`: the seats still in the game at this boundary -- at the table,
+    /// with chips, not out for good -- whoever the running hand deals in. A
+    /// hand of two at a table of three such seats is no heads-up game: the
+    /// third seat, certified out and kept out, is a player all the same.
+    pub fn seats_in_the_game(&self) -> usize {
+        let out = self.out_for_good();
+        self.open
+            .seats
+            .iter()
+            .filter(|(s, _, _)| self.boundary_stack_of(*s) > 0 && !out.contains(s))
+            .count()
     }
 
     // ---------------------------------------------------------------------
@@ -8649,12 +8676,14 @@ impl Hand {
         // certificate that named it is an accusation on a peer's word, and
         // `HandAbort::consistent` refuses that shape in both directions.
         // D-036: every seat the certificate names, in seat order.
+        let by_cert = cert_hash.is_some() && !named.is_empty();
         if let Some(h) = cert_hash.filter(|_| !named.is_empty()) {
             body.attributed = named;
             body.cert_hash = Some(h);
         }
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
         self.give_up(Abort::Told { cause: 1 });
+        self.cert_ended = by_cert;
         Ok(vec![Send::Broadcast(bytes)])
     }
 
@@ -10867,8 +10896,16 @@ impl Hand {
     /// nothing and sees *sitting in at the next hand*. A client told to stay
     /// out simply does not call `sit_in_request`.
     pub fn may_ask_to_sit_in(&self) -> bool {
-        self.settled_terminal().is_some()
-            && !self.open.required.contains(&self.open.my_seat)
+        self.settled_terminal().is_some() && self.kept_out()
+    }
+
+    /// `S1-JR`: this client sits at the table with chips, outside `R(k)`, and
+    /// no return of it is banked at this boundary -- whether it could ask here
+    /// or not: at a boundary the table aborted there is no return to ask for,
+    /// and a seat kept out behind hands a rogue calls off is kept out all the
+    /// same.
+    pub fn kept_out(&self) -> bool {
+        !self.open.required.contains(&self.open.my_seat)
             && self.occupies_a_seat(self.open.my_seat)
             && self.boundary_stack_of(self.open.my_seat) > 0
             && !self.returned.contains(&self.open.my_seat)
@@ -15943,6 +15980,7 @@ mod tests {
         assert_eq!(aborted.stack_at_boundary(1), 10_000, "an abort restores every stack, and the boundary stack says so");
         assert!(aborted.stacks().is_empty(), "while stacks() has nothing to say outside play -- the trap S1-CR fell into");
         assert!(!aborted.may_ask_to_sit_in(), "nobody asks at an aborted boundary");
+        assert!(!aborted.ended_by_certificate(), "`S1-JR`: given up on its own deadline, not ended by a certificate");
         assert!(aborted.vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap().is_empty());
         let refused = aborted.on_event(&cert, &keys[1], NOW);
         assert!(
@@ -15965,6 +16003,8 @@ mod tests {
         assert!(bys.aborted().is_some(), "the bystander's twin ended on an abort");
         assert!(bys.terminal().is_some(), "and holds a terminal");
         assert!(!bys.may_ask_to_sit_in(), "a bystander asks nothing at an aborted boundary");
+        assert!(bys.kept_out(), "`S1-JR`: but it is kept out all the same, with chips, outside the roster");
+        assert_eq!(bys.seats_in_the_game(), 3, "`S1-JR`: three seats in the game, whatever the hand dealt in");
         assert!(bys.sit_in_request(&keys[2], late_now).unwrap().is_none());
         // A hand aborted at stage 0 has no successor of its own to derive; that
         // is `next_hand`'s existing answer and not the return's business.
@@ -17457,6 +17497,8 @@ mod tests {
             }
             assert!(hands[i].named_for_flooding(3) && hands[i].named_for_flooding(4), "seat {i}: both named with the cause");
             assert_eq!(hands[i].out_for_good(), vec![3, 4], "seat {i}: out for good");
+            assert!(hands[i].ended_by_certificate(), "seat {i}: `S1-JR`, the table settled it -- no hand called off");
+            assert_eq!(hands[i].seats_in_the_game(), 3, "seat {i}: the two out for good are in the game no more");
             assert_eq!(
                 certificate_cause(&copies[i], &hands[i].open.table_id, hands[i].open.hand_id, 3),
                 Some(CAUSE_FLOOD),

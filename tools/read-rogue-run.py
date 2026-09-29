@@ -47,7 +47,7 @@ def lines(path):
 def read_node(path):
     node = {
         'opened': [], 'over': [], 'voided': {}, 'not_safe': None, 'certified': 0,
-        'first_hand_at': None, 'genesis': {}, 'said': 0, 'stands': [],
+        'first_hand_at': None, 'genesis': {}, 'said': 0, 'stands': [], 'asked_opponent': [],
     }
     current = None
     counted = set()
@@ -75,10 +75,13 @@ def read_node(path):
         m = NOT_SAFE.search(text)
         if m:
             node['said'] += 1
-            if '[the running hand stands]' in text:
-                node['stands'].append(secs)
             if node['not_safe'] is None:
                 node['not_safe'] = (secs, m.group(1))
+        if 'the running hand stands (S1-JR)' in text:
+            node['stands'].append(secs)
+        # Heads-up, the window's own question about the opponent (D-007).
+        if 'held back its part of the cards' in text or 'on the clock for' in text:
+            node['asked_opponent'].append(secs)
         if CERTIFIED.search(text):
             node['certified'] += 1
     return node
@@ -112,11 +115,14 @@ def main():
             secs, why = n['not_safe']
             after = '' if n['first_hand_at'] is None else ', %.0f s after its first hand' % (secs - n['first_hand_at'])
             print('         NOT SAFE at %.1f s%s: %s' % (secs, after, why[:200]))
-            print('         said %d times; with the running hand standing %d times%s' % (
+            print('         asked %d times; the running hand said to stand %d times%s' % (
                 n['said'], len(n['stands']),
                 '' if not n['stands'] else ', first at %.1f s' % n['stands'][0]))
         else:
             print('         never said the table is not safe')
+        if n['asked_opponent']:
+            print('         asked about the heads-up opponent %d times, first at %.1f s' % (
+                len(n['asked_opponent']), n['asked_opponent'][0]))
         if n['certified']:
             print('         certificate lines: %d' % n['certified'])
 

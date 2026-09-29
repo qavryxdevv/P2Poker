@@ -175,6 +175,10 @@ param(
     # never held for ever. Needs a `--features fault-harness` binary.
     [string]$Rogue = '',
     [ValidateRange(0, 32)][int]$RogueNode = 1,
+    # Several nodes at once, comma-separated -- rogues that hold the lowest seat
+    # together keep any certificate from completing (`D-036`, `D-066`). Takes
+    # the place of `-RogueNode`.
+    [string]$RogueNodes = '',
     [ValidateRange(1, 100000)][int]$RogueFromHand = 1,
     # `-LinkDownAt <s> -LinkDownFor <s>` takes one node's LINE away without
     # killing it. The process, its Hand, its chain position and its keys all
@@ -549,7 +553,10 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $offAt = if ($OfflineAt -gt 0 -and (($offList.Count -eq 0 -and $i -eq $OfflineNode) -or ($offList -contains $i))) { $OfflineAt } else { 0 }
     $noAnswerForNode = ($noAnswerList -contains 'all') -or ($noAnswerList -contains "$i")
     $deafToForNode = if ($DeafToFor -gt 0 -and $i -eq $DeafToNode) { "$DeafToSeat,$DeafToAt,$DeafToFor" } else { '' }
-    $rogueForNode = if ($Rogue -and $i -eq $RogueNode) { $Rogue } else { '' }
+    # Not `$rogueNodes`: a local of that name IS the parameter.
+    $rogueList = @("$RogueNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+    if ($rogueList.Count -eq 0) { $rogueList = @($RogueNode) }
+    $rogueForNode = if ($Rogue -and ($rogueList -contains $i)) { $Rogue } else { '' }
     $afkForNode = if ($AfkAt -gt 0 -and $i -eq $AfkNode) { $AfkAt } else { 0 }
     $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
     # `D-051`. Not `$floodNodes`: a local of that name IS the parameter.
@@ -681,7 +688,8 @@ if ($DivergeAt -gt 0) {
     Write-Host "    (needs a binary built with --features fault-harness)"
 }
 if ($Rogue) {
-    Write-Host "==> n$RogueNode plays a rogue's client from hand ${RogueFromHand}: $Rogue (S1-JR)"
+    $roguesShown = if ("$RogueNodes" -ne '') { ("$RogueNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { "n$_" }) -join ', ' } else { "n$RogueNode" }
+    Write-Host "==> $roguesShown play(s) a rogue's client from hand ${RogueFromHand}: $Rogue (S1-JR)"
     Write-Host "    (needs a binary built with --features fault-harness)"
 }
 if ($StallJoin -gt 0) {
