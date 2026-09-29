@@ -50,6 +50,12 @@ use crate::table::join::{
 /// The capability every seat must declare (§4.3).
 pub const DECK_CAPABILITY: &[u8] = b"deck/bs-bg12-secp256k1/1";
 
+/// `S1-JM`: how long a founder left alone keeps its table set to start before
+/// a stranger may fill it afresh -- time for a seat of its own, given back for
+/// a short fault, to ask again (`S1-FY`: 2 s after, and once more 30 s after an
+/// asking that failed, which takes up to the join's own 30 s).
+pub const LEFT_ALONE_WAIT_MS: u64 = 90_000;
+
 /// What this client should put on the wire as a result of a step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Send {
@@ -271,11 +277,16 @@ pub struct Formation {
     /// play too.
     admitted: bool,
     /// `S1-JM`: at the founder, every key of a roster it adopted at the
-    /// advert's minimum or above -- a seat that learnt the table was set to
-    /// start, and kept it on disk (`S1-JJ`). One that asks again is no stranger
-    /// to a table set to start below its minimum. A key seated only while the
-    /// table was short never learnt it, and is a stranger like any other.
+    /// advert's minimum or above -- a seat that will have learnt the table was
+    /// set to start and kept it on disk (`S1-JJ`), unless it missed that list.
+    /// One that asks again is no stranger to a table set to start below its
+    /// minimum. A key seated only while the table was short never learnt it,
+    /// and is a stranger like any other; so is one that showed it had not
+    /// learnt it ([`Formation::forget_seated_before`]).
     seated_before: std::collections::BTreeSet<[u8; 32]>,
+    /// `S1-JM`: when the founder was left alone at a table set to start, on its
+    /// own clock -- a stranger fills it afresh only after [`LEFT_ALONE_WAIT_MS`].
+    alone_since_ms: Option<u64>,
 }
 
 /// What this client may need to say again.
@@ -351,6 +362,7 @@ impl Formation {
             hold_ready: false,
             admitted: false,
             seated_before: std::collections::BTreeSet::new(),
+            alone_since_ms: None,
         })
     }
 
@@ -413,6 +425,7 @@ impl Formation {
             hold_ready: false,
             admitted: false,
             seated_before: std::collections::BTreeSet::new(),
+            alone_since_ms: None,
         };
         f.said.list = Some(list_bytes.to_vec());
         let out = f.adopt(&list, now_ms)?;
@@ -520,6 +533,7 @@ impl Formation {
                 hold_ready: false,
                 admitted: false,
                 seated_before: std::collections::BTreeSet::new(),
+                alone_since_ms: None,
             },
             bytes,
         ))
@@ -909,14 +923,18 @@ impl Formation {
         // (`S1-JJ`).
         //
         // A founder left alone fills its table afresh -- but only once a
-        // stranger comes, which is when it stops being set to start (below).
-        // Kept set to start, it would refuse every stranger who came alone, and
-        // its table would never fill; un-set the moment it was left alone, a
-        // seat of its own given back for a short fault, asking again seconds
-        // later (`S1-FY`), found a table no longer set to start, and the two of
-        // them waited for the minimum instead of playing heads-up.
+        // stranger comes after `LEFT_ALONE_WAIT_MS`, which is when it stops
+        // being set to start (below). Kept set to start, it would refuse every
+        // stranger who came alone, and its table would never fill; un-set the
+        // moment it was left alone, or by a stranger's asking a second later, a
+        // seat of its own given back for a short fault, asking again (`S1-FY`),
+        // found a table no longer set to start, and the two of them waited for
+        // the minimum instead of playing heads-up.
         let known = self.seated_before.contains(&sender);
-        let afresh = self.started && self.roster.len() < 2 && !known;
+        let waited = self
+            .alone_since_ms
+            .is_none_or(|at| now_ms.saturating_sub(at) >= LEFT_ALONE_WAIT_MS);
+        let afresh = self.started && self.roster.len() < 2 && !known && waited;
         if self.started
             && !afresh
             && !known
@@ -966,6 +984,7 @@ impl Formation {
                 if afresh {
                     self.started = false;
                 }
+                self.alone_since_ms = None;
 
                 // The copy the joiner named, echoed back. Sending the
                 // newest instead would fail the joiner's own check that the
@@ -1146,6 +1165,11 @@ impl Formation {
         self.ratified_bytes.clear();
         self.sent_ready = false;
         self.session = None;
+        // `S1-JM`: left alone -- a stranger fills the table afresh only after
+        // `LEFT_ALONE_WAIT_MS`, time for a seat of its own to come back.
+        if self.roster.len() < 2 {
+            self.alone_since_ms = Some(now_ms);
+        }
 
         let list = PlayerList {
             roster: self.roster.seats().to_vec(),
@@ -1158,6 +1182,23 @@ impl Formation {
         let mut out = vec![Send::Broadcast(list_bytes)];
         out.extend(self.adopt(&list, now_ms)?);
         Ok(out)
+    }
+
+    /// `S1-JM`: a seat that heard every seat of the table and still did not say
+    /// it was ready took the roster for short -- it never learnt the table was
+    /// set to start (a client of 0.1.5, which keeps nothing on disk, or one that
+    /// missed the list at the minimum) -- and is a stranger to it from now on:
+    /// back at a table below its minimum it would only hold the set up again,
+    /// and be given back again, for as long as its window stays open.
+    pub fn forget_seated_before(&mut self, key: &[u8; 32]) {
+        self.seated_before.remove(key);
+    }
+
+    /// `S1-JB`: the wall clock jumped by `by_ms`. The moment this founder was
+    /// left alone moves with it, so its wait is the time that passed: a clock
+    /// put back an hour does not keep strangers out for an hour.
+    pub fn rebase_clock(&mut self, by_ms: i64) {
+        crate::clock::rebase_opt(&mut self.alone_since_ms, by_ms);
     }
 
     /// The joiner's handling of whatever came back.
@@ -3219,9 +3260,10 @@ mod tests {
     }
 
     /// `S1-JM`: a founder left alone fills its table afresh once a stranger
-    /// comes -- kept set to start, it would have refused every stranger who
-    /// came alone, and its table would never have filled. Until one comes it is
-    /// still set to start: a seat of its own may come back to it
+    /// comes after `LEFT_ALONE_WAIT_MS` -- kept set to start, it would have
+    /// refused every stranger who came alone, and its table would never have
+    /// filled. Until then it is still set to start and a stranger is refused:
+    /// a seat of its own may come back to it
     /// (`a_seat_given_back_finds_its_table_still_set_to_start`).
     #[test]
     fn a_founder_left_alone_fills_its_table_afresh() {
@@ -3229,15 +3271,106 @@ mod tests {
         seat_players(&mut t, &a, hash, &[2, 3]);
         assert!(t.founder.set_to_start());
         t.founder.release_seat_before_the_first_hand(&peer(2), NOW + 1_000).expect("given back");
-        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 1_001).expect("given back");
+        let alone = NOW + 1_001;
+        t.founder.release_seat_before_the_first_hand(&peer(3), alone).expect("given back");
         assert_eq!(t.founder.roster().len(), 1);
         assert!(t.founder.set_to_start(), "alone, and still set to start until a stranger comes");
 
-        assert!(a_stranger_asks(&mut t, &a, hash, 5, NOW + 2_000).is_ok(), "a stranger is seated");
+        let early = a_stranger_asks(&mut t, &a, hash, 5, alone + LEFT_ALONE_WAIT_MS - 1);
+        assert!(
+            matches!(early, Err(Failed::Refused { reason, .. }) if reason == RejectReason::TableFull.code()),
+            "a stranger while the founder's own seats may still come back: {early:?}"
+        );
+        assert!(t.founder.set_to_start(), "and the table is still set to start");
+
+        let later = alone + LEFT_ALONE_WAIT_MS;
+        assert!(a_stranger_asks(&mut t, &a, hash, 5, later).is_ok(), "a stranger after the wait is seated");
         assert!(!t.founder.set_to_start(), "and the advert's minimum is the founder's own again");
-        assert!(a_stranger_asks(&mut t, &a, hash, 6, NOW + 3_000).is_ok(), "and another");
+        assert!(a_stranger_asks(&mut t, &a, hash, 6, later + 1_000).is_ok(), "and another");
         assert_eq!(t.founder.roster().len(), 3);
         assert!(t.founder.set_to_start(), "set to start again at its minimum");
+    }
+
+    /// `S1-JM`, `S1-JB`: the moment a founder was left alone moves with a jump
+    /// of the wall clock, so its wait is the time that passed -- a clock put
+    /// back an hour does not keep strangers out for an hour.
+    #[test]
+    fn a_founder_left_alone_waits_the_time_that_passed_across_a_clock_jump() {
+        let (mut t, _, a, hash) = found(6, 3);
+        seat_players(&mut t, &a, hash, &[2, 3]);
+        t.founder.release_seat_before_the_first_hand(&peer(2), NOW + 1_000).expect("given back");
+        let alone = NOW + 1_001;
+        t.founder.release_seat_before_the_first_hand(&peer(3), alone).expect("given back");
+        let back: i64 = 3_600_000;
+        t.founder.rebase_clock(-back);
+        let later = alone - back.unsigned_abs() + LEFT_ALONE_WAIT_MS;
+        assert!(a_stranger_asks(&mut t, &a, hash, 5, later).is_ok(), "the wait is over by the clock as it reads now");
+        assert!(!t.founder.set_to_start(), "and the table fills afresh");
+    }
+
+    /// `S1-JM`, `D-044`: a stranger whose seat brings a table set to start back
+    /// to its minimum is seated -- the table is whole again -- and knows the
+    /// table is set from its acceptance.
+    #[test]
+    fn a_stranger_that_makes_a_set_table_whole_again_is_seated() {
+        let (mut t, _, a, hash) = found(6, 4);
+        seat_players(&mut t, &a, hash, &[2, 3, 4]);
+        t.founder.release_seat_before_the_first_hand(&peer(4), NOW + 1_000).expect("given back");
+        assert_eq!(t.founder.roster().len(), 3);
+        assert!(a_stranger_asks(&mut t, &a, hash, 5, NOW + 2_000).is_ok(), "three and the stranger make four");
+        assert_eq!(t.founder.roster().len(), 4);
+        assert!(t.founder.set_to_start());
+    }
+
+    /// `S1-JM`: a stranger refused for something of its own -- its buy-in --
+    /// leaves a founder left alone as it was: set to start, for a seat of its
+    /// own to come back to.
+    #[test]
+    fn a_stranger_refused_for_its_buyin_leaves_a_lone_founder_set_to_start() {
+        let (mut t, _, a, hash) = found(6, 3);
+        seat_players(&mut t, &a, hash, &[2, 3]);
+        t.founder.release_seat_before_the_first_hand(&peer(2), NOW + 1_000).expect("given back");
+        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 1_001).expect("given back");
+        let now = NOW + 1_001 + LEFT_ALONE_WAIT_MS;
+        let table_id = t.founder.table_id();
+        let (_, request) = Formation::join(
+            key(5),
+            a.clone(),
+            hash,
+            table_id,
+            peer(5),
+            "player 5".into(),
+            50,
+            None,
+            None,
+            [5; 32],
+            now,
+            None,
+        )
+        .unwrap();
+        let out = t.founder.on_join_request(&request, &peer(5), false, now).expect("answered");
+        assert!(out.iter().all(|s| matches!(s, Send::Reply(_))), "refused, and no roster said");
+        assert_eq!(t.founder.roster().len(), 1);
+        assert!(t.founder.set_to_start(), "a refused stranger un-sets nothing");
+    }
+
+    /// `S1-JM`: a seat that showed it never learnt the table was set to start
+    /// -- it heard every seat and did not say it was ready, and was given back
+    /// for it (`run.rs`) -- is forgotten, and asks again as a stranger: back
+    /// below the minimum it would only hold the set up again.
+    #[test]
+    fn a_seat_that_never_learnt_the_set_is_a_stranger_once_forgotten() {
+        let (mut t, _, a, hash) = found(6, 4);
+        seat_players(&mut t, &a, hash, &[2, 3, 4]);
+        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 1_000).expect("given back");
+        t.founder.release_seat_before_the_first_hand(&peer(4), NOW + 1_001).expect("given back");
+        t.founder.forget_seated_before(&key(3).verifying_key().to_bytes());
+        let refused = a_stranger_asks(&mut t, &a, hash, 3, NOW + 2_000);
+        assert!(
+            matches!(refused, Err(Failed::Refused { reason, .. }) if reason == RejectReason::TableFull.code()),
+            "forgotten, and a stranger to the table: {refused:?}"
+        );
+        assert!(a_stranger_asks(&mut t, &a, hash, 4, NOW + 3_000).is_ok(), "a seat not forgotten comes back");
     }
 
     /// `S1-JM`: a seat given back for a short fault, which left its founder
@@ -3257,8 +3390,15 @@ mod tests {
         assert_eq!(t.founder.roster().len(), 1);
         t.joiners.clear();
 
+        // A stranger turned away before asks again while the founder is alone,
+        // ahead of the seat: it un-sets nothing.
+        let early = a_stranger_asks(&mut t, &a, hash, 9, NOW + 30_000);
+        assert!(matches!(early, Err(Failed::Refused { .. })), "{early:?}");
+
+        // The seat's first asking failed (its line was still down, and the join
+        // waited out its 30 s); it asks again 30 s after that.
         let table_id = t.founder.table_id();
-        let now = NOW + 3_000;
+        let now = NOW + 1_002 + 62_000;
         let (j, request) = Formation::join(
             key(2),
             a.clone(),

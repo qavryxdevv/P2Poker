@@ -1782,6 +1782,9 @@ impl TableRun {
         if let Some(h) = self.hand.as_mut() {
             h.rebase_clock(by_ms);
         }
+        if let Some(f) = self.table.as_mut() {
+            f.rebase_clock(by_ms);
+        }
     }
 
     fn new(
@@ -10725,6 +10728,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // `S1-JF`: the seats' own words, and whether the founder's
                                 // reading is what made the trouble.
                                 let (by, founders) = marks.iter().find(|m| m.0 == x).map_or((by, false), |m| (m.2, m.6));
+                                // `S1-JM`: given back for never saying it was ready, having
+                                // heard every seat -- the last road below.
+                                let stalled = !(founders && cannot == 0 && by < 2) && cannot + by == 0;
+                                let stalled_key = t
+                                    .table
+                                    .as_ref()
+                                    .and_then(|f| f.roster().seats().iter().find(|e| e.seat == x).map(|e| e.app_public_key));
                                 let why = if founders && cannot == 0 && by < 2 {
                                     format!(
                                         "was not heard in the table's group by its founder, which hears more than half the table, for {} s before the table was set",
@@ -10742,6 +10752,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 t.ready_stall.remove(&x);
                                 if let Some((peer, tox_key)) = entry {
                                     release_the_seat!(t, x, peer, tox_key, why, now);
+                                }
+                                // `S1-JM`: such a seat took the roster for short -- it never
+                                // learnt the table was set to start -- and is a stranger to it
+                                // from now on, once it is off the roster: back below the
+                                // minimum it would only hold the set up again.
+                                if stalled {
+                                    if let (Some(f), Some(k)) = (t.table.as_mut(), stalled_key) {
+                                        if f.roster().seat_of(&k).is_none() {
+                                            f.forget_seated_before(&k);
+                                        }
+                                    }
                                 }
                             }
                             // A seat that speaks of an older roster missed the last one:
@@ -19214,6 +19235,7 @@ mod tests {
         }
         let run = include_str!("run.rs");
         let hand = include_str!("../table/hand.rs");
+        let formation = include_str!("formation.rs");
         // What looks like a moment on the wall clock and is not one.
         let not_moments: [(&str, &str); 4] = [
             ("resend_at", "a key of the hand and its sequence, `(hand_id << 20) | sequence`"),
@@ -19225,6 +19247,7 @@ mod tests {
         for (source, header, mover) in [
             (run, "struct TableRun {", "    fn rebase_clock(&mut self, by_ms: i64) {"),
             (hand, "pub struct Hand {", "    pub fn rebase_clock(&mut self, by_ms: i64) {"),
+            (formation, "pub struct Formation {", "    pub fn rebase_clock(&mut self, by_ms: i64) {"),
         ] {
             let moved = method(source, mover);
             for (name, ty) in fields(source, header) {
@@ -19237,6 +19260,12 @@ mod tests {
         assert!(
             unmoved.is_empty(),
             "fields that look like moments on the wall clock, neither moved by rebase_clock nor named as not one: {unmoved:?}"
+        );
+        // And the table's move carries the running hand's and the formation's own.
+        let table_mover = method(run, "    fn rebase_clock(&mut self, by_ms: i64) {");
+        assert!(
+            table_mover.contains("h.rebase_clock(by_ms)") && table_mover.contains("f.rebase_clock(by_ms)"),
+            "TableRun::rebase_clock moves the hand's moments and the formation's too"
         );
         // And the ones named as not moments are there to be named.
         for (name, why) in not_moments {
@@ -21056,6 +21085,29 @@ mod a_joiner_before_the_first_hand {
             read_back.contains("crate::storage::set_to_start::was(&profile_dir, &key, now)")
                 && read_back.contains("f = f.with_set_to_start();"),
             "read back for the table being joined, before the formation is used"
+        );
+    }
+
+    /// `S1-JM`: a seat given back for never saying it was ready, having heard
+    /// every seat, took the roster for short -- it never learnt the table was
+    /// set to start -- and is forgotten as a seat of the roster at the minimum,
+    /// once it is off the roster; given back for any other trouble, it is not.
+    #[test]
+    fn a_seat_that_never_said_it_was_ready_is_forgotten_as_seated_before() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let stalled = code
+            .find("let stalled = !(founders && cannot == 0 && by < 2) && cannot + by == 0;")
+            .expect("the road of a seat that heard everybody and did not say it was ready");
+        let rest = &code[stalled..];
+        let why = rest.find("format!(\"heard every seat and did not say it was ready").expect("its reason");
+        let released = rest.find("release_the_seat!(t, x, peer, tox_key, why, now);").expect("the release");
+        let forgotten = rest.find("f.forget_seated_before(&k);").expect("the key forgotten");
+        assert!(why < released && released < forgotten, "forgotten after the release, on that road");
+        assert!(
+            rest[released..forgotten].contains("if stalled {")
+                && rest[released..forgotten].contains("if f.roster().seat_of(&k).is_none() {"),
+            "only on that road, and only once the seat is off the roster"
         );
     }
 
