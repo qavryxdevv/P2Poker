@@ -5880,8 +5880,11 @@ impl Hand {
         }
 
         self.give_up(Abort::Told { cause: body.cause });
-        // `S1-JR`: ended by the certificate that named its seats.
-        self.cert_ended = body.cause == 1 && !body.attributed.is_empty();
+        // `S1-JR`: ended by the certificate that named its seats -- and a bare
+        // abort arriving after one takes nothing back.
+        if body.cause == 1 && !body.attributed.is_empty() {
+            self.cert_ended = true;
+        }
         // `S1-JR`: another seat's evidence, which this client's own check just
         // confirmed (causes 2 and 3 are accepted on nothing less).
         if matches!(body.cause, 2 | 3) && self.proven_cheat.is_none() {
@@ -6765,13 +6768,17 @@ impl Hand {
     /// `S1-JR`: the seats still in the game at this boundary -- at the table,
     /// with chips, not out for good -- whoever the running hand deals in. A
     /// hand of two at a table of three such seats is no heads-up game: the
-    /// third seat, certified out and kept out, is a player all the same.
+    /// third seat, certified out and kept out, is a player all the same --
+    /// unless its player left by its own word.
     pub fn seats_in_the_game(&self) -> usize {
         let out = self.out_for_good();
         self.open
             .seats
             .iter()
             .filter(|(s, _, _)| self.boundary_stack_of(*s) > 0 && !out.contains(s))
+            // Nor a seat outside the roster whose player left by its own
+            // signed word: the window reads it gone, and so does this.
+            .filter(|(s, _, _)| !(self.leave_words.contains_key(s) && !self.open.required.contains(s)))
             .count()
     }
 
@@ -16797,6 +16804,21 @@ mod tests {
         again[0].note_gone_by_their_word(&[3, 4]);
         again[0].note_gone_by_their_word(&[]);
         assert!(bytes_of_sends(again[0].vote_on_timeouts(&keys[0], early, 0).unwrap()).is_empty());
+    }
+
+    /// `S1-JR`: a seat outside the roster whose player left by its own signed
+    /// word is in the game no more -- the window reads the two left as a
+    /// heads-up game, and the node must too; kept out with chips, it was.
+    #[test]
+    fn a_seat_that_left_by_its_word_outside_the_roster_is_in_the_game_no_more() {
+        let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+        let mut o = opening3(0);
+        o.required = vec![0, 1];
+        let (mut a, _) = Hand::open(o, &keys[0], NOW, 30_000).unwrap();
+        assert_eq!(a.seats_in_the_game(), 3, "seat 2 kept out with chips is in the game");
+        let w2 = crate::net::tabletalk::leave_word(&keys[2], &a.open.table_id, NOW).unwrap();
+        a.note_leave_words(&[(2, w2)]);
+        assert_eq!(a.seats_in_the_game(), 2, "its player left by its word: two seats in the game");
     }
 
     /// `D-063`: two of three players leave by their own signed word: the seat

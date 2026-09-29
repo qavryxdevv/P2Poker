@@ -366,6 +366,7 @@ pub struct TableApp {
     pub turns: u64,
     pub strength: Option<crate::poker::strength::Strength>,
     pub turn_seat: Option<u8>,
+    pub turn_moves: u64,
     pub turn_since: Option<std::time::Instant>,
     pub turn_floor: Option<(u8, std::time::Instant)>,
     pub table_chat: VecDeque<TableLine>,
@@ -489,6 +490,9 @@ pub struct AppState {
     /// window draws the fraction left from it and nothing is sent per
     /// frame.
     pub turn_seat: Option<u8>,
+    /// `S1-JR`: how often the turn moved from one seat to another here -- a
+    /// part of the `PlayMark`.
+    pub turn_moves: u64,
     pub turn_since: Option<std::time::Instant>,
     /// `S1-FX`: heads-up, when the opponent whose turn stands came back on the
     /// line: its countdown runs from there, and no later word about the same
@@ -933,12 +937,13 @@ pub struct OpponentGone {
 }
 
 /// `S1-JR`: where the running hand is, as far as the felt shows it -- the
-/// hand, whose turn, the street, how much of the board is out, the seats
-/// dealt cards, this client's own two. A word that the hand stands -- the
+/// hand, whose turn and how often it moved, the street, how much of the
+/// board is out, the seats dealt cards, this client's own two -- a turn back
+/// at the same seat within two seconds is a move. A word that the hand stands -- the
 /// node's, or `D-058`'s about a stage -- holds while this does not move:
-/// the node reads it every two seconds, and a hand that moved in between is
-/// played again.
-pub type PlayMark = (u64, Option<u8>, Option<u16>, usize, usize, bool);
+/// the node reads the hand every two seconds and says it when it changes,
+/// and a hand that moved in between is played again.
+pub type PlayMark = (u64, Option<u8>, Option<u16>, usize, usize, bool, u64);
 
 /// `S1-JR`: how long a heads-up hand stands on the opponent's part of the
 /// cards before the player is asked -- a step's own budget, which an honest
@@ -1059,6 +1064,7 @@ impl AppState {
         std::mem::swap(&mut self.turns, &mut other.turns);
         std::mem::swap(&mut self.strength, &mut other.strength);
         std::mem::swap(&mut self.turn_seat, &mut other.turn_seat);
+        std::mem::swap(&mut self.turn_moves, &mut other.turn_moves);
         std::mem::swap(&mut self.turn_since, &mut other.turn_since);
         std::mem::swap(&mut self.turn_floor, &mut other.turn_floor);
         std::mem::swap(&mut self.table_chat, &mut other.table_chat);
@@ -3779,7 +3785,7 @@ impl AppState {
         self.hand
             .as_ref()
             .filter(|h| !h.over)
-            .map(|h| (h.hand_id, self.turn_seat, h.street, h.board.len(), h.holding.len(), h.cards.is_some()))
+            .map(|h| (h.hand_id, self.turn_seat, h.street, h.board.len(), h.holding.len(), h.cards.is_some(), self.turn_moves))
     }
 
     /// `D-068`: whether a hand is being played at any of this client's tables.
@@ -3821,6 +3827,7 @@ impl AppState {
         });
         if seat != self.turn_seat {
             self.turn_seat = seat;
+            self.turn_moves = self.turn_moves.wrapping_add(1);
             self.turn_since = anchored;
             self.turn_floor = None;
             // `D-034`: the slow opponent acted; the question is withdrawn.
@@ -6006,6 +6013,8 @@ mod tests {
         assert_eq!(said(&s), 1, "and the log is not told again");
         s.apply(NodeEvent::NotYourTurn { hand_id: 4, seat: Some(2), elapsed_ms: 0 });
         assert!(!s.table_view().unsafe_may_show, "the turn moved before the node read it again: played again");
+        s.apply(NodeEvent::NotYourTurn { hand_id: 4, seat: Some(1), elapsed_ms: 0 });
+        assert!(!s.table_view().unsafe_may_show, "and back at the same seat within the node's two seconds: still played");
         s.apply(unsafe_word(false, false));
         assert_eq!(serial(&s), Some(first));
         s.apply(NodeEvent::HandEnded { hand_id: 4, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });

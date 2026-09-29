@@ -1434,6 +1434,17 @@ struct TableRun {
     /// hand with chips and asking to be dealt in again, was not; and the last
     /// hand counted.
     return_short: (u32, Option<u64>),
+    /// `S1-JR`: the hands counted while this client heard no other seat, held
+    /// back from `voided_recent` (a bit each, and how many): counted if that
+    /// silence ended before the window asks about it, dropped if not.
+    voided_pending: (u8, u8),
+    /// `S1-JT`: the hand this client was in when it last began to hear
+    /// nobody, and its own count of returns there -- the fourth absence a
+    /// lobby answer may bring is about that hand or a later one.
+    alone_hand: Option<(u64, u8)>,
+    /// `S1-JR`: since when this client, resuming, has held no hand of the
+    /// table's.
+    resuming_since: Option<std::time::Instant>,
     /// `S1-JT`: since when this client has heard no other seat of the table --
     /// out of its group, or cut off -- the only time a word in a lobby answer
     /// about it being out for good is taken.
@@ -1907,6 +1918,9 @@ impl TableRun {
             forming_since: None,
             return_short: (0, None),
             heard_nobody_since: None,
+            voided_pending: (0, 0),
+            alone_hand: None,
+            resuming_since: None,
             ever_on_line: false,
             nobody_said: false,
             readmitted: Vec::new(),
@@ -4095,9 +4109,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.finish_said_for = None;
             $t.act_by = None;
             $t.stage_waiting = (u64::MAX, 0);
-            // `S1-JR`: the hands this client called off on a branch it drops, and
-            // its own stall, are no reading of the table it rejoins.
-            $t.voided_recent = (0, None);
+            // `S1-JR`: its own stall is no reading of the table it rejoins. The
+            // hands called off stay counted: a rogue that sends a seat adrift
+            // (a signed frame of a later hand is all it takes where it is most
+            // of the others) wiped the count clean each time.
             $t.stands = None;
             $t.overlong.clear();
             // Not the boundaries at which it asked to be dealt in again and was
@@ -4244,6 +4259,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.forming_since = None;
             $t.return_short = (0, None);
             $t.heard_nobody_since = None;
+            $t.voided_pending = (0, 0);
+            $t.alone_hand = None;
+            $t.resuming_since = None;
             $t.ever_on_line = false;
             $t.nobody_said = false;
             $t.taught.clear();
@@ -5327,9 +5345,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // (`D-051`, every vote saying so), or the fourth
                                             // absence (`D-047` point 3, the owner's ruling): every
                                             // vote an absence -- no cause, or gone long -- about
-                                            // this client's running hand or a later one, while the
-                                            // table's own opening of that hand says it came back
-                                            // `MAX_RETURNS` times already. The bytes alone cannot
+                                            // the hand this client was in as it began to hear
+                                            // nobody, or a later one, while the table's own opening
+                                            // of that hand says it came back `MAX_RETURNS` times
+                                            // already (a client cut off runs ahead alone, hand after
+                                            // hand: its running hand is no reading). The bytes alone cannot
                                             // tell a fourth absence from a first; this client's own
                                             // count can, and a rogue that replayed the table's
                                             // genuine first to a client whose line was down is
@@ -5337,11 +5357,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // hand adopted from the others' copies carries none)
                                             // takes no absence.
                                             let returns = t
-                                                .hand
-                                                .as_ref()
-                                                .filter(|h| w.hand_id >= h.hand_id())
-                                                .and_then(|h| h.returns().get(usize::from(w.seat)).copied())
-                                                .unwrap_or(0);
+                                                .alone_hand
+                                                .filter(|(hand, _)| w.hand_id >= *hand)
+                                                .map_or(0, |(_, returns)| returns);
                                             let absent = returns >= crate::protocol::constants::MAX_RETURNS
                                                 && !causes.is_empty()
                                                 && causes.iter().all(|c| {
@@ -13155,15 +13173,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // leaving by its word, a seat gone). At a table of three
                         // seats or more in the game, whatever the hand deals in: a
                         // true heads-up game is the window's own question, and the
-                        // count starts afresh. Not while this client's own line is
-                        // down by a reading nobody else can make up -- it deals alone
-                        // then, and the table does not.
-                        let mask = if own_line_down(t) {
+                        // count starts afresh. Not while this client's library says
+                        // its own line is down -- it deals alone then, and the table
+                        // does not.
+                        let voided = h.aborted().is_some() && !h.late_settled() && !h.ended_by_certificate();
+                        let mask = if library_down(t) {
                             t.voided_recent.0
                         } else if h.seats_in_the_game() < 3 {
+                            t.voided_pending = (0, 0);
                             0
+                        } else if t.heard_nobody_since.is_some() {
+                            // Hearing nobody is a reading every other seat's
+                            // silence makes -- rogues' included: held back, and
+                            // counted when the silence ends before the window
+                            // asks about it (`watch_progress`).
+                            let (bits, n) = t.voided_pending;
+                            t.voided_pending = (((bits << 1) | u8::from(voided)) & VOIDED_WINDOW_MASK, n.saturating_add(1).min(5));
+                            t.voided_recent.0
                         } else {
-                            let voided = h.aborted().is_some() && !h.late_settled() && !h.ended_by_certificate();
                             ((t.voided_recent.0 << 1) | u8::from(voided)) & VOIDED_WINDOW_MASK
                         };
                         t.voided_recent = (mask, Some(h.hand_id()));
@@ -14497,11 +14524,21 @@ fn own_line_suspect(t: &TableRun) -> bool {
         || t.group_timeouts.iter().filter(|at| at.elapsed() < OWN_LINE_WINDOW).count() >= 2
 }
 
-/// `S1-JR`: whether this client's own line is down by a reading no other seat
-/// can make up -- the library's verdict, or no other seat of the table heard
-/// at all. `own_line_suspect`'s third reading, two members timing out of the
-/// group within a minute, is what two rogues falling silent together produce:
-/// it kept the hands they called off out of the count.
+/// `S1-JR`: whether this client's own line is down -- the library's verdict,
+/// or no other seat of the table heard at all. `own_line_suspect`'s third
+/// reading, two members timing out of the group within a minute, is what two
+/// rogues falling silent together produce: it kept the hands they called off
+/// out of the count. Hearing nobody they can make too, where they are every
+/// other seat; the stands and turns wait while it lasts -- the window asks
+/// about a table nobody at can be reached -- and the hands called off are
+/// held back, not dropped (`voided_pending`).
+/// `S1-JR`: the library's own verdict on this client's line -- the one
+/// reading of it no other seat's silence can make.
+fn library_down(t: &TableRun) -> bool {
+    (t.ever_on_line && t.tox_sink.is_on_tox() && t.tox_sink.tox_connection() == 0)
+        || t.tox_down_at.is_some_and(|at| at.elapsed().as_secs() < QUIET_LIMIT_S)
+}
+
 fn own_line_down(t: &TableRun) -> bool {
     (t.ever_on_line && t.tox_sink.is_on_tox() && t.tox_sink.tox_connection() == 0)
         || t.tox_down_at.is_some_and(|at| at.elapsed().as_secs() < QUIET_LIMIT_S)
@@ -14858,6 +14895,13 @@ const OVERLONG_WINDOW: std::time::Duration = std::time::Duration::from_secs(900)
 /// `S1-JR`: how long the words said about a table not safe stay once no
 /// reason holds -- a reason that lapses for a hand is no table safe again.
 const UNSAFE_CLEAR_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+/// `S1-JR`: how long after the node reads that it hears nobody the window
+/// asks about a table nobody at can be reached -- the window's
+/// `OPPONENT_GONE_MS`, fifteen seconds.
+const ALONE_ASKED: std::time::Duration = std::time::Duration::from_secs(15);
+/// `S1-JR`: a client resuming that has held no hand of the table's this long
+/// is not safe -- the copies of the running hand it adopts from do not come.
+const RESUME_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 /// `S1-JR`: a table with players enough to start and no hand dealt this long
 /// is not safe. An honest table sets within a minute or two: the group joined
 /// within `GROUP_JOIN_GRACE`, every seat ready within `READY_GRACE` after.
@@ -14984,7 +15028,30 @@ fn watch_progress(t: &mut TableRun) {
             let others: Vec<u8> = f.roster().seats().iter().map(|e| e.seat).filter(|s| Some(*s) != me).collect();
             f.session().is_some() && !others.is_empty() && others.iter().all(|s| unheard.contains(s))
         });
+    if alone && t.heard_nobody_since.is_none() {
+        // `S1-JT`: the hand this client is in as the silence begins, and its
+        // own count of returns there.
+        t.alone_hand = t.hand.as_ref().map(|h| {
+            let me = h.my_seat();
+            (h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0))
+        });
+    }
+    if !alone {
+        if let Some(since) = t.heard_nobody_since {
+            // `S1-JR`: the hands called off while it heard nobody count if the
+            // silence ended before the window asks about it -- one every other
+            // seat's rogue could make -- and are dropped if it lasted longer:
+            // its own line, or a table the player was asked about.
+            let (bits, n) = t.voided_pending;
+            if now.duration_since(since) < ALONE_ASKED && n > 0 {
+                t.voided_recent.0 = ((t.voided_recent.0 << n) | bits) & VOIDED_WINDOW_MASK;
+            }
+        }
+        t.voided_pending = (0, 0);
+        t.alone_hand = None;
+    }
     t.heard_nobody_since = if alone { Some(t.heard_nobody_since.unwrap_or(now)) } else { None };
+    t.resuming_since = if t.resuming && t.hand.is_none() { Some(t.resuming_since.unwrap_or(now)) } else { None };
     // A turn standing half a minute past its whole allowance at three seats or
     // more is one the table could not act for: kept, once a stage, for
     // `OVERLONG_WINDOW` -- and none at a hand of two, where the window asks its
@@ -15029,6 +15096,8 @@ fn watch_progress(t: &mut TableRun) {
 /// * `OVERLONG_LIMIT` turns within `OVERLONG_WINDOW` stood half a minute past
 ///   their whole allowance at three seats or more -- a player that holds each
 ///   turn just short of the limit above holds the game up as surely;
+/// * this client, resuming, has held no hand of the table's for
+///   `RESUME_LIMIT` -- the copies it adopts from do not come;
 /// * the table has had players enough to start for `FORMING_LIMIT` and was
 ///   never set (`watch_progress`);
 /// * this client, with chips and outside the roster, was kept out at
@@ -15101,6 +15170,12 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             "turns keep standing past their time -- more than once within a quarter of an hour, a turn stood half a minute past its whole allowance and the table could not act for the player: a player may be holding the game up on purpose, or a line keeps failing."
                 .to_string(),
         );
+    }
+    if t.resuming_since.is_some_and(|since| now.duration_since(since) >= RESUME_LIMIT) {
+        return Some(format!(
+            "this client has waited {} minutes or more to be dealt back into the table's running hand, and the others' copies of it do not come: a player at the table may be holding it out.",
+            RESUME_LIMIT.as_secs() / 60
+        ));
     }
     if t.forming_since.is_some_and(|since| now.duration_since(since) >= FORMING_LIMIT) {
         return Some(format!(
@@ -17535,6 +17610,13 @@ fn note_a_hand_ahead(
         .filter(|s| *s != me)
         .collect();
     let others: Vec<u8> = others.into_iter().collect();
+    // `S1-JR`: one other seat is the table only where two are left in the
+    // game. At a hand of two at a table of three -- the third seat kept out
+    // -- the other seat alone sent this client adrift with one signed frame
+    // of a later hand, and the copies to come back by needed two.
+    if others.len() == 1 && h.seats_in_the_game() >= 3 {
+        return;
+    }
     if let Some(out) = adrift_now(mine, ahead, &others) {
         *adrift = Some(out);
     }
@@ -21597,6 +21679,11 @@ mod a_joiner_before_the_first_hand {
         t.forming_since = None;
         t.cheats.insert([1u8; 32], (2, 2, true));
         assert_eq!(unsafe_reason(&t), None, "a proven cheat not in the running hand is no reason");
+        t.resuming_since = Some(now - RESUME_LIMIT + std::time::Duration::from_secs(5));
+        assert_eq!(unsafe_reason(&t), None, "resuming, inside the limit");
+        t.resuming_since = Some(now - RESUME_LIMIT - std::time::Duration::from_secs(1));
+        assert!(unsafe_reason(&t).is_some_and(|w| w.contains("dealt back into")), "resuming with no hand for five minutes");
+        t.resuming_since = None;
         t.overlong = vec![(3, 5, now)];
         assert_eq!(unsafe_reason(&t), None, "one turn past its time");
         t.overlong.push((4, 9, now));
@@ -21658,9 +21745,9 @@ mod a_joiner_before_the_first_hand {
         // while this client's own line is down by a reading no rogue can make.
         assert!(
             code.contains(
-                "let mask = if own_line_down(t) { t.voided_recent.0 } else if h.seats_in_the_game() < 3 { 0 } else { \
-                 let voided = h.aborted().is_some() && !h.late_settled() && !h.ended_by_certificate(); \
-                 ((t.voided_recent.0 << 1) | u8::from(voided)) & VOIDED_WINDOW_MASK };"
+                "let voided = h.aborted().is_some() && !h.late_settled() && !h.ended_by_certificate(); \
+                 let mask = if library_down(t) { t.voided_recent.0 } else if h.seats_in_the_game() < 3 { \
+                 t.voided_pending = (0, 0); 0 } else if t.heard_nobody_since.is_some() {"
             ),
             "the boundary count"
         );
@@ -21688,7 +21775,14 @@ mod a_joiner_before_the_first_hand {
         assert!(counted < moved_on, "counted before the boundary moves on without it");
         let rejoin = code.find("macro_rules! rejoin_from_copies {").expect("the rejoin");
         let rejoin = &code[rejoin..rejoin + code[rejoin..].find("macro_rules! ask_lobby {").expect("its end")];
-        assert!(!rejoin.contains("return_short"), "a rejoin keeps the count");
+        assert!(!rejoin.contains("return_short") && !rejoin.contains("voided_recent"), "a rejoin keeps the counts");
+        // The silence's end: held-back hands counted if it was short.
+        assert!(
+            code.contains("if now.duration_since(since) < ALONE_ASKED && n > 0 { t.voided_recent.0 = ((t.voided_recent.0 << n) | bits) & VOIDED_WINDOW_MASK; }"),
+            "counted when the silence ended before the window asks"
+        );
+        // One other seat is the table only in a true heads-up game.
+        assert!(code.contains("if others.len() == 1 && h.seats_in_the_game() >= 3 { return; }"), "one seat of three sends nobody adrift");
         // Kept out at a boundary the table aborted counts too: no return can be
         // asked there, and a seat behind hands a rogue calls off is kept out.
         assert_eq!(code.matches("} else if h.kept_out() && !stay_out {").count(), 1, "at the boundary");
@@ -21696,6 +21790,30 @@ mod a_joiner_before_the_first_hand {
         assert!(!code.contains("may_ask_to_sit_in() && !stay_out"), "not only where it could ask");
         // A table of three seats or more in the game, whatever the hand deals in.
         assert!(!code.contains("h.required().len() >= 3") && !code.contains("h.required().len() < 3"), "never the hand's roster");
+    }
+
+    /// `S1-JR`: the hands called off while this client heard no other seat are
+    /// held back -- every other seat's silence makes that reading, rogues'
+    /// included -- and counted when the silence ends before the window asks
+    /// about it; one that lasted longer was this client's own line, or a table
+    /// its player was asked about, and they are dropped.
+    #[test]
+    fn hands_called_off_in_a_short_silence_are_counted_and_in_a_long_one_dropped() {
+        let dir = std::env::temp_dir();
+        let mut t = TableRun::new(0, &dir, None, super::super::toxsink::TableSink::none());
+        let now = std::time::Instant::now();
+        t.voided_recent = (0b1, Some(4));
+        t.voided_pending = (0b101, 3);
+        t.heard_nobody_since = Some(now - std::time::Duration::from_secs(5));
+        watch_progress(&mut t);
+        assert_eq!(t.voided_recent.0, 0b0_1101, "a short silence: the three held back counted after the one before");
+        assert_eq!(t.voided_pending, (0, 0));
+        assert!(t.heard_nobody_since.is_none());
+        t.voided_pending = (0b111, 3);
+        t.heard_nobody_since = Some(now - ALONE_ASKED - std::time::Duration::from_secs(1));
+        watch_progress(&mut t);
+        assert_eq!(t.voided_recent.0, 0b0_1101, "a long one: dropped");
+        assert_eq!(t.voided_pending, (0, 0));
     }
 
     /// `S1-JR`: a hand stands for the window about a table that is not safe --
@@ -21733,7 +21851,10 @@ mod a_joiner_before_the_first_hand {
             code.contains("let absent = returns >= crate::protocol::constants::MAX_RETURNS && !causes.is_empty()"),
             "a fourth absence by this client's own count of its returns"
         );
-        assert!(code.contains(".filter(|h| w.hand_id >= h.hand_id())"), "about its running hand or a later one");
+        assert!(
+            code.contains("let returns = t .alone_hand .filter(|(hand, _)| w.hand_id >= *hand) .map_or(0, |(_, returns)| returns);"),
+            "about the hand the silence began in or a later one, by its count there"
+        );
         let told = code.find("NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded }").expect("the word said");
         assert!(alone < told);
         assert!(
