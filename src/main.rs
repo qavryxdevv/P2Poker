@@ -2023,6 +2023,11 @@ fn preview_table(args: &[String]) {
         view.out_for_good = Some("certified out for flooding the table's group (hand 128)".into());
         view.out_flooded = true;
     }
+    // `D-084`: out for a proof that does not hold.
+    if has("--preview-cheated") {
+        view.out_for_good = Some("certified out for a proof that does not hold (hand 128)".into());
+        view.out_cheated = true;
+    }
     if has("--preview-unsafe") {
         view.unsafe_note = Some((
             "2 of the 4 players flooded the table's connection with junk traffic. They are cut off here, but too few other players are left to put them out of the game.".into(),

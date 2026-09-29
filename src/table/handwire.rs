@@ -811,6 +811,14 @@ pub const CAUSE_LONG_GONE: u16 = 3;
 /// and certified out. The ordinary vote goes at the deadline.
 pub const CAUSE_QUESTION: u16 = 4;
 
+/// `D-084`: a timeout vote's cause -- the seat named sent a proof that does
+/// not hold (a shuffle proof, `PROTOCOL.md` §4.10's cause 2, or a card share,
+/// cause 3), and the voter found it so by its own check, on its own chain, at
+/// the stage the vote is about: the stage waits on that seat for ever. A seat
+/// every vote of a certificate names with it is out of the table for good at
+/// that boundary -- `D-014`'s tier-1 removal, reached by a certificate.
+pub const CAUSE_CHEAT: u16 = 5;
+
 impl TimeoutVote {
     /// The digest a certificate identifies this subject by.
     ///
@@ -844,7 +852,10 @@ impl TimeoutVote {
     /// is refused rather than read as no cause: it is a second encoding of
     /// the same subject.
     pub fn cause_is_known(&self) -> bool {
-        matches!(self.cause, None | Some(CAUSE_FLOOD) | Some(CAUSE_SILENT_VOTER) | Some(CAUSE_LONG_GONE))
+        matches!(
+            self.cause,
+            None | Some(CAUSE_FLOOD) | Some(CAUSE_SILENT_VOTER) | Some(CAUSE_LONG_GONE) | Some(CAUSE_CHEAT)
+        )
     }
 }
 
@@ -1140,10 +1151,13 @@ mod tests {
         assert_eq!(back, flagged, "the cause survives the wire");
         assert!(flagged.cause_is_known() && vote.cause_is_known());
         assert!(!TimeoutVote { cause: Some(0), ..vote }.cause_is_known(), "no second spelling of no cause");
-        // `D-065`: 2 is the silent voter; `D-066`: 3 the seat long gone; the catalogue ends there.
+        // `D-065`: 2 is the silent voter; `D-066`: 3 the seat long gone; `S1-JS`: 4
+        // is a question and no vote; `D-084`: 5 the proven cheat; the catalogue ends there.
         assert!(TimeoutVote { cause: Some(CAUSE_SILENT_VOTER), ..vote }.cause_is_known());
         assert!(TimeoutVote { cause: Some(CAUSE_LONG_GONE), ..vote }.cause_is_known());
         assert!(!TimeoutVote { cause: Some(4), ..vote }.cause_is_known());
+        assert!(TimeoutVote { cause: Some(CAUSE_CHEAT), ..vote }.cause_is_known());
+        assert!(!TimeoutVote { cause: Some(6), ..vote }.cause_is_known());
 
         // A joint subject names each seat's cause; one without any hashes as before.
         let mut joint = CertSubject::of(&vote);

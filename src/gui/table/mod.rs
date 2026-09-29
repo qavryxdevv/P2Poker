@@ -285,6 +285,9 @@ pub struct TableView {
     pub out_for_good: Option<String>,
     /// `D-051`: and the word was that this client flooded the table's group.
     pub out_flooded: bool,
+    /// `D-084`: and the word was that this client sent a proof that does not
+    /// hold -- a modified client, or one whose cryptography is broken.
+    pub out_cheated: bool,
     /// `S1-FY`: this client is no longer at the table and its player did not
     /// ask to leave it: why. The window stays and says so; the player closes it.
     pub lost: Option<String>,
@@ -1780,7 +1783,10 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                 ui.set_min_width(400.0);
                 ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
                 window_heading(ui, "Out of the game", false);
-                if view.out_flooded {
+                if view.out_cheated {
+                    // `D-084`.
+                    ui.label("You were removed from this table: every other player's client found that yours sent a shuffle proof or a card share that does not hold, and the table plays on without you. An unmodified client never does this -- if you did not change yours, install it again.");
+                } else if view.out_flooded {
                     // `D-051`.
                     ui.label("You were removed from this table for flooding its connection: every other player's client measured junk traffic from yours, and the table plays on without you.");
                 } else {
@@ -2235,6 +2241,7 @@ impl TableView {
             opponent_left: false,
             out_for_good: None,
             out_flooded: false,
+            out_cheated: false,
             lost: None,
             unsafe_note: None,
             unsafe_may_show: false,

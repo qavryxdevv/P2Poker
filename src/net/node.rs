@@ -558,8 +558,9 @@ pub enum NodeEvent {
     /// `D-047`: this client's own seat is out of the table for good -- the
     /// table's word about its fourth absence, verified. The window says so
     /// and holds the table until the player closes it. `D-051`: `flooded`
-    /// when the word is that it flooded the table's group.
-    OutForGood { key: [u8; 32], why: String, flooded: bool },
+    /// when the word is that it flooded the table's group; `D-084`: `cheated`
+    /// when it is that it sent a proof that does not hold.
+    OutForGood { key: [u8; 32], why: String, flooded: bool, cheated: bool },
     /// `D-051`: this client cut a seat off for flooding the table's group.
     SeatFlooded { seat: u8 },
     /// `D-051`: this table is not safe, and why -- flooders the table cannot put

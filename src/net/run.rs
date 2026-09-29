@@ -3584,6 +3584,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `D-051`: no return for a seat cut off here for flooding.
                 let flooders: Vec<u8> = $t.flooders.keys().copied().collect();
                 $h.note_flooders(&flooders);
+                // `D-084`: nor for a seat this client proved cheating here.
+                let cheaters: Vec<u8> = $t.cheats.values().filter(|(_, _, own)| *own).map(|(s, _, _)| *s).collect();
+                $h.note_cheaters(&cheaters);
                 match $h.vote_on_returns(&evidence, &app_key, super::node::now_unix_ms()) {
                     Ok(sends) => {
                         if !sends.is_empty() {
@@ -3989,7 +3992,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // `D-051`: or certified with the flood cause by every voter --
                     // out for good the same way.
                     let flooded = $h.named_for_flooding(seat);
+                    // `D-084`: or with the cheat cause.
+                    let cheated = $h.named_for_cheating(seat);
                     let at_the_limit = flooded
+                        || cheated
                         || $h.returns().get(usize::from(seat)).copied().unwrap_or(0)
                             >= crate::protocol::constants::MAX_RETURNS;
                     if at_the_limit {
@@ -4026,6 +4032,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .send(NodeEvent::Warning(if flooded {
                                 format!(
                                     "seat {seat} is out of the table for good for flooding the table's group (D-051): every voter's client cut it off, the certificate says so, it is removed from the group by the table's word and never invited again; its chips leave the table at the boundary"
+                                )
+                            } else if cheated {
+                                format!(
+                                    "seat {seat} is out of the table for good for a proof that does not hold (D-084): every voter's client found it failing, the certificate says so, it is removed from the group by the table's word and never invited again; its chips leave the table at the boundary"
                                 )
                             } else {
                                 format!(
@@ -5299,7 +5309,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // leaves, a window holds the table for its player to close.
                                 for w in out_words.iter().filter(|w| w.app_key == my_app_key) {
                                     for i in 0..tables.len() {
-                                        let verdict: Option<(String, bool)> = (|| {
+                                        let verdict: Option<(String, (bool, bool))> = (|| {
                                             let t = &tables[i];
                                             let f = t.table.as_ref()?;
                                             if t.out_told || f.table_id() != w.table_id || f.my_seat() != Some(w.seat) {
@@ -5337,6 +5347,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             )?;
                                             let flooded = !causes.is_empty()
                                                 && causes.iter().all(|c| *c == Some(crate::table::handwire::CAUSE_FLOOD));
+                                            // `D-084`: or every vote the cheat cause.
+                                            let cheated = !causes.is_empty()
+                                                && causes.iter().all(|c| *c == Some(crate::table::handwire::CAUSE_CHEAT));
                                             // `S1-JT`: **and it must be a word about being out
                                             // for good.** A certificate that names this seat is
                                             // a word about one hand; any certificate verified here
@@ -5376,11 +5389,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             let alone = t
                                                 .heard_nobody_since
                                                 .is_some_and(|since| since.elapsed() >= LOBBY_WORD_ALONE);
-                                            if !alone || !(flooded || absent) {
+                                            if !alone || !(flooded || cheated || absent) {
                                                 return None;
                                             }
                                             Some((
-                                                if flooded {
+                                                if cheated {
+                                                    format!(
+                                                        "seat {} -- this client -- is out of the table for good for a proof that does not hold (D-084): the table's word, certified by seats {:?} at hand #{}, carried in the lobby answer of {peer}",
+                                                        w.seat, voters, w.hand_id
+                                                    )
+                                                } else if flooded {
                                                     format!(
                                                         "seat {} -- this client -- is out of the table for good for flooding the table's group (D-051): the table's word, certified by seats {:?} at hand #{}, carried in the lobby answer of {peer}",
                                                         w.seat, voters, w.hand_id
@@ -5391,15 +5409,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         w.seat, voters, w.hand_id
                                                     )
                                                 },
-                                                flooded,
+                                                (flooded, cheated),
                                             ))
                                         })();
-                                        if let Some((why, flooded)) = verdict {
+                                        if let Some((why, (flooded, cheated))) = verdict {
                                             let t = &mut tables[i];
                                             t.out_told = true;
                                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
                                             let _ = events
-                                                .send(NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded })
+                                                .send(NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded, cheated })
                                                 .await;
                                             if autoplay.is_some() {
                                                 leave_table_now!(t, why);
@@ -11175,14 +11193,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // does at its fourth absence.
                     let out_myself = t.hand.as_ref().and_then(|h| {
                         let me = h.my_seat();
-                        h.out_for_good().contains(&me).then_some((me, h.named_for_flooding(me)))
+                        h.out_for_good().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))
                     });
-                    if let Some((me, flooded)) = out_myself {
+                    if let Some((me, flooded, cheated)) = out_myself {
                         if !t.out_told {
                             t.out_told = true;
                             let why = if flooded {
                                 format!(
                                     "seat {me} -- this client -- is out of the table for good for flooding the table's group (D-051): every other voter's client cut it off"
+                                )
+                            } else if cheated {
+                                format!(
+                                    "seat {me} -- this client -- is out of the table for good for a proof that does not hold (D-084): every other voter's client found it failing"
                                 )
                             } else {
                                 format!(
@@ -11191,7 +11213,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let key = t.table.as_ref().map(|f| f.table_id()).unwrap_or([0; 32]);
                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                            let _ = events.send(NodeEvent::OutForGood { key, why: why.clone(), flooded }).await;
+                            let _ = events.send(NodeEvent::OutForGood { key, why: why.clone(), flooded, cheated }).await;
                             // A headless client leaves at once; a window holds the
                             // table until its player closes it.
                             if autoplay.is_some() {
@@ -12151,6 +12173,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // the flood cause.
                     let flooders: Vec<u8> = t.flooders.keys().copied().collect();
                     h.note_flooders(&flooders);
+                    // `D-084`: and the seats this client proved cheating here.
+                    let cheaters: Vec<u8> = t.cheats.values().filter(|(_, _, own)| *own).map(|(s, _, _)| *s).collect();
+                    h.note_cheaters(&cheaters);
                     h.note_gone_by_their_word(&gone_by_word);
                     // `D-063`: and their words, for the certificate that names them.
                     h.note_leave_words(&leave_words);
@@ -12243,6 +12268,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events
                                 .send(NodeEvent::Warning(format!("the clock: {e}")))
                                 .await;
+                        }
+                    }
+                    // `D-084`: a proven cheat's certificate sought for
+                    // `CHEAT_CERT_MS` and not come: the hand given up with the
+                    // evidence (§4.10), as before the certificate.
+                    match h.cheat_fallback(&app_key, now) {
+                        Ok(sends) if !sends.is_empty() => {
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "no certificate about the proven cheat came: the hand is given up with the evidence (D-084, PROTOCOL.md 4.10)".into(),
+                                ))
+                                .await;
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            hand_may_have_ended!(t, h);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = events.send(NodeEvent::Warning(format!("the proven cheat's evidence: {e}"))).await;
                         }
                     }
                     // Two seats have signed this hand at a genesis this client
@@ -21844,6 +21887,27 @@ mod a_joiner_before_the_first_hand {
         assert_eq!(t.voided_pending, (0, 0));
     }
 
+    /// `D-084`: a proven cheat's certificate is sought, and the hand given up
+    /// with the evidence when none comes, on the stall tick; the seats this
+    /// client proved cheating are noted for the returns at both vote sites; a
+    /// seat named with the cheat cause is out of the table for good, removed
+    /// from the group by the table's word; this client itself is told so; and a
+    /// lobby answer's word with the cheat cause is taken as the flood's is.
+    #[test]
+    fn a_proven_cheat_is_answered_on_the_tick_and_out_for_good_by_the_word() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let votes = code.find("h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery())").expect("the votes");
+        let fallback = code.find("match h.cheat_fallback(&app_key, now) {").expect("the fallback");
+        assert!(votes < fallback, "after the votes, on the same tick");
+        assert!(code[fallback..fallback + 900].contains("hand_may_have_ended!(t, h);"), "and the end said");
+        assert_eq!(code.matches("note_cheaters(&cheaters);").count(), 2, "noted at both vote sites");
+        assert!(code.contains("let cheated = $h.named_for_cheating(seat); let at_the_limit = flooded || cheated"), "out for good");
+        assert!(code.contains("h.out_for_good().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))"), "this client");
+        assert!(code.contains("if !alone || !(flooded || cheated || absent) { return None; }"), "the lobby word");
+    }
+
     /// `S1-JR`: a hand stands for the window about a table that is not safe --
     /// which may then cover it -- at a cryptographic stage after a minute, and at
     /// a turn after that turn's whole allowance and half a minute more.
@@ -21873,7 +21937,7 @@ mod a_joiner_before_the_first_hand {
         let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
         let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
         let alone = code
-            .find("let alone = t .heard_nobody_since .is_some_and(|since| since.elapsed() >= LOBBY_WORD_ALONE); if !alone || !(flooded || absent) { return None; }")
+            .find("let alone = t .heard_nobody_since .is_some_and(|since| since.elapsed() >= LOBBY_WORD_ALONE); if !alone || !(flooded || cheated || absent) { return None; }")
             .expect("taken only while alone, as a flood or a fourth absence");
         assert!(
             code.contains("let absent = returns >= crate::protocol::constants::MAX_RETURNS && !causes.is_empty()"),
@@ -21883,7 +21947,7 @@ mod a_joiner_before_the_first_hand {
             code.contains("let returns = t .alone_hand .filter(|(hand, _)| w.hand_id >= *hand) .map_or(0, |(_, returns)| returns);"),
             "about the hand the silence began in or a later one, by its count there"
         );
-        let told = code.find("NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded }").expect("the word said");
+        let told = code.find("NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded, cheated }").expect("the word said");
         assert!(alone < told);
         assert!(
             code.contains(

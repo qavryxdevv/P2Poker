@@ -198,6 +198,7 @@ impl AppState {
             opponent_left: self.opponent_left,
             out_for_good: self.out_for_good.clone(),
             out_flooded: self.out_flooded,
+            out_cheated: self.out_cheated,
             lost: self.lost.clone(),
             // `S1-JR`: never over a hand being played -- said at the boundary,
             // before the hand's cards are out, or over a hand that stands.
@@ -1062,9 +1063,14 @@ mod tests {
         assert!(second > first, "asked again");
         s.apply(NodeEvent::TableUnsafe { why: None, stuck: false, ask: false });
         assert_eq!(s.table_view().unsafe_note, None, "safe again");
-        s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for flooding".into(), flooded: true });
+        s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for flooding".into(), flooded: true, cheated: false });
         let v = s.table_view();
-        assert!(v.out_for_good.is_some() && v.out_flooded);
+        assert!(v.out_for_good.is_some() && v.out_flooded && !v.out_cheated);
+        // `D-084`: out for a proof that does not hold is said as that.
+        let mut s = seated(0);
+        s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for a proof".into(), flooded: false, cheated: true });
+        let v = s.table_view();
+        assert!(v.out_for_good.is_some() && v.out_cheated && !v.out_flooded);
     }
 
     /// `S1-IX`, section 6.4: a table stopped on a disagreement about a hand's

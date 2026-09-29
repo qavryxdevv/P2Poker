@@ -390,6 +390,7 @@ pub struct TableApp {
     pub finished: Option<(crate::gui::table::Finish, std::time::Instant)>,
     pub show_choice: Option<(u64, std::time::Instant)>,
     pub out_flooded: bool,
+    pub out_cheated: bool,
     pub unsafe_note: Option<(String, u64)>,
     pub unsafe_stuck: Option<PlayMark>,
     pub stood_at: Option<PlayMark>,
@@ -566,6 +567,7 @@ pub struct AppState {
     /// `D-051`: this seat is out for good for flooding the table's group, as
     /// against `D-047`'s fourth absence.
     pub out_flooded: bool,
+    pub out_cheated: bool,
     /// `D-051`: why this table is not safe, as the node last said it, with a
     /// serial the window closes by -- the question comes back when the node
     /// says it again.
@@ -1088,6 +1090,7 @@ impl AppState {
         std::mem::swap(&mut self.finished, &mut other.finished);
         std::mem::swap(&mut self.show_choice, &mut other.show_choice);
         std::mem::swap(&mut self.out_flooded, &mut other.out_flooded);
+        std::mem::swap(&mut self.out_cheated, &mut other.out_cheated);
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
         std::mem::swap(&mut self.unsafe_stuck, &mut other.unsafe_stuck);
         std::mem::swap(&mut self.stood_at, &mut other.stood_at);
@@ -2309,9 +2312,11 @@ impl AppState {
             }
             // `D-047`: this seat is out of the table for good. The table is held
             // for the window to say so; leaving is the player's click.
-            NodeEvent::OutForGood { key: _, why, flooded } => {
+            NodeEvent::OutForGood { key: _, why, flooded, cheated } => {
                 self.out_for_good = Some(why.clone());
                 self.out_flooded = flooded;
+                // `D-084`: or for a proof that does not hold.
+                self.out_cheated = cheated;
                 self.note(why);
             }
             // `D-051`: a seat this client cut off for flooding the table's group.
@@ -2583,6 +2588,7 @@ impl AppState {
         self.finished = None;
         self.show_choice = None;
         self.out_flooded = false;
+        self.out_cheated = false;
         self.unsafe_note = None;
         self.unsafe_stuck = None;
         self.stood_at = None;

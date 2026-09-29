@@ -244,7 +244,7 @@ fn nothing_but_a_deliberate_leave_is_penalised() {
             r.on_event(&NodeEvent::TableStopped { stop: Some(stop) }, now)
         }),
         ("put out by the table", |r, g, now| {
-            r.on_event(&NodeEvent::OutForGood { key: g.key, why: "fourth absence".into(), flooded: false }, now)
+            r.on_event(&NodeEvent::OutForGood { key: g.key, why: "fourth absence".into(), flooded: false, cheated: false }, now)
         }),
         ("a hand standing on an absent seat", |r, g, now| {
             r.on_event(&NodeEvent::StageStands { hand_id: g.hand, seats: vec![3] }, now)
