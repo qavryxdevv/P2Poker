@@ -811,10 +811,10 @@ pub const CAUSE_LONG_GONE: u16 = 3;
 /// and certified out. The ordinary vote goes at the deadline.
 pub const CAUSE_QUESTION: u16 = 4;
 
-/// `D-084`: a timeout vote's cause -- the seat named sent a proof that does
-/// not hold (a shuffle proof, `PROTOCOL.md` §4.10's cause 2, or a card share,
-/// cause 3), and the voter found it so by its own check, on its own chain, at
-/// the stage the vote is about: the stage waits on that seat for ever. A seat
+/// `D-084`: a timeout vote's cause -- the seat named sent a shuffle proof that
+/// does not hold (`PROTOCOL.md` §4.10's cause 2), and the voter found it so by
+/// its own check, on its own chain, at the stage the vote is about: the stage
+/// waits on that seat for ever, its one attempt spent. A seat
 /// every vote of a certificate names with it is out of the table for good at
 /// that boundary -- `D-014`'s tier-1 removal, reached by a certificate.
 pub const CAUSE_CHEAT: u16 = 5;

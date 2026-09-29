@@ -3531,7 +3531,7 @@ in this paragraph, which records its withdrawal.
 | `n(3) parent_event_hash` | `bytes[32]` | `stage_hash(subject_sequence - 1)` |
 | `n(4) deadline_ms` | `u32` | the `next_deadline_ms` carried by the parent stage's events |
 | `n(5) kind` | `u16` | `1` = action deadline, `2` = cryptographic-step deadline |
-| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. `2` (**D-065**): the seat is not one the stage waits on but a voter of the round at that stage that has said nothing about it within the round's air -- no vote about every seat the voter voted about there, or no copy of the certificate the voter sealed. `3` (**D-066**): the seat, one the stage waits on, has been out of the table's group or silent there for `LONG_GONE_S` or more by the voter's own reading. `4` (**S1-JS**): no vote at all but the early question below -- taken by a receiver and counted towards nothing, and refused in a certificate. `5` (**D-084**): the seat sent a proof that does not hold -- a shuffle proof or a card share -- and the voter found it so by its own check, on its own chain, at the stage the vote is about; the vote goes at once, and a seat every vote of a certificate names with it is out of the table for good at that boundary, as a flooder is. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
+| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. `2` (**D-065**): the seat is not one the stage waits on but a voter of the round at that stage that has said nothing about it within the round's air -- no vote about every seat the voter voted about there, or no copy of the certificate the voter sealed. `3` (**D-066**): the seat, one the stage waits on, has been out of the table's group or silent there for `LONG_GONE_S` or more by the voter's own reading. `4` (**S1-JS**): no vote at all but the early question below -- taken by a receiver and counted towards nothing, and refused in a certificate. `5` (**D-084**): the seat sent a shuffle proof that does not hold, and the voter found it so by its own check, on its own chain, at the stage the vote is about -- the stage waits on the seat for ever, its one attempt spent; the vote goes at once, no voter is named silent in such a round, and a seat every vote of a certificate names with it is out of the table for good at that boundary, as a flooder is. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
 
 *Envelope:* `sequence = subject_sequence`,
 `previous_event_hash = parent_event_hash`, `chain_scope = 1` and
@@ -4547,18 +4547,20 @@ receiver's own state**:
 | `6`, tier 1 (D-014) | `n(3) evidence` carries exactly one `SignedEvent` signed by the seat named in `n(1) attributed`, and **this receiver's own** run of §4.0 over that event returns a tier-1 illegality — a signature that does not verify, a non-canonical encoding, a malformed message, an out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that is not a permutation, a signer who is not a party to this table. **The list is closed and every member is decidable from the offending event's own bytes**; *a parent that does not exist* stood here and is deleted, because it is decidable only against this receiver's own store (§4.0's box, `THREAT_MODEL.md` §5.1) | accept at once |
 | `6`, tier 2 (D-014) | as above, **and** this receiver holds a completed `STATE_ACK` stage for a checkpoint of the same chain **whose §6.2 checkpoint number is at or after the number of the checkpoint the illegality was fixed at** (`G7-S8`; the clause read *at or before the offending event's `sequence`*, and the box below says why the number replaces it), whose emitter set contained both the accused and this receiver, **and** the event is illegal against the `PublicTableState` that checkpoint fixed | reject |
 
-**Causes `2` and `3` at a hand of three seats or more (D-084).** The table above says how a
-*receiver* takes a peer's abort, and that is unchanged: a `cause = 2` or `3` abort whose evidence
-verifies is accepted at once. What changes is when a peer *sends* one. A client whose own check
-finds a shuffle proof or a card share failing, at a hand dealt to three seats or more, keeps the
-evidence and does not send its abort: it takes nothing more from that seat in the hand -- the
-stage waits on it for ever, a shuffler's one attempt being spent (C-6 rule 4) -- and votes about
-it at once with `TIMEOUT_VOTE` `cause = 5` (§4.8). Every client that found the same proof failing
-builds the same subject, and the certificate, `kind = 2`, ends the hand by the certified-subject
-path above and takes the seat out of the table for good. If no certificate has completed
-`CHEAT_CERT_MS` (45 s) after the finding -- a voter that never saw the proof fail, a client that
-knows no `cause = 5` -- the client sends its `cause = 2` or `3` abort with the evidence, and the
-hand ends as it ended before. Heads-up the abort goes at once: two seats certify nobody.
+**`cause = 2` at a hand of three seats or more (D-084).** The table above says how a *receiver*
+takes a peer's abort, and that is unchanged: a `cause = 2` or `3` abort whose evidence verifies is
+accepted at once. What changes is when a peer *sends* a `cause = 2` one. A client whose own check
+finds a shuffle proof failing, at a hand dealt to three seats or more where the floor holds for the
+shuffler, keeps the evidence and votes about the shuffler at once with `TIMEOUT_VOTE` `cause = 5`
+(§4.8): the stage waits on it for ever, its one attempt spent (C-6 rule 4). Every client that found
+the same proof failing builds the same subject, and the certificate, `kind = 2`, ends the hand by
+the certified-subject path above and takes the seat out of the table for good. The abort with the
+evidence goes -- and the hand ends as it ended before -- `CHEAT_CERT_MS` (10 s) after the finding
+if no certificate has completed; at once when another seat's frame of a later stage, or a second
+proof from the shuffler, shows that some seat took a good proof and went on; and in place of any
+bare abort this client would send or take meanwhile. A `cause = 3` abort goes at once as before: a
+reveal stage closes at a seat the rogue sent a good share to, and a client that stood on it could
+be certified out by that seat and the rogue. Heads-up both go at once: two seats certify nobody.
 
 **The tier-2 precondition is stated in the checkpoint number, not in a `sequence` — `G7-S8`.**
 The clause that stood in that row named *"a checkpoint of the same chain at or before the offending
