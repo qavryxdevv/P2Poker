@@ -1438,9 +1438,10 @@ struct TableRun {
     /// back from `voided_recent` (a bit each, and how many): counted if that
     /// silence ended before the window asks about it, dropped if not.
     voided_pending: (u8, u8),
-    /// `S1-JT`: the hand this client was in when it last began to hear
-    /// nobody, and its own count of returns there -- the fourth absence a
-    /// lobby answer may bring is about that hand or a later one.
+    /// `S1-JT`: the hand this client was in the last time it heard another
+    /// seat of the table, and its own count of returns there -- the fourth
+    /// absence a lobby answer may bring is about that hand or a later one.
+    /// Kept through a silence, whatever the library says meanwhile.
     alone_hand: Option<(u64, u8)>,
     /// `S1-JR`: since when this client, resuming, has held no hand of the
     /// table's.
@@ -15028,30 +15029,47 @@ fn watch_progress(t: &mut TableRun) {
             let others: Vec<u8> = f.roster().seats().iter().map(|e| e.seat).filter(|s| Some(*s) != me).collect();
             f.session().is_some() && !others.is_empty() && others.iter().all(|s| unheard.contains(s))
         });
-    if alone && t.heard_nobody_since.is_none() {
-        // `S1-JT`: the hand this client is in as the silence begins, and its
-        // own count of returns there.
-        t.alone_hand = t.hand.as_ref().map(|h| {
+    // Another seat of the table heard: a reading the library's verdict does
+    // not make either way.
+    let heard_someone = t.table.as_ref().is_some_and(|f| {
+        let me = f.my_seat();
+        let unheard = seats_unheard(f, &t.tox_sink);
+        f.roster().seats().iter().any(|e| Some(e.seat) != me && !unheard.contains(&e.seat))
+    });
+    if heard_someone {
+        // `S1-JT`: the hand this client is in while it hears the table, and its
+        // own count of returns there -- kept through any silence after: a
+        // client cut off runs ahead alone, and its library's verdict comes and
+        // goes meanwhile.
+        if let Some(h) = t.hand.as_ref() {
             let me = h.my_seat();
-            (h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0))
-        });
+            t.alone_hand = Some((h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0)));
+        }
     }
     if !alone {
         if let Some(since) = t.heard_nobody_since {
             // `S1-JR`: the hands called off while it heard nobody count if the
             // silence ended before the window asks about it -- one every other
-            // seat's rogue could make -- and are dropped if it lasted longer:
-            // its own line, or a table the player was asked about.
+            // seat's rogue could make -- and are dropped if it lasted longer, or
+            // ended in the library's word that this client's own line is down.
             let (bits, n) = t.voided_pending;
-            if now.duration_since(since) < ALONE_ASKED && n > 0 {
+            if !off_network && now.duration_since(since) < ALONE_ASKED && n > 0 {
                 t.voided_recent.0 = ((t.voided_recent.0 << n) | bits) & VOIDED_WINDOW_MASK;
             }
         }
         t.voided_pending = (0, 0);
-        t.alone_hand = None;
     }
     t.heard_nobody_since = if alone { Some(t.heard_nobody_since.unwrap_or(now)) } else { None };
-    t.resuming_since = if t.resuming && t.hand.is_none() { Some(t.resuming_since.unwrap_or(now)) } else { None };
+    // `S1-JR`: resuming with no hand of the table's -- at a table that was set,
+    // while this client hears another seat of it and its own line is up: the
+    // copies it would adopt from are the others' to send, and nobody's line
+    // is at fault.
+    let resuming = t.resuming
+        && t.hand.is_none()
+        && heard_someone
+        && !own_line_down(t)
+        && t.table.as_ref().is_some_and(|f| f.session().is_some());
+    t.resuming_since = if resuming { Some(t.resuming_since.unwrap_or(now)) } else { None };
     // A turn standing half a minute past its whole allowance at three seats or
     // more is one the table could not act for: kept, once a stage, for
     // `OVERLONG_WINDOW` -- and none at a hand of two, where the window asks its
@@ -15173,7 +15191,7 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
     }
     if t.resuming_since.is_some_and(|since| now.duration_since(since) >= RESUME_LIMIT) {
         return Some(format!(
-            "this client has waited {} minutes or more to be dealt back into the table's running hand, and the others' copies of it do not come: a player at the table may be holding it out.",
+            "this client has waited {} minutes or more to be dealt back into the table's running hand while it hears the other players, and their copies of the hand do not come: a player at the table may be holding it out, or the table has gone on without this seat.",
             RESUME_LIMIT.as_secs() / 60
         ));
     }
@@ -21778,11 +21796,21 @@ mod a_joiner_before_the_first_hand {
         assert!(!rejoin.contains("return_short") && !rejoin.contains("voided_recent"), "a rejoin keeps the counts");
         // The silence's end: held-back hands counted if it was short.
         assert!(
-            code.contains("if now.duration_since(since) < ALONE_ASKED && n > 0 { t.voided_recent.0 = ((t.voided_recent.0 << n) | bits) & VOIDED_WINDOW_MASK; }"),
+            code.contains("if !off_network && now.duration_since(since) < ALONE_ASKED && n > 0 { t.voided_recent.0 = ((t.voided_recent.0 << n) | bits) & VOIDED_WINDOW_MASK; }"),
             "counted when the silence ended before the window asks"
         );
         // One other seat is the table only in a true heads-up game.
         assert!(code.contains("if others.len() == 1 && h.seats_in_the_game() >= 3 { return; }"), "one seat of three sends nobody adrift");
+        // Resuming with no hand is read only at a table that was set, heard, with
+        // this client's own line up.
+        assert!(
+            code.contains("let resuming = t.resuming && t.hand.is_none() && heard_someone && !own_line_down(t) && t.table.as_ref().is_some_and(|f| f.session().is_some());"),
+            "resuming, guarded"
+        );
+        // The hand of the fourth absence: kept on every tick another seat is heard.
+        let heard = code.find("if heard_someone { ").expect("kept while the table is heard");
+        assert!(code[heard..heard + 400].contains("t.alone_hand = Some((h.hand_id(),"), "the hand and its count");
+        assert_eq!(code.matches(" t.alone_hand = None;").count(), 0, "never wiped by a silence (only a table left forgets it)");
         // Kept out at a boundary the table aborted counts too: no return can be
         // asked there, and a seat behind hands a rogue calls off is kept out.
         assert_eq!(code.matches("} else if h.kept_out() && !stay_out {").count(), 1, "at the boundary");
