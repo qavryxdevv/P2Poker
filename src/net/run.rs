@@ -1583,9 +1583,9 @@ struct TableRun {
     hearing_said: Option<(u64, Vec<u8>, tokio::time::Instant)>,
     /// `D-060`: at the founder, since when each seat has not been able to play
     /// with the table by its hearing, and since when each seat that hears every
-    /// seat has not said it is ready.
+    /// seat has not said it is ready -- to the roster at which serial (`S1-JP`).
     mesh_trouble: std::collections::BTreeMap<u8, tokio::time::Instant>,
-    ready_stall: std::collections::BTreeMap<u8, tokio::time::Instant>,
+    ready_stall: std::collections::BTreeMap<u8, (u64, tokio::time::Instant)>,
     /// `S1-JF`: at the founder, since when its own reading of its group has
     /// named each settled seat without a break while the table could start.
     founder_unheard_since: std::collections::BTreeMap<u8, tokio::time::Instant>,
@@ -1754,6 +1754,12 @@ struct Origin {
     /// no table of the game any more, whatever its stale advert says.
     dead: bool,
 }
+
+/// `S1-JQ`: how often a table set to start is noted on disk again while this
+/// seat sits at it (`S1-JJ`) -- well inside the note's own age, the resume
+/// record's (`RESUME_RECORD_MAX_AGE_MS`), which a long stay before the first
+/// hand outlived: the seat, given back then, came back not knowing the set.
+const SET_TO_START_RENEW: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// `S1-FY`: how soon a seat given back before the start is asked for again,
 /// and how long after an asking that did not go through.
@@ -10308,10 +10314,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // took a roster below the minimum as short. Only where the
                             // minimum is above two (at two, `D-044`'s floor is the minimum,
                             // and the search's tables would crowd the few kept out); a write
-                            // that fails is tried again ten seconds later, and said once.
+                            // that fails is tried again ten seconds later, and said once. And
+                            // written again every `SET_TO_START_RENEW` while this seat sits
+                            // there (`S1-JQ`): the note lasts the resume record's age.
                             if f.set_to_start()
                                 && f.ad().min_players_to_start > 2
-                                && !t.set_to_start_noted.is_some_and(|(k, kept, at)| k == f.table_id() && (kept || at.elapsed() < std::time::Duration::from_secs(10)))
+                                && !t.set_to_start_noted.is_some_and(|(k, kept, at)| {
+                                    k == f.table_id()
+                                        && at.elapsed() < if kept { SET_TO_START_RENEW } else { std::time::Duration::from_secs(10) }
+                                })
                             {
                                 match crate::storage::set_to_start::note(&profile_dir, &f.table_id(), now_ms) {
                                     Ok(()) => t.set_to_start_noted = Some((f.table_id(), true, now_tick)),
@@ -10665,15 +10676,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .hearing
                                 .iter()
                                 .any(|(s, (said, _, at))| *said < serial && at.elapsed() < HEARING_FRESH && seats.contains(s));
-                            (marks, behind, reading)
+                            (marks, behind, reading, serial)
                         });
                         // `S1-JF`: the founder's reading is timed only while it judges.
                         note_founders_reading(
                             &mut t.founder_unheard_since,
-                            judged.as_ref().map(|(_, _, reading)| reading.as_slice()),
+                            judged.as_ref().map(|(_, _, reading, _)| reading.as_slice()),
                             tokio::time::Instant::now(),
                         );
-                        if let Some((marks, behind, _)) = judged {
+                        if let Some((marks, behind, _, serial)) = judged {
                             let now_i = tokio::time::Instant::now();
                             let mut due: Vec<(u8, usize, usize, u64, bool)> = Vec::new();
                             for (x, cannot, by, stalling, sat, speaking, founders) in &marks {
@@ -10686,7 +10697,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     t.mesh_trouble.remove(x);
                                 }
                                 if *stalling {
-                                    if t.ready_stall.entry(*x).or_insert(now_i).elapsed() >= READY_GRACE {
+                                    if ready_stall_due(&mut t.ready_stall, *x, serial, now_i) {
                                         due.push((*x, 0, 0, *sat, *speaking));
                                     }
                                 } else {
@@ -10705,7 +10716,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     let since = t
                                         .mesh_trouble
                                         .get(x)
-                                        .or_else(|| t.ready_stall.get(x))
+                                        .or_else(|| t.ready_stall.get(x).map(|(_, at)| at))
                                         .map_or(0, |at| at.elapsed().as_secs());
                                     if *founders && *cannot == 0 && *by < 2 {
                                         format!("seat {x} is not heard by the founder in the table's group ({since} s)")
@@ -10731,11 +10742,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // `S1-JM`: given back for never saying it was ready, having
                                 // heard every seat -- the last road below -- at a roster below
                                 // the minimum, the one a seat may take for short.
-                                let stalled = !(founders && cannot == 0 && by < 2)
-                                    && cannot + by == 0
-                                    && t.table.as_ref().is_some_and(|f| {
-                                        f.roster().len() < usize::from(f.ad().min_players_to_start)
-                                    });
+                                let stalled = t.table.as_ref().is_some_and(|f| {
+                                    stalled_below_the_minimum(
+                                        founders,
+                                        cannot,
+                                        by,
+                                        f.roster().len(),
+                                        f.ad().min_players_to_start,
+                                    )
+                                });
                                 let stalled_key = t
                                     .table
                                     .as_ref()
@@ -14064,6 +14079,36 @@ fn is_a_hand_frame(bytes: &[u8]) -> bool {
 /// itself, any one seat cannot.
 fn in_hearing_trouble(cannot_speaking: usize, unheard_by: usize, speaking: bool) -> bool {
     cannot_speaking >= 1 || unheard_by >= 2 || (!speaking && unheard_by >= 1)
+}
+
+/// `S1-JM`: whether a seat given back before the first hand went by the one
+/// road that says it will not ratify a roster below the minimum: not the
+/// founder's own reading of it (`founders` with nobody else's word), not
+/// trouble hearing (`cannot`, `by`) -- it heard every seat, was heard by every
+/// seat, and never said it was ready -- and at a roster (`roster` seats,
+/// itself among them) below the advert's minimum, the one a seat may take for
+/// short. At the minimum every client ratifies, and a stall says nothing.
+fn stalled_below_the_minimum(founders: bool, cannot: usize, by: usize, roster: usize, min: u8) -> bool {
+    !(founders && cannot == 0 && by < 2) && cannot + by == 0 && roster < usize::from(min)
+}
+
+/// `S1-JP`: whether a seat that hears every seat, and has not said it is ready
+/// to the roster at `serial`, has been so for `READY_GRACE` -- counted from when
+/// it was first seen so at that serial. A roster said again begins the grace
+/// afresh: a seat must hear a roster before it can say it is ready to it, and
+/// a moment carried over from the roster before gave a seat back two seconds
+/// into the new one.
+fn ready_stall_due(
+    stall: &mut std::collections::BTreeMap<u8, (u64, tokio::time::Instant)>,
+    seat: u8,
+    serial: u64,
+    now: tokio::time::Instant,
+) -> bool {
+    let at = stall.entry(seat).or_insert((serial, now));
+    if at.0 != serial {
+        *at = (serial, now);
+    }
+    now.saturating_duration_since(at.1) >= READY_GRACE
 }
 
 /// `S1-JF`: how long the founder's own reading of its group must have named a
@@ -20857,6 +20902,60 @@ mod a_joiner_before_the_first_hand {
         assert!(!in_hearing_trouble(0, 0, false), "silence alone is the founder's other readings'");
     }
 
+    /// `S1-JM`: only a seat that heard every seat, was heard by every seat and
+    /// never said it was ready, at a roster below the minimum, is counted as
+    /// one that will not ratify there.
+    #[test]
+    fn only_a_stall_below_the_minimum_counts_against_a_seat() {
+        assert!(stalled_below_the_minimum(false, 0, 0, 2, 4), "heard everybody, never ready, two of four");
+        assert!(stalled_below_the_minimum(false, 0, 0, 3, 4), "three of four");
+        assert!(!stalled_below_the_minimum(false, 0, 0, 4, 4), "at the minimum every client ratifies");
+        assert!(!stalled_below_the_minimum(false, 0, 0, 5, 4), "above it too");
+        assert!(!stalled_below_the_minimum(false, 1, 0, 2, 4), "it could not hear a seat");
+        assert!(!stalled_below_the_minimum(false, 0, 1, 2, 4), "a seat could not hear it");
+        assert!(!stalled_below_the_minimum(false, 0, 2, 2, 4), "two seats could not hear it");
+        assert!(!stalled_below_the_minimum(true, 0, 0, 2, 4), "the founder's own reading");
+        assert!(!stalled_below_the_minimum(true, 0, 1, 2, 4), "the founder's own reading and one word");
+    }
+
+    /// `S1-JP`: a seat that hears every seat and has not said it is ready has
+    /// its whole `READY_GRACE` at every roster: a roster said again begins it
+    /// afresh -- the seat must hear the roster before it can say it is ready to
+    /// it -- where the moment carried over gave it back two seconds in.
+    #[test]
+    fn a_seat_has_its_whole_grace_at_every_roster() {
+        let mut stall = std::collections::BTreeMap::new();
+        let t0 = tokio::time::Instant::now();
+        assert!(!ready_stall_due(&mut stall, 3, 7, t0));
+        assert!(!ready_stall_due(&mut stall, 3, 7, t0 + READY_GRACE - std::time::Duration::from_millis(1)));
+        assert!(ready_stall_due(&mut stall, 3, 7, t0 + READY_GRACE), "a whole grace at serial 7");
+        let t1 = t0 + READY_GRACE + std::time::Duration::from_secs(2);
+        assert!(!ready_stall_due(&mut stall, 3, 8, t1), "the roster said again: the grace begins afresh");
+        assert!(!ready_stall_due(&mut stall, 3, 8, t1 + READY_GRACE - std::time::Duration::from_millis(1)));
+        assert!(ready_stall_due(&mut stall, 3, 8, t1 + READY_GRACE), "and runs out at the new roster");
+        assert!(!ready_stall_due(&mut stall, 4, 8, t1 + READY_GRACE), "each seat its own");
+    }
+
+    /// `S1-JQ`: the note that a table was set to start is written again every
+    /// `SET_TO_START_RENEW` while this seat sits at it -- a note lasts the
+    /// resume record's age, and a stay before the first hand longer than that
+    /// came back, given back, not knowing the set.
+    #[test]
+    fn a_note_of_a_table_set_to_start_is_renewed_while_the_seat_sits() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert!(
+            code.contains(
+                "&& at.elapsed() < if kept { SET_TO_START_RENEW } else { std::time::Duration::from_secs(10) }"
+            ),
+            "a kept note is written again once it is SET_TO_START_RENEW old, a failed one ten seconds after"
+        );
+        assert!(
+            u128::from(crate::protocol::constants::RESUME_RECORD_MAX_AGE_MS) >= 2 * SET_TO_START_RENEW.as_millis(),
+            "renewed well inside the note's own age"
+        );
+    }
+
     /// `S1-JF`: a seat only the founder cannot hear in its group -- every other
     /// seat hears it, and it speaks -- was in no trouble on the founder's one
     /// word, while the founder never said it was ready without hearing it
@@ -21103,16 +21202,16 @@ mod a_joiner_before_the_first_hand {
     fn a_seat_that_never_said_it_was_ready_below_the_minimum_is_counted() {
         let src = include_str!("run.rs");
         let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        // Read with the whitespace squashed: what is pinned is the code, not its layout.
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
         let stalled = code
-            .find("let stalled = !(founders && cannot == 0 && by < 2)\n")
-            .expect("the road of a seat that heard everybody and did not say it was ready");
+            .find(
+                "let stalled = t.table.as_ref().is_some_and(|f| { stalled_below_the_minimum( founders, cannot, by, \
+                 f.roster().len(), f.ad().min_players_to_start, ) });",
+            )
+            .expect("the road of a seat that heard everybody and never said it was ready, by the rule's own function");
         let rest = &code[stalled..];
         let why = rest.find("format!(\"heard every seat and did not say it was ready").expect("its reason");
-        assert!(
-            rest[..why].contains("&& cannot + by == 0\n")
-                && rest[..why].contains("f.roster().len() < usize::from(f.ad().min_players_to_start)"),
-            "the road the reason names, at a roster below the minimum"
-        );
         let released = rest.find("release_the_seat!(t, x, peer, tox_key, why, now);").expect("the release");
         let counted = rest.find("f.stalled_below_the_minimum(&k);").expect("the key counted");
         assert!(why < released && released < counted, "counted after the release, on that road");

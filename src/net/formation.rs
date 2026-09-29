@@ -288,7 +288,8 @@ pub struct Formation {
     /// own clock -- a stranger fills it afresh only after [`LEFT_ALONE_WAIT_MS`].
     alone_since_ms: Option<u64>,
     /// `S1-JM`: every key given back once below the minimum for hearing every
-    /// seat and never saying it was ready ([`Formation::stalled_below_the_minimum`]).
+    /// seat and never saying it was ready ([`Formation::stalled_below_the_minimum`]),
+    /// and not heard saying it was ready below the minimum since.
     stalled_once: std::collections::BTreeSet<[u8; 32]>,
 }
 
@@ -989,6 +990,7 @@ impl Formation {
                 // table fills afresh, the advert's minimum its own again.
                 if afresh {
                     self.started = false;
+                    self.stalled_once.clear();
                 }
                 self.alone_since_ms = None;
 
@@ -1612,6 +1614,14 @@ impl Formation {
             None => {
                 self.ratified.insert(ready.my_seat, event_hash);
                 self.ratified_bytes.insert(ready.my_seat, bytes.to_vec());
+                // `S1-JM`: a seat that says it is ready to a roster below the
+                // minimum knows the table was set to start -- a stall it was
+                // counted for before was a word of its lost on the way.
+                if self.founder.is_some()
+                    && self.roster.len() < usize::from(self.under.ad.min_players_to_start)
+                {
+                    self.stalled_once.remove(&sender);
+                }
                 // `D-060`: this client's own ratification, made before -- by a
                 // life of this client that is gone -- and carried back by another
                 // seat. It is this seat's word already: a new one would be a new
@@ -3383,6 +3393,9 @@ mod tests {
         t.founder.stalled_below_the_minimum(&three);
         assert!(a_stranger_asks(&mut t, &a, hash, 3, NOW + 2_000).is_ok(), "once may be a word lost: let in");
 
+        // Seat 4's player was given back so once too: its count is its own.
+        t.founder.stalled_below_the_minimum(&key(4).verifying_key().to_bytes());
+
         t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 60_000).expect("given back again");
         t.founder.stalled_below_the_minimum(&three);
         let refused = a_stranger_asks(&mut t, &a, hash, 3, NOW + 61_000);
@@ -3390,7 +3403,50 @@ mod tests {
             matches!(refused, Err(Failed::Refused { reason, .. }) if reason == RejectReason::TableFull.code()),
             "twice, and a stranger to the table: {refused:?}"
         );
-        assert!(a_stranger_asks(&mut t, &a, hash, 4, NOW + 62_000).is_ok(), "a seat that never stalled comes back");
+        assert!(a_stranger_asks(&mut t, &a, hash, 4, NOW + 62_000).is_ok(), "a seat counted once comes back");
+    }
+
+    /// `S1-JM`: a seat that says it is ready to a roster below the minimum
+    /// knows the table was set to start, so a stall it was counted for before
+    /// was a word of its lost -- the count starts again, and one more stall
+    /// does not make it a stranger.
+    #[test]
+    fn a_seat_that_says_it_is_ready_below_the_minimum_is_counted_afresh() {
+        let (mut t, _, a, hash) = found(6, 4);
+        seat_players(&mut t, &a, hash, &[2, 3, 4]);
+        t.founder.release_seat_before_the_first_hand(&peer(4), NOW + 1_000).expect("given back");
+        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 1_001).expect("given back");
+        let three = key(3).verifying_key().to_bytes();
+        t.founder.stalled_below_the_minimum(&three);
+        // Seat 2's player stays; the clients of 3 and 4 were given back.
+        t.joiners.truncate(1);
+
+        // Back, knowing the table was set (its disk), and ready to three of four.
+        let table_id = t.founder.table_id();
+        let now = NOW + 2_000;
+        let (j, request) = Formation::join(
+            key(3),
+            a.clone(),
+            hash,
+            table_id,
+            peer(3),
+            "player 3".into(),
+            1_000,
+            None,
+            None,
+            [33; 32],
+            now,
+            None,
+        )
+        .unwrap();
+        let mut j = j.with_set_to_start();
+        let out = t.founder.on_join_request(&request, &peer(3), false, now).expect("seated again");
+        deliver(&mut t, &mut j, out, table_id, now);
+        assert!(t.founder.ratified_seats().contains(&j.my_seat().expect("seated")), "it said it was ready");
+
+        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 60_000).expect("given back again");
+        t.founder.stalled_below_the_minimum(&three);
+        assert!(a_stranger_asks(&mut t, &a, hash, 3, NOW + 61_000).is_ok(), "counted once since: let in");
     }
 
     /// `S1-JM`: a seat given back for a short fault, which left its founder
