@@ -901,7 +901,16 @@ pub struct OpponentGone {
     /// heads-up's question with more chairs, since nobody can certify
     /// anybody alone (D-036).
     pub alone: bool,
+    /// `S1-JR`: with `slow`, what the present opponent holds back is its part
+    /// of the cards, not a decision -- heads-up the hand is called off and
+    /// dealt again, and it can hold every one up. Ends when the stage moves.
+    pub step: bool,
 }
+
+/// `S1-JR`: how long a heads-up hand stands on the opponent's part of the
+/// cards before the player is asked -- a step's own budget, which an honest
+/// client never needs: its part is arithmetic, not a decision.
+pub const OPPONENT_STEP_MS: u64 = 30_000;
 
 /// How long an opponent must be unreachable before it is said: longer
 /// than a reconnection takes, shorter than a player's patience.
@@ -1482,6 +1491,7 @@ impl AppState {
                         dismissed_at: None,
                         slow: false,
                         alone: false,
+                        step: false,
                     });
                     self.note("your opponent left the table (D-035): its own word -- the game is over, leave the table".into());
                 }
@@ -2654,6 +2664,7 @@ impl AppState {
                 dismissed_at: None,
                 slow: false,
                 alone: false,
+                step: false,
             });
         }
     }
@@ -2958,18 +2969,30 @@ impl AppState {
                     });
                 }
                 Some(Stands::Stage) => {
-                    let steps = vec![
-                        (Done, first),
-                        (state(w.votes.is_some(), true), "The cards cannot move on without it".to_string()),
-                        (
-                            state(false, w.votes.is_some()),
-                            match w.votes {
-                                Some((held, need)) => format!("The other seats agree to end the hand – {held} of {need}"),
-                                None => "The other seats agree to end the hand".to_string(),
-                            },
-                        ),
-                        (Later, "The next hand is dealt without it".to_string()),
-                    ];
+                    // `S1-JR`: heads-up nobody can end the hand for it (D-007):
+                    // it is called off and dealt again, with it -- the panel said
+                    // the next hand went on without it, and that nothing was stuck.
+                    let heads_up = self.heads_up_opponent() == Some(*seat);
+                    let steps = if heads_up {
+                        vec![
+                            (Done, first),
+                            (Now, "The cards cannot move on without it".to_string()),
+                            (Later, "Heads-up nobody can end the hand for it: it is called off and dealt again, with it".to_string()),
+                        ]
+                    } else {
+                        vec![
+                            (Done, first),
+                            (state(w.votes.is_some(), true), "The cards cannot move on without it".to_string()),
+                            (
+                                state(false, w.votes.is_some()),
+                                match w.votes {
+                                    Some((held, need)) => format!("The other seats agree to end the hand – {held} of {need}"),
+                                    None => "The other seats agree to end the hand".to_string(),
+                                },
+                            ),
+                            (Later, "The next hand is dealt without it".to_string()),
+                        ]
+                    };
                     // `D-059`: and how much the table waits for it at a step now.
                     let patience = seated
                         .patience
@@ -2986,7 +3009,12 @@ impl AppState {
                             )
                         })
                         .unwrap_or_default();
-                    let detail = if w.votes.is_some() {
+                    let detail = if heads_up {
+                        format!(
+                            "The cards need {name}'s part{}; heads-up nobody can end the hand for it -- when its time runs out the hand is called off and dealt again, with it",
+                            quiet.map(|q| format!(", silent {q} s")).unwrap_or_default()
+                        )
+                    } else if w.votes.is_some() {
                         format!("Its time ran out; when every other seat agrees, this hand ends and the next is dealt without it{patience}")
                     } else {
                         format!(
@@ -3196,6 +3224,7 @@ impl AppState {
                         dismissed_at: None,
                         slow: false,
                         alone: true,
+                        step: false,
                     });
                 }
                 (false, Some(g)) if g.alone => {
@@ -3228,7 +3257,36 @@ impl AppState {
                     dismissed_at: None,
                     slow: true,
                     alone: false,
+                    step: false,
                 });
+            }
+        }
+        // `S1-JR`: a present opponent the hand has stood on, for its part of
+        // the cards, for longer than a step takes -- heads-up nobody can end the
+        // hand for it, which is then called off and dealt again, and it can hold
+        // every hand up (D-007). The same question; withdrawn when the stage
+        // moves off it.
+        if let Some(opponent) = self.heads_up_opponent() {
+            let stood = self.stands.1.contains(&opponent)
+                && self.turn_seat != Some(opponent)
+                && self
+                    .waits
+                    .get(&opponent)
+                    .is_some_and(|w| w.since.elapsed().as_millis() as u64 >= OPPONENT_STEP_MS);
+            if stood && self.opponent_gone.is_none() && !self.opponent_out {
+                self.opponent_gone = Some(OpponentGone {
+                    since: std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_millis(OPPONENT_GONE_MS))
+                        .unwrap_or_else(std::time::Instant::now),
+                    said: false,
+                    dismissed_at: None,
+                    slow: true,
+                    alone: false,
+                    step: true,
+                });
+            }
+            if !self.stands.1.contains(&opponent) && self.opponent_gone.as_ref().is_some_and(|g| g.step) {
+                self.opponent_gone = None;
             }
         }
         // A link reading gone stale is an opponent this client cannot reach,
@@ -3271,6 +3329,10 @@ impl AppState {
                     "your opponent has been unreachable for {secs} s, for the {}th time; {} returns are the limit (D-032): the game ends here -- leave the table",
                     self.opponent_returns + 1,
                     crate::protocol::constants::MAX_RETURNS
+                ));
+            } else if self.opponent_gone.as_ref().is_some_and(|g| g.step) {
+                self.note(format!(
+                    "your opponent's client has held back its part of the cards for {secs} s; heads-up, nobody can end the hand for it, and it is called off and dealt again (D-007, S1-JR): wait for it, or leave the table"
                 ));
             } else if self.opponent_gone.as_ref().is_some_and(|g| g.slow) {
                 let past = self.turn_since.map(|t| t.elapsed().as_secs()).unwrap_or(secs);
@@ -5699,6 +5761,52 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None, away: false });
         assert!(s.opponent_out, "and nothing reachable undoes it");
         assert_eq!(s.opponent_returns, MAX_RETURNS);
+    }
+
+    /// `S1-JR`: heads-up, a present opponent the hand has stood on, for its part
+    /// of the cards, longer than a step takes is asked about with the same
+    /// question -- nobody can end the hand for it, which is called off and
+    /// dealt again, over and over. Withdrawn when the stage moves off it; and
+    /// the panel no longer says the next hand is dealt without it.
+    #[test]
+    fn a_heads_up_opponent_holding_back_its_part_of_the_cards_is_asked_about() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::TableParams {
+            key: [7u8; 32],
+            name: "t".into(),
+            seats: 2,
+            needed: 2,
+            small_blind: 50,
+            big_blind: 100,
+            action_ms: 30_000,
+            tournament: true,
+        });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1], small_blind: 50, big_blind: 100 });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 3, seat: None, elapsed_ms: 0 });
+        s.apply(NodeEvent::StageStands { hand_id: 3, seats: vec![1] });
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none(), "a step's own time: nothing is asked");
+        let panel = s.table_view().waits;
+        assert!(
+            panel[0].panel.steps.iter().all(|(_, t)| !t.contains("dealt without it")),
+            "heads-up the next hand is not dealt without it: {:?}",
+            panel[0].panel.steps
+        );
+        s.waits.get_mut(&1).expect("waited on").since =
+            std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_STEP_MS + 1_000);
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow && g.step), "past a step's time: asked");
+        let line = s.log.back().unwrap().clone();
+        assert!(line.contains("part of the cards") && line.contains("S1-JR"), "{line}");
+        assert!(s.table_view().opponent_step && s.table_view().opponent_gone_s.is_some());
+        // The stage moves off it: the question is withdrawn.
+        s.apply(NodeEvent::StageStands { hand_id: 3, seats: Vec::new() });
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none(), "the cards moved: withdrawn");
     }
 
     /// `D-034`: a present heads-up opponent long past their time to decide is

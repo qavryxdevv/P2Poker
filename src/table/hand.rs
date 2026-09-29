@@ -63,7 +63,7 @@ use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
     DealPrivate, DeckCommit, DeckInit, Field, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
     Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep, TimeoutCert,
-    TimeoutVote, CertSubject, CAUSE_FLOOD, CAUSE_LONG_GONE, CAUSE_SILENT_VOTER};
+    TimeoutVote, CertSubject, CAUSE_FLOOD, CAUSE_LONG_GONE, CAUSE_QUESTION, CAUSE_SILENT_VOTER};
 use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 
@@ -601,6 +601,30 @@ fn diverge_if_asked(state_hash: Hash, hand_id: u64) -> Hash {
 #[cfg(not(feature = "fault-harness"))]
 fn diverge_if_asked(state_hash: Hash, _hand_id: u64) -> Hash {
     state_hash
+}
+
+/// `S1-JR`: whether this harness client plays the rogue behaviour `kind` at
+/// hand `hand_id` -- `P2P_POKER_ROGUE` names the behaviours, comma-separated
+/// (`bad-shuffle`: its shuffle proof is broken on the wire; `withhold-step`: it
+/// never takes its shuffle step), from hand `P2P_POKER_ROGUE_FROM_HAND` (1 when
+/// unset). For measuring what the honest seats do about a rogue; a build
+/// without `--features fault-harness` reads neither and plays none.
+#[cfg(feature = "fault-harness")]
+pub(crate) fn rogue(kind: &str, hand_id: u64) -> bool {
+    let Ok(kinds) = std::env::var("P2P_POKER_ROGUE") else {
+        return false;
+    };
+    let from = std::env::var("P2P_POKER_ROGUE_FROM_HAND")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1);
+    hand_id >= from && kinds.split(',').any(|k| k.trim() == kind)
+}
+
+/// Never, in every build that did not ask for the harness.
+#[cfg(not(feature = "fault-harness"))]
+pub(crate) fn rogue(_kind: &str, _hand_id: u64) -> bool {
+    false
 }
 
 /// How much of an event body this client will decode.
@@ -1747,6 +1771,15 @@ pub struct Hand {
     /// `D-051`: the seats a banked certificate named with `CAUSE_FLOOD`: every
     /// voter's client cut them off for flooding the group.
     flood_named: BTreeSet<SeatIdx>,
+    /// `S1-JR`: the seat whose proof this hand was voided over, the cause (2 a
+    /// shuffle, 3 a reveal share), and whether this client's own check found
+    /// it (`true`) or it checked another seat's evidence (`false`). Evidence
+    /// and nothing else (`D-010`): it moves no chip and unseats nobody; the
+    /// node reads it to tell the player the table is not safe.
+    proven_cheat: Option<(SeatIdx, u16, bool)>,
+    /// `S1-JS`: the (stage, seat) pairs this client has asked about early --
+    /// `D-065`'s question, once each.
+    questions: BTreeSet<(u64, SeatIdx)>,
     /// `D-052`: the pots this hand settled into, in the settlement's own
     /// order -- the main pot first, then each side pot -- with what each held
     /// and which seats took it. Kept when the settlement is applied, because
@@ -2288,6 +2321,8 @@ impl Hand {
                 line_down_recently: false,
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
+                proven_cheat: None,
+                questions: BTreeSet::new(),
                 settled_pots: Vec::new(),
                 settled_gain: Vec::new(),
                 forked: None,
@@ -2948,6 +2983,10 @@ impl Hand {
         if self.restoring || chain.whose_turn() != Some(self.open.my_seat) {
             return Ok(Vec::new());
         }
+        // `S1-JR` harness: a rogue that never takes its step.
+        if rogue("withhold-step", self.open.hand_id) {
+            return Ok(Vec::new());
+        }
         let round = u8::try_from(chain.steps_taken()).map_err(|_| Failed::NotInThisStage)?;
 
         // The proof is proved under the *proof* stage's sequence, one past the
@@ -3004,10 +3043,20 @@ impl Hand {
             output_deck_hash: output_hash,
             proof,
         };
+        // `S1-JR` harness: a rogue's proof, broken on the wire only -- its own
+        // chain takes the real one, as a modified client's would.
+        let wire = rogue("bad-shuffle", self.open.hand_id).then(|| {
+            let mut broken = body.clone();
+            let n = broken.proof.len();
+            if n > 0 {
+                broken.proof[n / 2] ^= 0xff;
+            }
+            broken
+        });
         let proof_event = chained::seal(
             EventType::ShuffleProof,
             &after_step,
-            &body,
+            wire.as_ref().unwrap_or(&body),
             key,
             now_ms,
             self.open.crypto_step_timeout_ms,
@@ -5568,6 +5617,7 @@ impl Hand {
             .map_err(|what| Failed::Elsewhere { seat, what })?;
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
         self.give_up(Abort::BadShuffle { seat });
+        self.proven_cheat = Some((seat, 2, true));
         Ok(vec![Send::Broadcast(bytes)])
     }
 
@@ -5604,6 +5654,7 @@ impl Hand {
             .map_err(|what| Failed::Elsewhere { seat, what })?;
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
         self.give_up(Abort::BadReveal { seat });
+        self.proven_cheat = Some((seat, 3, true));
         Ok(vec![Send::Broadcast(bytes)])
     }
 
@@ -5824,7 +5875,23 @@ impl Hand {
         }
 
         self.give_up(Abort::Told { cause: body.cause });
+        // `S1-JR`: another seat's evidence, which this client's own check just
+        // confirmed (causes 2 and 3 are accepted on nothing less).
+        if matches!(body.cause, 2 | 3) && self.proven_cheat.is_none() {
+            let accused = body
+                .attributed
+                .first()
+                .and_then(|k| self.open.seats.iter().find(|(_, key, _)| key == k).map(|(s, _, _)| *s));
+            self.proven_cheat = accused.map(|s| (s, body.cause, false));
+        }
         Ok(Vec::new())
+    }
+
+    /// `S1-JR`: the seat whose proof voided this hand, the cause (2 a shuffle,
+    /// 3 a reveal share), and whether this client's own check found it or it
+    /// checked another seat's evidence -- `None` for any other hand.
+    pub fn proven_cheat(&self) -> Option<(SeatIdx, u16, bool)> {
+        self.proven_cheat
     }
 
     /// Does the `cause = 2` evidence really disprove the proof it names?
@@ -6962,13 +7029,29 @@ impl Hand {
             // receiver checks, and a certificate needs every voter: the table
             // votes a seat out when the most patient voter's clock says so.
             let after = self.vote_after_ms(seat, owed);
-            // `D-065`'s early question: a seat whose event of this stage another
-            // seat has visibly moved past is asked about five seconds in, not at
-            // the deadline -- that seat holds the event, so the vote can complete
-            // no certificate and only brings the answer.
-            let asking = age >= crate::protocol::constants::QUESTION_AFTER_MS
-                && self.later_frame_from_another(seat);
-            if age < after && !asking {
+            if age < after {
+                // `D-065`'s early question: a seat whose event of this stage
+                // another seat has visibly moved past is asked for it five
+                // seconds in, not at the deadline -- that seat holds the event.
+                // `S1-JS`: **asked as a question, which counts towards no
+                // certificate** (`CAUSE_QUESTION`), once a stage and seat. It was
+                // an ordinary vote, and *that seat holds the event, so the vote
+                // can complete no certificate* held only while the seat that
+                // moved past was honest: a rogue that planted a later frame had
+                // every honest voter vote at five seconds about a seat still
+                // thinking, voted too, and the seat was folded and certified out.
+                // The vote goes at the deadline, like any other.
+                if age >= crate::protocol::constants::QUESTION_AFTER_MS
+                    && self.later_frame_from_another(seat)
+                    && self.questions.insert((self.slot.sequence, seat))
+                {
+                    if let Some(mut question) = self.subject_now(seat) {
+                        question.cause = Some(CAUSE_QUESTION);
+                        let bytes =
+                            self.say_at(EventType::TimeoutVote, &question, TIMEOUT_VOTE_CAP, key, now_ms)?;
+                        out.push(Send::Broadcast(bytes));
+                    }
+                }
                 continue;
             }
             // **A seat the carrier is mid-delivery with is late, not silent.**
@@ -7288,6 +7371,11 @@ impl Hand {
                 seat,
                 what: "it were not the subject of its own vote",
             });
+        }
+        // `S1-JS`: a question, not a vote -- the node answered it before the
+        // hand was asked (`vote_asks`), and it counts towards nothing.
+        if body.cause == Some(CAUSE_QUESTION) {
+            return Ok(Vec::new());
         }
         if !body.cause_is_known() {
             return Err(Failed::Elsewhere {
@@ -8839,6 +8927,14 @@ impl Hand {
                 hand_id,
                 seat: self.seat_of_key(&opened.sender),
             };
+        }
+        // `S1-JS`: **held only from a seat of this hand.** A key that is no
+        // seat here has nothing to say in it; a frame of a later stage held
+        // from one proved nothing and brought an early question about a seat
+        // still thinking (`later_frame_from_another`), and every such frame
+        // took a slot of the queue and a signature check at every replay.
+        if self.seat_of_key(&opened.sender).is_none() {
+            return Holding::Malformed;
         }
         // **The same bytes twice are one held event.** The power-of-two re-send
         // puts every recent stage on the wire again at ticks 2, 4, 8, 16, 32,
@@ -14994,7 +15090,7 @@ mod tests {
     /// check and dies at the DLEQ, which is the only failure that is evidence.
     #[test]
     fn a_reveal_share_that_does_not_hold_ends_the_hand_with_cause_three() {
-        let (_a, mut b, deal, _other) = ready_to_deal();
+        let (mut a, mut b, deal, _other) = ready_to_deal();
         let broken = tamper::<DealPrivate>(
             &deal,
             EventType::DealPrivate,
@@ -15032,6 +15128,14 @@ mod tests {
         assert_eq!(body.attributed, vec![b.open.seats[0].1]);
         assert!(body.cert_hash.is_none(), "no certificate: none is needed");
         assert!(body.consistent(&b.mine.stacks).is_ok());
+
+        // `S1-JR`: kept for the node, which tells the player the table is not
+        // safe -- this client's own finding here, and another seat's evidence,
+        // checked, at a receiver.
+        assert_eq!(b.proven_cheat(), Some((0, 3, true)));
+        a.on_event(bytes, &key(10), NOW).expect("the evidence holds at the other client too");
+        assert!(a.aborted().is_some());
+        assert_eq!(a.proven_cheat(), Some((0, 3, false)));
     }
 
     /// **A `cause = 3` abort over a share that is perfectly good ends nobody's
@@ -15184,6 +15288,7 @@ mod tests {
             Some(Abort::BadShuffle { seat: 0 }),
             "the seat whose proof failed is named"
         );
+        assert_eq!(b.proven_cheat(), Some((0, 2, true)), "and kept for the node (S1-JR)");
 
         // The message really is a `cause = 2` carrying both frames, and it says
         // so on the wire rather than only in this client's own phase.
@@ -17106,6 +17211,63 @@ mod tests {
         let _ = hands[0].replay_early(&keys[0], t + 100);
         assert_ne!(hands[0].waiting_for(), vec![4], "seat 0 has the opening and its hand moves on");
         assert!(hands[0].slot().sequence >= 1, "past stage 0");
+    }
+
+    /// `S1-JS`: the early question is a question and nothing more. A frame of a
+    /// later stage held from another seat -- genuine, or planted by a rogue --
+    /// brings a `TIMEOUT_VOTE` with `CAUSE_QUESTION` five seconds in: answered,
+    /// and counted by no receiver, so no certificate about a seat still
+    /// thinking can complete before its deadline, whatever a rogue votes. The
+    /// ordinary vote goes at the deadline.
+    #[test]
+    fn an_early_question_counts_towards_no_certificate() {
+        let keys: Vec<SigningKey> = (0..5u8).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..5u8 {
+            let (h, from) = Hand::open(opening_n(5, seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        let mut later: Vec<Vec<u8>> = Vec::new();
+        for i in 1..5 {
+            for j in 0..5 {
+                if i != j {
+                    later.extend(bytes_of_sends(deliver(&mut hands[i], &inits[j], &keys[i])));
+                }
+            }
+        }
+        for j in 1..4 {
+            let _ = deliver(&mut hands[0], &inits[j], &keys[0]);
+            let _ = deliver(&mut hands[2], &inits[j], &keys[2]);
+        }
+        let t = NOW + 6_000;
+        for b in later.iter().filter(|b| chained::sender_of(b, FRAME_CAP) == Some(keys[1].verifying_key().to_bytes())) {
+            if let Err(Failed::NotYet) = hands[0].on_event(b, &keys[0], t) {
+                let _ = hands[0].hold(b.clone());
+            }
+        }
+        let asked = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], t, 0).unwrap());
+        assert_eq!(asked.len(), 1, "seat 0 asks about seat 4");
+        let opened = chained::open_in_hand(&asked[0], FRAME_CAP, EventType::TimeoutVote, &hands[0].open.table_id, 1).unwrap();
+        let body: TimeoutVote = chained::payload(&opened, TIMEOUT_VOTE_CAP).unwrap();
+        assert_eq!((body.subject_seat, body.cause), (4, Some(CAUSE_QUESTION)), "a question, not a vote");
+        assert!(bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], t + 2_000, 0).unwrap()).is_empty(), "asked once");
+        assert!(hands[0].votes.values().all(|m| m.is_empty()), "and not counted by its own asker");
+
+        // Another voter takes it and keeps nothing: no tally, no certificate.
+        assert!(hands[2].on_event(&asked[0], &keys[2], t).expect("taken").is_empty());
+        assert!(hands[2].votes.values().all(|m| !m.contains_key(&0)), "counted towards nothing");
+
+        // At the deadline the vote is the ordinary one.
+        let voted = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], NOW + 31_000, 0).unwrap());
+        let vote = voted
+            .iter()
+            .filter_map(|b| chained::open_in_hand(b, FRAME_CAP, EventType::TimeoutVote, &hands[0].open.table_id, 1).ok())
+            .filter_map(|o| chained::payload::<TimeoutVote>(&o, TIMEOUT_VOTE_CAP).ok())
+            .find(|v| v.subject_seat == 4)
+            .expect("the vote about seat 4 at its deadline");
+        assert_eq!(vote.cause, None, "an ordinary vote");
     }
 
     /// `D-065`: one voter's word that another is silent seals nothing while

@@ -1406,6 +1406,25 @@ struct TableRun {
     strangers: Vec<std::time::Instant>,
     /// `D-051`: why the window was last told the table is not safe, and when.
     unsafe_said: Option<(String, std::time::Instant)>,
+    /// `S1-JR`: how many hands in a row, up to the last boundary, ended without
+    /// being played out, and the last hand counted.
+    voided_in_row: (u32, Option<u64>),
+    /// `S1-JR`: the seats a hand here was voided over for a proof that does not
+    /// hold, by application key -- the seat, the cause, and whether this
+    /// client's own check found it.
+    cheats: std::collections::BTreeMap<[u8; 32], (u8, u16, bool)>,
+    /// `S1-JR`: the seats seen sending two different copies of one stage, by
+    /// application key -- the seat and the hands it was seen in.
+    equivocators: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
+    /// `S1-JR`: the hand and stage the running hand stands at, and since when.
+    stands: Option<(u64, u64, std::time::Instant)>,
+    /// `S1-JR`: since when the table has had players enough to start, with no
+    /// hand dealt.
+    forming_since: Option<std::time::Instant>,
+    /// `S1-JR`: the hand boundaries in a row at which this client, out of the
+    /// hand with chips and asking to be dealt in again, was not; and the last
+    /// hand counted.
+    return_short: (u32, Option<u64>),
     /// `S1-EH`: whether another seat was ever on the line here, and whether
     /// the last word about this client's own line was *nobody reachable*.
     ever_on_line: bool,
@@ -1866,6 +1885,12 @@ impl TableRun {
             flooders: std::collections::BTreeMap::new(),
             strangers: Vec::new(),
             unsafe_said: None,
+            voided_in_row: (0, None),
+            cheats: std::collections::BTreeMap::new(),
+            equivocators: std::collections::BTreeMap::new(),
+            stands: None,
+            forming_since: None,
+            return_short: (0, None),
             ever_on_line: false,
             nobody_said: false,
             readmitted: Vec::new(),
@@ -2837,6 +2862,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
         }};
     }
+    // `S1-JR`: a hand voided over a proof that does not hold -- this client's
+    // own check, or another seat's evidence it checked -- is kept by the
+    // accused seat's key, and makes the table not safe while it plays there.
+    macro_rules! note_a_proven_cheat {
+        ($t:ident, $h:expr) => {{
+            if let Some((seat, cause, own)) = $h.proven_cheat() {
+                if let Some(k) = $h.key_of(seat) {
+                    $t.cheats.insert(k, (seat, cause, own));
+                }
+            }
+        }};
+    }
     // `S1-CW`: what every road that can end a hand does once its frames are
     // out -- the abort said once, the boundary armed, this client's clock
     // read. `hand_event!` below does it for an incoming event; the stall
@@ -2857,6 +2894,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(why) = $h.aborted().filter(|_| !$t.abort_reported) {
                 $t.abort_reported = true;
                 $t.act_by = None;
+                note_a_proven_cheat!($t, $h);
                 let _ = events.send(NodeEvent::Warning(abort_words(why))).await;
                 arm_boundary!($t, std::time::Duration::from_millis(800));
             }
@@ -3148,6 +3186,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // nothing to do with anybody's
                                     // clock. A player told the wrong
                                     // reason looks for the wrong fault.
+                                    note_a_proven_cheat!($t, $h);
                                     let words = abort_words(why);
                                     let _ = events
                                         .send(NodeEvent::Warning(words))
@@ -3438,6 +3477,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = events
                                         .send(NodeEvent::Warning(n))
                                         .await;
+                                }
+                                // `S1-JR`: two different copies of one stage from
+                                // one seat, kept by its key and the hand.
+                                if let Failed::Equivocation { seat } = &e {
+                                    if let Some(k) = $h.key_of(*seat) {
+                                        $t.equivocators
+                                            .entry(k)
+                                            .or_insert_with(|| (*seat, std::collections::BTreeSet::new()))
+                                            .1
+                                            .insert($h.hand_id());
+                                    }
                                 }
                                 let _ = events
                                     .send(NodeEvent::Warning(format!("hand: {e}")))
@@ -4156,6 +4206,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.flooders.clear();
             $t.strangers.clear();
             $t.unsafe_said = None;
+            $t.voided_in_row = (0, None);
+            $t.cheats.clear();
+            $t.equivocators.clear();
+            $t.stands = None;
+            $t.forming_since = None;
+            $t.return_short = (0, None);
             $t.ever_on_line = false;
             $t.nobody_said = false;
             $t.taught.clear();
@@ -5222,8 +5278,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 return None;
                                             }
                                             // `D-051`: the votes say why.
-                                            let flooded = crate::table::hand::certificate_cause(&w.cert, &w.table_id, w.hand_id, w.seat)
-                                                == Some(crate::table::handwire::CAUSE_FLOOD);
+                                            let cause = crate::table::hand::certificate_cause(&w.cert, &w.table_id, w.hand_id, w.seat);
+                                            let flooded = cause == Some(crate::table::handwire::CAUSE_FLOOD);
+                                            // `S1-JT`: **and it must be a word about being out
+                                            // for good.** A certificate that names this seat is
+                                            // a word about one hand. Out for good is a flood
+                                            // (`D-051`) or the fourth absence (`D-047`) -- the
+                                            // absence after the third return this client's own
+                                            // hand counts -- and never a seat named only as a
+                                            // silent voter, which loses a veto and nothing else.
+                                            // Any certificate verified here was taken for the
+                                            // fourth absence, so one rogue's lobby answer carrying
+                                            // an old single absence ended this client's game.
+                                            if cause == Some(crate::table::handwire::CAUSE_SILENT_VOTER) {
+                                                return None;
+                                            }
+                                            let fourth = t.hand.as_ref().is_some_and(|h| {
+                                                h.returns().get(usize::from(w.seat)).copied().unwrap_or(0)
+                                                    >= crate::protocol::constants::MAX_RETURNS
+                                                    && w.hand_id >= h.hand_id()
+                                            });
+                                            if !flooded && !fourth {
+                                                return None;
+                                            }
                                             Some((
                                                 if flooded {
                                                     format!(
@@ -5839,167 +5916,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             );
                             continue;
                         }
-                        // The hand first, if there is one. A `HAND_INIT`
-                        // decodes as neither a player list nor a ratification,
-                        // so without this it would fall through to the
-                        // formation and be refused as malformed.
-                        if let Some(h) = t.hand.as_mut() {
-                            // The hand, through the shared handling. The macro is
-                            // defined above the loop and this is one of its two call
-                            // sites; the other is the Tox group's. See there for why it
-                            // is a macro, and for what the verdict is.
-                            // **A checkpoint-8 `STATE_HASH` of a hand this
-                            // client has finished is taken here and not by the
-                            // hand**, which owns only its own stages and would
-                            // refuse it for naming a position it has left. It
-                            // is accepted for the mesh either way: it verified,
-                            // and it is worth forwarding whether or not it
-                            // agreed.
-                            if link_is_down() {
-                                continue;
-                            }
-                            cross_boundary_at_t47(h, &mut t.boundaries, &mut t.crossed_for);
-                            let verdict: Option<gossipsub::MessageAcceptance> =
-                                match checkpoint_event(
-                                    &message.data,
-                                    h,
-                                    &mut t.boundaries,
-                                    &mut t.readmitted,
-                                    &mut t.sit_ins,
-                                    &app_key,
-                                    &mut t.checkpoint_said,
-                                    &mut t.frozen,
-                                    &t.roster_seats,
-                                    &mut t.no_round_said,
-                                    &mut t.early_checkpoints,
-                                    &profile_dir,
-                                    &events,
-                                )
-                                .await
-                                {
-                                    // A dispute is unchained and out of stage,
-                                    // so the hand would refuse it; it is taken
-                                    // here instead. Before the freeze test,
-                                    // because a dispute is one of the things
-                                    // that may **cause** the freeze.
-                                    None if dispute_event(
-                                        &message.data,
-                                        h,
-                                        &mut t.boundaries,
-                                        &mut t.frozen,
-                                        &mut t.disputes_seen,
-                                        &events,
-                                    )
-                                    .await =>
-                                    {
-                                        Some(gossipsub::MessageAcceptance::Accept)
-                                    }
-                                    // **§6.3 step 1: no hand event is accepted
-                                    // while frozen.** Ignored rather than
-                                    // rejected — the sender is not at fault and
-                                    // its message is not invalid; this receiver
-                                    // has stopped, which is a different thing
-                                    // and must not cost anybody peer score.
-                                    None if t.frozen.is_some() => {
-                                        // `S1-IN`: **the freeze stops the hand,
-                                        // not the news.** A verified frame of a
-                                        // LATER hand is another seat's signature
-                                        // on the proposition that the table has
-                                        // moved past this one, and `D-038`'s
-                                        // *drop the branch and rejoin from the
-                                        // copies* is the only way out of a
-                                        // freeze that §6.3's round cannot
-                                        // release (`S1-CI`). Reading it was
-                                        // latched inside the handler this arm
-                                        // skips, so a frozen client could never
-                                        // become adrift and stayed frozen for
-                                        // the life of the process. Nothing is
-                                        // kept and nothing of this hand is
-                                        // touched.
-                                        note_the_table_moved_on(
-                                            h,
-                                            &message.data,
-                                            &mut t.ahead,
-                                            &mut t.adrift,
-                                        );
-                                        Some(gossipsub::MessageAcceptance::Ignore)
-                                    }
-                                    // §4.10's hand boundary window, for the same
-                                    // reason the checkpoint is taken above: it
-                                    // belongs to the hand that has just ended
-                                    // and the live one would answer it with
-                                    // `WrongType` (`S1-BZ`).
-                                    //
-                                    // **Below the freeze, and a dispute is
-                                    // above it.** A boundary event is a chained
-                                    // event of a hand, so §6.3 step 1 covers it
-                                    // like any other; a dispute is what may
-                                    // *cause* the freeze and cannot be behind
-                                    // it. A frozen table deals no further hand,
-                                    // so there is nothing for a readmission to
-                                    // be readmitted to.
-                                    None if boundary_event(
-                                        &message.data,
-                                        h,
-                                        &mut t.boundaries,
-                                        &mut t.readmitted,
-                                        &mut t.sit_ins,
-                                        &mut t.early_boundary,
-                                        &events,
-                                    )
-                                    .await =>
-                                    {
-                                        Some(gossipsub::MessageAcceptance::Accept)
-                                    }
-                                    None => hand_event!(t, h, &message.data),
-                                    Some(out) => {
-                                        if !out.is_empty() {
-                                            publish_and_hear(
-                                                out,
-                                                h,
-                                                &mut t.boundaries,
-                                                &mut t.readmitted,
-                                                &mut t.sit_ins,
-                                                &app_key,
-                                                &mut t.checkpoint_said,
-                                                &mut t.frozen,
-                                                &t.roster_seats,
-                                                &mut t.no_round_said,
-                                                &mut t.early_checkpoints,
-                                                &profile_dir,
-                                                &events,
-                                                &mut swarm,
-                                                &mut t.said,
-                                                &t.tox_sink,
-                                            )
-                                            .await;
-                                        }
-                                        Some(gossipsub::MessageAcceptance::Accept)
-                                    }
-                                };
-                            // The single exit. A hand event never leaves this
-                            // branch without the mesh being told what became of
-                            // it.
-                            if let Some(v) = verdict {
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .report_message_validation_result(
-                                        &message_id,
-                                        &propagation_source,
-                                        v,
-                                    );
-                                continue;
-                            }
-                        }
+                        // `S1-JU`: **nor does the hand, nor anything of it.** Hands
+                        // travel in the table's Tox group and nowhere else (`D-019`,
+                        // "Tox or nothing", `S1-JG`): `publish_hand` cannot reach this
+                        // topic, and a checkpoint, a dispute or a boundary word rides
+                        // the group with the hand. The topic's name is the public
+                        // table id, so what arrived here for the hand -- which this arm
+                        // used to hand to the engine, checkpoints and disputes first --
+                        // came from a peer with no seat: fed this client's engine,
+                        // froze it on a checkpoint, and cost a signature check a frame.
+                        // It falls to the formation now, which refuses it as it refuses
+                        // anything that is not the formation's.
 
                         // Nothing arrives while the link is down.
                         if link_is_down() {
                             continue;
                         }
-                        if t.resuming && t.hand.is_none() {
-                            let _ = stash_for_resume(&message.data, &mut t.resume_inits, &mut t.resume_early);
-                        }
+                        // `S1-JU`: and nothing is kept here for a resume either -- the
+                        // hand's copies a seat back from a restart adopts come over the
+                        // group, and this topic carried only a stranger's.
                         // `S1-GA`: a seat's word that its player left, before the table
                         // is set -- heard on the topic too, where a seat still joining
                         // the group is heard at all. After the set the group alone
@@ -10196,6 +10131,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(f) = t.table.as_ref() {
                         seats_on_tox(f, &t.tox_sink);
                     }
+                    watch_progress(t);
                     let unsafe_now = unsafe_reason(t);
                     let say = match (&unsafe_now, &t.unsafe_said) {
                         (Some(why), Some((said, at))) => why != said || at.elapsed() >= UNSAFE_ASK_AGAIN,
@@ -10207,7 +10143,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         t.unsafe_said = unsafe_now.clone().map(|w| (w, std::time::Instant::now()));
                         if let Some(why) = &unsafe_now {
                             let _ = events
-                                .send(NodeEvent::Warning(format!("this table is not safe: {why} (D-051)")))
+                                .send(NodeEvent::Warning(format!("this table is not safe: {why} (D-051, S1-JR)")))
                                 .await;
                         }
                         let _ = events.send(NodeEvent::TableUnsafe { why: unsafe_now }).await;
@@ -13081,6 +13017,34 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let next = t.hand.as_ref().and_then(|h| h.next_hand());
+                // `S1-JR`: the hands voided one after another, and the
+                // boundaries at which this client asked to be dealt in again
+                // and was not -- each counted once per hand, and read by
+                // `unsafe_reason`.
+                if let Some(h) = t.hand.as_ref() {
+                    if t.voided_in_row.1 != Some(h.hand_id()) {
+                        t.voided_in_row = (
+                            if h.aborted().is_some() && !h.late_settled() {
+                                t.voided_in_row.0.saturating_add(1)
+                            } else {
+                                0
+                            },
+                            Some(h.hand_id()),
+                        );
+                    }
+                    if t.return_short.1 != Some(h.hand_id()) {
+                        let me = h.my_seat();
+                        let dealt_next = next.as_ref().is_some_and(|o| o.required.contains(&me));
+                        let count = if dealt_next {
+                            0
+                        } else if h.may_ask_to_sit_in() {
+                            t.return_short.0.saturating_add(1)
+                        } else {
+                            t.return_short.0
+                        };
+                        t.return_short = (count, Some(h.hand_id()));
+                    }
+                }
                 // `S1-FL`: what this boundary decided about the tournament --
                 // every seat's place, from the stacks every peer agreed the hand
                 // began with, the stacks it ended with, and `R(k+1)` as just
@@ -14717,6 +14681,148 @@ fn unsafe_reason(t: &TableRun) -> Option<String> {
         return Some(format!(
             "{strangers} strangers who are no players entered the table's connection within {} minutes and were removed: somebody at the table keeps letting them in.",
             STRANGERS_WINDOW.as_secs() / 60
+        ));
+    }
+    no_progress_reason(t, now)
+}
+
+/// `S1-JR`: this many hands in a row called off before they were played out
+/// make the table not safe.
+const VOIDED_LIMIT: u32 = 3;
+/// `S1-JR`: a running hand standing at one stage this long makes the table not
+/// safe. Nothing an honest table does stands this long: a turn is decided or
+/// acted for within its clock and a vote, and a cryptographic stage ends within
+/// three budgets -- by a certificate, or by giving the hand up.
+const STANDS_LIMIT: std::time::Duration = std::time::Duration::from_secs(240);
+/// `S1-JR`: a table with players enough to start and no hand dealt this long
+/// is not safe. An honest table sets within a minute or two: the group joined
+/// within `GROUP_JOIN_GRACE`, every seat ready within `READY_GRACE` after.
+const FORMING_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+/// `S1-JR`: this many boundaries in a row at which this client asked to be
+/// dealt in again and was not make the table not safe for it.
+const RETURN_SHORT_LIMIT: u32 = 3;
+/// `S1-JR`: a seat seen sending two different copies of one stage in this
+/// many hands makes the table not safe. Not in one: a client back from a
+/// restart in the middle of a hand could do it once.
+const EQUIVOCATION_HANDS: usize = 2;
+
+/// `S1-JR`: "seat 2 (Alice)", or "seat 2" when the roster has no name for it.
+fn seat_called(t: &TableRun, seat: u8) -> String {
+    let name = t
+        .table
+        .as_ref()
+        .and_then(|f| f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.display_name.clone()))
+        .filter(|n| !n.trim().is_empty());
+    match name {
+        Some(n) => format!("seat {seat} ({n})"),
+        None => format!("seat {seat}"),
+    }
+}
+
+/// `S1-JR`: what `unsafe_reason` reads of the table's progress, kept on the
+/// stall tick -- the stage the running hand stands at and since when, and
+/// since when a table with players enough to start has dealt no hand. The
+/// hands voided in a row and the returns not taken are counted at the
+/// boundary instead, where a hand is seen whole before the next replaces it.
+fn watch_progress(t: &mut TableRun) {
+    let now = std::time::Instant::now();
+    t.stands = match t.hand.as_ref().filter(|h| !h.over()) {
+        Some(h) => {
+            let at = (h.hand_id(), h.slot().sequence);
+            match t.stands {
+                Some((hand, stage, since)) if (hand, stage) == at => Some((hand, stage, since)),
+                _ => Some((at.0, at.1, now)),
+            }
+        }
+        None => None,
+    };
+    let forming = t.hand.is_none() && !t.search && t.table.as_ref().is_some_and(|f| f.may_start());
+    t.forming_since = if forming { Some(t.forming_since.unwrap_or(now)) } else { None };
+}
+
+/// `S1-JR`, the owner's rule (2026-09-29): *no player at a table may hold its
+/// game up for ever; what the table's certificates cannot settle, the player
+/// is told, and asked whether to leave.* Why this table is not safe on that
+/// ground, or `None`:
+///
+/// * a seat still in the game sent a proof that does not hold -- this client's
+///   own check, or another seat's evidence it checked (`cause` 2 or 3); every
+///   hand it spoils is called off, and nothing puts it out of the game yet;
+/// * a seat sent two different copies of one stage in `EQUIVOCATION_HANDS`
+///   hands or more;
+/// * `VOIDED_LIMIT` hands in a row were called off before they were played out;
+/// * the running hand has stood at one stage for `STANDS_LIMIT` -- not while
+///   this client's own line is the likely cause, and not at a heads-up turn,
+///   which the player is asked about anyway (`D-034`);
+/// * the table has had players enough to start for `FORMING_LIMIT` and dealt
+///   no hand -- not a search's table, whose founder waits for its seats on
+///   purpose (`D-064`);
+/// * this client asked to be dealt in again at `RETURN_SHORT_LIMIT`
+///   boundaries in a row and was not.
+fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
+    let in_game = |key: &[u8; 32]| {
+        let seat = t.table.as_ref().and_then(|f| f.roster().seat_of(key));
+        seat.is_some_and(|s| t.hand.as_ref().is_none_or(|h| !h.out_for_good().contains(&s)))
+    };
+    if let Some((_, (seat, cause, own))) = t.cheats.iter().find(|(k, _)| in_game(k)) {
+        let what = if *cause == 3 { "a card share" } else { "a shuffle proof" };
+        let whose = seat_called(t, *seat);
+        return Some(if *own {
+            format!(
+                "{whose} sent {what} that does not hold: its client does not play by the rules. Every hand it spoils is called off, and nothing here puts it out of the game."
+            )
+        } else {
+            format!(
+                "another player proved that {whose} sent {what} that does not hold: its client does not play by the rules. Every hand it spoils is called off, and nothing here puts it out of the game."
+            )
+        });
+    }
+    if let Some((_, (seat, hands))) =
+        t.equivocators.iter().find(|(k, (_, hands))| hands.len() >= EQUIVOCATION_HANDS && in_game(k))
+    {
+        return Some(format!(
+            "{} sent two different versions of one step in {} hands: the players can end up in different games.",
+            seat_called(t, *seat),
+            hands.len()
+        ));
+    }
+    if t.voided_in_row.0 >= VOIDED_LIMIT {
+        return Some(format!(
+            "the last {} hands were called off before they were played out: a player may be holding the game up on purpose, or a line keeps failing.",
+            t.voided_in_row.0
+        ));
+    }
+    if let (Some((hand, _, since)), Some(h)) = (t.stands, t.hand.as_ref()) {
+        let heads_up_turn = h.required().len() <= 2 && h.turn().is_some();
+        if now.duration_since(since) >= STANDS_LIMIT && !heads_up_turn && !own_line_suspect(t) {
+            let waiting: Vec<String> = h.waiting_for().into_iter().map(|s| seat_called(t, s)).collect();
+            return Some(if waiting.is_empty() {
+                format!(
+                    "hand #{hand} has not moved for {} minutes, and the table cannot go on with it.",
+                    now.duration_since(since).as_secs() / 60
+                )
+            } else {
+                format!(
+                    "hand #{hand} has not moved for {} minutes: it waits for {}, and the table cannot go on without {}.",
+                    now.duration_since(since).as_secs() / 60,
+                    waiting.join(", "),
+                    if waiting.len() == 1 { "it" } else { "them" }
+                )
+            });
+        }
+    }
+    if let Some(since) = t.forming_since {
+        if now.duration_since(since) >= FORMING_LIMIT {
+            return Some(format!(
+                "the table has had players enough to start for {} minutes and has not dealt a hand: a player may be holding it up.",
+                now.duration_since(since).as_secs() / 60
+            ));
+        }
+    }
+    if t.return_short.0 >= RETURN_SHORT_LIMIT {
+        return Some(format!(
+            "you asked to be dealt in again at the last {} hand boundaries and were not: a player at the table does not sign your return.",
+            t.return_short.0
         ));
     }
     None
@@ -21167,6 +21273,60 @@ mod a_joiner_before_the_first_hand {
         t.group_timeouts.clear();
         t.tox_down_at = Some(now);
         assert!(own_line_suspect(&t), "the library said offline a moment ago");
+    }
+
+    /// `S1-JR`, the owner's rule: a table whose hands keep being called off, at
+    /// which this client is kept out, or which has had its players and dealt
+    /// nothing, is not safe -- the player is told, and asked whether to leave --
+    /// at the limits and not before.
+    #[test]
+    fn a_table_that_cannot_go_on_is_not_safe() {
+        let dir = std::env::temp_dir();
+        let mut t = TableRun::new(0, &dir, None, super::super::toxsink::TableSink::none());
+        assert_eq!(unsafe_reason(&t), None, "nothing read: safe");
+        t.voided_in_row = (VOIDED_LIMIT - 1, Some(7));
+        assert_eq!(unsafe_reason(&t), None, "one hand short of the limit");
+        t.voided_in_row = (VOIDED_LIMIT, Some(8));
+        assert!(unsafe_reason(&t).is_some_and(|w| w.contains("called off")), "the limit");
+        t.voided_in_row = (0, Some(9));
+        assert_eq!(unsafe_reason(&t), None, "a hand played out: safe again");
+        t.return_short = (RETURN_SHORT_LIMIT - 1, Some(10));
+        assert_eq!(unsafe_reason(&t), None);
+        t.return_short = (RETURN_SHORT_LIMIT, Some(11));
+        assert!(unsafe_reason(&t).is_some_and(|w| w.contains("dealt in again")));
+        t.return_short = (0, None);
+        let now = std::time::Instant::now();
+        t.forming_since = Some(now - FORMING_LIMIT + std::time::Duration::from_secs(5));
+        assert_eq!(unsafe_reason(&t), None, "forming, inside the limit");
+        t.forming_since = Some(now - FORMING_LIMIT - std::time::Duration::from_secs(1));
+        assert!(unsafe_reason(&t).is_some_and(|w| w.contains("has not dealt a hand")));
+        t.forming_since = None;
+        t.cheats.insert([1u8; 32], (2, 2, true));
+        assert_eq!(unsafe_reason(&t), None, "a proven cheat no longer at the table is no reason");
+    }
+
+    /// `S1-JR`: what the not-safe reasons read is kept where it happens -- a
+    /// proven cheat on both roads that report an abort, before the words; two
+    /// copies of one stage where a refused event is said; and the progress
+    /// watched on the tick just before the reason is read.
+    #[test]
+    fn the_progress_a_table_is_judged_on_is_kept_where_it_happens() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let body = |name: &str| -> &str {
+            let from = code.find(&format!("macro_rules! {name} {{")).unwrap_or_else(|| panic!("{name}"));
+            let to = from + code[from..].find("\n    }\n").expect("its end");
+            &code[from..to]
+        };
+        for road in ["hand_may_have_ended", "hand_event"] {
+            let b = body(road);
+            let noted = b.find("note_a_proven_cheat!($t, $h);").unwrap_or_else(|| panic!("{road} keeps a proven cheat"));
+            assert!(b[noted..].contains("abort_words("), "{road}: kept before the abort is said");
+        }
+        assert!(body("hand_event").contains("if let Failed::Equivocation { seat } = &e {"), "two copies kept");
+        let watched = code.find("watch_progress(t);\n").expect("watched");
+        let read = code.find("let unsafe_now = unsafe_reason(t);").expect("read");
+        assert!(watched < read && read - watched < 200, "watched on the tick, just before the reason is read");
     }
 
     /// `S1-JJ`: a client keeps on disk that its table was set to start the moment

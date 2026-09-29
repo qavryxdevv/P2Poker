@@ -275,6 +275,9 @@ pub struct TableView {
     pub opponent_out: bool,
     /// `D-034`: the opponent is on the line but long past their time to decide.
     pub opponent_slow: bool,
+    /// `S1-JR`: ...and what it holds back is its part of the cards, not a
+    /// decision.
+    pub opponent_step: bool,
     /// `D-035`: the opponent quit the table; the game is over.
     pub opponent_left: bool,
     /// `D-047`: this seat is out of the table for good -- said with the one
@@ -1703,6 +1706,8 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                 window_heading(ui, title, false);
                 if view.opponent_left {
                     ui.label("Your opponent left the table.");
+                } else if view.opponent_slow && view.opponent_step {
+                    ui.label(format!("Your opponent's client has held back its part of the cards for {secs} s."));
                 } else if view.opponent_slow {
                     ui.label(format!("Your opponent has been on the clock for {secs} s past their time to decide."));
                 } else if view.opponent_alone {
@@ -1718,6 +1723,8 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                     ui.label(
                         RichText::new(if view.opponent_alone {
                             "Alone at the table, nobody can certify anybody: the table waits for them."
+                        } else if view.opponent_slow && view.opponent_step {
+                            "Heads-up, nobody can end the hand for them: it is called off and dealt again, and they can hold it up every time."
                         } else {
                             "Heads-up, nobody can fold a hand for an absent player: the table waits for them."
                         })
@@ -2205,6 +2212,7 @@ impl TableView {
             opponent_gone_s: None,
             opponent_out: false,
             opponent_slow: false,
+            opponent_step: false,
             opponent_left: false,
             out_for_good: None,
             out_flooded: false,

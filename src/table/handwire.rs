@@ -798,6 +798,17 @@ pub const CAUSE_SILENT_VOTER: u16 = 2;
 /// roster as any quiet seat does.
 pub const CAUSE_LONG_GONE: u16 = 3;
 
+/// `S1-JS`: not a vote but `D-065`'s early question -- the voter holds a frame
+/// of a later stage from another seat, which proves the named seat's frame
+/// of this stage exists, and asks for it five seconds in rather than at the
+/// deadline. **Counted towards nothing**: a receiver takes it without keeping
+/// it, and a certificate carrying it is refused (`cause_is_known` does not
+/// know it). It was an ordinary vote, so one rogue that planted a later frame
+/// had every honest voter vote at five seconds about a seat still thinking,
+/// and with its own vote the certificate was unanimous: the seat was folded
+/// and certified out. The ordinary vote goes at the deadline.
+pub const CAUSE_QUESTION: u16 = 4;
+
 impl TimeoutVote {
     /// The digest a certificate identifies this subject by.
     ///

@@ -3531,7 +3531,7 @@ in this paragraph, which records its withdrawal.
 | `n(3) parent_event_hash` | `bytes[32]` | `stage_hash(subject_sequence - 1)` |
 | `n(4) deadline_ms` | `u32` | the `next_deadline_ms` carried by the parent stage's events |
 | `n(5) kind` | `u16` | `1` = action deadline, `2` = cryptographic-step deadline |
-| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. `2` (**D-065**): the seat is not one the stage waits on but a voter of the round at that stage that has said nothing about it within the round's air -- no vote about every seat the voter voted about there, or no copy of the certificate the voter sealed. `3` (**D-066**): the seat, one the stage waits on, has been out of the table's group or silent there for `LONG_GONE_S` or more by the voter's own reading. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
+| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. `2` (**D-065**): the seat is not one the stage waits on but a voter of the round at that stage that has said nothing about it within the round's air -- no vote about every seat the voter voted about there, or no copy of the certificate the voter sealed. `3` (**D-066**): the seat, one the stage waits on, has been out of the table's group or silent there for `LONG_GONE_S` or more by the voter's own reading. `4` (**S1-JS**): no vote at all but the early question below -- taken by a receiver and counted towards nothing, and refused in a certificate. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
 
 *Envelope:* `sequence = subject_sequence`,
 `previous_event_hash = parent_event_hash`, `chain_scope = 1` and
@@ -3597,14 +3597,19 @@ did not vote about may be what it has. Once per hand, stage, seat and cause at
 each receiver. Answering is never a precondition of anything: a receiver that
 answers nothing breaks no rule, and the vote is judged as before.
 
-**The question may come early.** A voter may cast its vote about seat `s` at stage
-`x` before `x`'s deadline -- `QUESTION_AFTER_MS`, five seconds, into the stage --
-when it holds an event of a later stage of this hand signed by a seat other than
-`s` and itself. That seat moved past `x`, which no seat does without `s`'s event of
-`x` (a collective stage needs every event, a single-writer one builds on the last),
-so it will never vote about `s` at `x` and the early vote can complete no
-certificate: it is a question and nothing else, and the answer comes seconds after
-the loss rather than a deadline after it.
+**The question may come early.** A voter may ask about seat `s` at stage `x` before
+`x`'s deadline -- `QUESTION_AFTER_MS`, five seconds, into the stage -- when it holds
+an event of a later stage of this hand signed by another seat of the hand than `s`
+and itself. That seat moved past `x`, which no honest seat does without `s`'s event
+of `x` (a collective stage needs every event, a single-writer one builds on the last),
+so the answer comes seconds after the loss rather than a deadline after it. **The
+early question is a `TIMEOUT_VOTE` with `cause = 4` and counts towards nothing**
+(`S1-JS`): a receiver takes it without keeping it, a certificate carrying it is
+refused, and the voter's vote about `s` goes at the deadline like any other. It was
+an ordinary vote, on the reasoning that the seat that moved past would never vote
+about `s` at `x` -- true of an honest seat only: a rogue that planted a frame of a
+later stage had every honest voter vote about a seat still thinking five seconds
+in, voted too, and the certificate was unanimous.
 The one field that varies freely is the advisory `emitted_at_unix_ms`, which is
 why §5.2's re-emission rule is normative: a peer that must send its vote again
 sends the stored bytes and never re-signs.

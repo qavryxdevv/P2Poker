@@ -194,6 +194,7 @@ impl AppState {
             opponent_gone_s: if self.tox_line_gone() { None } else { self.opponent_gone_for_s() },
             opponent_out: self.opponent_out,
             opponent_slow: self.opponent_gone.as_ref().is_some_and(|g| g.slow),
+            opponent_step: self.opponent_gone.as_ref().is_some_and(|g| g.step),
             opponent_left: self.opponent_left,
             out_for_good: self.out_for_good.clone(),
             out_flooded: self.out_flooded,

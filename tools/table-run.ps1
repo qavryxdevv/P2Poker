@@ -168,6 +168,14 @@ param(
     # are not: a peer that diverges does not know it, which is the whole reason
     # everybody else compares.
     [ValidateRange(0, 32)][int]$DivergeNode = 1,
+    # `S1-JR`: `-Rogue <kinds>` makes one node play a rogue's client from hand
+    # `-RogueFromHand`: `bad-shuffle` (its shuffle proof is broken on the wire),
+    # `withhold-step` (it never takes its shuffle step); comma-separated. For
+    # measuring what the honest seats do about it -- the table not safe, a hand
+    # never held for ever. Needs a `--features fault-harness` binary.
+    [string]$Rogue = '',
+    [ValidateRange(0, 32)][int]$RogueNode = 1,
+    [ValidateRange(1, 100000)][int]$RogueFromHand = 1,
     # `-LinkDownAt <s> -LinkDownFor <s>` takes one node's LINE away without
     # killing it. The process, its Hand, its chain position and its keys all
     # survive; only the table messages stop, in both directions.
@@ -541,6 +549,7 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $offAt = if ($OfflineAt -gt 0 -and (($offList.Count -eq 0 -and $i -eq $OfflineNode) -or ($offList -contains $i))) { $OfflineAt } else { 0 }
     $noAnswerForNode = ($noAnswerList -contains 'all') -or ($noAnswerList -contains "$i")
     $deafToForNode = if ($DeafToFor -gt 0 -and $i -eq $DeafToNode) { "$DeafToSeat,$DeafToAt,$DeafToFor" } else { '' }
+    $rogueForNode = if ($Rogue -and $i -eq $RogueNode) { $Rogue } else { '' }
     $afkForNode = if ($AfkAt -gt 0 -and $i -eq $AfkNode) { $AfkAt } else { 0 }
     $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
     # `D-051`. Not `$floodNodes`: a local of that name IS the parameter.
@@ -565,9 +574,13 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # P2P_POKER_STAYS, every mute was on-turn, every stranger flooded and every
     # return sat out (found by -NoVote reaching all five nodes, S1-AQ,
     # 2026-09-18). In parentheses it is an expression and a bool.
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode), ([bool]$noAnswerForNode), $deafToForNode -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote, $noAnswer, $deafTo)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode), ([bool]$noAnswerForNode), $deafToForNode, $rogueForNode, $RogueFromHand -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote, $noAnswer, $deafTo, $rogue, $rogueFrom)
         if ($stays) { $env:P2P_POKER_STAYS = '1' }
+        if ($rogue) {
+            $env:P2P_POKER_ROGUE = "$rogue"
+            $env:P2P_POKER_ROGUE_FROM_HAND = "$rogueFrom"
+        }
         if ($noVote) { $env:P2P_POKER_NO_VOTE = '1' }
         if ($noAnswer) { $env:P2P_POKER_NO_ANSWER = '1' }
         if ($deafTo) {
@@ -665,6 +678,10 @@ if ($LeaverSeconds -gt 0) {
 
 if ($DivergeAt -gt 0) {
     Write-Host "==> n$DivergeNode will hold a wrong end-of-hand state for hand $DivergeAt"
+    Write-Host "    (needs a binary built with --features fault-harness)"
+}
+if ($Rogue) {
+    Write-Host "==> n$RogueNode plays a rogue's client from hand ${RogueFromHand}: $Rogue (S1-JR)"
     Write-Host "    (needs a binary built with --features fault-harness)"
 }
 if ($StallJoin -gt 0) {
