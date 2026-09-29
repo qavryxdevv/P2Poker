@@ -10729,8 +10729,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // reading is what made the trouble.
                                 let (by, founders) = marks.iter().find(|m| m.0 == x).map_or((by, false), |m| (m.2, m.6));
                                 // `S1-JM`: given back for never saying it was ready, having
-                                // heard every seat -- the last road below.
-                                let stalled = !(founders && cannot == 0 && by < 2) && cannot + by == 0;
+                                // heard every seat -- the last road below -- at a roster below
+                                // the minimum, the one a seat may take for short.
+                                let stalled = !(founders && cannot == 0 && by < 2)
+                                    && cannot + by == 0
+                                    && t.table.as_ref().is_some_and(|f| {
+                                        f.roster().len() < usize::from(f.ad().min_players_to_start)
+                                    });
                                 let stalled_key = t
                                     .table
                                     .as_ref()
@@ -10753,14 +10758,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some((peer, tox_key)) = entry {
                                     release_the_seat!(t, x, peer, tox_key, why, now);
                                 }
-                                // `S1-JM`: such a seat took the roster for short -- it never
-                                // learnt the table was set to start -- and is a stranger to it
-                                // from now on, once it is off the roster: back below the
-                                // minimum it would only hold the set up again.
+                                // `S1-JM`: such a seat, given back so twice, will not ratify
+                                // below the minimum -- it never learnt the table was set to
+                                // start -- and is a stranger to it from then on, once it is off
+                                // the roster: back below the minimum it would only hold the
+                                // set up again. Once may be its one ratification lost.
                                 if stalled {
                                     if let (Some(f), Some(k)) = (t.table.as_mut(), stalled_key) {
                                         if f.roster().seat_of(&k).is_none() {
-                                            f.forget_seated_before(&k);
+                                            f.stalled_below_the_minimum(&k);
                                         }
                                     }
                                 }
@@ -21089,24 +21095,30 @@ mod a_joiner_before_the_first_hand {
     }
 
     /// `S1-JM`: a seat given back for never saying it was ready, having heard
-    /// every seat, took the roster for short -- it never learnt the table was
-    /// set to start -- and is forgotten as a seat of the roster at the minimum,
-    /// once it is off the roster; given back for any other trouble, it is not.
+    /// every seat, at a roster below the minimum -- the one a seat may take for
+    /// short -- is counted, once it is off the roster (twice, and it is a
+    /// stranger to the table); given back for any other trouble, or at a
+    /// roster at the minimum, it is not.
     #[test]
-    fn a_seat_that_never_said_it_was_ready_is_forgotten_as_seated_before() {
+    fn a_seat_that_never_said_it_was_ready_below_the_minimum_is_counted() {
         let src = include_str!("run.rs");
         let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
         let stalled = code
-            .find("let stalled = !(founders && cannot == 0 && by < 2) && cannot + by == 0;")
+            .find("let stalled = !(founders && cannot == 0 && by < 2)\n")
             .expect("the road of a seat that heard everybody and did not say it was ready");
         let rest = &code[stalled..];
         let why = rest.find("format!(\"heard every seat and did not say it was ready").expect("its reason");
-        let released = rest.find("release_the_seat!(t, x, peer, tox_key, why, now);").expect("the release");
-        let forgotten = rest.find("f.forget_seated_before(&k);").expect("the key forgotten");
-        assert!(why < released && released < forgotten, "forgotten after the release, on that road");
         assert!(
-            rest[released..forgotten].contains("if stalled {")
-                && rest[released..forgotten].contains("if f.roster().seat_of(&k).is_none() {"),
+            rest[..why].contains("&& cannot + by == 0\n")
+                && rest[..why].contains("f.roster().len() < usize::from(f.ad().min_players_to_start)"),
+            "the road the reason names, at a roster below the minimum"
+        );
+        let released = rest.find("release_the_seat!(t, x, peer, tox_key, why, now);").expect("the release");
+        let counted = rest.find("f.stalled_below_the_minimum(&k);").expect("the key counted");
+        assert!(why < released && released < counted, "counted after the release, on that road");
+        assert!(
+            rest[released..counted].contains("if stalled {")
+                && rest[released..counted].contains("if f.roster().seat_of(&k).is_none() {"),
             "only on that road, and only once the seat is off the roster"
         );
     }

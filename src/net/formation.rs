@@ -282,11 +282,14 @@ pub struct Formation {
     /// One that asks again is no stranger to a table set to start below its
     /// minimum. A key seated only while the table was short never learnt it,
     /// and is a stranger like any other; so is one that showed it had not
-    /// learnt it ([`Formation::forget_seated_before`]).
+    /// learnt it ([`Formation::stalled_below_the_minimum`]).
     seated_before: std::collections::BTreeSet<[u8; 32]>,
     /// `S1-JM`: when the founder was left alone at a table set to start, on its
     /// own clock -- a stranger fills it afresh only after [`LEFT_ALONE_WAIT_MS`].
     alone_since_ms: Option<u64>,
+    /// `S1-JM`: every key given back once below the minimum for hearing every
+    /// seat and never saying it was ready ([`Formation::stalled_below_the_minimum`]).
+    stalled_once: std::collections::BTreeSet<[u8; 32]>,
 }
 
 /// What this client may need to say again.
@@ -363,6 +366,7 @@ impl Formation {
             admitted: false,
             seated_before: std::collections::BTreeSet::new(),
             alone_since_ms: None,
+            stalled_once: std::collections::BTreeSet::new(),
         })
     }
 
@@ -426,6 +430,7 @@ impl Formation {
             admitted: false,
             seated_before: std::collections::BTreeSet::new(),
             alone_since_ms: None,
+            stalled_once: std::collections::BTreeSet::new(),
         };
         f.said.list = Some(list_bytes.to_vec());
         let out = f.adopt(&list, now_ms)?;
@@ -534,6 +539,7 @@ impl Formation {
                 admitted: false,
                 seated_before: std::collections::BTreeSet::new(),
                 alone_since_ms: None,
+                stalled_once: std::collections::BTreeSet::new(),
             },
             bytes,
         ))
@@ -1184,14 +1190,20 @@ impl Formation {
         Ok(out)
     }
 
-    /// `S1-JM`: a seat that heard every seat of the table and still did not say
-    /// it was ready took the roster for short -- it never learnt the table was
-    /// set to start (a client of 0.1.5, which keeps nothing on disk, or one that
-    /// missed the list at the minimum) -- and is a stranger to it from now on:
-    /// back at a table below its minimum it would only hold the set up again,
-    /// and be given back again, for as long as its window stays open.
-    pub fn forget_seated_before(&mut self, key: &[u8; 32]) {
-        self.seated_before.remove(key);
+    /// `S1-JM`: a seat given back below the table's minimum for hearing every
+    /// seat and never saying it was ready. Twice, and it will not ratify a
+    /// roster below the minimum -- it never learnt the table was set to start (a
+    /// client of 0.1.5, which keeps nothing on disk, or one that missed the list
+    /// at the minimum), or a search seat that sits down only at a full table
+    /// (`D-064`) -- and it is a stranger to the table from then on: back below
+    /// the minimum it would only hold the set up again, and be given back again,
+    /// for as long as its window stays open. Once is not enough: a seat that
+    /// knows the set says it is ready once, and that one word may be lost on
+    /// its way.
+    pub fn stalled_below_the_minimum(&mut self, key: &[u8; 32]) {
+        if !self.stalled_once.insert(*key) {
+            self.seated_before.remove(key);
+        }
     }
 
     /// `S1-JB`: the wall clock jumped by `by_ms`. The moment this founder was
@@ -3354,23 +3366,31 @@ mod tests {
         assert!(t.founder.set_to_start(), "a refused stranger un-sets nothing");
     }
 
-    /// `S1-JM`: a seat that showed it never learnt the table was set to start
-    /// -- it heard every seat and did not say it was ready, and was given back
-    /// for it (`run.rs`) -- is forgotten, and asks again as a stranger: back
-    /// below the minimum it would only hold the set up again.
+    /// `S1-JM`: a seat given back twice below the minimum for hearing every
+    /// seat and never saying it was ready (`run.rs`) will not ratify there --
+    /// it never learnt the table was set to start -- and asks again as a
+    /// stranger: back below the minimum it would only hold the set up again.
+    /// Once is not enough: a seat that knows says it is ready once, and that
+    /// word may be lost.
     #[test]
-    fn a_seat_that_never_learnt_the_set_is_a_stranger_once_forgotten() {
+    fn a_seat_that_never_learnt_the_set_is_a_stranger_once_it_has_shown_it_twice() {
         let (mut t, _, a, hash) = found(6, 4);
         seat_players(&mut t, &a, hash, &[2, 3, 4]);
-        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 1_000).expect("given back");
-        t.founder.release_seat_before_the_first_hand(&peer(4), NOW + 1_001).expect("given back");
-        t.founder.forget_seated_before(&key(3).verifying_key().to_bytes());
-        let refused = a_stranger_asks(&mut t, &a, hash, 3, NOW + 2_000);
+        t.founder.release_seat_before_the_first_hand(&peer(4), NOW + 1_000).expect("given back");
+        let three = key(3).verifying_key().to_bytes();
+
+        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 1_001).expect("given back");
+        t.founder.stalled_below_the_minimum(&three);
+        assert!(a_stranger_asks(&mut t, &a, hash, 3, NOW + 2_000).is_ok(), "once may be a word lost: let in");
+
+        t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 60_000).expect("given back again");
+        t.founder.stalled_below_the_minimum(&three);
+        let refused = a_stranger_asks(&mut t, &a, hash, 3, NOW + 61_000);
         assert!(
             matches!(refused, Err(Failed::Refused { reason, .. }) if reason == RejectReason::TableFull.code()),
-            "forgotten, and a stranger to the table: {refused:?}"
+            "twice, and a stranger to the table: {refused:?}"
         );
-        assert!(a_stranger_asks(&mut t, &a, hash, 4, NOW + 3_000).is_ok(), "a seat not forgotten comes back");
+        assert!(a_stranger_asks(&mut t, &a, hash, 4, NOW + 62_000).is_ok(), "a seat that never stalled comes back");
     }
 
     /// `S1-JM`: a seat given back for a short fault, which left its founder
