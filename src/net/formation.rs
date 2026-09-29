@@ -270,8 +270,11 @@ pub struct Formation {
     /// a roster said to a seat already on it, which a founder says at a table in
     /// play too.
     admitted: bool,
-    /// `S1-JM`: at the founder, every key it has seated at this table -- one
-    /// that asks again is no stranger to a table set to start below its minimum.
+    /// `S1-JM`: at the founder, every key of a roster it adopted at the
+    /// advert's minimum or above -- a seat that learnt the table was set to
+    /// start, and kept it on disk (`S1-JJ`). One that asks again is no stranger
+    /// to a table set to start below its minimum. A key seated only while the
+    /// table was short never learnt it, and is a stranger like any other.
     seated_before: std::collections::BTreeSet<[u8; 32]>,
 }
 
@@ -411,8 +414,6 @@ impl Formation {
             admitted: false,
             seated_before: std::collections::BTreeSet::new(),
         };
-        // `S1-JM`: every seat of the recorded roster sat here.
-        f.seated_before = f.roster.seats().iter().map(|e| e.app_public_key).collect();
         f.said.list = Some(list_bytes.to_vec());
         let out = f.adopt(&list, now_ms)?;
         Ok((f, out))
@@ -903,13 +904,23 @@ impl Formation {
         // minimum reads one below it as short: it never says it is ready, and it
         // held the set up until it was given back -- 55 s at the least, and a
         // trickle of them kept the table from setting at all. Refused as the
-        // table being full, a word every client knows. A key seated here before
-        // is let in: it kept on disk that the table was set to start (`S1-JJ`).
-        // A founder left alone fills its table afresh
-        // (`release_seat_before_the_first_hand`), so this never shuts a table.
+        // table being full, a word every client knows. A seat of a roster at the
+        // minimum is let in: it kept on disk that the table was set to start
+        // (`S1-JJ`).
+        //
+        // A founder left alone fills its table afresh -- but only once a
+        // stranger comes, which is when it stops being set to start (below).
+        // Kept set to start, it would refuse every stranger who came alone, and
+        // its table would never fill; un-set the moment it was left alone, a
+        // seat of its own given back for a short fault, asking again seconds
+        // later (`S1-FY`), found a table no longer set to start, and the two of
+        // them waited for the minimum instead of playing heads-up.
+        let known = self.seated_before.contains(&sender);
+        let afresh = self.started && self.roster.len() < 2 && !known;
         if self.started
+            && !afresh
+            && !known
             && self.roster.len() + 1 < usize::from(self.under.ad.min_players_to_start)
-            && !self.seated_before.contains(&sender)
         {
             let reply = joinwire::publish_join_reject(request_hash, RejectReason::TableFull, 0, &f.key, now_ms)?;
             return Ok(vec![Send::Reply(reply)]);
@@ -950,7 +961,11 @@ impl Formation {
                 seats.sort_by_key(|e| e.seat);
                 self.roster = Roster::form(seats, &self.under.ad, false)
                     .map_err(|e| Failed::List(ListRefused::Roster(e)))?;
-                self.seated_before.insert(entry.app_public_key);
+                // `S1-JM`: a stranger seated beside a founder left alone -- the
+                // table fills afresh, the advert's minimum its own again.
+                if afresh {
+                    self.started = false;
+                }
 
                 // The copy the joiner named, echoed back. Sending the
                 // newest instead would fail the joiner's own check that the
@@ -1131,13 +1146,6 @@ impl Formation {
         self.ratified_bytes.clear();
         self.sent_ready = false;
         self.session = None;
-        // `S1-JM`: a founder left alone is no table set to start any more --
-        // nobody it could go on with is left -- and fills afresh, the advert's
-        // minimum its own again. Kept set to start, it refused every stranger
-        // who came alone (`on_join_request`) and its table never filled.
-        if self.roster.len() < 2 {
-            self.started = false;
-        }
 
         let list = PlayerList {
             roster: self.roster.seats().to_vec(),
@@ -1198,6 +1206,13 @@ impl Formation {
         self.pending = None;
         self.my_seat = Some(accept.seat);
         self.admitted = true;
+        // `S1-JM`: a roster at the minimum, signed by the table's key, is the
+        // table set to start -- known from the acceptance itself, and not only
+        // from a list that may come after a seat was given back, when this
+        // client would never see the minimum and take every roster for short.
+        if roster.len() >= usize::from(self.under.ad.min_players_to_start) {
+            self.started = true;
+        }
 
         // **A `JOIN_ACCEPT` is a bootstrap, not an update.**
         //
@@ -1318,6 +1333,11 @@ impl Formation {
 
         if self.roster.len() >= self.under.ad.min_players_to_start as usize {
             self.started = true;
+            // `S1-JM`: at the founder, every seat of a roster at the minimum is
+            // one that may come back to the table below it.
+            if self.founder.is_some() {
+                self.seated_before.extend(self.roster.seats().iter().map(|e| e.app_public_key));
+            }
         }
         // `D-044`: a table that was set to start goes on with the seats that
         // remain, two at the least, when the founder says its roster again
@@ -3175,7 +3195,7 @@ mod tests {
     /// no stranger who would leave it there -- one never at the minimum reads
     /// the roster as short, never says it is ready, and held the set up -- and
     /// says so as the table being full, with no new word on the wire. A player
-    /// seated there before, and given back, is let in again.
+    /// of the roster at four, given back, is let in again.
     #[test]
     fn a_table_set_to_start_below_its_minimum_seats_no_stranger_that_leaves_it_there() {
         let (mut t, _, a, hash) = found(6, 4);
@@ -3198,9 +3218,11 @@ mod tests {
         assert_eq!(t.founder.roster().len(), 3);
     }
 
-    /// `S1-JM`: a founder left alone fills its table afresh -- kept set to
-    /// start, it would have refused every stranger who came alone, and its
-    /// table would never have filled.
+    /// `S1-JM`: a founder left alone fills its table afresh once a stranger
+    /// comes -- kept set to start, it would have refused every stranger who
+    /// came alone, and its table would never have filled. Until one comes it is
+    /// still set to start: a seat of its own may come back to it
+    /// (`a_seat_given_back_finds_its_table_still_set_to_start`).
     #[test]
     fn a_founder_left_alone_fills_its_table_afresh() {
         let (mut t, _, a, hash) = found(6, 3);
@@ -3209,12 +3231,112 @@ mod tests {
         t.founder.release_seat_before_the_first_hand(&peer(2), NOW + 1_000).expect("given back");
         t.founder.release_seat_before_the_first_hand(&peer(3), NOW + 1_001).expect("given back");
         assert_eq!(t.founder.roster().len(), 1);
-        assert!(!t.founder.set_to_start(), "alone, the advert's minimum is its own again");
+        assert!(t.founder.set_to_start(), "alone, and still set to start until a stranger comes");
 
         assert!(a_stranger_asks(&mut t, &a, hash, 5, NOW + 2_000).is_ok(), "a stranger is seated");
+        assert!(!t.founder.set_to_start(), "and the advert's minimum is the founder's own again");
         assert!(a_stranger_asks(&mut t, &a, hash, 6, NOW + 3_000).is_ok(), "and another");
         assert_eq!(t.founder.roster().len(), 3);
         assert!(t.founder.set_to_start(), "set to start again at its minimum");
+    }
+
+    /// `S1-JM`: a seat given back for a short fault, which left its founder
+    /// alone, asks again seconds later (`S1-FY`) knowing from its disk that the
+    /// table was set to start (`S1-JJ`) -- and finds it still set to start, so
+    /// the two of them play heads-up (`D-044`). Un-set the moment it was left
+    /// alone, the founder took their roster of two as short, and they waited
+    /// for the advert's minimum.
+    #[test]
+    fn a_seat_given_back_finds_its_table_still_set_to_start() {
+        let (mut t, _, a, hash) = found(6, 4);
+        seat_players(&mut t, &a, hash, &[2, 3, 4]);
+        assert!(t.founder.set_to_start(), "set with four");
+        for (n, at) in [(3u8, 1_000u64), (4, 1_001), (2, 1_002)] {
+            t.founder.release_seat_before_the_first_hand(&peer(n), NOW + at).expect("given back");
+        }
+        assert_eq!(t.founder.roster().len(), 1);
+        t.joiners.clear();
+
+        let table_id = t.founder.table_id();
+        let now = NOW + 3_000;
+        let (j, request) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "player 2".into(),
+            1_000,
+            None,
+            None,
+            [2; 32],
+            now,
+            None,
+        )
+        .unwrap();
+        // What the node does with a table it kept on disk as set to start.
+        let mut j = j.with_set_to_start();
+        let out = t.founder.on_join_request(&request, &peer(2), false, now).expect("seated again");
+        deliver(&mut t, &mut j, out, table_id, now);
+        assert_eq!(t.founder.roster().len(), 2);
+        let session = t.founder.session().expect("the two of them are set, heads-up");
+        assert_eq!(j.session(), Some(session), "and agree on it");
+    }
+
+    /// `S1-JM`: only a seat of a roster at the minimum is no stranger to a
+    /// table set to start below it. One given back before the table was ever
+    /// set never learnt it was set, and would read the roster as short like
+    /// any stranger -- so it is refused like one.
+    #[test]
+    fn a_seat_given_back_before_the_set_is_a_stranger_to_it() {
+        let (mut t, _, a, hash) = found(6, 4);
+        seat_players(&mut t, &a, hash, &[2]);
+        t.founder.release_seat_before_the_first_hand(&peer(2), NOW + 500).expect("given back");
+        seat_players(&mut t, &a, hash, &[3, 4, 5]);
+        assert!(t.founder.set_to_start(), "set with four, seat 2's player not among them");
+        t.founder.release_seat_before_the_first_hand(&peer(4), NOW + 1_000).expect("given back");
+        t.founder.release_seat_before_the_first_hand(&peer(5), NOW + 1_001).expect("given back");
+        assert_eq!(t.founder.roster().len(), 2);
+
+        let refused = a_stranger_asks(&mut t, &a, hash, 2, NOW + 2_000);
+        assert!(
+            matches!(refused, Err(Failed::Refused { reason, .. }) if reason == RejectReason::TableFull.code()),
+            "seated only while the table was short: {refused:?}"
+        );
+        assert!(a_stranger_asks(&mut t, &a, hash, 4, NOW + 3_000).is_ok(), "a seat of the roster at four comes back");
+    }
+
+    /// `S1-JM`: a seat whose acceptance brings the roster to the minimum knows
+    /// the table is set to start from the acceptance itself -- signed by the
+    /// table's key -- and not only from a list, which may come after a seat
+    /// was given back, when it would never see the minimum.
+    #[test]
+    fn an_acceptance_at_the_minimum_says_the_table_is_set_to_start() {
+        let (mut t, _, a, hash) = found(6, 3);
+        seat_players(&mut t, &a, hash, &[2]);
+        let table_id = t.founder.table_id();
+        let (mut j, request) = Formation::join(
+            key(3),
+            a.clone(),
+            hash,
+            table_id,
+            peer(3),
+            "player 3".into(),
+            1_000,
+            None,
+            None,
+            [3; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        let out = t.founder.on_join_request(&request, &peer(3), false, NOW).expect("seated");
+        let reply = out.iter().find_map(|s| match s {
+            Send::Reply(b) => Some(b.clone()),
+            Send::Broadcast(_) => None,
+        });
+        j.on_join_answer(&reply.expect("a reply"), NOW).expect("accepted");
+        assert!(j.set_to_start(), "three of three, from the acceptance alone");
     }
 
     /// `S1-JJ`: a table that starts at three, set with three, gives a seat back
