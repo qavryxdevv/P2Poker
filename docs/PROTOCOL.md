@@ -4558,10 +4558,16 @@ them on its own chain and votes too. Every client that found the same proof fail
 same subject, and the certificate, `kind = 2`, ends the hand by the certified-subject path above
 and takes the seat out of the table for good. The abort with the evidence goes -- and the hand
 ends as it ended before -- `CHEAT_CERT_MS` (10 s) after the finding if no certificate has
-completed; on the next tick when another seat's frame of a later stage, or a second proof from the
-shuffler that holds or is of another step, shows that some seat took a good proof and went on (a
-second proof that fails too, or the failing one said again, is nothing new); and in place of any
-bare abort this client would send, or would take -- never on the shuffler's own word -- meanwhile. A `cause = 3` abort goes at once as before: a
+completed; on the next tick when another seat's frame of a later stage shows that some seat took a
+good proof and went on -- a frame the shuffler cannot sign; and in place of any bare abort this
+client would send, or would take -- never on the shuffler's own word -- meanwhile. A further proof
+from the shuffler -- the failing one said again, one that holds, one of another step -- is nothing,
+and is neither checked nor kept: the shuffler can always make a good one, and judged it would send
+the evidence and keep the certificate off every hand. For the same reason the shuffler's own
+`cause = 2` abort accusing itself is not accepted at once at such a hand: its two frames are held
+and judged at the receiver's own stage, as a finder judges them. A seat voted about without a cause
+at the stage's deadline whose proof then fails is voted about again with `cause = 5`, a vote of
+another subject (§4.8). A `cause = 3` abort goes at once as before: a
 reveal stage closes at a seat the rogue sent a good share to, and a client that stood on it could
 be certified out by that seat and the rogue. Heads-up both go at once: two seats certify nobody.
 

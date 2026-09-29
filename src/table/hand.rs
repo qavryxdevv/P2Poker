@@ -1810,6 +1810,12 @@ pub struct Hand {
     cheat_named: BTreeSet<SeatIdx>,
     /// `D-084`: the evidence kept while the certificate is sought.
     pending_cheat: Option<PendingCheat>,
+    /// `D-084`: set by a handler that took a frame and did nothing with it --
+    /// a further proof from a seat whose proof failed here -- and read once
+    /// where frames are kept, so that frame is not kept either: each re-signed
+    /// copy of a failing proof was kept, and `D-065`'s answer to a vote then
+    /// said them all again.
+    unkept: bool,
     /// `S1-JR`: the seat whose proof this hand was voided over, the cause (2 a
     /// shuffle, 3 a reveal share), and whether this client's own check found
     /// it (`true`) or it checked another seat's evidence (`false`). Evidence
@@ -2368,6 +2374,7 @@ impl Hand {
                 cheaters: BTreeSet::new(),
                 cheat_named: BTreeSet::new(),
                 pending_cheat: None,
+                unkept: false,
                 proven_cheat: None,
                 cert_ended: false,
                 questions: BTreeSet::new(),
@@ -2545,8 +2552,10 @@ impl Hand {
         // `D-033`: kept once, for a seat back from a restart -- keyed by the
         // frame's own bytes: the slot has moved on by now, and a frame opened
         // against it reads as a stage this hand has left (`run105747-2`, where
-        // the survivor said only its own frames again).
-        if out.is_ok() {
+        // the survivor said only its own frames again). `D-084`: not a frame
+        // the handler took and did nothing with.
+        let unkept = std::mem::take(&mut self.unkept);
+        if out.is_ok() && !unkept {
             let digest: Hash = *blake3::hash(bytes).as_bytes();
             if self.transcript_seen.insert(digest) {
                 self.transcript.push(bytes.to_vec());
@@ -3221,25 +3230,16 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::ShuffleProof)?;
         let seat = self.seat_of(&opened.sender)?;
-        // `D-084`: a second, different proof from a seat whose first failed here
-        // is a proof it sent elsewhere -- a seat that took a good one went on
-        // without seeing the failure, and needs the evidence now. The same
-        // proof again is nothing new: `D-065`'s answer to a vote says the
-        // frames it holds again, and it said the failing one.
+        // `D-084`: any further proof from a seat whose proof failed here is
+        // nothing, and is neither checked nor kept. A seat that took a good one
+        // from it and went on shows itself by its own frame of a later stage,
+        // which one rogue cannot sign (`cheat_fallback`), or the fallback's
+        // clock runs out. Judged, a proof the rogue sent itself -- one that
+        // holds, one of another step, one that does not decode -- sent the
+        // evidence at once and kept the certificate off every hand, and each
+        // re-signed copy of the failing one cost a whole verification.
         if self.disproved.contains(&seat) {
-            let same = self
-                .pending_cheat
-                .as_ref()
-                .is_some_and(|p| p.evidence.get(1).is_some_and(|b| b[..] == bytes[..]));
-            if same || self.pending_cheat.is_none() {
-                return Ok(Vec::new());
-            }
-            // Another proof: one that holds -- or one of another step -- is
-            // what a seat that went on took; one that fails too is nothing new
-            // (a rogue re-signing its failing proof kept every certificate off).
-            if self.another_proof_holds(bytes) {
-                return self.evidence_abort(key, now_ms);
-            }
+            self.unkept = true;
             return Ok(Vec::new());
         }
         self.note_signed(seat);
@@ -5705,38 +5705,6 @@ impl Hand {
         self.evidence_abort(key, now_ms)
     }
 
-    /// `D-084`: whether a second shuffle proof from the proven seat is one a
-    /// seat could have gone on with -- it holds for the step this client
-    /// holds, or it is about another step -- rather than the failing one again
-    /// under another signature. Checked as §4.10's evidence is: this client's
-    /// own input deck and context, the proof's own signed sequence. What cannot
-    /// be checked here counts as one a seat could have gone on with.
-    fn another_proof_holds(&self, bytes: &[u8]) -> bool {
-        let Ok(opened) = self.opened(bytes, EventType::ShuffleProof) else {
-            return true;
-        };
-        let Ok(body) = chained::payload::<ShuffleProof>(&opened, SHUFFLE_PROOF_CAP) else {
-            return true;
-        };
-        let Phase::Shuffling { deal, chain, heard } = &self.phase else {
-            return true;
-        };
-        let Some(held) = heard.as_ref() else {
-            return true;
-        };
-        if body.output_deck_hash != deck_hash(&held.deck) || body.input_deck_hash != input_deck_hash(chain.last_verified()) {
-            return true;
-        }
-        let Some(ctx) = chain.next_ctx(opened.envelope.sequence) else {
-            return true;
-        };
-        let verdict = match chain.last_verified() {
-            None => deal.deck.verify_initial_shuffle(&held.deck, &body.proof, &ctx),
-            Some(prev) => deal.deck.verify_shuffle(prev.as_ref(), &held.deck, &body.proof, &ctx),
-        };
-        !matches!(verdict, Err(VerifyOutcome::Invalid(_)))
-    }
-
     /// `D-084`: the hand given up with the evidence kept, now -- §4.10's cause
     /// 2. Nothing where none is kept or the hand is over.
     fn evidence_abort(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
@@ -6002,6 +5970,19 @@ impl Hand {
                     }
                     return Err(Failed::NotYet);
                 }
+            }
+            // `D-084`: never on the accused's own word where the table's
+            // certificate answers a proven cheat. An honest client never
+            // accuses itself, and a rogue that did ended the hand before any
+            // vote could go, every hand, where its own bare abort could not.
+            // Its two frames are held and judged at this client's own stage,
+            // as any finder judges them -- so the certificate comes all the
+            // same.
+            2 if self.cheat_by_certificate() && body.attributed.first() == Some(&opened.sender) => {
+                for frame in &body.evidence {
+                    let _ = self.hold(frame.clone());
+                }
+                return Ok(Vec::new());
             }
             // §4.10: *accept at once* - the evidence carries its own disproof.
             // At once, and not on this peer's word: this client redoes the
@@ -7301,12 +7282,17 @@ impl Hand {
             // `D-051`: once about one seat at one stage, whatever the cause --
             // a seat cut off after this client voted about it without one is
             // voted about with the cause at its next stage, never twice here.
-            // `D-066` is the one exception: a seat that has been gone long
+            // `D-066` is one exception: a seat that has been gone long
             // enough while its stage stood -- a turn that waits for the hand's
             // own budget has no next stage -- is voted about again with
-            // `CAUSE_LONG_GONE`, another subject in another slot.
+            // `CAUSE_LONG_GONE`, another subject in another slot. `D-084` is
+            // the other: a seat voted about without a cause at the stage's
+            // deadline, whose proof then failed here, is voted about again with
+            // `CAUSE_CHEAT` -- a proof sent a second after the deadline split
+            // the voters between the two subjects, and neither could complete.
             if self.voted.contains(&digest)
-                || (self.voted_about.contains(&seat) && subject.cause != Some(CAUSE_LONG_GONE))
+                || (self.voted_about.contains(&seat)
+                    && !matches!(subject.cause, Some(CAUSE_LONG_GONE) | Some(CAUSE_CHEAT)))
             {
                 continue;
             }
@@ -9801,6 +9787,11 @@ impl Hand {
         rebase(&mut self.opened_at_ms, by_ms);
         rebase_opt(&mut self.showdown_opened_ms, by_ms);
         rebase_opt(&mut self.muck_held_until_ms, by_ms);
+        // `D-084`: a proven cheat's fallback runs on this clock too; a clock
+        // that jumped ahead fired it before the certificate could form.
+        if let Some(p) = self.pending_cheat.as_mut() {
+            rebase(&mut p.at_ms, by_ms);
+        }
     }
 
     /// `D-059`: the table's cryptographic step, in milliseconds.
@@ -17901,7 +17892,9 @@ mod tests {
     /// `D-084`: the evidence of a proven cheat is never dropped for a bare
     /// give-up -- this client's own at its stage budget, or a peer's -- and it
     /// goes at once when another seat's later frame shows that seat went on
-    /// without seeing the proof fail, or when the seat sends a second proof.
+    /// without seeing the proof fail. A further proof from the proven seat --
+    /// the failing one again, or one that holds, which the rogue can always
+    /// make -- is nothing, and is not kept.
     #[test]
     fn a_proven_cheats_evidence_is_never_dropped_for_a_bare_give_up() {
         let (mut hands, keys, held) = three_to_the_first_shuffle();
@@ -17917,15 +17910,88 @@ mod tests {
         assert_eq!(hands[1].cheat_fallback(&keys[1], NOW + 600_000).unwrap().len(), 1, "the evidence, on the tick");
         assert_eq!(hands[1].aborted(), Some(Abort::BadShuffle { seat: 0 }));
         // The same failing proof said again -- `D-065`'s answer to a vote does
-        // that -- is nothing new; the seat's second, different proof was sent
-        // elsewhere, and the evidence goes at once.
+        // that -- and a proof that holds, from the proven seat itself: nothing,
+        // and neither is kept. Judged, the second sent the evidence and kept
+        // the certificate off every hand.
         let (mut hands, keys, held) = three_to_the_first_shuffle();
         let broken = a_broken_proof_to(&mut hands, &keys, &held, &[1]);
+        let kept = hands[1].transcript.len();
         assert!(hands[1].on_event(&broken, &keys[1], NOW + 300).unwrap().is_empty(), "the same proof again: nothing");
+        assert!(hands[1].on_event(&held[1], &keys[1], NOW + 500).unwrap().is_empty(), "a proof that holds, from the proven seat: nothing");
         assert!(hands[1].aborted().is_none(), "and the certificate still sought");
-        let sends = hands[1].on_event(&held[1], &keys[1], NOW + 500).unwrap();
-        assert_eq!(sends.len(), 1, "the evidence at once");
+        assert_eq!(hands[1].transcript.len(), kept, "neither is kept, to be said again");
+        // Seat 2 took a good proof from it and went on: its frame of a later
+        // stage, held here, sends the evidence on the tick -- a frame one rogue
+        // cannot sign.
+        let _ = hands[2].on_event(&held[0], &keys[2], NOW + 600);
+        let _ = hands[2].on_event(&held[1], &keys[2], NOW + 600);
+        assert!(hands[2].slot().sequence > hands[1].slot().sequence, "seat 2 went on");
+        let later = hands[2].say_at(EventType::ShuffleStep, &0u8, SHUFFLE_STEP_CAP, &keys[2], NOW + 700).unwrap();
+        assert!(matches!(hands[1].on_event(&later, &keys[1], NOW + 700), Err(Failed::NotYet)));
+        let _ = hands[1].hold(later);
+        assert_eq!(hands[1].cheat_fallback(&keys[1], NOW + 800).unwrap().len(), 1, "the evidence, long before the wait is out");
         assert_eq!(hands[1].aborted(), Some(Abort::BadShuffle { seat: 0 }));
+    }
+
+    /// `D-084`: a seat's own cause-2 abort accusing itself is not taken at three
+    /// seats -- an honest client never accuses itself, and taken at once it
+    /// ended every hand before any vote could go. Its two frames are judged here
+    /// as any finder judges them, and the vote with the cheat cause follows.
+    #[test]
+    fn a_seat_that_accuses_itself_is_judged_not_believed() {
+        let (mut hands, keys, held) = three_to_the_first_shuffle();
+        let broken = a_broken_proof_to(&mut hands, &keys, &held, &[2]);
+        let own = bytes_of_sends(
+            hands[0]
+                .abort_bad_shuffle(0, [held[0].clone(), broken], &keys[0], NOW + 500)
+                .unwrap(),
+        );
+        assert!(hands[1].on_event(&own[0], &keys[1], NOW + 500).unwrap().is_empty(), "not taken");
+        assert!(hands[1].aborted().is_none(), "the hand stands");
+        let _ = hands[1].replay_early(&keys[1], NOW + 600);
+        assert_eq!(hands[1].proven_cheat(), Some((0, 2, true)), "seat 1 found the proof failing itself");
+        let votes = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 2_000, 0).unwrap());
+        assert_eq!(votes.len(), 3, "and votes with the cheat cause, the step and the proof with it");
+    }
+
+    /// `D-084`: a proof that fails a second after the stage's deadline, when
+    /// this client has voted about the seat without a cause: it votes about it
+    /// again with the cheat cause. Once a seat a stage, it did not, and the
+    /// voters that found the proof before the deadline voted about another
+    /// subject -- neither could complete.
+    #[test]
+    fn a_vote_without_a_cause_does_not_keep_the_cheat_cause_off() {
+        let (mut hands, keys, held) = three_to_the_first_shuffle();
+        assert!(hands[1].on_event(&held[0], &keys[1], NOW).unwrap().is_empty(), "the step, on time");
+        let first = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 60_000, 0).unwrap());
+        assert_eq!(first.len(), 1, "no proof by the deadline: a vote without a cause");
+        let broken = tamper::<ShuffleProof>(&held[1], EventType::ShuffleProof, &hands[1].slot(), SHUFFLE_PROOF_CAP, |p| {
+            let n = p.proof.len();
+            p.proof[n / 2] ^= 0xff;
+        });
+        assert!(hands[1].on_event(&broken, &keys[1], NOW + 61_000).unwrap().is_empty());
+        assert_eq!(hands[1].proven_cheat(), Some((0, 2, true)));
+        let second = bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], NOW + 62_000, 0).unwrap());
+        assert_eq!(second.len(), 3, "voted about again, the step and the proof with it");
+        let v = chained::open_in_hand(&second[0], FRAME_CAP, EventType::TimeoutVote, &hands[1].open.table_id, hands[1].open.hand_id)
+            .expect("a vote");
+        let body: TimeoutVote = chained::payload(&v, TIMEOUT_VOTE_CAP).expect("its body");
+        assert_eq!(body.cause, Some(CAUSE_CHEAT), "with the cheat cause");
+    }
+
+    /// `D-084`: the wait for a proven cheat's certificate moves with the
+    /// clock (`S1-JB`): a clock that jumped ahead fired the fallback before the
+    /// certificate could form.
+    #[test]
+    fn a_proven_cheats_wait_moves_with_the_clock() {
+        let (mut hands, keys, held) = three_to_the_first_shuffle();
+        let _ = a_broken_proof_to(&mut hands, &keys, &held, &[1]);
+        hands[1].rebase_clock(60_000);
+        assert!(
+            hands[1].cheat_fallback(&keys[1], NOW + 60_000 + CHEAT_CERT_MS - 1).unwrap().is_empty(),
+            "the clock jumped a minute on, and the wait with it"
+        );
+        assert_eq!(hands[1].cheat_fallback(&keys[1], NOW + 60_000 + CHEAT_CERT_MS).unwrap().len(), 1);
     }
 
     /// `D-084`: a rogue that sends its failing proof to one seat alone: that
