@@ -10696,7 +10696,6 @@ impl Hand {
         }
     }
 
-    /// The stacks at this boundary, which are what `next_hand` opens `k+1` on.
     /// `S1-JN`: the stacks this hand began with, laid out by seat number.
     ///
     /// `mine.stacks` is `HAND_INIT`'s `n(9) stacks` -- one per **occupied** seat,
@@ -10719,6 +10718,7 @@ impl Hand {
         by_seat
     }
 
+    /// The stacks at this boundary, which are what `next_hand` opens `k+1` on.
     fn boundary_stacks(&self) -> Vec<Chips> {
         match &self.phase {
             Phase::Playing { play, .. } if matches!(play.step, Step::Ended) => {
@@ -17532,6 +17532,42 @@ mod tests {
             assert_eq!(c.deltas.iter().sum::<i64>(), 0);
             assert_eq!(c.final_stacks.iter().sum::<u64>(), 20_000);
         }
+    }
+
+    /// `S1-JN`, the settled road: at a table with a hole in its seat numbers
+    /// -- seats 0 and 2 of three -- `HAND_COMPLETE`'s `deltas` and `busted`,
+    /// both signed, measure each seat from its own start. Read from
+    /// `HAND_INIT`'s per-occupied-seat list by seat number, the hole "busted"
+    /// with seat 2's chips and seat 2 was measured from none; and a seat 2 that
+    /// busted was given no place. Seat 2 is all in with 100 against 10 000 and
+    /// the deal is random, so hands are dealt until it busts once.
+    #[test]
+    fn a_settlement_at_a_table_with_a_hole_measures_each_seat_from_its_own_start() {
+        for _ in 0..40 {
+            let (a, b, complete) = a_heads_up_hand_at([(0, 10_000), (2, 100)], 3);
+            assert_eq!(complete[0], complete[1], "one settlement, said by both seats");
+            let c = &complete[0];
+            let end = |s: usize| i64::try_from(c.final_stacks[s]).expect("a stack");
+            assert_eq!((c.deltas[1], c.final_stacks[1]), (0, 0), "the hole neither won nor lost: {c:?}");
+            assert_eq!(c.deltas[0], end(0) - 10_000, "seat 0 from its own 10 000: {c:?}");
+            assert_eq!(c.deltas[2], end(2) - 100, "seat 2 from its own 100: {c:?}");
+            if c.final_stacks[2] > 0 {
+                assert!(c.busted.is_empty(), "nobody busted, the hole least of all: {c:?}");
+                continue;
+            }
+            assert_eq!(c.busted, vec![2], "seat 2 busted, and only seat 2: {c:?}");
+            for h in [&a, &b] {
+                let (over, finishes) = h.finishes_at_boundary();
+                assert!(over, "one seat is left with chips");
+                assert_eq!(
+                    finishes.iter().map(|f| (f.seat, f.place)).collect::<Vec<_>>(),
+                    vec![(0, 1), (2, 2)],
+                    "seat 2 second, and not left without a place"
+                );
+            }
+            return;
+        }
+        panic!("seat 2 never lost its all-in in forty deals");
     }
 
     /// The two-seat fixture with the roster hash its seats and stacks really
