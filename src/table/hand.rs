@@ -8590,7 +8590,12 @@ impl Hand {
         // other honest seat silent: the floor held on the long-gone relaxation,
         // this guard counted the one seat waited on against two voters, and
         // both honest seats took it -- the first certified out, the second's
-        // veto gone. A voter named silent that is here says so by refusing.
+        // veto gone. A voter named silent that is here says so by refusing --
+        // unless it holds every seat waited on as quiet itself: then its vote
+        // was late, not withheld, and it takes the certificate as it always did.
+        // And a seat the certificate would put out for good -- a flooder, a
+        // proven cheat -- takes it on no reading of its own line: two rogues
+        // waited for an honest seat's line to blip and named it a flooder.
         let named: Vec<SeatIdx> = c
             .subject
             .subject_seats
@@ -8598,9 +8603,23 @@ impl Hand {
             .copied()
             .filter(|s| !resigned.contains(s))
             .collect();
+        let me = self.open.my_seat;
+        // Its own stage's wait counts only at the certificate's own stage: a
+        // client that moved on heard every seat there.
+        let at_the_stage = self.slot.sequence == c.subject.subject_sequence;
+        let quiet_here = if at_the_stage { self.waiting_for() } else { Vec::new() };
+        let agrees = c.subject.names_silent(me)
+            && c.subject.quiet_seats().iter().filter(|s| !resigned.contains(s)).all(|s| {
+                quiet_here.contains(s)
+                    || (at_the_stage && self.voted_about.contains(s))
+                    || self.gone_from_group.contains(s)
+                    || self.long_gone.contains(s)
+            });
+        let for_good = matches!(c.subject.cause_of(me), Some(CAUSE_FLOOD) | Some(CAUSE_CHEAT));
         if !Self::admissible(voter_seats.len(), named.len())
-            && named.contains(&self.open.my_seat)
-            && !self.line_down_recently
+            && named.contains(&me)
+            && !agrees
+            && (!self.line_down_recently || for_good)
         {
             if self.shortfall_said.insert(c.subject.digest()) {
                 self.cert_note.push(format!(
@@ -11162,11 +11181,12 @@ impl Hand {
     /// `S1-JX`: the stacks this client's own derivation holds for the table at
     /// this hand's end, indexed by seat -- what a rejoin from the table's copies
     /// may adopt heads-up, where the one other seat's copy alone names them: the
-    /// stacks at this boundary (settled, restored by an abort, or the hand's own
-    /// start while it runs), and this client's own settlement where it signed
-    /// one the table may have closed without it.
+    /// stacks at this boundary (settled, or restored by an abort), the hand's own
+    /// start -- the other seat may have given the hand up, this client's copy of
+    /// the settlement lost on the way, and played on from the stacks before it --
+    /// and this client's own settlement where it signed one the table may have
+    /// closed without it.
     pub fn stacks_this_client_holds(&self) -> Vec<Vec<Chips>> {
-        let mut out = vec![self.boundary_stacks()];
         let signed = match &self.phase {
             Phase::Playing { play, .. } => match &play.step {
                 Step::Settling { mine, .. } => Some(mine.final_stacks.clone()),
@@ -11175,8 +11195,11 @@ impl Hand {
             Phase::Aborted(_) => self.late.as_ref().filter(|l| l.own).map(|l| l.body.final_stacks.clone()),
             _ => None,
         };
-        if let Some(s) = signed.filter(|s| !out.contains(s)) {
-            out.push(s);
+        let mut out: Vec<Vec<Chips>> = Vec::new();
+        for s in [Some(self.boundary_stacks()), Some(self.start_stacks_by_seat()), signed].into_iter().flatten() {
+            if !out.contains(&s) {
+                out.push(s);
+            }
         }
         out
     }
@@ -16921,11 +16944,13 @@ mod tests {
     fn a_settled_hand_holds_the_stacks_it_settled() {
         let (hands, _) = a_table_after_hand_one();
         let held = hands[0].stacks_this_client_holds();
-        assert_eq!(held.len(), 1, "settled: one reading");
         let next = hands[0].next_hand().expect("hand 2");
-        for (seat, _, stack) in &next.seats {
-            assert_eq!(held[0].get(usize::from(*seat)).copied(), Some(*stack), "seat {seat}");
-        }
+        let settled: Vec<u64> = (0..4u8)
+            .map(|s| next.seats.iter().find(|x| x.0 == s).map(|x| x.2).unwrap_or(0))
+            .collect();
+        assert!(held.iter().any(|h| h[..4] == settled[..]), "the settled stacks, the next hand's own: {held:?}");
+        assert!(held.contains(&hands[0].start_stacks_by_seat()), "and the hand's start, which the other seat may have kept");
+        assert!(held.len() <= 2, "and nothing else: {held:?}");
     }
 
     /// The decisive test: the adopter opens hand 2 from the copies, follows
@@ -17668,7 +17693,10 @@ mod tests {
     #[test]
     fn two_seats_cannot_certify_a_third_by_naming_the_fourth_silent() {
         let (mut hands, keys) = with_present(4, &[0, 1, 3]);
-        // The two rogues, seats 0 and 1: seat 2 long gone, seat 3 out of the group.
+        // Seat 2 is here: seat 3 hears it. The two rogues, seats 0 and 1, do not
+        // say so -- seat 2 long gone, seat 3 out of the group.
+        let (mut two, from_two) = Hand::open(opening_n(4, 2), &key(12), NOW, 30_000).unwrap();
+        let _ = deliver(&mut hands[2], &from_two, &keys[2]);
         for i in 0..2 {
             hands[i].note_long_gone(&[2]);
             hands[i].note_gone_from_group(&[3]);
@@ -17687,7 +17715,7 @@ mod tests {
             Some(CAUSE_LONG_GONE),
             "seat 2 named long gone"
         );
-        // Seat 3, here all along and named silent: not taken.
+        // Seat 3, here all along, named silent, and hearing seat 2: not taken.
         for c in &copies {
             let _ = hands[2].on_event(c, &keys[2], t1 + 1_000);
         }
@@ -17696,11 +17724,51 @@ mod tests {
         let note = hands[2].take_cert_note().expect("said");
         assert!(note.contains("names this client, which is here"), "{note}");
         // Seat 2, here all along and named long gone: not taken either.
-        let (mut two, _) = Hand::open(opening_n(4, 2), &key(12), NOW, 30_000).unwrap();
         for c in &copies {
             let _ = two.on_event(c, &key(12), t1 + 1_000);
         }
         assert!(two.aborted().is_none() && two.took_part(2), "seat 2 keeps its table");
+        // A seat 3 that did not hear seat 2 either holds it quiet itself: its
+        // vote was late, not withheld, and it takes the certificate as it always
+        // did -- `D-065`'s silent voter, which the guard must not fork.
+        let (mut late, _) = with_present(4, &[0, 1, 3]);
+        for c in &copies {
+            let _ = late[2].on_event(c, &keys[2], t1 + 1_000);
+        }
+        assert!(late[2].aborted().is_some(), "a silent voter that agrees takes it");
+    }
+
+    /// `S1-JY` (`D-086`): a certificate half the table carries puts no seat out
+    /// for good, whatever the seat's own line did: two rogues of four, holding
+    /// the lowest seat, name seat 2 a flooder and seat 3 silent within five
+    /// minutes of seat 2's line blinking -- seat 2 does not take it.
+    #[test]
+    fn half_the_table_puts_no_seat_out_for_good_whatever_its_line_did() {
+        let (mut hands, keys) = with_present(4, &[0, 1, 3]);
+        let (mut two, from_two) = Hand::open(opening_n(4, 2), &key(12), NOW, 30_000).unwrap();
+        let _ = deliver(&mut hands[2], &from_two, &keys[2]);
+        for i in 0..2 {
+            hands[i].note_flooders(&[2]);
+            hands[i].note_gone_from_group(&[3]);
+        }
+        let t1 = NOW + 30_000;
+        let votes: Vec<Vec<Vec<u8>>> = (0..2)
+            .map(|i| bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()))
+            .collect();
+        let copies: Vec<Vec<u8>> = cross(&mut hands[..2], &keys[..2], &[0, 1], &votes, t1 + 500)
+            .into_iter()
+            .flat_map(certs_of)
+            .collect();
+        assert!(!copies.is_empty(), "the two seal it, holding the lowest seat");
+        assert_eq!(
+            certificate_cause(&copies[0], &hands[0].open.table_id, hands[0].open.hand_id, 2),
+            Some(CAUSE_FLOOD)
+        );
+        two.note_line_down_recently(true);
+        for c in &copies {
+            let _ = two.on_event(c, &key(12), t1 + 1_000);
+        }
+        assert!(two.aborted().is_none() && !two.named_for_flooding(2), "seat 2 is not put out for good");
     }
 
     /// `D-065`'s early question: seat 0 never received seat 4's opening, while

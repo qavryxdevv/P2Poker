@@ -4101,13 +4101,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $theirs
                 )))
                 .await;
-            // `S1-JX`: what the dropped hand holds, by this client's own
-            // derivation, for the adoption to agree with where the one other
-            // seat's copy names the stacks alone -- heads-up, where one signed
-            // frame of a later hand sent this client adrift and its copy
-            // named any stacks it liked.
-            if let Some(h) = $t.hand.as_ref() {
-                $t.rejoin_stacks = Some(h.stacks_this_client_holds());
+            // `S1-JX`: what the dropped hand and the one retained before it
+            // hold, by this client's own derivation, for the adoption to agree
+            // with where the one other seat's copy names the stacks alone --
+            // heads-up, where one signed frame of a later hand sent this client
+            // adrift and its copy named any stacks it liked. The retained hand
+            // too: a settlement this client signed there, and the other seat
+            // closed, is where the table went on from.
+            let held: Vec<Vec<u64>> = $t
+                .hand
+                .iter()
+                .chain($t.previous.iter())
+                .flat_map(|h| h.stacks_this_client_holds())
+                .fold(Vec::new(), |mut all, s| {
+                    if !all.contains(&s) {
+                        all.push(s);
+                    }
+                    all
+                });
+            if !held.is_empty() {
+                $t.rejoin_stacks = Some(held);
             }
             $t.previous = None;
             $t.hand = None;
@@ -11479,6 +11492,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         "adopted hand #{current} did not follow the table, which has dealt on; abandoning it for the next hand's copies"
                                     )))
                                     .await;
+                                // `S1-JX`: and the next adoption is held to what this
+                                // one held -- cleared when it was taken up, the next
+                                // hand's copy named any stacks it liked: a rogue gave
+                                // a true copy, kept the hand undealt, then gave a
+                                // forged one.
+                                if let Some(h) = t.hand.as_ref() {
+                                    t.rejoin_stacks = Some(h.stacks_this_client_holds());
+                                }
                                 t.previous = t.hand.take();
                             }
                         }
@@ -20593,9 +20614,17 @@ mod tests {
         let src = include_str!("run.rs");
         let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
         let rejoin = code.find("macro_rules! rejoin_from_copies {").expect("the rejoin");
-        let kept = rejoin + code[rejoin..].find("$t.rejoin_stacks = Some(h.stacks_this_client_holds());").expect("kept");
+        let kept = rejoin + code[rejoin..].find("$t.rejoin_stacks = Some(held);").expect("kept");
         let dropped = rejoin + code[rejoin..].find("$t.hand = None;").expect("dropped");
         assert!(kept < dropped, "kept before the hand goes");
+        assert!(code[rejoin..kept].contains(".chain($t.previous.iter())"), "the retained hand's readings too");
+        // And an adopted hand abandoned for a newer one holds the next adoption
+        // to what it held: cleared at the adoption, a rogue gave a true copy,
+        // kept the hand undealt and then gave a forged one.
+        let abandon = code.find("abandoning it for the next hand's copies").expect("the abandon");
+        let again = abandon + code[abandon..].find("t.rejoin_stacks = Some(h.stacks_this_client_holds());").expect("held again");
+        let taken = abandon + code[abandon..].find("t.previous = t.hand.take();").expect("taken");
+        assert!(again < taken, "before the hand goes");
         let foreign = code.find("let foreign = heads_up").expect("the check");
         assert!(code[foreign..foreign + 300].contains("&& !signed_before"), "not for a hand this seat signed itself");
         assert!(code[foreign..foreign + 600].contains("!known.iter().any(|k| stacks_agree(&o.seats, k))"), "against what the hand holds");
