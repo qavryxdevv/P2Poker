@@ -1972,6 +1972,10 @@ pub struct Hand {
     turn_heard_ms: u64,
     /// `S1-FS`: when this client took the hand up again after a restart
     /// (`D-033`), on its own clock; zero for a hand it did not restore.
+    /// `S1-KK`: the adoption, not the restore's end: a turn standing at the
+    /// adoption is reported, and its clock armed, on the adoption's tick, and
+    /// counted from a take-up four seconds on it had a late turn's ten
+    /// seconds (this row's second refuter).
     taken_up_ms: u64,
     /// Seat → the genesis its sequence-0 `HAND_INIT` of this hand named, when
     /// that is not this client's. A roster seat's signed word that it opened
@@ -2482,7 +2486,7 @@ impl Hand {
                 last_stamp_ms: opened_at_ms,
                 turn_began_unix_ms: opened_at_ms,
                 turn_heard_ms: opened_at_ms,
-                taken_up_ms: 0,
+                taken_up_ms: if restoring { now_ms } else { 0 },
                 foreign_genesis: BTreeMap::new(),
                 genesis_note: None,
                 genesis_said: false,
@@ -2732,6 +2736,7 @@ impl Hand {
     fn stage_kinds(&self) -> &'static [EventType] {
         match &self.phase {
             Phase::Deck { .. } => &[EventType::DeckInit],
+            Phase::Shuffling { heard: Some(_), .. } => &[EventType::ShuffleProof],
             Phase::Shuffling { .. } => &[EventType::ShuffleStep],
             Phase::Committing { .. } => &[EventType::DeckCommit],
             Phase::Dealing { .. } => &[EventType::DealPrivate],
@@ -3259,10 +3264,15 @@ impl Hand {
     fn shuffle_if_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         // `S1-KK`: the previous life's step is held, and its proof with it.
         let held = self.own_frame_held(&[EventType::ShuffleStep]);
-        let Phase::Shuffling { deal, chain, .. } = &mut self.phase else {
+        let Phase::Shuffling { deal, chain, heard } = &mut self.phase else {
             return Ok(Vec::new());
         };
-        if self.restoring || held || chain.whose_turn() != Some(self.open.my_seat) {
+        // `S1-KK`: nor where this seat's step is heard, waiting for its proof --
+        // the previous life's, taken from the wire, whose proof only the wire
+        // can bring: a step made here besides was a second version of it, and
+        // the seat went on from a deck no other seat holds (this row's second
+        // refuter, the backstop at the proof's stage).
+        if self.restoring || held || heard.is_some() || chain.whose_turn() != Some(self.open.my_seat) {
             return Ok(Vec::new());
         }
         // `S1-JR` harness: a rogue that never takes its step.
@@ -9143,8 +9153,15 @@ impl Hand {
                         // voter's copy, and a voter's next life that had not
                         // its own sealed another: a fork of it from the table
                         // at the certificate (this row's refuter).
+                        //
+                        // A betting stage's only: a copy of a cryptographic
+                        // stage's reaching a seat behind its stage ends the hand
+                        // there, and one said again whose stage had closed the
+                        // ordinary way ended a live hand (this row's second
+                        // refuter). That stage's certificate ends the hand at
+                        // every seat anyway, with nothing to fork from.
                         let digest = chained::event_hash_of(bytes, FRAME_CAP).unwrap_or(c.event_hash);
-                        if self.transcript_seen.insert(digest) {
+                        if c.subject.kind == 1 && self.transcript_seen.insert(digest) {
                             self.transcript.push(bytes.to_vec());
                         }
                     }
@@ -10898,8 +10915,6 @@ impl Hand {
             return Ok(Vec::new());
         }
         self.restoring = false;
-        // `S1-FS`: from here this client can show the hand's turns to its player.
-        self.taken_up_ms = now_ms;
         let mut out = self.stage_mine(key, now_ms)?;
         // `S1-KK`: and a certificate held back while restoring, where its
         // previous life voted for none of it.
@@ -20743,6 +20758,63 @@ mod tests {
             kinds_of(&made)
         );
         assert!(!y2.waiting_for().contains(&3), "the stage no longer waits on it");
+    }
+
+    /// `S1-KK` (its second refuter's first finding): a turn that stood when the
+    /// hand was taken up stood at the adoption -- the node reports it, and arms
+    /// its clock, on the adoption's tick, while the restore still runs -- and
+    /// is shown from the adoption, not from the restore's end.
+    #[test]
+    fn a_turn_standing_at_the_adoption_is_taken_up_there() {
+        let ([mut a, _b], keys, transcript, mut a_said, kept) = heads_up_to_the_first_bet();
+        if a.turn().is_some_and(|t| t.mine) {
+            let turn = a.turn().unwrap();
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            a_said.extend(bytes_of(&a.act(action, &keys[0], NOW).unwrap()));
+        }
+        let back = NOW + 64_000;
+        let o = Opening::adopt(heads_up_opening(1), &transcript[..2]).unwrap();
+        let mut b2 = Hand::open_restoring(o, &keys[1], back, 30_000, Some(&kept)).unwrap();
+        replay_from_the_table(&mut b2, &a, &a_said, &keys[1]);
+        let standing = b2.turn().expect("the turn stands on the seat that came back");
+        assert!(b2.is_restoring(), "read while the restore still runs");
+        assert!(standing.mine && standing.taken_up, "it stood when the hand was taken up");
+        assert_eq!(standing.shown_unix_ms, back, "shown from the adoption");
+        let _ = b2.restore_done(&keys[1], back + RESTORE_SETTLE_MS).unwrap();
+        let after = b2.turn().expect("still standing");
+        assert!(after.taken_up && after.shown_unix_ms == back, "and the restore's end moves nothing");
+    }
+
+    /// `S1-KK` (its second refuter's second finding): three seats, the
+    /// restored seat shuffling last; its old step comes in the re-send and its
+    /// old proof does not. The proof's stage waits on it, and neither the
+    /// restore's end nor the backstop makes a step again: the proof of the old
+    /// one can only come from the wire, and a new step besides was a second
+    /// version of it and a deck no other seat holds.
+    #[test]
+    fn a_restored_seat_whose_step_came_without_its_proof_makes_no_step_again() {
+        let (hands, keys, said) = n_seats_to_the_bet(3);
+        let y = 2usize;
+        let kept = hands[y].secret().expect("dealt in").keep();
+        let back = NOW + 60_000;
+        let is_kind = |b: &Vec<u8>, k: EventType| chained::peek(b, FRAME_CAP).is_ok_and(|(x, _, _)| x == k);
+        let me = hands[y].open.seats[hands[y].seat_index()].1;
+        let mut burst: Vec<Vec<u8>> = hands[0].transcript().to_vec();
+        burst.extend(said[0].iter().cloned());
+        let copies: Vec<Vec<u8>> = burst.iter().filter(|b| is_kind(b, EventType::HandInit)).cloned().collect();
+        let without_proof: Vec<Vec<u8>> = burst
+            .iter()
+            .filter(|b| !(chained::sender_of(b, FRAME_CAP) == Some(me) && is_kind(b, EventType::ShuffleProof)))
+            .cloned()
+            .collect();
+        assert_eq!(without_proof.len() + 1, burst.len(), "its old proof, and only it, lost on the way");
+        let o = Opening::adopt(hashed_opening(opening_n(3, y as u8)), &copies).expect("both others");
+        let mut y2 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        let mut said_by = feed_restored(&mut y2, &without_proof, &keys[y], back);
+        said_by.extend(bytes_of(&y2.restore_done(&keys[y], back).unwrap()));
+        assert_eq!(y2.waiting_for(), vec![2], "the proof's stage waits on this seat's old proof");
+        said_by.extend(bytes_of(&y2.restored_stage_owed(&keys[y], back + RESTORED_OWED_AFTER_MS).unwrap()));
+        assert!(said_by.is_empty(), "no step made again: {:?}", kinds_of(&said_by));
     }
 
     /// `S1-KK`: a restored hand ends its restore `RESTORE_SETTLE_MS` after it
