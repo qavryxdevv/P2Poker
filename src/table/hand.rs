@@ -11009,19 +11009,90 @@ impl Hand {
     pub fn out_for_good(&self) -> Vec<SeatIdx> {
         let mut out = self.open.out.clone();
         for seat in &self.certified {
-            let came_back = self.open.returns.get(usize::from(*seat)).copied().unwrap_or(0);
+            // `D-047`: its fourth absence -- `S1-KA`: by a majority of the hand.
+            let absent = self.out_after_absences(*seat);
             // `D-051`: or certified with the flood cause by every voter.
-            let flooded = self.flood_named.contains(seat);
+            let flooded = self.named_for_flooding(*seat);
             // `D-084`: or with the cheat cause.
-            let cheated = self.cheat_named.contains(seat);
+            let cheated = self.named_for_cheating(*seat);
             // `D-063`: or named with its player's own word that it left.
             let resigned = self.resigned.contains(seat);
-            if (came_back >= crate::protocol::constants::MAX_RETURNS || flooded || cheated || resigned) && !out.contains(seat) {
+            if (absent || flooded || cheated || resigned) && !out.contains(seat) {
                 out.push(*seat);
             }
         }
         out.sort_unstable();
         out
+    }
+
+    /// `S1-KA`: whether this hand, as it ends, is still carried by a strict
+    /// majority of the seats with chips at its start -- the seats dealt in that
+    /// hold chips at its boundary and that no certificate of the hand certified
+    /// out. What puts a seat out of the table for good (a flood, a proof that
+    /// does not hold, the fourth absence) does so only in such a hand.
+    ///
+    /// **Why.** A certificate about a seat takes it out of every later voter
+    /// set of the hand, so two rogues of four, once the table had certified a
+    /// third seat out -- a seat they had kept a frame from, which the fourth
+    /// honestly voted out with them -- were the whole voter set about the
+    /// fourth, a plain majority of it, and named it a flooder: out of the table
+    /// for good. Here two of four is not a majority; nor a hand later, with
+    /// the third seat's return refused by the two and the hand dealt to three
+    /// -- counted against the seats dealt in, that was two of three.
+    ///
+    /// **Why from these and nothing else.** A seat's being out for good goes
+    /// into the next hand's genesis, so every seat must read it alike: from the
+    /// opening's stacks, the seats dealt in, the stacks at the boundary and the
+    /// seats certified out, which `R(k+1)` already asks every seat to agree on.
+    /// Not from a certificate's voters: a copy may carry more of them than
+    /// another (`on_timeout_cert` takes a copy whose voters hold the ones it
+    /// derives), and a count of a copy's voters parted honest seats by the copy
+    /// each banked first. Nor from the voters named silent: a voter named silent
+    /// by a certificate half the table carries refuses it (`D-086`), knowing it
+    /// voted, while the others bank it -- counted, a line blip at a fourth
+    /// absence parted an honest table of four (`S1-KA`'s first build). A seat
+    /// named silent is counted as a seat of the hand; what that leaves open is
+    /// written in `D-087`.
+    fn carried_by_majority(&self) -> bool {
+        let at_end = self.boundary_stacks();
+        let carrying = self
+            .mine
+            .dealt_in
+            .iter()
+            .filter(|s| at_end.get(usize::from(**s)).copied().unwrap_or(0) > 0 && !self.certified.contains(s))
+            .count();
+        carrying * 2 > self.seats_with_chips()
+    }
+
+    /// `S1-KA`: how many seats had chips at this hand's start -- the opening's
+    /// stacks, which every seat holds alike: what a majority of the hand is
+    /// counted against. A later hand has no more: chips only leave the table.
+    pub fn seats_with_chips(&self) -> usize {
+        self.open.seats.iter().filter(|(_, _, stack)| *stack > 0).count()
+    }
+
+    /// `S1-KA`: the seats out of the table for good as far as the table has
+    /// decided it -- those carried out of earlier hands, and this hand's own
+    /// once it is over. Mid-hand the count [`Hand::out_for_good`] rests on can
+    /// still fall -- a seat certified later is a seat the hand no longer carries
+    /// -- and what the node does with the answer (the group's word for good,
+    /// this client leaving) cannot be taken back.
+    pub fn out_for_good_decided(&self) -> Vec<SeatIdx> {
+        if self.over() {
+            self.out_for_good()
+        } else {
+            self.open.out.clone()
+        }
+    }
+
+    /// `D-047`, `S1-KA`: whether `seat`, certified in this hand at its fourth
+    /// absence, is out of the table for good -- in a hand a majority of the
+    /// seats with chips still carries as it ends. Short of that it is certified
+    /// out of the hand, and D-032's limit keeps it out: a dead seat that drains.
+    pub fn out_after_absences(&self, seat: SeatIdx) -> bool {
+        self.certified.contains(&seat)
+            && self.open.returns.get(usize::from(seat)).copied().unwrap_or(0) >= crate::protocol::constants::MAX_RETURNS
+            && self.carried_by_majority()
     }
 
     /// `D-052`: the pots this hand settled into -- the main pot first, then
@@ -11043,15 +11114,21 @@ impl Hand {
 
     /// `D-051`: whether this hand's certificate named the seat with the flood
     /// cause -- out of the table for good for flooding its carrier group, as
-    /// against `D-047`'s fourth absence.
+    /// against `D-047`'s fourth absence. `S1-KA`: in a hand a majority of the
+    /// seats with chips still carries.
     pub fn named_for_flooding(&self, seat: SeatIdx) -> bool {
-        self.flood_named.contains(&seat) && self.certified.contains(&seat)
+        self.flood_named.contains(&seat)
+            && self.certified.contains(&seat)
+            && self.carried_by_majority()
     }
 
     /// `D-084`: whether this hand's certificate named the seat with the cheat
     /// cause -- out of the table for good for a proof that does not hold.
+    /// `S1-KA`: in a hand a majority of the seats with chips still carries.
     pub fn named_for_cheating(&self, seat: SeatIdx) -> bool {
-        self.cheat_named.contains(&seat) && self.certified.contains(&seat)
+        self.cheat_named.contains(&seat)
+            && self.certified.contains(&seat)
+            && self.carried_by_majority()
     }
 
     /// `D-084`: the seats the node holds proven cheats at this table, by this
@@ -11883,8 +11960,8 @@ pub fn certificate_names(
     }
     seat_of(&opened.sender)?;
     let mut stage: Option<CertSubject> = None;
-    let mut subjects: Vec<SeatIdx> = Vec::new();
-    let mut voters: BTreeSet<SeatIdx> = BTreeSet::new();
+    let mut per_subject: BTreeMap<SeatIdx, BTreeSet<SeatIdx>> = BTreeMap::new();
+    let mut causes: BTreeMap<SeatIdx, Option<u16>> = BTreeMap::new();
     for vote in &body.votes {
         let v = chained::open_in_hand(vote, FRAME_CAP, EventType::TimeoutVote, table_id, hand_id).ok()?;
         let voter = seat_of(&v.sender)?;
@@ -11908,10 +11985,39 @@ pub fn certificate_names(
         if !named.cause_is_known() {
             return None;
         }
-        if !subjects.contains(&named.subject_seat) {
-            subjects.push(named.subject_seat);
+        // `S1-KA`: the rest of the shape the hand's own check asks
+        // (`verify_certificate`) -- each vote sealed at the stage it names, one
+        // cause per seat, no seat voting twice about one seat -- and below, one
+        // voter set for every seat named, none of them named, and the digest the
+        // votes hash to. Without them one rogue wrapped three honest votes about
+        // another seat with its own flood vote about a client cut off, and the
+        // lobby counted four voters.
+        if v.envelope.sequence != named.subject_sequence || v.envelope.previous_event_hash != named.parent_event_hash {
+            return None;
         }
-        voters.insert(voter);
+        if *causes.entry(named.subject_seat).or_insert(named.cause) != named.cause {
+            return None;
+        }
+        if !per_subject.entry(named.subject_seat).or_default().insert(voter) {
+            return None;
+        }
+    }
+    let voters: BTreeSet<SeatIdx> = per_subject.values().next().cloned().unwrap_or_default();
+    if per_subject.values().any(|v| *v != voters) {
+        return None;
+    }
+    let subjects: Vec<SeatIdx> = per_subject.keys().copied().collect();
+    if voters.iter().any(|v| subjects.contains(v)) {
+        return None;
+    }
+    let mut subject = stage?;
+    subject.subject_seats = subjects.clone();
+    subject.causes = subjects.iter().map(|s| causes.get(s).copied().flatten()).collect();
+    if opened.envelope.sequence != subject.subject_sequence
+        || opened.envelope.previous_event_hash != subject.parent_event_hash
+        || subject.digest() != body.subject_digest
+    {
+        return None;
     }
     Some((subjects, voters))
 }
@@ -18996,6 +19102,181 @@ mod tests {
         assert!(kept > 0);
         let next = hands[0].next_hand().expect("a successor");
         assert_eq!(next.seats.iter().find(|s| s.0 == 2).map(|s| s.2), Some(kept));
+        // `S1-KA`: nor at the limit in a hand one seat of three still carries.
+        let (mut hands, _keys) = a_settled_hand_with_a_bystander();
+        hands[0].open.returns[2] = MAX_RETURNS;
+        hands[0].certified.push(2);
+        hands[0].certified.push(1);
+        assert!(hands[0].out_for_good().is_empty(), "one of three is no majority");
+    }
+
+    /// `S1-KA`: out of the table for good -- a flood, a proven cheat, the
+    /// fourth absence -- only in a hand that, as it ends, a strict majority of
+    /// the seats with chips at its start still carries: dealt in, holding chips
+    /// at the boundary, certified out by no certificate of the hand. Two rogues
+    /// of four, once the third seat is certified out, are the whole voter set
+    /// about the fourth: what they sign about it puts it out of the hand and no
+    /// further. Read from what `R(k+1)` asks every seat to agree on, so it is
+    /// the same in any banking order -- and a voter named silent is counted, as
+    /// every seat of the hand can count it alike.
+    #[test]
+    fn out_for_good_takes_a_majority_of_the_seats_with_chips() {
+        use crate::protocol::constants::MAX_RETURNS;
+        let about = |seat: SeatIdx, cause: Option<u16>| CertSubject {
+            subject_sequence: 0,
+            subject_seats: vec![seat],
+            subject_event_type: 0,
+            parent_event_hash: [0; 32],
+            deadline_ms: 30_000,
+            kind: 0,
+            causes: vec![cause],
+        };
+        for cause in [Some(CAUSE_FLOOD), Some(CAUSE_CHEAT), None] {
+            // Seat 2 named with the cause -- at its fourth absence when there is none.
+            let fresh = || {
+                let mut h = present_and_quiet(4, 3).0.remove(0);
+                if cause.is_none() {
+                    h.open.returns[2] = MAX_RETURNS;
+                }
+                h
+            };
+            let out_by_cause = |h: &Hand| match cause {
+                Some(CAUSE_FLOOD) => h.named_for_flooding(2),
+                Some(CAUSE_CHEAT) => h.named_for_cheating(2),
+                _ => h.out_after_absences(2),
+            };
+
+            // Seat 3 certified out first, then seat 2: two of four carry the hand.
+            let mut h = fresh();
+            assert!(h.bank(&about(3, None), [3; 32], b"three"));
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert!(h.certified.contains(&2), "{cause:?}: seat 2 is out of the hand");
+            assert!(!out_by_cause(&h), "{cause:?}: and no further");
+            assert!(h.out_for_good().is_empty(), "{cause:?}: two of four is no majority");
+
+            // Banked in the other order: the same.
+            let mut h = fresh();
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert!(h.bank(&about(3, None), [3; 32], b"three"));
+            assert!(h.out_for_good().is_empty(), "{cause:?}: whichever banked first");
+
+            // Seat 2 alone certified: three of four carry the hand, out for good.
+            let mut h = fresh();
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert!(out_by_cause(&h), "{cause:?}: three of four");
+            assert_eq!(h.out_for_good(), vec![2], "{cause:?}: out for good");
+            // ... read as the hand ends: a seat certified out after it is one
+            // the hand no longer carries.
+            assert!(h.bank(&about(3, None), [3; 32], b"three"));
+            assert!(h.out_for_good().is_empty(), "{cause:?}: read as the hand ends");
+
+            // A voter named silent is still a seat of the hand: whether it was
+            // silent is a view its own client may not share (`D-086`), and
+            // counted out it parted an honest table of four.
+            let mut h = fresh();
+            assert!(h.bank(&about(1, Some(CAUSE_SILENT_VOTER)), [1; 32], b"one"));
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert!(!h.certified.contains(&1), "{cause:?}: a silent voter keeps its seat");
+            assert_eq!(h.out_for_good(), vec![2], "{cause:?}: and is counted");
+
+            // A seat with chips the hand does not deal in -- certified out a
+            // hand before, its return refused by the two -- is a seat of the
+            // count: two of four with chips is no majority, where two of the
+            // three dealt in was.
+            let mut h = fresh();
+            h.mine.dealt_in.retain(|s| *s != 3);
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert!(h.out_for_good().is_empty(), "{cause:?}: counted against the seats with chips");
+
+            // A seat that ends the hand without chips carries it no more.
+            let mut h = fresh();
+            h.mine.stacks[3] = 0;
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert!(h.out_for_good().is_empty(), "{cause:?}: a seat without chips at the boundary");
+
+            // A seat without chips at the hand's start is no seat of the count:
+            // two of three is a majority.
+            let mut h = fresh();
+            if let Some(s) = h.open.seats.iter_mut().find(|s| s.0 == 3) {
+                s.2 = 0;
+            }
+            h.mine.dealt_in.retain(|s| *s != 3);
+            assert_eq!(h.seats_with_chips(), 3);
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert_eq!(h.out_for_good(), vec![2], "{cause:?}: two of the three with chips");
+
+            // Decided only once the hand is over: before, only what earlier
+            // hands carried out.
+            let mut h = fresh();
+            assert!(h.bank(&about(2, cause), [2; 32], b"two"));
+            assert!(!h.over());
+            assert!(h.out_for_good_decided().is_empty(), "{cause:?}: not while the hand is played");
+        }
+    }
+
+    /// `S1-KA`: a lobby answer's certificate is read with the shape the hand's
+    /// own check asks -- one voter set for every seat named. One rogue wrapped
+    /// honest votes about another seat with its own flood vote about a client
+    /// cut off, and the lobby counted every signer as a voter of the flood.
+    #[test]
+    fn a_lobby_certificate_has_one_voter_set_for_every_seat_named() {
+        let (mut hands, keys) = three_present_two_quiet();
+        let t1 = NOW + 30_000;
+        let mut votes: Vec<Vec<Vec<u8>>> = Vec::new();
+        for i in 0..3 {
+            votes.push(bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()));
+        }
+        let mut copy: Vec<u8> = Vec::new();
+        for j in 1..3 {
+            for v in &votes[j] {
+                for b in bytes_of_sends(hands[0].on_event(v, &keys[0], t1 + 1_000).unwrap()) {
+                    copy = b;
+                }
+            }
+        }
+        let table_id = hands[0].open.table_id;
+        let hand_id = hands[0].open.hand_id;
+        let seat_of = |k: &[u8; 32]| (0..5u8).find(|s| key(10 + s).verifying_key().to_bytes() == *k);
+        let (named, voters) = certificate_names(&copy, &table_id, hand_id, &seat_of).expect("a genuine certificate reads");
+        assert_eq!((named, voters), (vec![3, 4], [0, 1, 2].into_iter().collect::<BTreeSet<SeatIdx>>()));
+
+        // Seat 2 wraps the votes of seats 0 and 1 about seat 3 with its own
+        // vote naming seat 1 a flooder, at the same stage, with the digest its
+        // mixed subject hashes to.
+        let about_three = |i: usize| {
+            votes[i]
+                .iter()
+                .find(|b| {
+                    chained::open_in_hand(b, FRAME_CAP, EventType::TimeoutVote, &table_id, hand_id)
+                        .ok()
+                        .and_then(|o| chained::payload::<TimeoutVote>(&o, TIMEOUT_VOTE_CAP).ok())
+                        .is_some_and(|v| v.subject_seat == 3)
+                })
+                .cloned()
+                .expect("a vote about seat 3")
+        };
+        let mut flood = hands[2].subject_now(1).expect("a stage open");
+        flood.cause = Some(CAUSE_FLOOD);
+        let slot = chained::Slot {
+            table_id,
+            hand_id,
+            sequence: flood.subject_sequence,
+            previous_event_hash: flood.parent_event_hash,
+        };
+        let rogue_vote = chained::seal(EventType::TimeoutVote, &slot, &flood, &keys[2], t1, 30_000, TIMEOUT_VOTE_CAP).unwrap();
+        let mut mixed = CertSubject::of(&flood);
+        mixed.subject_seats = vec![1, 3];
+        mixed.causes = vec![Some(CAUSE_FLOOD), None];
+        let body = TimeoutCert {
+            subject_digest: mixed.digest(),
+            votes: vec![about_three(0), about_three(1), rogue_vote],
+            resignations: Vec::new(),
+        };
+        let forged = chained::seal(EventType::TimeoutCert, &slot, &body, &keys[2], t1, 30_000, TIMEOUT_CERT_CAP).unwrap();
+        assert!(
+            certificate_names(&forged, &table_id, hand_id, &seat_of).is_none(),
+            "seat 1 has one voter where seat 3 has two: no certificate"
+        );
     }
 
     /// `D-033`: a table of two, dealt to the first bet, seen from a third

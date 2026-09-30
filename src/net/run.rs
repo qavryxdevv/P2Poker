@@ -1441,8 +1441,9 @@ struct TableRun {
     /// `S1-JT`: the hand this client was in the last time it heard another
     /// seat of the table, and its own count of returns there -- the fourth
     /// absence a lobby answer may bring is about that hand or a later one.
-    /// Kept through a silence, whatever the library says meanwhile.
-    alone_hand: Option<(u64, u8)>,
+    /// Kept through a silence, whatever the library says meanwhile. `S1-KA`:
+    /// and how many seats had chips there, which a later hand never exceeds.
+    alone_hand: Option<(u64, u8, usize)>,
     /// `S1-JR`: since when this client, resuming, has held no hand of the
     /// table's.
     resuming_since: Option<std::time::Instant>,
@@ -4008,69 +4009,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .map(|e| (e.app_public_key, e.tox_key))
                 });
                 if let Some((app, line)) = entry {
-                    // `D-047`: the fourth absence is the last. Out of the table's
-                    // group for good, never invited again, and out of the table:
-                    // its chips leave at the boundary (the engine), so what the
-                    // felt shows is a seat that left. Silence is no condition here:
-                    // a seat certified four times over is out whether its line is
-                    // bad or its play is.
-                    // `D-051`: or certified with the flood cause by every voter --
-                    // out for good the same way.
-                    let flooded = $h.named_for_flooding(seat);
-                    // `D-084`: or with the cheat cause.
-                    let cheated = $h.named_for_cheating(seat);
-                    let at_the_limit = flooded
-                        || cheated
-                        || $h.returns().get(usize::from(seat)).copied().unwrap_or(0)
-                            >= crate::protocol::constants::MAX_RETURNS;
-                    if at_the_limit {
-                        // The word for the seat's own client, kept for this
-                        // client's lobby answers; and no request from that key
-                        // sits here again.
-                        match $h.word_about(seat) {
-                            Some(cert) => {
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "the word about seat {seat} is kept for its client's asking: {} bytes of hand #{}",
-                                        cert.len(),
-                                        $h.hand_id()
-                                    )))
-                                    .await;
-                                $t.out_words.retain(|(s, _, _, _)| *s != seat);
-                                $t.out_words.push((seat, app, $h.hand_id(), cert));
-                            }
-                            None => {
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "no certificate about seat {seat} is banked this hand: its client cannot be told by asking"
-                                    )))
-                                    .await;
-                            }
-                        }
-                        $t.out_keys.insert(app);
-                        $t.tox_sink.tell(super::toxsink::Seat::Remove {
-                            app_key: Some(app),
-                            tox_key: line,
-                            for_good: true,
-                        });
-                        let _ = events
-                            .send(NodeEvent::Warning(if flooded {
-                                format!(
-                                    "seat {seat} is out of the table for good for flooding the table's group (D-051): every voter's client cut it off, the certificate says so, it is removed from the group by the table's word and never invited again; its chips leave the table at the boundary"
-                                )
-                            } else if cheated {
-                                format!(
-                                    "seat {seat} is out of the table for good for a proof that does not hold (D-084): every voter's client found it failing, the certificate says so, it is removed from the group by the table's word and never invited again; its chips leave the table at the boundary"
-                                )
-                            } else {
-                                format!(
-                                    "seat {seat} is out of the table for good after its fourth absence (D-047): removed from the table's group by the table's word, never to be invited again; its chips leave the table at the boundary"
-                                )
-                            }))
-                            .await;
-                        let _ = events.send(NodeEvent::SeatLeft { seat, quit: true, removed: true }).await;
-                        continue;
-                    }
                     let quiet = [
                         $t.tox_sink.quiet_secs(&app),
                         line.and_then(|k| $t.tox_sink.quiet_line(&k)),
@@ -4103,6 +4041,86 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )))
                             .await;
                     }
+                }
+            }
+            // `D-047`: the fourth absence is the last. Out of the table's group
+            // for good, never invited again, and out of the table: its chips
+            // leave at the boundary (the engine), so what the felt shows is a
+            // seat that left. Silence is no condition here: a seat certified
+            // four times over is out whether its line is bad or its play is.
+            // `D-051`: or certified with the flood cause by every voter -- out
+            // for good the same way. `D-084`: or with the cheat cause.
+            //
+            // `S1-KA`: each of the three only in a hand a majority of the seats
+            // with chips still carries as it ends -- the engine's own reading,
+            // which puts the chips out at the boundary -- and so only once the
+            // hand is over: read at the first sight of the seat certified, a seat
+            // certified later took the majority away after the word for good,
+            // which is not taken back, had gone to the group.
+            if $h.over() {
+                for seat in $h.certified_seats().to_vec() {
+                    let flooded = $h.named_for_flooding(seat);
+                    let cheated = $h.named_for_cheating(seat);
+                    let at_the_limit = flooded || cheated || $h.out_after_absences(seat);
+                    if !at_the_limit {
+                        continue;
+                    }
+                    let entry = $t.table.as_ref().and_then(|f| {
+                        f.roster()
+                            .seats()
+                            .iter()
+                            .find(|e| e.seat == seat)
+                            .map(|e| (e.app_public_key, e.tox_key))
+                    });
+                    let Some((app, line)) = entry else { continue };
+                    if $t.out_keys.contains(&app) {
+                        continue;
+                    }
+                    // The word for the seat's own client, kept for this
+                    // client's lobby answers; and no request from that key
+                    // sits here again.
+                    match $h.word_about(seat) {
+                        Some(cert) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the word about seat {seat} is kept for its client's asking: {} bytes of hand #{}",
+                                    cert.len(),
+                                    $h.hand_id()
+                                )))
+                                .await;
+                            $t.out_words.retain(|(s, _, _, _)| *s != seat);
+                            $t.out_words.push((seat, app, $h.hand_id(), cert));
+                        }
+                        None => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "no certificate about seat {seat} is banked this hand: its client cannot be told by asking"
+                                )))
+                                .await;
+                        }
+                    }
+                    $t.out_keys.insert(app);
+                    $t.tox_sink.tell(super::toxsink::Seat::Remove {
+                        app_key: Some(app),
+                        tox_key: line,
+                        for_good: true,
+                    });
+                    let _ = events
+                        .send(NodeEvent::Warning(if flooded {
+                            format!(
+                                "seat {seat} is out of the table for good for flooding the table's group (D-051): every voter's client cut it off, the certificate says so, it is removed from the group by the table's word and never invited again; its chips leave the table at the boundary"
+                            )
+                        } else if cheated {
+                            format!(
+                                "seat {seat} is out of the table for good for a proof that does not hold (D-084): every voter's client found it failing, the certificate says so, it is removed from the group by the table's word and never invited again; its chips leave the table at the boundary"
+                            )
+                        } else {
+                            format!(
+                                "seat {seat} is out of the table for good after its fourth absence (D-047): removed from the table's group by the table's word, never to be invited again; its chips leave the table at the boundary"
+                            )
+                        }))
+                        .await;
+                    let _ = events.send(NodeEvent::SeatLeft { seat, quit: true, removed: true }).await;
                 }
             }
         }};
@@ -5423,10 +5441,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // refused by it. A count this client does not hold (a
                                             // hand adopted from the others' copies carries none)
                                             // takes no absence.
-                                            let returns = t
-                                                .alone_hand
-                                                .filter(|(hand, _)| w.hand_id >= *hand)
-                                                .map_or(0, |(_, returns)| returns);
+                                            let held = t.alone_hand.filter(|(hand, _, _)| w.hand_id >= *hand);
+                                            let returns = held.map_or(0, |(_, returns, _)| returns);
+                                            // `S1-KA`: **and carried by a majority of the
+                                            // seats with chips**, as the engine counts it in
+                                            // the hand: at the hand this client was in as it
+                                            // began to hear nobody -- a later hand has no more
+                                            // -- or, holding no such hand, every seat of the
+                                            // roster. Two rogues of four, the third seat
+                                            // certified out first, were the whole voter set
+                                            // about the fourth and named it a flooder. The
+                                            // voters here are every signature the certificate
+                                            // carries, a few more than the engine counts
+                                            // (a voter certified out or named silent in the
+                                            // hand): each is a seat that signed, and rogues
+                                            // are no more of them than there are rogues.
+                                            let with_chips = held.map_or(roster.seats().len(), |(_, _, n)| n);
+                                            if voters.len() * 2 <= with_chips {
+                                                return None;
+                                            }
                                             let absent = returns >= crate::protocol::constants::MAX_RETURNS
                                                 && !causes.is_empty()
                                                 && causes.iter().all(|c| {
@@ -11250,7 +11283,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // does at its fourth absence.
                     let out_myself = t.hand.as_ref().and_then(|h| {
                         let me = h.my_seat();
-                        h.out_for_good().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))
+                        h.out_for_good_decided().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))
                     });
                     if let Some((me, flooded, cheated)) = out_myself {
                         if !t.out_told {
@@ -15222,7 +15255,7 @@ fn watch_progress(t: &mut TableRun) {
         // goes meanwhile.
         if let Some(h) = t.hand.as_ref() {
             let me = h.my_seat();
-            t.alone_hand = Some((h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0)));
+            t.alone_hand = Some((h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0), h.seats_with_chips()));
         }
     }
     if !alone {
@@ -22283,8 +22316,13 @@ mod a_joiner_before_the_first_hand {
         assert!(votes < fallback, "after the votes, on the same tick");
         assert!(code[fallback..fallback + 900].contains("hand_may_have_ended!(t, h);"), "and the end said");
         assert_eq!(code.matches("note_cheaters(&cheaters);").count(), 2, "noted at both vote sites");
-        assert!(code.contains("let cheated = $h.named_for_cheating(seat); let at_the_limit = flooded || cheated"), "out for good");
-        assert!(code.contains("h.out_for_good().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))"), "this client");
+        assert!(code.contains("let at_the_limit = flooded || cheated || $h.out_after_absences(seat);"), "out for good");
+        // `S1-KA`: once the hand is over, for every seat it certified.
+        assert!(
+            code.contains("if $h.over() { for seat in $h.certified_seats().to_vec() { let flooded = $h.named_for_flooding(seat); let cheated = $h.named_for_cheating(seat); let at_the_limit ="),
+            "the group's word for good, once the hand is over"
+        );
+        assert!(code.contains("h.out_for_good_decided().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))"), "this client, once decided");
         assert!(code.contains("if !alone || !(flooded || cheated || absent) { return None; }"), "the lobby word");
     }
 
@@ -22324,8 +22362,18 @@ mod a_joiner_before_the_first_hand {
             "a fourth absence by this client's own count of its returns"
         );
         assert!(
-            code.contains("let returns = t .alone_hand .filter(|(hand, _)| w.hand_id >= *hand) .map_or(0, |(_, returns)| returns);"),
+            code.contains("let held = t.alone_hand.filter(|(hand, _, _)| w.hand_id >= *hand); let returns = held.map_or(0, |(_, returns, _)| returns);"),
             "about the hand the silence began in or a later one, by its count there"
+        );
+        // `S1-KA`: carried by a majority of the seats with chips there, or of
+        // the whole roster when this client holds no such hand.
+        let majority = code
+            .find("let with_chips = held.map_or(roster.seats().len(), |(_, _, n)| n); if voters.len() * 2 <= with_chips { return None; }")
+            .expect("a majority of the seats with chips");
+        assert!(majority < alone, "before the word is taken");
+        assert!(
+            code.contains("t.alone_hand = Some((h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0), h.seats_with_chips()));"),
+            "the count kept with the hand"
         );
         let told = code.find("NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded, cheated }").expect("the word said");
         assert!(alone < told);
