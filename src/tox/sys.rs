@@ -332,6 +332,13 @@ extern "C" {
     ) -> bool;
     /// `tox.h:5254`. The founder's privacy state; see `tox_group_set_peer_limit`.
     pub fn tox_group_set_privacy_state(tox: *mut Tox, group_number: u32, privacy_state: c_int, error: *mut c_int) -> bool;
+    /// `tox.h:4194`. The group's peer limit as its shared state says it --
+    /// `MAX_GC_PEERS_DEFAULT` (100) until the founder's arrives, and after it
+    /// in every group a client of this build made (`S1-KH`).
+    pub fn tox_group_get_peer_limit(tox: *const Tox, group_number: u32, error: *mut c_int) -> u16;
+    /// `tox.h:4215`. The length of the group's password; zero for none, which
+    /// is every group a client of this build made (`S1-KH`).
+    pub fn tox_group_get_password_size(tox: *const Tox, group_number: u32, error: *mut c_int) -> usize;
     /// `tox.h:5393`
     pub fn tox_group_kick_peer(
         tox: *const Tox,

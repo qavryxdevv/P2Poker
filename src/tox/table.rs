@@ -653,6 +653,11 @@ pub struct Trouble {
     /// it has in the group (`seats_here`) -- where `in_group` counts members,
     /// which is what says one arrived.
     pub seats_in_group: AtomicU64,
+    /// `S1-KH`: the group's shared state keeps members out -- a peer limit or a
+    /// password, which no client of this build sets -- as first read once this
+    /// copy of the group had confirmed a member. Kept for the table's life: a
+    /// founder that locked its group once runs a client that is not ours.
+    pub group_lock: std::sync::Mutex<Option<crate::tox::GroupLock>>,
     /// Invitations toxcore **accepted** from the founder.
     ///
     /// Beside `invites_refused` because zero refusals means one of two very
@@ -1853,6 +1858,20 @@ fn sweep_table(
         t.group.is_some() && group_complete(seats_here(t), t.roster.len()),
         Ordering::Relaxed,
     );
+    // `S1-KH`: a group a client of this build made keeps nobody out; one that
+    // does was changed by its founder since -- the only member whose word on
+    // the group's shared state the library takes. Read once this copy has
+    // confirmed a member, by when the founder's state has come with it; before
+    // that the library holds its defaults, which lock nothing.
+    if let (Some(g), true) = (t.group, t.settled) {
+        if let Some(lock) = tox.group_lock(g).filter(|l| l.locked()) {
+            if let Ok(mut seen) = t.trouble.group_lock.lock() {
+                if seen.is_none() {
+                    *seen = Some(lock);
+                }
+            }
+        }
+    }
 
     // `S1-DB`: what a seat's dead process left in the group goes, once the seat
     // is back under a fresh key of its own binding. **After the counts above

@@ -553,6 +553,22 @@ impl TableSink {
         }
     }
 
+    /// `S1-KH`: whether the table's group was changed to keep members out --
+    /// a peer limit or a password, which no client of this build sets -- and
+    /// how, once the carrier has seen it. `None` on a build with no Tox.
+    pub fn group_lock(&self) -> Option<(Option<u16>, bool)> {
+        #[cfg(feature = "tox")]
+        {
+            let t = self.inner.as_ref()?;
+            let seen = t.trouble().group_lock.lock().ok().and_then(|g| *g)?;
+            Some((seen.peer_limit, seen.password))
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            None
+        }
+    }
+
     /// Hand events received and thrown away because the node loop was not
     /// draining. Any non-zero value is a seat diverging from the table.
     /// `D-035`: seats whose client left the table's group since the last

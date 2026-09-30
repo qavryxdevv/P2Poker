@@ -15170,6 +15170,14 @@ const STRANGERS_LIMIT: usize = 3;
 /// * `STRANGERS_LIMIT` strangers removed within `STRANGERS_WINDOW`.
 fn unsafe_reason(t: &TableRun) -> Option<String> {
     let now = std::time::Instant::now();
+    // `S1-KH`: the table's group was changed by its founder to keep players
+    // out. Nothing at the table can undo it -- the group's settings are the
+    // founder's signed word, and no certificate touches them -- and a seat
+    // whose line drops cannot come back, hand after hand: told at once, to
+    // every player, not after that seat has been kept out three times.
+    if let Some((peer_limit, password)) = t.tox_sink.group_lock() {
+        return Some(group_locked_words(peer_limit, password));
+    }
     if let Some(h) = t.hand.as_ref() {
         let out = h.out_for_good();
         let in_game: Vec<u8> = t
@@ -15212,6 +15220,19 @@ fn unsafe_reason(t: &TableRun) -> Option<String> {
         ));
     }
     no_progress_reason(t, now)
+}
+
+/// `S1-KH`: the words for a group its founder locked -- what it did, and what
+/// that does to a player.
+fn group_locked_words(peer_limit: Option<u16>, password: bool) -> String {
+    let what = match (peer_limit, password) {
+        (Some(n), true) => format!("a password, and room for {n} member(s)"),
+        (Some(n), false) => format!("room for {n} member(s) only"),
+        (None, _) => "a password".to_string(),
+    };
+    format!(
+        "the player who created the table's connection has changed it to keep players out -- {what}, which no client of this game sets: a player whose line drops cannot come back to the table."
+    )
 }
 
 /// `S1-JR`: this many of the last five hands called off before they were
@@ -21658,6 +21679,22 @@ mod late_roster_tests {
         assert!(code.contains("$t.left_by_own_word.insert(f.table_id(), tokio::time::Instant::now());"));
         assert!(code.contains("&& f.ratified_at().iter().any(|(s, at)| *s == seat && said_ms < *at) => {}"), "an older sitting's word");
         assert!(code.contains("is_ok_and(|(_, at)| at > said_ms)"), "the newest word");
+    }
+
+    /// `S1-KH`: a group its founder locked is the players' question at once,
+    /// and says what was done -- and it is the first reason read.
+    #[test]
+    fn a_locked_group_is_told_at_once() {
+        let both = group_locked_words(Some(1), true);
+        assert!(both.contains("a password") && both.contains("room for 1 member"), "{both}");
+        assert!(group_locked_words(Some(3), false).contains("room for 3 member(s) only"));
+        assert!(group_locked_words(None, true).contains("-- a password, which"));
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let body = &code[code.find("fn unsafe_reason(t: &TableRun) -> Option<String> {").expect("the reasons")..];
+        let lock = body.find("t.tox_sink.group_lock()").expect("the lock is read");
+        let first_other = body.find("t.flooders").expect("the flood reason");
+        assert!(lock < first_other, "before every other reason");
     }
 
     /// `S1-KJ`: a seat named for another version of a step is counted for

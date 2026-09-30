@@ -461,6 +461,23 @@ pub struct Tox {
     ptr: *mut sys::Tox,
 }
 
+/// `S1-KH`: what of a group's shared state keeps a member out -- see
+/// [`Tox::group_lock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GroupLock {
+    /// The peer limit, when it is below [`Tox::GROUP_PEER_LIMIT`].
+    pub peer_limit: Option<u16>,
+    /// Whether the group asks a password of a member coming in.
+    pub password: bool,
+}
+
+impl GroupLock {
+    /// Whether anything keeps a member out.
+    pub fn locked(&self) -> bool {
+        self.peer_limit.is_some() || self.password
+    }
+}
+
 /// Why an instance could not be created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failed {
@@ -1216,6 +1233,35 @@ impl Tox {
         }
     }
 
+    /// `S1-KH`: what of the group's shared state keeps a member out that no
+    /// client of this build sets -- a peer limit below the library's default
+    /// of a hundred, or a password -- as its founder's signed state says it.
+    /// `None` where the group cannot be read; before the founder's state has
+    /// arrived the library holds the defaults, which lock nothing.
+    ///
+    /// The privacy state is not read: a member's copy of the group starts
+    /// *public* until the founder's state arrives, so it could not tell a lock
+    /// from a join still settling.
+    pub fn group_lock(&self, group: u32) -> Option<GroupLock> {
+        let mut e1: c_int = 0;
+        let mut e2: c_int = 0;
+        // SAFETY: valid pointer; the calls only read.
+        let (limit, password) = unsafe {
+            (
+                sys::tox_group_get_peer_limit(self.ptr, group, &mut e1),
+                sys::tox_group_get_password_size(self.ptr, group, &mut e2),
+            )
+        };
+        (e1 == 0 && e2 == 0).then_some(GroupLock {
+            peer_limit: (limit < Self::GROUP_PEER_LIMIT).then_some(limit),
+            password: password > 0,
+        })
+    }
+
+    /// `S1-KH`: the peer limit every group a client of this build makes keeps,
+    /// toxcore's own `MAX_GC_PEERS_DEFAULT`.
+    pub const GROUP_PEER_LIMIT: u16 = 100;
+
     /// Remove a peer the roster no longer seats. Founder only.
     pub fn kick(&mut self, group: u32, peer: u32) -> Result<(), Failed> {
         let mut err: c_int = 0;
@@ -1317,6 +1363,26 @@ mod tests {
         assert_ne!(tox.chat_id(other).unwrap(), id);
 
         tox.leave(group).expect("leaving is allowed");
+    }
+
+    /// `S1-KH`: a group as the client makes it keeps nobody out, and the
+    /// harness's rogue founder's lock -- a peer limit of one and a password --
+    /// reads as locked, each part of it.
+    #[test]
+    fn a_group_the_client_makes_is_unlocked_and_a_founders_lock_reads() {
+        let mut tox = Tox::new().expect("a tox instance");
+        let group = tox.new_group("Locked", "host").expect("a group");
+        let lock = tox.group_lock(group).expect("its shared state reads");
+        assert!(!lock.locked(), "as made: {lock:?}");
+        #[cfg(feature = "fault-harness")]
+        {
+            let took = tox.lock_group(group);
+            assert!(took[0] && took[1], "the harness's lock took: {took:?}");
+            let lock = tox.group_lock(group).expect("its shared state reads");
+            assert_eq!(lock, GroupLock { peer_limit: Some(1), password: true });
+            assert!(lock.locked());
+        }
+        assert_eq!(tox.group_lock(u32::MAX - 1), None, "no such group: nothing read");
     }
 
     /// The MTU is refused rather than truncated.
