@@ -529,6 +529,30 @@ impl TableSink {
         }
     }
 
+    /// `S1-KI`: the other seats the group holds -- a seat once, however many
+    /// entries its binding names -- and what it wanted. `group_seen` counts
+    /// members, which is what says one arrived; whether the group holds every
+    /// seat is this.
+    ///
+    /// `(0, 0)` on a build with no Tox, where there is no group to count.
+    pub fn group_seats(&self) -> (u64, u64) {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => (
+                    t.trouble().seats_in_group.load(Ordering::Relaxed),
+                    t.trouble().want_in_group.load(Ordering::Relaxed),
+                ),
+                None => (0, 0),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            (0, 0)
+        }
+    }
+
     /// Hand events received and thrown away because the node loop was not
     /// draining. Any non-zero value is a seat diverging from the table.
     /// `D-035`: seats whose client left the table's group since the last

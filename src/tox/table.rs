@@ -247,13 +247,48 @@ fn stranger_plan() -> Option<(Duration, bool, bool)> {
     })
 }
 
+/// fault-harness, `S1-KI`: `P2P_POKER_PUPPETS=N` -- with `P2P_POKER_STRANGER_AT`,
+/// N strangers in place of one, each named with THIS client's own binding for
+/// its member key: entries of this client's seat that its player brought into
+/// the group itself, as a rogue can.
+#[cfg(feature = "fault-harness")]
+fn puppets() -> Option<usize> {
+    use std::sync::OnceLock;
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("P2P_POKER_PUPPETS")
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(|n| n.min(16))
+    })
+}
+
+/// fault-harness, `S1-KI`: `P2P_POKER_COUNT_BY_MEMBER=1` -- the control: the
+/// group counted by member and metered by member key, and no entry cut for
+/// being one too many, as before `S1-KI`.
+#[cfg(feature = "fault-harness")]
+fn count_by_member() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("P2P_POKER_COUNT_BY_MEMBER").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(not(feature = "fault-harness"))]
+fn count_by_member() -> bool {
+    false
+}
+
 /// fault-harness: the stranger's instance and how far it got.
 #[cfg(feature = "fault-harness")]
 struct Stranger {
     tox: Tox,
     /// The stranger as this client's friend, and this client as the stranger's.
     friend_here: u32,
-    invited: bool,
+    /// When this client last invited it, until it takes an invitation.
+    invited: Option<Instant>,
     group: Option<u32>,
     joined: bool,
     flood_sent: u64,
@@ -614,6 +649,10 @@ pub struct Trouble {
     /// peer cannot see the others yet*. Two numbers do.
     pub in_group: AtomicU64,
     pub want_in_group: AtomicU64,
+    /// `S1-KI`: the OTHER seats the group holds, a seat once however many entries
+    /// it has in the group (`seats_here`) -- where `in_group` counts members,
+    /// which is what says one arrived.
+    pub seats_in_group: AtomicU64,
     /// Invitations toxcore **accepted** from the founder.
     ///
     /// Beside `invites_refused` because zero refusals means one of two very
@@ -704,6 +743,9 @@ pub enum Cut {
     /// It is bound to a seat barred here: one this client cut off for
     /// flooding, or one the table put out for good.
     Barred,
+    /// `S1-KI`: its seat holds `ENTRIES_A_SEAT` other entries in the group the
+    /// group has heard from more recently.
+    Surplus,
 }
 
 impl std::fmt::Display for Cut {
@@ -714,6 +756,10 @@ impl std::fmt::Display for Cut {
             Cut::NotItsBinding => write!(f, "its name is a binding made for another member"),
             Cut::Nameless => write!(f, "it said no seat within {} s of joining", NAME_GRACE.as_secs()),
             Cut::Barred => write!(f, "it is bound to a seat barred from this table"),
+            Cut::Surplus => write!(
+                f,
+                "its seat holds {ENTRIES_A_SEAT} other entries in the group that spoke more recently"
+            ),
         }
     }
 }
@@ -1455,11 +1501,32 @@ fn score_noise(tox: &mut Tox, t: &mut TableState, g: u32, key: [u8; 32], points:
         return;
     }
     let now = millis();
-    let meter = t.meters.entry(key).or_default();
+    let mk = metered_as(t, &key);
+    let meter = t.meters.entry(mk).or_default();
     meter.noise(now, points);
     if let Some(flood) = meter.over(now) {
         cut_off(tox, t, g, key, Cut::Flood(flood));
     }
+}
+
+/// `S1-KI`: whose meter a member's traffic is counted on: its seat's -- the key
+/// its binding names -- once the binding is read, its own key before that.
+///
+/// Every entry a seat binds is a member with a key of its own, and metered by
+/// member key a rogue's allowance was `D-051`'s limits times the entries it
+/// kept in the group. Metered by seat, a seat's entries share one allowance:
+/// an honest seat holds one entry, or two for the moments of `S1-DB` while its
+/// dead process's entry goes -- and a dead process sends nothing.
+fn metered_as(t: &TableState, key: &[u8; 32]) -> [u8; 32] {
+    if count_by_member() {
+        return *key;
+    }
+    meter_key(&t.bound, key)
+}
+
+/// `S1-KI`: `metered_as` on the bindings alone.
+fn meter_key(bound: &HashMap<[u8; 32], [u8; 32]>, key: &[u8; 32]) -> [u8; 32] {
+    bound.get(key).copied().unwrap_or(*key)
 }
 
 fn by_group(tables: &mut HashMap<TableId, TableState>, g: u32) -> Option<&mut TableState> {
@@ -1581,7 +1648,8 @@ fn sweep_table(
         // group looked whole from 105 s to 175 s and the seat that needed the
         // offer got none until its next outage).
         // `S1-FE`: short of an OTHER seat -- the roster leaves this client out.
-        let short = t.group.is_some() && group_short(t.confirmed.len(), t.roster.len());
+        // `S1-KI`: by seat, however many entries one seat holds.
+        let short = t.group.is_some() && group_short(seats_here(t), t.roster.len());
         if short {
             // `S1-EG`: only the seats NOT in the group are asked again. Clearing
             // the record wholesale invited the confirmed members too, each such
@@ -1601,9 +1669,15 @@ fn sweep_table(
     }
     // Whether the group now holds every other seat. **Counted, not matched**:
     // `tox_group_peer_get_public_key` gives a peer's group key, not the friend
-    // key the roster holds, so no scan can say which seat a member is. A count
-    // answers the only question the gate asks, and it is sound because the
-    // group is PRIVATE and the founder the sole admin.
+    // key the roster holds, so no scan can say which seat a member is.
+    // `S1-KI`: **the members for an arrival, the seats for a whole group.** The
+    // count of members is what says somebody arrived -- a seat back under a
+    // fresh key raises it while its old entry is still in (`S1-DX` answers
+    // that with the node's list and ratification, `run162035-3`). Whether the
+    // group holds every seat is `seats_here`: by member, the count was sound
+    // only while nobody but the founder brought members in, and any member of
+    // a private group can invite -- a rogue's own extra entries, each bound to
+    // its seat, read as the seats still missing.
     // `S1-DZ`: CONFIRMED members -- never the library's peer count, which
     // holds unconfirmed entries: an invitation half-way through its handshake,
     // a dropped seat's old key re-added by the library's own reconnection. The
@@ -1618,9 +1692,9 @@ fn sweep_table(
     // missing seat -- the founder's `S1-EG` sweep and `S1-FB`'s `offer_again`
     // alike. The node reads this number as other seats too (*not one of N
     // other seats*, *held N of M other seats*).
-    let seen = match t.group {
-        Some(_) => t.confirmed.len(),
-        None => 0,
+    let (seen, seats) = match t.group {
+        Some(_) => (t.confirmed.len(), seats_here(t)),
+        None => (0, 0),
     };
     // The friend connections that are up among the ones THIS table needs.
     let mine_up = connected
@@ -1630,6 +1704,7 @@ fn sweep_table(
     t.trouble.self_connection.store(self_connection, Ordering::Relaxed);
     t.trouble.friends_up.store(mine_up as u64, Ordering::Relaxed);
     t.trouble.in_group.store(seen as u64, Ordering::Relaxed);
+    t.trouble.seats_in_group.store(seats as u64, Ordering::Relaxed);
     // `D-035`, `D-041`: which seats are confirmed members right now, by
     // APPLICATION key through the bridge `known_as` holds.
     // `D-049`: this seat's own word on sitting out is the group's status of
@@ -1651,8 +1726,7 @@ fn sweep_table(
         let mut away: HashMap<[u8; 32], (u64, bool)> = HashMap::new();
         if let Some(g) = t.group {
             for (group_key, app_key) in t.known_as.iter() {
-                let member =
-                    (0..Tox::PEER_SCAN).find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(group_key));
+                let member = peer_of(tox, t, g, group_key);
                 if let Some(p) = member.filter(|p| t.confirmed.contains(p)) {
                     present.insert(*app_key);
                     // `S1-DT`: and how long the group has heard nothing from it.
@@ -1731,7 +1805,7 @@ fn sweep_table(
         if t.self_joined && t.roster.contains(founder) {
             if let Some(n) = friend_number(friends, founder) {
                 let here = t.peer_lines.iter().any(|(p, l)| l == founder && t.confirmed.contains(p));
-                let absent = !here && group_short(t.confirmed.len(), t.roster.len());
+                let absent = !here && group_short(seats_here(t), t.roster.len());
                 if !absent {
                     t.founder_offered = None;
                 } else if connected.contains(&n)
@@ -1776,7 +1850,7 @@ fn sweep_table(
     // the library's count holds unconfirmed entries. `S1-FE`: every OTHER
     // seat -- see `seen`.
     t.trouble.complete.store(
-        t.group.is_some() && group_complete(t.confirmed.len(), t.roster.len()),
+        t.group.is_some() && group_complete(seats_here(t), t.roster.len()),
         Ordering::Relaxed,
     );
 
@@ -1790,6 +1864,8 @@ fn sweep_table(
     // the rest of the run (`run162035-3`).
     if let (Some(g), true) = (t.group, t.setup.binder.is_some()) {
         drop_stale_twins(tox, t, g);
+        // `S1-KI`: and what a seat holds past two living entries.
+        cut_surplus(tox, t, g);
     }
 
     // **A join that never finished, given up and started again** (`S1-AA`
@@ -1869,7 +1945,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
     #[cfg(feature = "fault-harness")]
     let mut junk_state: u64 = 0x9E37_79B9_7F4A_7C15 ^ u64::from(std::process::id());
     #[cfg(feature = "fault-harness")]
-    let mut stranger: Option<Stranger> = None;
+    let mut strangers: Vec<Stranger> = Vec::new();
     #[cfg(feature = "fault-harness")]
     let mut stranger_tried = false;
 
@@ -2064,8 +2140,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             // in for a taught seat, and five seconds of *not on the
                             // line* at every deal would be its price.
                             if let Some(g) = t.group {
-                                let member = (0..Tox::PEER_SCAN)
-                                    .find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(&group_key));
+                                let member = peer_of(&tox, t, g, &group_key);
                                 if member.is_some_and(|p| t.confirmed.contains(&p)) {
                                     if let Ok(mut present) = t.trouble.present.lock() {
                                         present.insert(app_key);
@@ -2454,7 +2529,10 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             if t.cut.contains(&k) {
                                 continue;
                             }
-                            let meter = t.meters.entry(k).or_default();
+                            // `S1-KI`: on its seat's meter, however many entries
+                            // the seat holds.
+                            let mk = metered_as(t, &k);
+                            let meter = t.meters.entry(mk).or_default();
                             meter.packet(now, data.len());
                             let over = meter.over(now);
                             #[cfg(feature = "fault-harness")]
@@ -2492,6 +2570,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                 let max = t.inbox.max_capacity();
                                 if t.inbox.capacity() < max / 4 {
                                     if let Some(k) = claimed {
+                                        // `S1-KI`: by seat, as metered.
+                                        let k = metered_as(t, &k);
                                         let mine = t.meters.get(&k).map_or(0, |m| m.this_second(now));
                                         let others = t
                                             .meters
@@ -2585,43 +2665,57 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                 }
             }
             if let Some((at, flood, copy)) = stranger_plan() {
+                let puppet = puppets().is_some();
                 if now >= at && !stranger_tried {
                     stranger_tried = true;
-                    match (Tox::new(), tox.local_node()) {
-                        (Ok(mut st), Some((port, dht))) => {
-                            let _ = st.bootstrap("127.0.0.1", port, &dht);
-                            let here: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
-                            let there: [u8; 32] = st.address()[..32].try_into().unwrap_or([0u8; 32]);
-                            let _ = st.add_friend(&here);
-                            match tox.add_friend(&there) {
-                                Ok(n) => {
-                                    println!(
-                                        "fault-harness: a stranger is made at {} s and befriended, as P2P_POKER_STRANGER_AT asked",
-                                        now.as_secs()
-                                    );
-                                    stranger = Some(Stranger {
-                                        tox: st,
-                                        friend_here: n,
-                                        invited: false,
-                                        group: None,
-                                        joined: false,
-                                        flood_sent: 0,
-                                        flood_since: None,
-                                    });
+                    for _ in 0..puppets().unwrap_or(1) {
+                        match (Tox::new(), tox.local_node()) {
+                            (Ok(mut st), Some((port, dht))) => {
+                                let _ = st.bootstrap("127.0.0.1", port, &dht);
+                                let here: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
+                                let there: [u8; 32] = st.address()[..32].try_into().unwrap_or([0u8; 32]);
+                                let _ = st.add_friend(&here);
+                                match tox.add_friend(&there) {
+                                    Ok(n) => {
+                                        println!(
+                                            "fault-harness: a stranger is made at {} s and befriended, as P2P_POKER_STRANGER_AT asked",
+                                            now.as_secs()
+                                        );
+                                        strangers.push(Stranger {
+                                            tox: st,
+                                            friend_here: n,
+                                            invited: None,
+                                            group: None,
+                                            joined: false,
+                                            flood_sent: 0,
+                                            flood_since: None,
+                                        });
+                                    }
+                                    Err(e) => println!("fault-harness: the stranger could not be befriended: {e}"),
                                 }
-                                Err(e) => println!("fault-harness: the stranger could not be befriended: {e}"),
                             }
+                            _ => println!("fault-harness: no stranger could be made"),
                         }
-                        _ => println!("fault-harness: no stranger could be made"),
                     }
                 }
-                if let Some(s) = stranger.as_mut() {
+                for s in strangers.iter_mut() {
                     for e in s.tox.iterate() {
                         match e {
                             Event::GroupInvite { friend, invite } if s.group.is_none() => {
                                 match s.tox.accept_invite(friend, &invite, "stranger") {
                                     Ok(g2) => {
                                         s.group = Some(g2);
+                                        // `S1-KI`: this client's own binding for the
+                                        // stranger's member key -- an entry of its seat.
+                                        if puppet {
+                                            let binder = tables.values().find_map(|t| t.setup.binder.clone());
+                                            if let (Some(key), Ok(chat), Some(me)) =
+                                                (binder, s.tox.chat_id(g2), s.tox.self_key(g2))
+                                            {
+                                                let name = crate::table::membership::binding_for(&key, &chat, &me);
+                                                let _ = s.tox.set_self_name(g2, &name);
+                                            }
+                                        }
                                         if copy {
                                             // A seat's binding, as this client reads it.
                                             let name = tables.values().find_map(|t| {
@@ -2637,7 +2731,13 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                         }
                                         println!(
                                             "fault-harness: the stranger took the invitation{}",
-                                            if copy { ", named with a copy of a seat's binding" } else { "" }
+                                            if puppet {
+                                                ", named with this client's own binding: an entry of its seat (S1-KI)"
+                                            } else if copy {
+                                                ", named with a copy of a seat's binding"
+                                            } else {
+                                                ""
+                                            }
                                         );
                                     }
                                     Err(e) => println!("fault-harness: the stranger could not take the invitation: {e}"),
@@ -2651,10 +2751,14 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             _ => {}
                         }
                     }
-                    if !s.invited && tox.friend_connection(s.friend_here) > 0 {
+                    // Again every five seconds until the stranger takes one: an
+                    // invitation sent while this client's own join was settling
+                    // went nowhere (`S1-KI`'s first beds, one puppet of three in).
+                    let due = s.group.is_none() && s.invited.is_none_or(|at| at.elapsed() >= Duration::from_secs(5));
+                    if due && tox.friend_connection(s.friend_here) > 0 {
                         if let Some(g) = tables.values().find_map(|t| t.group) {
                             if tox.invite(g, s.friend_here).is_ok() {
-                                s.invited = true;
+                                s.invited = Some(Instant::now());
                                 println!("fault-harness: this client invited the stranger into its table's group");
                             }
                         }
@@ -2686,7 +2790,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                 // offer it to.
                 if !t.offer_again.is_empty() {
                     let gone = std::mem::take(&mut t.offer_again);
-                    if t.group.is_some() && group_short(t.confirmed.len(), t.roster.len()) {
+                    if t.group.is_some() && group_short(seats_here(t), t.roster.len()) {
                         t.invited
                             .retain(|f| friends.get(f).is_none_or(|k| !gone.contains(k)));
                         t.last_invite = None;
@@ -2912,7 +3016,7 @@ fn member_gone(tox: &Tox, t: &mut TableState, g: u32, peer: u32, key: Option<[u8
         // The library has dropped the leaving peer before
         // this, so the scan holds the others.
         let still = !quit
-            && entries_of(&app, scan_pairs(tox, g), &t.known_as)
+            && entries_of(&app, scan_pairs(tox, t, g), &t.known_as)
                 .iter()
                 .any(|(p, _)| t.confirmed.contains(p));
         seat_still = still;
@@ -3056,7 +3160,7 @@ fn invite_pending(
 ) {
     let Some(g) = t.group else { return };
     if let Some((at, confirmed_then)) = t.last_invite {
-        if t.confirmed.len() <= confirmed_then && at.elapsed() < INVITE_GAP {
+        if seats_here(t) <= confirmed_then && at.elapsed() < INVITE_GAP {
             return;
         }
     }
@@ -3071,7 +3175,7 @@ fn invite_pending(
     if tox.invite(g, friend).is_ok() {
         t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
         t.invited.push(friend);
-        t.last_invite = Some((Instant::now(), t.confirmed.len()));
+        t.last_invite = Some((Instant::now(), seats_here(t)));
     } else {
         // Counted rather than logged: a refusal here is ordinary while the
         // group is settling, and the number is only interesting if it does
@@ -3080,10 +3184,51 @@ fn invite_pending(
     }
 }
 
+/// `S1-KI`: how many OTHER seats the table's group holds -- counted by seat, not
+/// by member.
+///
+/// A member's binding is its seat's signature over that member's key, and a
+/// seat's player can sign as many as it likes: every group key a rogue binds
+/// to its own seat is a confirmed member of its own, and `confirmed.len()`
+/// read each as a seat. The group read whole while an honest seat was still
+/// out of it -- hand 1 opened without it, and the offers of the group again
+/// that only a short group makes (`S1-EG`, `S1-FB`, `D-037`) never went to it.
+/// So a member counts as the seat its binding names, placed at this table,
+/// and a seat counts once however many entries it holds. A member not placed
+/// yet -- its name not read, the roster not said -- counts for nothing until
+/// it is, and one never placed is cut off within `NAME_GRACE`. Without a
+/// binder (the transport's own tests) there is no seat to count by, and every
+/// confirmed member counts.
+fn seats_here(t: &TableState) -> usize {
+    if t.setup.binder.is_none() || count_by_member() {
+        return t.confirmed.len();
+    }
+    seats_among(&t.confirmed, &t.peer_keys, &t.cut, &t.bound, &t.seat_apps)
+}
+
+/// `S1-KI`: `seats_here` on the maps alone: the seats of the table that the
+/// confirmed members not cut off here are bound to, each once.
+fn seats_among(
+    confirmed: &std::collections::HashSet<u32>,
+    peer_keys: &HashMap<u32, [u8; 32]>,
+    cut: &std::collections::HashSet<[u8; 32]>,
+    bound: &HashMap<[u8; 32], [u8; 32]>,
+    seat_apps: &[[u8; 32]],
+) -> usize {
+    peer_keys
+        .iter()
+        .filter(|(p, k)| confirmed.contains(*p) && !cut.contains(*k))
+        .filter_map(|(_, k)| bound.get(k))
+        .filter(|app| seat_apps.contains(*app))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 /// `S1-FE`: whether the table's group holds every other seat. `confirmed`
-/// counts the confirmed OTHER members; `others` the roster's seats but this
-/// client's own, which is how `TableState::roster` holds them. An empty roster
-/// is never complete: the roster reaches the driver a turn behind the node.
+/// counts the OTHER seats in it (`seats_here`); `others` the roster's seats but
+/// this client's own, which is how `TableState::roster` holds them. An empty
+/// roster is never complete: the roster reaches the driver a turn behind the
+/// node.
 fn group_complete(confirmed: usize, others: usize) -> bool {
     others > 0 && confirmed >= others
 }
@@ -3328,7 +3473,7 @@ fn drop_stale_twins(tox: &mut Tox, t: &mut TableState, g: u32) {
     if keys_of.is_empty() {
         return;
     }
-    let pairs = scan_pairs(tox, g);
+    let pairs = scan_pairs(tox, t, g);
     for (app, keys) in keys_of {
         let entries: Vec<TwinEntry> = keys
             .iter()
@@ -3371,6 +3516,72 @@ fn drop_stale_twins(tox: &mut Tox, t: &mut TableState, g: u32) {
     }
 }
 
+/// `S1-KI`: how many entries of one seat the group may hold at once: the two of
+/// `S1-DB`, a dead process's and its fresh one's, until the first goes.
+pub const ENTRIES_A_SEAT: usize = 2;
+
+/// `S1-KI`: of one seat's entries, the ones past the `ENTRIES_A_SEAT` the group
+/// has heard from most recently.
+///
+/// **Only a confirmed entry with a reading is judged**, and every such entry
+/// but the freshest two goes. For an honest seat this is never its living
+/// process: a profile runs one client (`S1-FV`), so the seat's processes came
+/// one after another, the living one joined after every other died, and it
+/// has been heard since -- every dead entry has been silent longer. A member
+/// still shaking hands, or one the group has heard nothing from, is not judged
+/// (`stale_twins` says the same). Ties go by key, so the choice is the same
+/// on every sweep.
+fn surplus_entries(entries: &[TwinEntry]) -> Vec<[u8; 32]> {
+    let mut heard: Vec<(u64, [u8; 32])> = entries
+        .iter()
+        .filter(|e| e.present && e.confirmed)
+        .filter_map(|e| e.quiet.map(|q| (q, e.key)))
+        .collect();
+    heard.sort_unstable();
+    heard.into_iter().skip(ENTRIES_A_SEAT).map(|(_, key)| key).collect()
+}
+
+/// `S1-KI`: cut off every entry a seat holds past `ENTRIES_A_SEAT`.
+///
+/// A seat's player can bind as many group keys to its seat as it likes and
+/// bring each into the group itself -- any member of a private group can
+/// invite. Counted by seat (`seats_here`) and metered by seat (`metered_as`)
+/// they are no seat and no allowance; this is what keeps them from filling the
+/// group: at the library's hundred members every join is refused, and a seat
+/// that dropped could not come back. The seat is not barred -- the entries go,
+/// not the player -- and where this client is the founder they are kicked from
+/// the group for everybody.
+fn cut_surplus(tox: &mut Tox, t: &mut TableState, g: u32) {
+    if count_by_member() {
+        return;
+    }
+    let mut keys_of: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    for (p, k) in t.peer_keys.iter() {
+        if !t.confirmed.contains(p) || t.cut.contains(k) {
+            continue;
+        }
+        if let Some(app) = t.bound.get(k) {
+            keys_of.entry(*app).or_default().push(*k);
+        }
+    }
+    keys_of.retain(|_, keys| keys.len() > ENTRIES_A_SEAT);
+    for keys in keys_of.into_values() {
+        let entries: Vec<TwinEntry> = keys
+            .iter()
+            .map(|key| TwinEntry {
+                key: *key,
+                bound: true,
+                present: true,
+                confirmed: true,
+                quiet: tox.peer_quiet_secs(g, key),
+            })
+            .collect();
+        for key in surplus_entries(&entries) {
+            cut_off(tox, t, g, key, Cut::Surplus);
+        }
+    }
+}
+
 /// `S1-DW`: whether a claim that `group_key` speaks for `app_key` is refused:
 /// another group key holds that application key, is a confirmed member, and
 /// has spoken within `quiet_limit` seconds. A seat back under a fresh key
@@ -3392,10 +3603,35 @@ fn claim_refused(
 /// library. Peer ids are small and dense and a table is at most ten seats, so
 /// a scan beats keeping a second map in step with joins and parts -- except
 /// per nudge, where `TableState::peer_keys` is the cheap copy (see `Nudge`).
-fn scan_pairs(tox: &Tox, group: u32) -> Vec<(u32, [u8; 32])> {
-    (0..Tox::PEER_SCAN)
+///
+/// `S1-KI`: **and every member this client has seen past the scan**, each checked
+/// against the library. Ids are handed out lowest first, so a group a rogue
+/// filled with entries of its own put later members at 64 and above, where
+/// the scan stopped: a seat there read as not in the group at all.
+fn scan_pairs(tox: &Tox, t: &TableState, group: u32) -> Vec<(u32, [u8; 32])> {
+    let mut pairs: Vec<(u32, [u8; 32])> = (0..Tox::PEER_SCAN)
         .filter_map(|p| tox.peer_key(group, p).ok().map(|k| (p, k)))
-        .collect()
+        .collect();
+    pairs.extend(
+        t.peer_keys
+            .iter()
+            .filter(|(p, k)| **p >= Tox::PEER_SCAN && tox.peer_key(group, **p).ok().as_ref() == Some(*k))
+            .map(|(p, k)| (*p, *k)),
+    );
+    pairs
+}
+
+/// `S1-KI`: the peer number the group holds this group key at, if any -- a scan,
+/// then the members seen past it (see `scan_pairs`).
+fn peer_of(tox: &Tox, t: &TableState, group: u32, group_key: &[u8; 32]) -> Option<u32> {
+    (0..Tox::PEER_SCAN)
+        .find(|p| tox.peer_key(group, *p).ok().as_ref() == Some(group_key))
+        .or_else(|| {
+            t.peer_keys
+                .iter()
+                .find(|(p, k)| *k == group_key && tox.peer_key(group, **p).ok().as_ref() == Some(group_key))
+                .map(|(p, _)| *p)
+        })
 }
 
 /// `S1-DU`: of a seat's entries, the group key the group heard from most
@@ -3552,6 +3788,110 @@ mod tests {
         assert!(stale_twins(&[e(3, true, true, false, None), fresh]).is_empty());
         // Of two that speak, the freshest is the proof and the other is left.
         assert!(stale_twins(&[e(1, true, true, true, Some(9)), fresh]).is_empty());
+    }
+
+    /// `S1-KI`: the group is counted by seat. A rogue's own entries, each bound
+    /// to its seat by its own binding, are one seat -- the group holds two of
+    /// three other seats however many of them it brought in, and stays short
+    /// until the missing seat is there. A member not placed at a seat, one
+    /// cut off here, and one still shaking hands count for nothing.
+    #[test]
+    fn a_group_is_counted_by_seat_however_many_entries_a_seat_holds() {
+        let (rogue, honest, missing, stranger) = ([1u8; 32], [2u8; 32], [3u8; 32], [9u8; 32]);
+        let seat_apps = [rogue, honest, missing, [7u8; 32]];
+        let member = |n: u8| [100 + n; 32];
+        let mut peer_keys: HashMap<u32, [u8; 32]> = HashMap::new();
+        let mut bound: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+        let mut confirmed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // The rogue and four entries of its own, the honest seat, a stranger
+        // bound to a key the table does not seat, and a member not named yet.
+        for n in 0..5u8 {
+            peer_keys.insert(u32::from(n), member(n));
+            bound.insert(member(n), rogue);
+            confirmed.insert(u32::from(n));
+        }
+        peer_keys.insert(5, member(5));
+        bound.insert(member(5), honest);
+        confirmed.insert(5);
+        peer_keys.insert(6, member(6));
+        bound.insert(member(6), stranger);
+        confirmed.insert(6);
+        peer_keys.insert(7, member(7));
+        confirmed.insert(7);
+        let cut = std::collections::HashSet::new();
+        let seats = seats_among(&confirmed, &peer_keys, &cut, &bound, &seat_apps);
+        assert_eq!(seats, 2, "the rogue once, the honest seat once: eight members");
+        assert!(group_short(seats, 3), "the group is short of the missing seat, and offered to it again");
+        assert!(!group_complete(seats, 3), "so hand 1 does not open without it");
+        // Counted by member, as before: complete while a seat is missing.
+        assert!(group_complete(confirmed.len(), 3), "the defect: eight members read as three seats");
+        // The missing seat arrives; one of its members still shaking hands
+        // (not confirmed) is nothing, a confirmed one is the seat.
+        peer_keys.insert(8, member(8));
+        bound.insert(member(8), missing);
+        assert_eq!(seats_among(&confirmed, &peer_keys, &cut, &bound, &seat_apps), 2);
+        confirmed.insert(8);
+        let seats = seats_among(&confirmed, &peer_keys, &cut, &bound, &seat_apps);
+        assert_eq!(seats, 3);
+        assert!(group_complete(seats, 3) && !group_short(seats, 3));
+        // A seat whose only entry is cut off here is not in the group here.
+        let cut: std::collections::HashSet<[u8; 32]> = [member(5)].into_iter().collect();
+        assert_eq!(seats_among(&confirmed, &peer_keys, &cut, &bound, &seat_apps), 2);
+    }
+
+    /// `S1-KI`: a seat's entries share one allowance. Three entries of one seat,
+    /// each well inside `D-051`'s ten-second limit on its own, are a flood
+    /// together; before the binding is read a member is metered by its own
+    /// key, and a member of another seat keeps its own allowance.
+    #[test]
+    fn a_seats_entries_share_one_flood_allowance() {
+        use crate::table::membership::{Meter, FLOOD_SHORT_PACKETS};
+        let (seat, other) = ([1u8; 32], [2u8; 32]);
+        let entries = [[11u8; 32], [12u8; 32], [13u8; 32]];
+        let bound: HashMap<[u8; 32], [u8; 32]> =
+            entries.iter().map(|e| (*e, seat)).chain([([21u8; 32], other)]).collect();
+        let each = FLOOD_SHORT_PACKETS / 2;
+        let mut by_seat: HashMap<[u8; 32], Meter> = HashMap::new();
+        let mut by_member: HashMap<[u8; 32], Meter> = HashMap::new();
+        let now = 1_000_000u64;
+        // Five seconds of it, in the order it arrives.
+        for i in 0..each {
+            let t = now + i * 5_000 / each;
+            for e in entries.iter() {
+                by_seat.entry(meter_key(&bound, e)).or_default().packet(t, 100);
+                by_member.entry(*e).or_default().packet(t, 100);
+            }
+            by_seat.entry(meter_key(&bound, &[21u8; 32])).or_default().packet(t, 100);
+        }
+        let at = now + 5_000;
+        assert!(by_seat[&seat].over(at).is_some(), "three entries, one seat: one allowance, spent");
+        assert!(by_seat[&other].over(at).is_none(), "the other seat keeps its own");
+        assert!(by_member.values().all(|m| m.over(at).is_none()), "the defect: by member, nobody floods");
+        assert_eq!(meter_key(&bound, &[99u8; 32]), [99u8; 32], "unbound: its own key");
+    }
+
+    /// `S1-KI`: of a seat's confirmed entries the group has heard from, every one
+    /// but the two it heard from most recently goes -- never an honest seat's
+    /// living process, which joined after its dead ones died and has been
+    /// heard since; never an entry with no reading or not confirmed.
+    #[test]
+    fn a_seat_keeps_its_two_freshest_entries_and_no_more() {
+        let e = |key: u8, confirmed, quiet| TwinEntry { key: [key; 32], bound: true, present: true, confirmed, quiet };
+        // A rogue's entries, all living: the two freshest stay.
+        let mut cut = surplus_entries(&[e(1, true, Some(4)), e(2, true, Some(1)), e(3, true, Some(9)), e(4, true, Some(2))]);
+        cut.sort_unstable();
+        assert_eq!(cut, vec![[1u8; 32], [3u8; 32]]);
+        // Two entries -- S1-DB's pair -- are never judged here.
+        assert!(surplus_entries(&[e(1, true, Some(14)), e(2, true, Some(0))]).is_empty());
+        // Two quick restarts: two dead entries and the living one, which the
+        // group heard last. The oldest dead one goes, the living one stays.
+        assert_eq!(surplus_entries(&[e(1, true, Some(12)), e(2, true, Some(6)), e(3, true, Some(1))]), vec![[1u8; 32]]);
+        // An entry with no reading, or still shaking hands, is not judged and
+        // is not counted against the others.
+        assert!(surplus_entries(&[e(1, true, Some(3)), e(2, true, Some(1)), e(3, true, None)]).is_empty());
+        assert!(surplus_entries(&[e(1, true, Some(3)), e(2, true, Some(1)), e(3, false, Some(0))]).is_empty());
+        // Ties go by key: the same choice on every sweep.
+        assert_eq!(surplus_entries(&[e(3, true, Some(1)), e(1, true, Some(1)), e(2, true, Some(1))]), vec![[3u8; 32]]);
     }
 
     /// `S1-DU`: a seat's entries are all of them, and each reader chooses by

@@ -334,6 +334,14 @@ param(
     # `-NoSayAgain` (S1-KB's control): no node says another seat's betting action
     # again. Needs `--features fault-harness`.
     [switch]$NoSayAgain,
+    # `-Puppets <n>` (S1-KI): with `-StrangerAt`, the stranger node makes n strangers
+    # in place of one, each named with that node's OWN binding for its member key
+    # -- entries of its seat its player brought into the group itself, as a rogue
+    # can. `-CountByMember` (S1-KI's control): every node counts the group by member
+    # and meters it by member key, and cuts no entry for being one too many, as
+    # before S1-KI. Both need `--features fault-harness`.
+    [ValidateRange(0, 16)][int]$Puppets = 0,
+    [switch]$CountByMember,
     # `-LockGroupAt <s>` (S1-KH): at that second the founder locks the table's
     # group -- the peer limit to one, a password, public -- as a rogue founder
     # can, for measuring what that does to a seat whose line drops. Needs
@@ -482,6 +490,9 @@ $t0 = Get-Date
 # process's environment -- and cleared otherwise, so no run inherits the last.
 if ($DeafToActions) { $env:P2P_POKER_DEAF_TO_ACTIONS = '1' } else { Remove-Item Env:P2P_POKER_DEAF_TO_ACTIONS -ErrorAction SilentlyContinue }
 if ($NoSayAgain) { $env:P2P_POKER_NO_SAY_AGAIN = '1' } else { Remove-Item Env:P2P_POKER_NO_SAY_AGAIN -ErrorAction SilentlyContinue }
+# `S1-KI`: every node reads them; only the stranger node makes puppets.
+if ($Puppets -gt 0) { $env:P2P_POKER_PUPPETS = "$Puppets" } else { Remove-Item Env:P2P_POKER_PUPPETS -ErrorAction SilentlyContinue }
+if ($CountByMember) { $env:P2P_POKER_COUNT_BY_MEMBER = '1' } else { Remove-Item Env:P2P_POKER_COUNT_BY_MEMBER -ErrorAction SilentlyContinue }
 # `S1-KH`: every node reads it; only the founder's acts.
 if ($LockGroupAt -gt 0) { $env:P2P_POKER_LOCK_GROUP_AT = "$LockGroupAt" } else { Remove-Item Env:P2P_POKER_LOCK_GROUP_AT -ErrorAction SilentlyContinue }
 $jobs = @()
@@ -749,6 +760,12 @@ if ($DeafToFor -gt 0) {
 if ($NoSayAgain) {
     Write-Host "==> no node says another seat's betting action again (S1-KB's control; needs --features fault-harness)"
 }
+if ($Puppets -gt 0 -and $StrangerAt -gt 0) {
+    Write-Host "==> n$StrangerNode brings $Puppets entries of its own seat into its table's group at $StrangerAt s, each bound by its own binding (S1-KI; needs --features fault-harness)"
+}
+if ($CountByMember) {
+    Write-Host "==> every node counts the table's group by member and meters it by member key, as before S1-KI (the control; needs --features fault-harness)"
+}
 if ($LockGroupAt -gt 0) {
     Write-Host "==> the founder locks the table's group at $LockGroupAt s: peer limit one, a password, public (S1-KH; needs --features fault-harness)"
 }
@@ -826,13 +843,17 @@ if ($NoJoin -or $Watchers -gt 0) {
 }
 if ($LeaveTableAt -gt 0) { Write-Host "==> n$LeaveTableNode leaves its table at $LeaveTableAt s" }
 if ($KickWithoutWordAt -gt 0) { Write-Host "==> n0 kicks a seat without the table's word at $KickWithoutWordAt s (D-045)" }
+# The node is found by the file name of the binary the bed runs: a copy named
+# for its arm (fix.exe, control.exe) was never killed, and its start again was
+# refused by the profile lock (the S1-KI beds, 2026-09-30).
+$exeFile = [System.IO.Path]::GetFileName($Exe)
 if ($KillAt -gt 0) {
     Write-Host "==> n$KillNode is killed outright at $KillAt s"
     $killProfile = Join-Path $work "n$KillNode"
-    $null = Start-Job -Name 'killer' -ArgumentList $KillAt, $killProfile -ScriptBlock {
-        param($at, $profile)
+    $null = Start-Job -Name 'killer' -ArgumentList $KillAt, $killProfile, $exeFile -ScriptBlock {
+        param($at, $profile, $procFile)
         Start-Sleep -Seconds $at
-        Get-CimInstance Win32_Process -Filter "Name = 'p2p-poker.exe'" |
+        Get-CimInstance Win32_Process -Filter "Name = '$procFile'" |
             Where-Object { $_.CommandLine -like "*$profile*" } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
     }
@@ -857,10 +878,10 @@ if ($KillAt -gt 0) {
 if ($Kill2At -gt 0) {
     Write-Host "==> n$Kill2Node is killed outright at $Kill2At s (the second kill)"
     $kill2Profile = Join-Path $work "n$Kill2Node"
-    $null = Start-Job -Name 'killer2' -ArgumentList $Kill2At, $kill2Profile -ScriptBlock {
-        param($at, $profile)
+    $null = Start-Job -Name 'killer2' -ArgumentList $Kill2At, $kill2Profile, $exeFile -ScriptBlock {
+        param($at, $profile, $procFile)
         Start-Sleep -Seconds $at
-        Get-CimInstance Win32_Process -Filter "Name = 'p2p-poker.exe'" |
+        Get-CimInstance Win32_Process -Filter "Name = '$procFile'" |
             Where-Object { $_.CommandLine -like "*$profile *" -or $_.CommandLine -like "*$profile" } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
     }

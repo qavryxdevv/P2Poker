@@ -19596,7 +19596,9 @@ async fn hand_one_may_open(
     // was set (`churn182836-10`); the far seat's group then held seven of nine,
     // and it waited two minutes for *no new seat* before dealing, holding the
     // whole table's first hand to 203.7 s.
-    if group_holds_all_but_the_gone(tox.group_seen(), gone) {
+    // `S1-KI`: by seat -- a rogue's extra entries in the group are no seat that
+    // is here.
+    if group_holds_all_but_the_gone(tox.group_seats(), gone) {
         return true;
     }
     let now = std::time::Instant::now();
