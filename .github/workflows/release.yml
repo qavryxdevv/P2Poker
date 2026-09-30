@@ -515,7 +515,7 @@ jobs:
                 '',
                 "It waits for the Microsoft Store to publish $version. Until it does, nobody is asked to update and nobody is locked out of a game.",
                 '',
-                'Publish it once the Store has that version:',
+                'store-watch.yml publishes it within the hour after the Store serves that version. By hand:',
                 '',
                 $fence,
                 "gh release edit $tag --draft=false --latest",

@@ -7246,6 +7246,19 @@ builds alone now (`pattern: p2p-poker-*-x64`, held by
 the draft before it was published. The package for Partner Center is the run's own, and the program inside it is
 the attested `p2p-poker.exe` byte for byte.
 
+**Amended 2026-09-30, on the owner's word (*"postav to, aby GitHub to poznal automaticky"*): the draft is
+published when the Store serves its version, by `.github/workflows/store-watch.yml`, not by hand.** Every hour it
+reads the Store's public catalog -- the one the Store app asks, which needs no account at Microsoft -- where every
+package of the product is named `<identity>_<version>_<arch>__<publisher id>`, and publishes each draft whose
+version both markets it asks (US and CZ) serve, the newest as the latest release (`tools/store-watch.py`, which
+has a `--dry-run` and a `--self-test`). It acts only while `RELEASE_WAITS_FOR_STORE` is set and the product is
+named (`STORE_PRODUCT_ID`, `MSIX_IDENTITY_NAME`, repository variables beside the identity values); a catalog that
+does not answer or names no package of the product publishes nothing, and the run fails while a draft waits, so a
+watcher gone blind is seen. So the lobby's gate (`D-077`) closes to 0.1.x copies about an hour after the Store has
+published the new version -- by which time a Store copy can update from the page the gate's button opens. Checked
+on 0.2.0's draft: the catalog served `0.1.5.0` in both markets and the watcher left the draft as it was. By hand
+it stays one command: `gh release edit <tag> --draft=false --latest`.
+
 
 ## D-081 -- a clock that is out, and the company it costs
 

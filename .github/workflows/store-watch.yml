@@ -1,0 +1,49 @@
+# D-080: a release waits for the Microsoft Store as a draft -- the client closes its lobby to every older copy as
+# soon as a newer release is public (D-077), and a copy from the Store cannot update before Microsoft has certified
+# and published the new one. This publishes the draft once the Store serves its version: every hour it reads the
+# Store's public catalog (tools/store-watch.py says how), and when both markets it asks serve the draft's version,
+# it makes that release public and the latest.
+#
+# It needs no account at Microsoft: the catalog is the one the Store app itself asks. It acts only while the
+# repository waits for the Store at all (RELEASE_WAITS_FOR_STORE) and knows which product to ask about
+# (STORE_PRODUCT_ID, MSIX_IDENTITY_NAME). A catalog that does not answer, or names no package of this product,
+# publishes nothing, and the run fails while a draft waits, so a watcher gone blind is seen.
+#
+# By hand, at any time: gh release edit <tag> --draft=false --latest
+
+name: store-watch
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-watch
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ vars.RELEASE_WAITS_FOR_STORE != '' && vars.STORE_PRODUCT_ID != '' && vars.MSIX_IDENTITY_NAME != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write          # to publish a draft release
+    steps:
+      - name: Check out the watcher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The watcher's own checks
+        run: python3 tools/store-watch.py --self-test
+
+      - name: Publish what the Store serves
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STORE_PRODUCT_ID: ${{ vars.STORE_PRODUCT_ID }}
+          MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+        run: python3 tools/store-watch.py
