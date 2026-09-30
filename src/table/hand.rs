@@ -1031,6 +1031,29 @@ pub const NEXT_EARLY_BYTES: usize =
 /// highest sequence, never the oldest arrival.
 pub const EARLY_CAP: usize = 100;
 
+/// `S1-KF` (`D-088`): whether a frame of `kind` is a stage of a hand past its
+/// opening -- which a hand reaches only with every seat it requires, so never
+/// with one seat alone. The settlement is left out: a seat's last one is said
+/// again with the frames it kept, long after its hand.
+pub fn played_past_its_opening(kind: EventType) -> bool {
+    matches!(
+        kind,
+        EventType::DeckInit
+            | EventType::ShuffleStep
+            | EventType::ShuffleProof
+            | EventType::DeckCommit
+            | EventType::DealPrivate
+            | EventType::BoardReveal
+            | EventType::ActionCheck
+            | EventType::ActionCall
+            | EventType::ActionBet
+            | EventType::ActionRaise
+            | EventType::ActionFold
+            | EventType::ShowdownReveal
+            | EventType::ShowdownMuck
+    )
+}
+
 /// `S1-KB`: the largest frame said again for another seat -- a betting action
 /// is some two hundred bytes (`ACTION_CAP` and its envelope).
 const SAID_AGAIN_MAX: usize = 256;
@@ -2230,6 +2253,10 @@ pub struct Hand {
     /// using, is proof of the opposite: this client shrank further than the
     /// table did, and `D-024`'s monotone roster forbids the way back. `S1-CE`.
     foreign_outside: std::collections::BTreeSet<SeatIdx>,
+    /// `S1-KF` (`D-088`): seats this hand does not require that signed a
+    /// stage of this hand's number past its opening -- the same hand of
+    /// another game (`outside_players`).
+    outside_play: std::collections::BTreeSet<SeatIdx>,
 }
 
 impl Hand {
@@ -2557,6 +2584,7 @@ impl Hand {
                 params: DeckParams::new(),
                 early: VecDeque::new(),
                 foreign_outside: std::collections::BTreeSet::new(),
+                outside_play: std::collections::BTreeSet::new(),
             },
             // Nothing goes out from a seat that is in no `R` of this hand,
             // and nothing from a quiet or muted one.
@@ -9633,6 +9661,15 @@ impl Hand {
         if self.seat_of_key(&opened.sender).is_none() {
             return Holding::Malformed;
         }
+        // `S1-KF` (`D-088`): a seat this hand does not require, signing a stage
+        // of it past the opening -- which no hand reaches with one seat alone,
+        // and which a seat outside the hand has no part in -- plays this hand's
+        // number in another game.
+        if let Some(seat) = self.seat_of_key(&opened.sender).filter(|s| !self.open.required.contains(s)) {
+            if played_past_its_opening(kind) {
+                self.outside_play.insert(seat);
+            }
+        }
         // **The same bytes twice are one held event.** The power-of-two re-send
         // puts every recent stage on the wire again at ticks 2, 4, 8, 16, 32,
         // and each copy used to take a slot of its own: `split092359-10`,
@@ -9791,6 +9828,13 @@ impl Hand {
         }
         self.early.push_back(bytes);
         Holding::Kept
+    }
+
+    /// `S1-KF` (`D-088`): the seats this hand does not require that were heard
+    /// signing a stage of it past its opening -- playing this hand's number in
+    /// another game.
+    pub fn outside_players(&self) -> Vec<SeatIdx> {
+        self.outside_play.iter().copied().collect()
     }
 
     /// The foreign genesis named by at least `FOREIGN_GENESIS_FLOOR` roster
@@ -17514,6 +17558,35 @@ mod tests {
         assert!(!opened[0].dealt(), "stage 0 is open without seat 3: {:?}", opened[0].waiting_for());
         opened[0].on_event(&mine[0], &keys[0], NOW + 2_000).expect("seat 3's copy");
         assert!(opened[0].dealt(), "and closes on it");
+    }
+
+    /// `S1-KF` (`D-088`): a seat this hand does not require, signing a stage of
+    /// this hand's number past its opening, plays it in another game; its
+    /// opening alone, or a seat the hand requires, says nothing of the kind.
+    #[test]
+    fn a_seat_outside_the_hand_playing_its_number_is_seen() {
+        let keys: Vec<SigningKey> = (0..4).map(|s| key(10 + s)).collect();
+        let mut o = hashed_opening(opening_n(4, 0));
+        o.required = vec![0, 1, 2];
+        let (mut hand, _) = Hand::open(o, &keys[0], NOW, 30_000).unwrap();
+        let seal = |kind: EventType, sequence: u64, from: usize| {
+            let slot = chained::Slot {
+                table_id: hand.table_id(),
+                hand_id: hand.hand_id(),
+                sequence,
+                previous_event_hash: [9u8; 32],
+            };
+            let body = DeckInit { key: vec![1; 32], proof: vec![2; 64] };
+            chained::seal(kind, &slot, &body, &keys[from], NOW, 30_000, DECK_INIT_CAP).unwrap()
+        };
+        let from_a_seat_in_it = seal(EventType::DeckInit, 1, 2);
+        let from_outside = seal(EventType::DeckInit, 1, 3);
+        let _ = hand.hold(from_a_seat_in_it);
+        assert!(hand.outside_players().is_empty(), "a seat the hand requires");
+        let _ = hand.hold(from_outside);
+        assert_eq!(hand.outside_players(), vec![3], "seat 3, outside the hand, played its number");
+        assert!(played_past_its_opening(EventType::ActionCall) && !played_past_its_opening(EventType::HandInit));
+        assert!(!played_past_its_opening(EventType::HandComplete) && !played_past_its_opening(EventType::TimeoutVote));
     }
 
     /// `S1-KF` (`D-088`): the copies are taken where the count the node gives

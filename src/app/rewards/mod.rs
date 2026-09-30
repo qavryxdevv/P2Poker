@@ -922,6 +922,7 @@ impl Rewards {
                 | NodeEvent::SeatLeft { .. }
                 | NodeEvent::SeatLeftTable { .. }
                 | NodeEvent::TableUnsafe { .. }
+                | NodeEvent::TableSplit { .. }
                 | NodeEvent::OutForGood { .. }
                 | NodeEvent::TableLost { .. }
                 | NodeEvent::TableStopped { .. }
@@ -1006,6 +1007,13 @@ impl Rewards {
                 self.slot().off_line.insert(*seat);
             }
             NodeEvent::TableUnsafe { why, .. } => {
+                if why.is_some() {
+                    self.slot().unsafe_ever = true;
+                }
+            }
+            // `S1-KF` (`D-088`): a table split into separate games is one that
+            // was not safe.
+            NodeEvent::TableSplit { why } => {
                 if why.is_some() {
                     self.slot().unsafe_ever = true;
                 }

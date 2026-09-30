@@ -297,6 +297,9 @@ pub struct TableView {
     /// `S1-JR`, the owner's rule: whether that window may be drawn now -- no
     /// hand being played at this table (`AppState::unsafe_may_show`).
     pub unsafe_may_show: bool,
+    /// `S1-KF` (`D-088`): the table has split into separate games, with the
+    /// serial the window's *Agree* closes it by.
+    pub split_note: Option<(String, u64)>,
     /// `S1-IX`: the table stopped on a disagreement about a hand's result, or
     /// the game ended on it.
     pub stopped: Option<StoppedView>,
@@ -682,6 +685,9 @@ pub struct TableUi {
     /// `D-051`: the serial of the *not safe* question the player chose to
     /// stay through.
     pub unsafe_closed: u64,
+    /// `S1-KF` (`D-088`): the serial of the *table split* word the player
+    /// agreed to play on through.
+    pub split_closed: u64,
     /// `S1-IX`: the serial of the *table stopped* word the player chose to
     /// wait through.
     pub stopped_closed: u64,
@@ -1695,6 +1701,28 @@ fn unsafe_question<'a>(view: &'a TableView, state: &TableUi) -> Option<(&'a Stri
             && view.lost.is_none()
             && view.opponent_gone_s.is_none()
             && !stopped_asked
+            && split_question(view, state).is_none()
+    })
+}
+
+/// `S1-KF` (`D-088`), the owner's word: the table split into separate games
+/// in an emergency, for security, and the players it split are told and asked
+/// to agree and play on, or to leave -- as the window about a table not safe
+/// is asked: never over a hand being played, never over another question
+/// about the table, and not once *Agree* closed its serial. Before the window
+/// about a table not safe, which says less.
+fn split_question<'a>(view: &'a TableView, state: &TableUi) -> Option<(&'a String, &'a u64)> {
+    let stopped_asked = view
+        .stopped
+        .as_ref()
+        .is_some_and(|s| s.ended.is_some() || s.serial != state.stopped_closed);
+    view.split_note.as_ref().map(|(why, serial)| (why, serial)).filter(|(_, n)| {
+        view.unsafe_may_show
+            && **n != state.split_closed
+            && view.out_for_good.is_none()
+            && view.lost.is_none()
+            && view.opponent_gone_s.is_none()
+            && !stopped_asked
     })
 }
 
@@ -1820,6 +1848,35 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                 if ui.add(egui::Button::new(RichText::new("Close the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
                     action = Some(TableAction::CloseOut);
                 }
+            });
+    }
+
+    // `S1-KF` (`D-088`), the owner: the table split into separate games in an
+    // emergency, for security -- the players it split are told, and agree to
+    // play on or leave. *Agree* closes the question until the node's words
+    // change.
+    if let Some((why, serial)) = split_question(view, state) {
+        egui::Window::new("Split")
+            .id(egui::Id::new("table-split"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(window_frame(&ctx))
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(&ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
+                window_heading(ui, "The table has split", false);
+                ui.label(why.as_str());
+                ui.label(RichText::new("Do you agree to keep playing in this game, or will you leave the table?").strong());
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new("Agree and keep playing").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
+                        state.split_closed = *serial;
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                        action = Some(TableAction::LeaveTable);
+                    }
+                });
             });
     }
 
@@ -2245,6 +2302,7 @@ impl TableView {
             lost: None,
             unsafe_note: None,
             unsafe_may_show: false,
+            split_note: None,
             stopped: None,
             line: None,
             absent: Vec::new(),
@@ -2322,6 +2380,28 @@ mod tests {
         v.lost = None;
         v.out_for_good = Some("out".into());
         assert!(unsafe_question(&v, &closed(0)).is_none(), "out of the game");
+    }
+
+    /// `S1-KF` (`D-088`): the table split into separate games is asked about
+    /// where the table not safe would be, before it, and *Agree* closes its
+    /// serial as *Stay* closes the other's.
+    #[test]
+    fn the_table_split_is_asked_first_and_agree_closes_it() {
+        let mut v = TableView::waiting("Riverside".into(), 6);
+        let ui = |split: u64, unsafe_: u64| TableUi { split_closed: split, unsafe_closed: unsafe_, ..TableUi::default() };
+        v.split_note = Some(("seat 1 and seat 2 are playing a game of their own".into(), 5));
+        v.unsafe_note = Some(("hands keep being called off".into(), 4));
+        assert!(split_question(&v, &ui(0, 0)).is_none(), "never over a hand being played");
+        v.unsafe_may_show = true;
+        assert_eq!(split_question(&v, &ui(0, 0)).map(|(_, n)| *n), Some(5), "asked");
+        assert!(unsafe_question(&v, &ui(0, 0)).is_none(), "and the table not safe waits behind it");
+        assert!(split_question(&v, &ui(5, 0)).is_none(), "Agree closed it");
+        assert_eq!(unsafe_question(&v, &ui(5, 0)).map(|(_, n)| *n), Some(4), "then the other question");
+        v.opponent_gone_s = Some(40);
+        assert!(split_question(&v, &ui(0, 0)).is_none(), "one question at a time");
+        v.opponent_gone_s = None;
+        v.lost = Some("gone".into());
+        assert!(split_question(&v, &ui(0, 0)).is_none(), "not at the table any more");
     }
 
     /// A table with nobody at it says what it is waiting for rather than

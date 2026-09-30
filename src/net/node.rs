@@ -572,6 +572,12 @@ pub enum NodeEvent {
     /// `UNSAFE_ASK_AGAIN` -- and a *Stay* given to the last word no longer
     /// holds; without it only `stuck` moved under the word.
     TableUnsafe { why: Option<String>, stuck: bool, ask: bool },
+    /// `S1-KF` (`D-088`): the table has split into separate games -- the seats
+    /// this client's game put out play on in a game of their own, or half the
+    /// table went on without this seat, which does not follow half the table
+    /// it was here for -- and the words to say so; `None` once they meet again.
+    /// The window asks the player to agree and play on, or to leave.
+    TableSplit { why: Option<String> },
     /// `S1-IX`, `PROTOCOL.md` §6.3 and §6.4: this table has stopped at a
     /// hand's boundary, because other seats finished that hand with a
     /// different result from this client's own -- and, once it has, the game
@@ -794,6 +800,7 @@ impl NodeEvent {
             | Self::OutForGood { .. }
             | Self::SeatFlooded { .. }
             | Self::TableUnsafe { .. }
+            | Self::TableSplit { .. }
             // `S1-IX`: the table stopped, or the game ended, over the felt.
             | Self::TableStopped { .. }
             // The lobby list and the counters above it.

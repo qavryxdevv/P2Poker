@@ -393,6 +393,7 @@ pub struct TableApp {
     pub out_cheated: bool,
     pub unsafe_note: Option<(String, u64)>,
     pub unsafe_stuck: Option<PlayMark>,
+    pub split_note: Option<(String, u64)>,
     pub stood_at: Option<PlayMark>,
     pub stopped: Option<(crate::net::node::TableStop, u64)>,
     pub rejoin: Option<Rejoin>,
@@ -575,6 +576,10 @@ pub struct AppState {
     /// `S1-JR`: the node's word that the running hand stands, so the window may
     /// cover it (`unsafe_may_show`) -- with the hand as it stood when said.
     pub unsafe_stuck: Option<PlayMark>,
+    /// `S1-KF` (`D-088`): the table has split into separate games, as the node
+    /// last said it, with a serial the window's *Agree* closes it by -- asked
+    /// again when the node's words change.
+    pub split_note: Option<(String, u64)>,
     /// `S1-JR`: the hand as it stood when `D-058` last said a stage stands on
     /// seats -- the word holds for the window about the table while the hand
     /// has not moved since.
@@ -1093,6 +1098,7 @@ impl AppState {
         std::mem::swap(&mut self.out_cheated, &mut other.out_cheated);
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
         std::mem::swap(&mut self.unsafe_stuck, &mut other.unsafe_stuck);
+        std::mem::swap(&mut self.split_note, &mut other.split_note);
         std::mem::swap(&mut self.stood_at, &mut other.stood_at);
         std::mem::swap(&mut self.stopped, &mut other.stopped);
         std::mem::swap(&mut self.rejoin, &mut other.rejoin);
@@ -2353,6 +2359,20 @@ impl AppState {
                     }
                 }
             }
+            // `S1-KF` (`D-088`): the table split into separate games, or met again.
+            // New words are a new question: a serial that never repeats.
+            NodeEvent::TableSplit { why } => match why {
+                None => self.split_note = None,
+                Some(w) => {
+                    if self.split_note.as_ref().is_none_or(|(said, _)| *said != w) {
+                        self.unsafe_serials = self.unsafe_serials.wrapping_add(1).max(1);
+                        let line = format!("The table has split: {w}");
+                        self.split_note = Some((w, self.unsafe_serials));
+                        self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
+                        self.note(line);
+                    }
+                }
+            },
             // `S1-IX`, section 6.4: the table stopped on a disagreement about a
             // hand's result, the game ended on it, or the table deals again.
             // Said plainly, and without guessing at whose fault it is.
@@ -2432,6 +2452,7 @@ impl AppState {
                     // with the seat, and says nothing more about it.
                     self.unsafe_note = None;
                     self.unsafe_stuck = None;
+                    self.split_note = None;
                     let first = self.rejoin.as_ref().is_none_or(|r| r.given_back.is_none());
                     let r = self.rejoin.get_or_insert_with(Rejoin::begin);
                     r.given_back = Some(why.clone());
@@ -2457,6 +2478,7 @@ impl AppState {
                     // with the seat, and says nothing more about it.
                     self.unsafe_note = None;
                     self.unsafe_stuck = None;
+                    self.split_note = None;
                     let r = self.rejoin.get_or_insert_with(Rejoin::begin);
                     r.given_back = Some(why.clone());
                     r.goes_on = true;
@@ -2591,6 +2613,7 @@ impl AppState {
         self.out_cheated = false;
         self.unsafe_note = None;
         self.unsafe_stuck = None;
+        self.split_note = None;
         self.stood_at = None;
         self.stopped = None;
         self.rejoin = None;

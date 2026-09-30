@@ -204,6 +204,7 @@ impl AppState {
             // before the hand's cards are out, or over a hand that stands.
             unsafe_note: self.unsafe_note.clone(),
             unsafe_may_show: self.unsafe_may_show(),
+            split_note: self.split_note.clone(),
             // `S1-IX`: the seats by the names the window shows.
             stopped: self.stopped.as_ref().map(|(s, serial)| crate::gui::table::StoppedView {
                 hand_id: s.hand_id,
@@ -1039,6 +1040,25 @@ mod tests {
         s.apply(running);
         s.apply(ended(Vec::new()));
         assert_eq!(s.table_view().seats[1].won, 300, "the last running state is the baseline");
+    }
+
+    /// `S1-KF` (`D-088`): the table split reaches the window with a serial;
+    /// the same words again are no new question, new words are, and the
+    /// split's end takes it away. The table's log says so.
+    #[test]
+    fn the_table_split_reaches_the_window_and_goes_when_the_games_meet() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::TableSplit { why: Some("seat 2 is playing a game of its own".into()) });
+        let (why, first) = s.table_view().split_note.expect("said");
+        assert!(why.contains("game of its own"));
+        assert!(s.table_view().log.iter().any(|l| l.text.contains("The table has split")), "the log says so");
+        s.apply(NodeEvent::TableSplit { why: Some("seat 2 is playing a game of its own".into()) });
+        assert_eq!(s.table_view().split_note.map(|(_, n)| n), Some(first), "the same words: no new question");
+        s.apply(NodeEvent::TableSplit { why: Some("seat 2 and seat 3 are playing a game of their own".into()) });
+        let (_, second) = s.table_view().split_note.expect("said again");
+        assert!(second > first, "new words, a new question");
+        s.apply(NodeEvent::TableSplit { why: None });
+        assert_eq!(s.table_view().split_note, None, "the games meet again");
     }
 
     /// `D-051`: the table not safe reaches the window with a serial the

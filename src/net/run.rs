@@ -1473,6 +1473,14 @@ struct TableRun {
     /// `S1-KF` (`D-088`): the table as the hand this client holds counted it
     /// on the last stall tick -- what the session record keeps.
     table_counted: Option<Vec<u8>>,
+    /// `S1-KF` (`D-088`): the seats this client's game certified out, and in
+    /// which hand -- a seat heard playing on after it is in another game.
+    certified_out: std::collections::BTreeMap<u8, u64>,
+    /// `S1-KF` (`D-088`): by seat certified out, the hands after that it was
+    /// heard playing past their openings, and when each was first heard.
+    split_heard: std::collections::BTreeMap<u8, std::collections::BTreeMap<u64, std::time::Instant>>,
+    /// `S1-KF` (`D-088`): the seats last said to play in another game.
+    split_said: Option<Vec<u8>>,
     /// `S1-JY`: the hand in which this client refused a certificate only half
     /// the table carried, naming it, and when -- until a later hand is played
     /// with it (`HALF_REFUSED_LIMIT`).
@@ -1970,6 +1978,9 @@ impl TableRun {
             rejoin_floor: None,
             rejoin_table: None,
             table_counted: None,
+            certified_out: std::collections::BTreeMap::new(),
+            split_heard: std::collections::BTreeMap::new(),
+            split_said: None,
             half_refused: None,
             half_seen: 0,
             ever_on_line: false,
@@ -3400,6 +3411,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             &mut $t.adrift,
                                             line_down_within($t.line_down_at),
                                         );
+                                        // `S1-KF` (`D-088`): a seat this client's game put out,
+                                        // heard playing a later hand past its opening.
+                                        note_split_play($bytes, hand_id, seat, &$t.certified_out, &mut $t.split_heard);
                                         // **A certificate about the hand just
                                         // finished, arriving during the next
                                         // one, was dropped here with no line**
@@ -4079,6 +4093,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             for seat in fresh {
                 // `S1-EI`: the window says what happens about a certified seat.
                 let _ = events.send(NodeEvent::SeatCertified { seat, hand_id: id }).await;
+                // `S1-KF` (`D-088`): heard playing on after it, it is in another game.
+                $t.certified_out.insert(seat, id);
                 let entry = $t.table.as_ref().and_then(|f| {
                     f.roster()
                         .seats()
@@ -4432,6 +4448,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.rejoin_floor = None;
             $t.rejoin_table = None;
             $t.table_counted = None;
+            $t.certified_out.clear();
+            $t.split_heard.clear();
+            $t.split_said = None;
             $t.half_refused = None;
             $t.half_seen = 0;
             $t.ever_on_line = false;
@@ -12631,6 +12650,47 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // its restore once the table's re-send is in, and a stage it
                     // leaves waiting on this seat, with nothing of this seat's own
                     // held for it, is given this seat's part.
+                    // `S1-KF` (`D-088`), the owner: where the table could not be kept
+                    // from splitting into separate games, the players it split are
+                    // told, and asked to agree and play on or to leave.
+                    {
+                        let at = std::time::Instant::now();
+                        let id = h.hand_id();
+                        // A seat back in this client's game is in it.
+                        let back: Vec<u8> = t
+                            .certified_out
+                            .iter()
+                            .filter(|(s, since)| id > **since && (h.required().contains(s) || h.returned().contains(s)))
+                            .map(|(s, _)| *s)
+                            .collect();
+                        for s in back {
+                            t.certified_out.remove(&s);
+                            t.split_heard.remove(&s);
+                        }
+                        // This hand's number, played in another game by a seat put out.
+                        for s in h.outside_players() {
+                            if t.certified_out.get(&s).is_some_and(|since| id > *since) {
+                                t.split_heard.entry(s).or_default().entry(id).or_insert(at);
+                            }
+                        }
+                        for hands in t.split_heard.values_mut() {
+                            hands.retain(|_, heard| at.saturating_duration_since(*heard) < SPLIT_WINDOW);
+                        }
+                        t.split_heard.retain(|_, hands| !hands.is_empty());
+                        let apart = apart_from_this_game(&t.split_heard, &t.ahead, &h.table_for_the_count(), h.my_seat(), id, t.adrift.is_some());
+                        let said = t.split_said.clone().unwrap_or_default();
+                        if apart != said {
+                            let why = (!apart.is_empty()).then(|| split_words(t.table.as_ref(), &apart));
+                            t.split_said = (!apart.is_empty()).then(|| apart.clone());
+                            let _ = events
+                                .send(NodeEvent::Warning(match &why {
+                                    Some(w) => format!("the table has split into separate games: {w} (S1-KF, D-088)"),
+                                    None => "the seats that played apart are in this client's game again (S1-KF, D-088)".to_string(),
+                                }))
+                                .await;
+                            let _ = events.send(NodeEvent::TableSplit { why }).await;
+                        }
+                    }
                     let restore_ends = h.restore_due(now);
                     let owed = if restore_ends {
                         h.restore_done(&app_key, now)
@@ -15407,15 +15467,21 @@ const EQUIVOCATION_HANDS: usize = 2;
 /// `S1-JR`: ...within this many hands of the running one: two restarts of an
 /// honest client in the middle of a hand, far apart, name nobody.
 const EQUIVOCATION_WITHIN: u64 = 10;
+/// `S1-KF` (`D-088`): how long a seat's play in another game is kept as
+/// evidence of a split -- a game played apart keeps giving it.
+const SPLIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// `S1-JR`: "seat 2 (Alice)", or "seat 2" when the roster has no name for it --
 /// the name as its player chose it, less anything that is no printable text:
 /// control characters, and the marks that turn a line's direction round, which
 /// could make a name read as another seat's number.
 fn seat_called(t: &TableRun, seat: u8) -> String {
-    let name: Option<String> = t
-        .table
-        .as_ref()
+    seat_called_in(t.table.as_ref(), seat)
+}
+
+/// [`seat_called`], from the formation alone.
+fn seat_called_in(f: Option<&Formation>, seat: u8) -> String {
+    let name: Option<String> = f
         .and_then(|f| f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.display_name.clone()))
         .map(|n| {
             n.chars()
@@ -15429,6 +15495,74 @@ fn seat_called(t: &TableRun, seat: u8) -> String {
     match name {
         Some(n) => format!("seat {seat} ({n})"),
         None => format!("seat {seat}"),
+    }
+}
+
+/// `S1-KF` (`D-088`): the words for a table split into separate games.
+fn split_words(f: Option<&Formation>, apart: &[u8]) -> String {
+    let who = apart.iter().map(|s| seat_called_in(f, *s)).collect::<Vec<_>>().join(", ");
+    let one = apart.len() == 1;
+    format!(
+        "for security reasons the table has split into separate games in an emergency: {who} {} playing a game of {} own, apart from yours, since the connection between the players failed. Your client does not take chips from a game it cannot check, and the two games no longer meet.",
+        if one { "is" } else { "are" },
+        if one { "its" } else { "their" }
+    )
+}
+
+/// `S1-KF` (`D-088`): the seats playing a game apart from this client's --
+/// seats its game put out, heard playing two later hands past their openings
+/// (`heard`), which no seat does alone; and exactly half of the table this
+/// client counts, two hands ahead, where this client does not follow it
+/// (`D-038`, counted as `D-066` counts: it was here, or that half holds no
+/// lowest seat). A minority ahead is a branch of its own, not a game.
+fn apart_from_this_game(
+    heard: &std::collections::BTreeMap<u8, std::collections::BTreeMap<u64, std::time::Instant>>,
+    ahead: &std::collections::HashMap<u8, u64>,
+    table: &[u8],
+    me: u8,
+    mine: u64,
+    adrift: bool,
+) -> Vec<u8> {
+    let mut apart: std::collections::BTreeSet<u8> =
+        heard.iter().filter(|(s, hands)| **s != me && hands.len() >= 2).map(|(s, _)| *s).collect();
+    if !adrift && table.len() > 2 {
+        let saying: Vec<u8> = table
+            .iter()
+            .copied()
+            .filter(|s| *s != me && ahead.get(s).is_some_and(|k| *k >= mine.saturating_add(ADRIFT_MARGIN)))
+            .collect();
+        if saying.len() * 2 == table.len() {
+            apart.extend(saying);
+        }
+    }
+    apart.into_iter().collect()
+}
+
+/// `S1-KF` (`D-088`): note a seat this client's game certified out, heard
+/// playing a hand after that one past its opening -- once a hand, eight
+/// hands at most.
+fn note_split_play(
+    bytes: &[u8],
+    hand_id: u64,
+    seat: Option<u8>,
+    certified_out: &std::collections::BTreeMap<u8, u64>,
+    heard: &mut std::collections::BTreeMap<u8, std::collections::BTreeMap<u64, std::time::Instant>>,
+) {
+    let Some(seat) = seat else { return };
+    if certified_out.get(&seat).is_none_or(|since| hand_id <= *since) {
+        return;
+    }
+    let Ok((kind, _, _)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
+        return;
+    };
+    if !crate::table::hand::played_past_its_opening(kind) {
+        return;
+    }
+    let hands = heard.entry(seat).or_default();
+    hands.entry(hand_id).or_insert_with(std::time::Instant::now);
+    while hands.len() > 8 {
+        let Some(first) = hands.keys().next().copied() else { break };
+        hands.remove(&first);
     }
 }
 
@@ -21384,6 +21518,46 @@ mod tests {
         let half_without = at(&[(1, 3), (2, 3)]);
         assert_eq!(adrift_now(mine, &half_without, &four, 3, true), None, "half without the lowest seat is not the table");
         assert_eq!(adrift_now(mine, &at(&[(0, 3), (1, 3), (2, 3)]), &four, 3, false), Some((3, mine)), "three of four is the table");
+    }
+
+    /// `S1-KF` (`D-088`): a game apart from this client's is seen where seats
+    /// its game put out were heard playing two later hands, or where exactly
+    /// half of its table is two hands ahead and this client does not follow;
+    /// one hand, a minority ahead, or a client that goes adrift is no split.
+    #[test]
+    fn a_game_apart_is_seen_by_two_hands_played_or_half_the_table_ahead() {
+        use std::collections::{BTreeMap, HashMap};
+        let now = std::time::Instant::now();
+        let heard = |pairs: &[(u8, &[u64])]| -> BTreeMap<u8, BTreeMap<u64, std::time::Instant>> {
+            pairs.iter().map(|(s, hs)| (*s, hs.iter().map(|h| (*h, now)).collect())).collect()
+        };
+        let none: HashMap<u8, u64> = HashMap::new();
+        let four = [0u8, 1, 2, 3];
+        assert!(apart_from_this_game(&heard(&[(2, &[12])]), &none, &four, 0, 10, false).is_empty(), "one hand");
+        assert_eq!(apart_from_this_game(&heard(&[(2, &[12, 13])]), &none, &four, 0, 10, false), vec![2], "two hands");
+        assert!(apart_from_this_game(&heard(&[(0, &[12, 13])]), &none, &four, 0, 10, false).is_empty(), "never this client");
+        let ahead: HashMap<u8, u64> = [(2, 12), (3, 13)].into_iter().collect();
+        assert_eq!(apart_from_this_game(&BTreeMap::new(), &ahead, &four, 0, 10, false), vec![2, 3], "half the table ahead");
+        assert!(apart_from_this_game(&BTreeMap::new(), &ahead, &four, 0, 10, true).is_empty(), "followed: no split");
+        let one: HashMap<u8, u64> = [(2, 12)].into_iter().collect();
+        assert!(apart_from_this_game(&BTreeMap::new(), &one, &four, 0, 10, false).is_empty(), "a minority ahead");
+        let near: HashMap<u8, u64> = [(2, 11), (3, 11)].into_iter().collect();
+        assert!(apart_from_this_game(&BTreeMap::new(), &near, &four, 0, 10, false).is_empty(), "one hand ahead is the pause");
+        assert!(apart_from_this_game(&BTreeMap::new(), &ahead, &[0u8, 2], 0, 10, false).is_empty(), "heads-up has no halves");
+    }
+
+    /// `S1-KF` (`D-088`): the split is read on the stall tick from the seats
+    /// the game certified out and the hands they were heard playing, and said
+    /// to the window when it changes.
+    #[test]
+    fn a_table_split_is_told_to_the_window() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(code.contains("let _ = events.send(NodeEvent::SeatCertified { seat, hand_id: id }).await; // `S1-KF` (`D-088`): heard playing on after it, it is in another game. $t.certified_out.insert(seat, id);"));
+        assert!(code.contains("note_split_play($bytes, hand_id, seat, &$t.certified_out, &mut $t.split_heard);"));
+        let tick = code.find("for s in h.outside_players() {").expect("the tick");
+        assert!(code[tick..tick + 2500].contains("let _ = events.send(NodeEvent::TableSplit { why }).await;"), "said to the window");
     }
 
     /// `S1-KF` (`D-088`): the copies a client comes back by are the table's
