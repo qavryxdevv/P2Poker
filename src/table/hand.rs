@@ -2691,6 +2691,15 @@ impl Hand {
     /// as a copy without checking a signature; only a different body is
     /// opened, and one that does not verify is nothing.
     fn another_version(&mut self, bytes: &[u8], kind: EventType, sequence: u64) -> Option<SeatIdx> {
+        // A vote **references** the stage it is about rather than occupying
+        // it (`PROTOCOL.md` §4.8), so its sequence is that stage's, beside the
+        // voter's own contribution there: two events of one honest seat at one
+        // sequence, and no second version of anything. Every other kind that
+        // reaches here occupies its stage (the abort, the certificate and the
+        // return pair are answered above the sequence gate).
+        if kind == EventType::TimeoutVote {
+            return None;
+        }
         let sender = chained::sender_of(bytes, FRAME_CAP)?;
         let taken = *self.taken_from.get(&(sequence, sender))?;
         if self.versions_said.contains(&(sequence, sender)) || chained::event_hash_of(bytes, FRAME_CAP)? == taken {
