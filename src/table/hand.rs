@@ -1006,8 +1006,6 @@ pub const EARLY_CAP: usize = 100;
 /// is some two hundred bytes (`ACTION_CAP` and its envelope).
 const SAID_AGAIN_MAX: usize = 256;
 
-/// `S1-KB`: how many seats dealt in after an action's writer say it again.
-const SAYERS: usize = 3;
 
 /// `S1-KB`: how many actions wait to be said again before the node drains
 /// them -- a bound, not a rate: the node drains after every frame and tick.
@@ -9565,9 +9563,8 @@ impl Hand {
     }
 
     /// `S1-KB`: whether a frame this hand has just taken, for the first time,
-    /// and applied as `writer`'s betting action, is one this client says again
-    /// to the table's group: at a hand dealt to three seats or more, when this
-    /// client is one of the `SAYERS` seats dealt in after the writer.
+    /// and applied as another seat's betting action, is one this client says
+    /// again to the table's group: at a hand dealt to three seats or more.
     ///
     /// **The writer before a seat can keep its action from that seat alone.** A
     /// Tox group message goes from its sender to each member, and nothing passes
@@ -9575,8 +9572,8 @@ impl Hand {
     /// others took the action and started the next seat's clock, the next seat
     /// never saw its turn, and at its deadline every other seat -- the rogue with
     /// them -- certified it: its chips in the pot forfeited, hand after hand, by
-    /// one rogue. Said again by the seats after the writer, the action reaches
-    /// the seat from any honest one of them a hop later.
+    /// one rogue. Said again by every seat that takes it, the action reaches the
+    /// seat from any honest one a hop later.
     ///
     /// **Once, and only what the hand took.** Asked where the frame enters the
     /// transcript -- verified, in its slot, the hand moved by it -- so a copy of
@@ -9587,22 +9584,19 @@ impl Hand {
     /// writer signed:** that path takes every type but a bet, a raise, a fold and
     /// a check as a call, and a call signed as another type was never said again.
     ///
-    /// **Three seats, not all.** At ten seats every seat saying every action
-    /// again is nine copies of each where one was; the three dealt in after the
-    /// writer are one rogue's partners at most two of, and the seat kept from the
-    /// action, if it is one of them, has the other two. Heads-up there is nobody
-    /// else to say it to. Not a cryptographic frame: what keeping one from a seat
-    /// costs it is written in `S1-KB`'s row.
+    /// **Every seat that takes it, not some.** Three seats named by the seating
+    /// -- the three dealt in after the writer, to spare ten seats nine copies of
+    /// each action -- were three the writer knew: it sent its action to the other
+    /// seats only, none of them said it again, and the seat after it was starved
+    /// as before. Whoever takes it says it; a writer that keeps it from every
+    /// honest seat is itself the seat the table waits on. Heads-up there is
+    /// nobody else to say it to. Not a cryptographic frame: what keeping one from
+    /// a seat costs it is written in `S1-KB`'s row.
     fn says_again(&self, writer: SeatIdx, bytes: &[u8]) -> bool {
-        let mut dealt = self.mine.dealt_in.clone();
-        dealt.sort_unstable();
-        if dealt.len() < 3 || bytes.len() > SAID_AGAIN_MAX || self.said_again.len() >= SAID_AGAIN_CAP {
-            return false;
-        }
-        let Some(at) = dealt.iter().position(|s| *s == writer) else {
-            return false;
-        };
-        (1..=SAYERS.min(dealt.len() - 1)).any(|i| dealt[(at + i) % dealt.len()] == self.open.my_seat)
+        self.mine.dealt_in.len() >= 3
+            && writer != self.open.my_seat
+            && bytes.len() <= SAID_AGAIN_MAX
+            && self.said_again.len() < SAID_AGAIN_CAP
     }
 
     /// `S1-KB`: the betting actions of other seats this hand has taken since
@@ -14989,19 +14983,20 @@ mod tests {
         }
     }
 
-    /// `S1-KB`: the three seats dealt in after an action's writer say it again,
-    /// and no other.
+    /// `S1-KB`: every seat that takes another seat's action says it again --
+    /// not three the writer could name and leave out -- at three seats or more,
+    /// and nothing larger than an action.
     #[test]
-    fn the_three_seats_after_the_writer_say_it_again() {
+    fn every_seat_that_takes_the_action_says_it_again() {
         let (mut hands, _keys) = three_to_the_bet();
         let h = &mut hands[0];
         assert_eq!(h.my_seat(), 0);
-        h.mine.dealt_in = vec![0, 1, 2, 3, 4, 5];
+        h.mine.dealt_in = vec![0, 1, 2, 3, 4, 5, 6];
         let frame = vec![0u8; 200];
-        assert!(h.says_again(5, &frame), "seat 0 is the first after seat 5");
-        assert!(h.says_again(3, &frame), "and the third after seat 3");
-        assert!(!h.says_again(2, &frame), "not one of the three after seat 2");
-        assert!(!h.says_again(1, &frame), "nor after seat 1");
+        for writer in 1..7u8 {
+            assert!(h.says_again(writer, &frame), "whoever wrote it: seat {writer}");
+        }
+        assert!(!h.says_again(0, &frame), "not its own");
         assert!(!h.says_again(5, &vec![0u8; 300]), "nothing larger than an action");
         h.mine.dealt_in = vec![0, 1];
         assert!(!h.says_again(1, &frame), "heads-up: nobody to say it to");
