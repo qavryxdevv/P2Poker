@@ -658,6 +658,11 @@ pub struct Trouble {
     /// copy of the group had confirmed a member. Kept for the table's life: a
     /// founder that locked its group once runs a client that is not ours.
     pub group_lock: std::sync::Mutex<Option<crate::tox::GroupLock>>,
+    /// `S1-KJ`: seats, by application key, seen in the group under a key they
+    /// never had here before -- a new process of the seat, whose hand may sign
+    /// again a step its previous life signed (`D-033`) -- since the node last
+    /// asked.
+    pub new_entries: std::sync::Mutex<Vec<[u8; 32]>>,
     /// Invitations toxcore **accepted** from the founder.
     ///
     /// Beside `invites_refused` because zero refusals means one of two very
@@ -1198,6 +1203,11 @@ struct TableState {
     /// the ratified roster's.
     seat_apps: Vec<[u8; 32]>,
     seats_fixed: bool,
+    /// `S1-KJ`: the seats placed here at least once, and every member key
+    /// placed -- so that a seat seen again under a key it never had here is
+    /// told as a new entry of that seat (`Trouble::new_entries`).
+    placed_seats: std::collections::HashSet<[u8; 32]>,
+    placed_keys: std::collections::HashSet<[u8; 32]>,
     /// `D-051`: member key -> the application key its name binds it to,
     /// verified against the group's own key for it.
     bound: HashMap<[u8; 32], [u8; 32]>,
@@ -1404,6 +1414,14 @@ fn place_member(tox: &mut Tox, t: &mut TableState, g: u32, peer: u32, key: [u8; 
             if t.seat_apps.contains(&app) {
                 t.unplaced.remove(&key);
                 t.known_as.insert(key, app);
+                // `S1-KJ`: a seat here before, under a key it never had here --
+                // a new process of that seat (`S1-DU`), or an entry its player
+                // brought in.
+                if a_new_entry_of_a_seat_seen(&mut t.placed_seats, &mut t.placed_keys, app, key) {
+                    if let Ok(mut n) = t.trouble.new_entries.lock() {
+                        n.push(app);
+                    }
+                }
                 if let Ok(mut known) = t.trouble.known.lock() {
                     known.insert(app);
                 }
@@ -1512,6 +1530,21 @@ fn score_noise(tox: &mut Tox, t: &mut TableState, g: u32, key: [u8; 32], points:
     if let Some(flood) = meter.over(now) {
         cut_off(tox, t, g, key, Cut::Flood(flood));
     }
+}
+
+/// `S1-KJ`: whether `key`, placed at `app`'s seat now, is a new entry of a
+/// seat that had another here before. Records both either way; a key placed
+/// again (every sweep reads an unplaced name again) is nothing.
+fn a_new_entry_of_a_seat_seen(
+    placed_seats: &mut std::collections::HashSet<[u8; 32]>,
+    placed_keys: &mut std::collections::HashSet<[u8; 32]>,
+    app: [u8; 32],
+    key: [u8; 32],
+) -> bool {
+    if !placed_keys.insert(key) {
+        return false;
+    }
+    !placed_seats.insert(app)
 }
 
 /// `S1-KI`: whose meter a member's traffic is counted on: its seat's -- the key
@@ -2024,6 +2057,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             named,
                             seat_apps: Vec::new(),
                             seats_fixed: false,
+                            placed_seats: std::collections::HashSet::new(),
+                            placed_keys: std::collections::HashSet::new(),
                             bound: HashMap::new(),
                             unplaced: HashMap::new(),
                             barred: std::collections::HashSet::new(),
@@ -3583,6 +3618,12 @@ fn cut_surplus(tox: &mut Tox, t: &mut TableState, g: u32) {
             keys_of.entry(*app).or_default().push(*k);
         }
     }
+    // One key a seat entry: the library can hold a key at two peer numbers
+    // for a moment (a dead entry's key coming back, `S1-DB`).
+    for keys in keys_of.values_mut() {
+        keys.sort_unstable();
+        keys.dedup();
+    }
     keys_of.retain(|_, keys| keys.len() > ENTRIES_A_SEAT);
     for keys in keys_of.into_values() {
         let entries: Vec<TwinEntry> = keys
@@ -3856,6 +3897,20 @@ mod tests {
         // A seat whose only entry is cut off here is not in the group here.
         let cut: std::collections::HashSet<[u8; 32]> = [member(5)].into_iter().collect();
         assert_eq!(seats_among(&confirmed, &peer_keys, &cut, &bound, &seat_apps), 2);
+    }
+
+    /// `S1-KJ`: a seat seen under a key it never had here is a new entry of
+    /// it -- its first key is not, and a key placed again is not.
+    #[test]
+    fn a_seat_under_a_key_it_never_had_here_is_a_new_entry() {
+        let mut seats = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        let (seat, other) = ([1u8; 32], [2u8; 32]);
+        assert!(!a_new_entry_of_a_seat_seen(&mut seats, &mut keys, seat, [11u8; 32]), "its first entry");
+        assert!(!a_new_entry_of_a_seat_seen(&mut seats, &mut keys, seat, [11u8; 32]), "placed again");
+        assert!(!a_new_entry_of_a_seat_seen(&mut seats, &mut keys, other, [21u8; 32]), "another seat's first");
+        assert!(a_new_entry_of_a_seat_seen(&mut seats, &mut keys, seat, [12u8; 32]), "back under a new key");
+        assert!(!a_new_entry_of_a_seat_seen(&mut seats, &mut keys, seat, [12u8; 32]), "said once");
     }
 
     /// `S1-KI`: a seat's entries share one allowance. Three entries of one seat,

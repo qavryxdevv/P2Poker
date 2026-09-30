@@ -553,6 +553,28 @@ impl TableSink {
         }
     }
 
+    /// `S1-KJ`: the seats seen in the group under a key they never had there
+    /// before, since the last call -- a new process of the seat, or an entry
+    /// its player brought in. Empty on a build with no Tox.
+    pub fn take_new_entries(&self) -> Vec<[u8; 32]> {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t
+                    .trouble()
+                    .new_entries
+                    .lock()
+                    .map(|mut n| std::mem::take(&mut *n))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            Vec::new()
+        }
+    }
+
     /// `S1-KH`: whether the table's group was changed to keep members out --
     /// a peer limit or a password, which no client of this build sets -- and
     /// how, once the carrier has seen it. `None` on a build with no Tox.

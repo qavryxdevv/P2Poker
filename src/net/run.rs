@@ -1425,6 +1425,13 @@ struct TableRun {
     /// `S1-JR`: the seats seen sending two different copies of one stage, by
     /// application key -- the seat and the hands it was seen in.
     equivocators: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
+    /// `S1-KJ`: the seats seen coming back under a new entry of theirs in the
+    /// table's group -- a new process -- by application key, and the hand it
+    /// was seen in. A seat back from a restart can sign a step again that its
+    /// previous life signed (`D-033` hands its own old frames back only as far
+    /// as the replay has reached), and that is no rogue's second version: not
+    /// counted in that hand or the ones either side of it.
+    back_from_restart: std::collections::BTreeMap<[u8; 32], u64>,
     /// `S1-JR`: the hand and stage the running hand stands at, and since when.
     stands: Option<(u64, u64, std::time::Instant)>,
     /// `S1-JR`: since when the table has had players enough to start, with no
@@ -1942,6 +1949,7 @@ impl TableRun {
             voided_recent: (0, None),
             cheats: std::collections::BTreeMap::new(),
             equivocators: std::collections::BTreeMap::new(),
+            back_from_restart: std::collections::BTreeMap::new(),
             stands: None,
             forming_since: None,
             return_short: (0, None),
@@ -3107,11 +3115,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // version of a step counts as one that came late.
                                     if let Failed::Equivocation { seat } = &e {
                                         if let Some(k) = $h.key_of(*seat) {
-                                            $t.equivocators
-                                                .entry(k)
-                                                .or_insert_with(|| (*seat, std::collections::BTreeSet::new()))
-                                                .1
-                                                .insert($h.hand_id());
+                                            count_equivocation(&mut $t.equivocators, &$t.back_from_restart, k, *seat, $h.hand_id());
                                         }
                                     }
                                     let _ = events
@@ -3592,11 +3596,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // one seat, kept by its key and the hand.
                                 if let Failed::Equivocation { seat } = &e {
                                     if let Some(k) = $h.key_of(*seat) {
-                                        $t.equivocators
-                                            .entry(k)
-                                            .or_insert_with(|| (*seat, std::collections::BTreeSet::new()))
-                                            .1
-                                            .insert($h.hand_id());
+                                        count_equivocation(&mut $t.equivocators, &$t.back_from_restart, k, *seat, $h.hand_id());
                                     }
                                 }
                                 let _ = events
@@ -4401,6 +4401,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.voided_recent = (0, None);
             $t.cheats.clear();
             $t.equivocators.clear();
+            $t.back_from_restart.clear();
             $t.stands = None;
             $t.forming_since = None;
             $t.return_short = (0, None);
@@ -11741,6 +11742,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         None => {}
                     }
+                    // `S1-KJ`: seats back in the table's group under a new entry --
+                    // a new process, whose hand may sign again what its previous
+                    // life signed: not counted as a second version around now.
+                    let hand_now = t.hand.as_ref().map_or(0, |h| h.hand_id());
+                    for app in t.tox_sink.take_new_entries() {
+                        if app != my_app_key {
+                            note_back_from_restart(&mut t.equivocators, &mut t.back_from_restart, app, hand_now);
+                        }
+                    }
                     // `D-035`: seats whose client left the table's group.
                     for (app, quit) in t.tox_sink.take_gone() {
                         // `S1-EE`: never about this client's own seat -- it is here.
@@ -12237,11 +12247,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `S1-KJ`: counted as the frame's own arrival would be.
                         if let crate::table::hand::Failed::Equivocation { seat } = &e {
                             if let Some(k) = h.key_of(*seat) {
-                                t.equivocators
-                                    .entry(k)
-                                    .or_insert_with(|| (*seat, std::collections::BTreeSet::new()))
-                                    .1
-                                    .insert(h.hand_id());
+                                count_equivocation(&mut t.equivocators, &t.back_from_restart, k, *seat, h.hand_id());
                             }
                         }
                         let _ = events
@@ -15220,6 +15226,40 @@ fn unsafe_reason(t: &TableRun) -> Option<String> {
         ));
     }
     no_progress_reason(t, now)
+}
+
+/// `S1-JR`, `S1-KJ`: count a seat named for a second version of a step in
+/// `hand` -- unless the seat came back from a restart in that hand or the one
+/// either side of it (`back_from_restart`), whose re-made frames are no rogue's.
+fn count_equivocation(
+    equivocators: &mut std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
+    back_from_restart: &std::collections::BTreeMap<[u8; 32], u64>,
+    key: [u8; 32],
+    seat: u8,
+    hand: u64,
+) {
+    if back_from_restart.get(&key).is_some_and(|h| h.abs_diff(hand) <= 1) {
+        return;
+    }
+    equivocators
+        .entry(key)
+        .or_insert_with(|| (seat, std::collections::BTreeSet::new()))
+        .1
+        .insert(hand);
+}
+
+/// `S1-KJ`: a seat seen back under a new entry in `hand` -- its restart's
+/// frames are not counted around that hand, including any already counted.
+fn note_back_from_restart(
+    equivocators: &mut std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
+    back_from_restart: &mut std::collections::BTreeMap<[u8; 32], u64>,
+    key: [u8; 32],
+    hand: u64,
+) {
+    back_from_restart.insert(key, hand);
+    if let Some((_, hands)) = equivocators.get_mut(&key) {
+        hands.retain(|h| h.abs_diff(hand) > 1);
+    }
 }
 
 /// `S1-KH`: the words for a group its founder locked -- what it did, and what
@@ -21705,12 +21745,46 @@ mod late_roster_tests {
         let src = include_str!("run.rs");
         let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
         let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
-        let counted = ".or_insert_with(|| (*seat, std::collections::BTreeSet::new())) .1 .insert(";
-        assert_eq!(code.matches(counted).count(), 3, "the arrival, and both replays of what was held");
-        for held in ["for e in held_failures { // `S1-KJ`: a held frame", "for e in held_failures { // `S1-KJ`: counted as"] {
+        let counted = "count_equivocation(&mut $t.equivocators, &$t.back_from_restart, k, *seat, $h.hand_id());";
+        let counted_tick = "count_equivocation(&mut t.equivocators, &t.back_from_restart, k, *seat, h.hand_id());";
+        assert_eq!(code.matches(counted).count(), 2, "the arrival, and the replay of what was held");
+        assert_eq!(code.matches(counted_tick).count(), 1, "and the tick's replay");
+        assert_eq!(code.matches(".or_insert_with(|| (seat, std::collections::BTreeSet::new()))").count(), 1, "one place counts");
+        for (held, how) in [
+            ("for e in held_failures { // `S1-KJ`: a held frame", counted),
+            ("for e in held_failures { // `S1-KJ`: counted as", counted_tick),
+        ] {
             let at = code.find(held).unwrap_or_else(|| panic!("{held}"));
-            assert!(code[at..at + 600].contains(counted), "{held}: counted");
+            assert!(code[at..at + 400].contains(how), "{held}: counted");
         }
+        assert!(
+            code.contains("for app in t.tox_sink.take_new_entries() { if app != my_app_key { note_back_from_restart(&mut t.equivocators, &mut t.back_from_restart, app, hand_now);"),
+            "a seat back under a new entry is noted"
+        );
+    }
+
+    /// `S1-KJ`: a seat back from a restart is not counted for a second
+    /// version in the hand it came back in or either one beside it -- and what
+    /// was counted there before the restart was seen goes -- while another hand,
+    /// and another seat, are counted as ever.
+    #[test]
+    fn a_seat_back_from_a_restart_is_not_counted_around_its_return() {
+        let mut eq: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)> =
+            std::collections::BTreeMap::new();
+        let mut back: std::collections::BTreeMap<[u8; 32], u64> = std::collections::BTreeMap::new();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        count_equivocation(&mut eq, &back, a, 1, 7);
+        count_equivocation(&mut eq, &back, a, 1, 3);
+        note_back_from_restart(&mut eq, &mut back, a, 8);
+        assert_eq!(eq[&a].1, [3u64].into_iter().collect(), "hand 7 was its restart's; hand 3 was not");
+        for hand in [7, 8, 9] {
+            count_equivocation(&mut eq, &back, a, 1, hand);
+        }
+        assert_eq!(eq[&a].1.len(), 1, "nothing counted around its return");
+        count_equivocation(&mut eq, &back, a, 1, 10);
+        assert!(eq[&a].1.contains(&10), "two hands on, counted as ever");
+        count_equivocation(&mut eq, &back, b, 2, 8);
+        assert!(eq[&b].1.contains(&8), "another seat is counted as ever");
     }
 
     /// Ties deal on, with this client's own seat counted on its side.
