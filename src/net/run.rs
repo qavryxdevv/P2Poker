@@ -3328,8 +3328,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // `D-038`: kept whether or not this client is resuming.
                                         // A seat that finds itself on a hand nobody else has
                                         // rejoins the table from these, and they are bounded --
-                                        // two hand ids, one copy per seat, `RESUME_EARLY_CAP`
-                                        // other frames -- so an ordinary table's pause skew costs
+                                        // the openings of `RESUME_INIT_HANDS` hand ids, one copy per
+                                        // seat, `RESUME_EARLY_CAP` other frames (`S1-KE`) -- so an
+                                        // ordinary table's pause skew costs
                                         // a few frames of memory and nothing else.
                                         // `S1-JX`: a roster seat's frame only -- a key that
                                         // holds no seat signed openings of hands far ahead
@@ -16679,10 +16680,26 @@ fn stop_on_turn_due(since: tokio::time::Instant) -> bool {
 
 /// `S1-CR`: keep one frame of the running table for a client that holds no
 /// hand of it -- a `HAND_INIT` under its hand id, anything else of a hand
-/// beside it -- under two bounds: two hand ids of inits with one copy per
-/// seat each, and `RESUME_EARLY_CAP` other frames, oldest out. Returns
+/// beside it -- under two bounds: the openings of `RESUME_INIT_HANDS` hand ids,
+/// one copy per seat each, and `RESUME_EARLY_CAP` other frames. Returns
 /// whether the frame was a hand frame at all.
+///
+/// `S1-KE`: **who signed them decides what goes.** Every frame kept here is a
+/// roster seat's (`a_seats_own_frame`), and one such seat, a rogue, filled both
+/// bounds: two openings of hands far ahead took the two hand ids held, and a
+/// copy of the table's own hand was never kept; a thousand frames of its own
+/// pushed the table's out of the rest; ten openings of one hand, each signed
+/// by it, filled that hand's copies. Now a seat is the only signer of one hand
+/// id at most -- its next opening of a hand nobody else has opened takes that
+/// one's place -- and the hands two seats or more opened are the newest two;
+/// a hand's copies are one per signer; and when the rest is full, the seat
+/// that holds the most of it gives its oldest up. A rogue keeps one hand id and
+/// its share of the rest, and the table's hands stay.
 const RESUME_EARLY_CAP: usize = 1_024;
+
+/// `S1-KE`: the hand ids whose openings are kept -- one for each seat alone,
+/// and two that two seats or more opened.
+const RESUME_INIT_HANDS: usize = crate::protocol::constants::MAX_SEATS as usize + 2;
 
 fn stash_for_resume(
     bytes: &[u8],
@@ -16696,22 +16713,50 @@ fn stash_for_resume(
     if hand_id == 0 {
         return false;
     }
+    let signer_of = |b: &[u8]| crate::net::chained::sender_of(b, crate::table::hand::FRAME_CAP);
+    let Some(signer) = signer_of(bytes) else {
+        return false;
+    };
+    let drop_hand = |inits: &mut std::collections::BTreeMap<u64, Vec<Vec<u8>>>, early: &mut Vec<(u64, Vec<u8>)>, h: u64| {
+        inits.remove(&h);
+        early.retain(|(x, _)| *x != h);
+    };
     if kind == EventType::HandInit {
+        let signers = |copies: &Vec<Vec<u8>>| -> std::collections::BTreeSet<[u8; 32]> {
+            copies.iter().filter_map(|b| signer_of(b)).collect()
+        };
         if !inits.contains_key(&hand_id) {
-            while inits.len() >= 2 {
-                let lowest = *inits.keys().next().expect("non-empty");
-                if lowest > hand_id {
-                    return true;
-                }
-                inits.remove(&lowest);
-                early.retain(|(h, _)| *h != lowest);
+            // A seat alone at a hand id gives it up for its next one.
+            let alone: Vec<u64> = inits
+                .iter()
+                .filter(|(_, c)| {
+                    let s = signers(c);
+                    s.len() == 1 && s.contains(&signer)
+                })
+                .map(|(h, _)| *h)
+                .collect();
+            for h in alone {
+                drop_hand(inits, early, h);
+            }
+            if inits.len() >= RESUME_INIT_HANDS {
+                // Not reached while each seat holds one alone and two are
+                // shared; a bound all the same.
+                return true;
             }
         }
         let slot = inits.entry(hand_id).or_default();
+        // One copy per signer: ten openings of one hand by one seat are one.
         if slot.len() < usize::from(crate::protocol::constants::MAX_SEATS)
-            && !slot.iter().any(|b| b[..] == bytes[..])
+            && !slot.iter().any(|b| signer_of(b) == Some(signer))
         {
             slot.push(bytes.to_vec());
+        }
+        // The hands two seats or more opened: the newest two.
+        let shared: Vec<u64> = inits.iter().filter(|(_, c)| signers(c).len() >= 2).map(|(h, _)| *h).collect();
+        if shared.len() > 2 {
+            for h in &shared[..shared.len() - 2] {
+                drop_hand(inits, early, *h);
+            }
         }
         return true;
     }
@@ -16719,7 +16764,22 @@ fn stash_for_resume(
         return true;
     }
     if early.len() >= RESUME_EARLY_CAP {
-        early.remove(0);
+        // The seat that holds the most gives its oldest up.
+        let mut held: std::collections::BTreeMap<[u8; 32], usize> = std::collections::BTreeMap::new();
+        for (_, b) in early.iter() {
+            if let Some(s) = signer_of(b) {
+                *held.entry(s).or_default() += 1;
+            }
+        }
+        let heaviest = held.iter().max_by_key(|(_, n)| **n).map(|(k, _)| *k);
+        match heaviest.and_then(|k| early.iter().position(|(_, b)| signer_of(b) == Some(k))) {
+            Some(i) => {
+                early.remove(i);
+            }
+            None => {
+                early.remove(0);
+            }
+        }
     }
     early.push((hand_id, bytes.to_vec()));
     true
@@ -21504,38 +21564,68 @@ mod late_roster_tests {
     }
 
     /// `S1-CR`: what a client with no hand keeps of the running table, and
-    /// the two bounds on it.
+    /// the bounds on it. `S1-KE`: bounds a seat's own frames cannot fill for
+    /// the others -- a seat is the only signer of one hand id at most, the
+    /// hands two seats or more opened are the newest two, a hand's copies are
+    /// one per signer, and the seat holding the most of the rest gives its
+    /// oldest up first.
     #[test]
     fn a_resuming_client_keeps_inits_by_hand_and_the_rest_bounded() {
         use crate::protocol::messages::EventType;
-        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let seal = |kind: EventType, hand_id: u64, tag: u16| -> Vec<u8> {
+        let keys: Vec<ed25519_dalek::SigningKey> =
+            (0..4u8).map(|i| ed25519_dalek::SigningKey::from_bytes(&[7 + i; 32])).collect();
+        let seal = |kind: EventType, hand_id: u64, tag: u16, by: usize| -> Vec<u8> {
             let slot = crate::net::chained::Slot {
                 table_id: [1; 32],
                 hand_id,
                 sequence: 0,
                 previous_event_hash: [2; 32],
             };
-            crate::net::chained::seal(kind, &slot, &tag, &key, 1_000, 30_000, 4096).unwrap()
+            crate::net::chained::seal(kind, &slot, &tag, &keys[by], 1_000, 30_000, 4096).unwrap()
         };
         let mut inits = std::collections::BTreeMap::new();
         let mut early = Vec::new();
         assert!(!stash_for_resume(b"not a frame", &mut inits, &mut early));
-        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 0), &mut inits, &mut early));
-        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 0), &mut inits, &mut early), "a duplicate is taken and not kept twice");
+        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 0, 0), &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 0, 0), &mut inits, &mut early), "a duplicate is taken and not kept twice");
+        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 1, 0), &mut inits, &mut early), "nor a second opening by one seat");
         assert_eq!(inits[&5].len(), 1);
-        assert!(stash_for_resume(&seal(EventType::DeckInit, 5, 1), &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 0, 1), &mut inits, &mut early));
+        assert_eq!(inits[&5].len(), 2, "one copy per signer");
+        assert!(stash_for_resume(&seal(EventType::DeckInit, 5, 1, 0), &mut inits, &mut early));
         assert_eq!(early.len(), 1);
-        assert!(stash_for_resume(&seal(EventType::HandInit, 6, 0), &mut inits, &mut early));
-        assert!(stash_for_resume(&seal(EventType::HandInit, 7, 0), &mut inits, &mut early));
-        assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![6, 7], "two hand ids, the lowest out");
-        assert!(early.is_empty(), "and hand 5's other frames went with it");
-        assert!(stash_for_resume(&seal(EventType::HandInit, 4, 0), &mut inits, &mut early));
-        assert!(!inits.contains_key(&4), "a hand below the two held is not kept");
-        for i in 0..(RESUME_EARLY_CAP as u16).saturating_add(10) {
-            let _ = stash_for_resume(&seal(EventType::DeckInit, 7, i), &mut inits, &mut early);
+
+        // Hands two seats or more opened: the newest two.
+        for h in [6u64, 7] {
+            assert!(stash_for_resume(&seal(EventType::HandInit, h, 0, 0), &mut inits, &mut early));
+            assert!(stash_for_resume(&seal(EventType::HandInit, h, 0, 1), &mut inits, &mut early));
         }
-        assert_eq!(early.len(), RESUME_EARLY_CAP, "bounded, oldest out");
+        assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![6, 7], "the newest two, hand 5 out");
+        assert!(early.is_empty(), "and hand 5's other frames went with it");
+
+        // A seat alone: one hand id, its next opening in that one's place --
+        // however far ahead, and however many.
+        for h in 1_000..1_010u64 {
+            assert!(stash_for_resume(&seal(EventType::HandInit, h, 0, 3), &mut inits, &mut early));
+        }
+        assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![6, 7, 1_009], "one hand id of its own");
+        // ... and the table's next hand still comes in.
+        assert!(stash_for_resume(&seal(EventType::HandInit, 8, 0, 0), &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::HandInit, 8, 0, 2), &mut inits, &mut early));
+        assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![7, 8, 1_009]);
+        assert_eq!(inits[&8].len(), 2);
+
+        // The rest: bounded, and a seat that fills it gives its own up -- the
+        // table's frames came first, and stay.
+        for i in 0..20u16 {
+            assert!(stash_for_resume(&seal(EventType::DeckInit, 8, i, 1), &mut inits, &mut early));
+        }
+        for i in 0..(RESUME_EARLY_CAP as u16).saturating_add(100) {
+            let _ = stash_for_resume(&seal(EventType::DeckInit, 1_009, i, 3), &mut inits, &mut early);
+        }
+        assert_eq!(early.len(), RESUME_EARLY_CAP, "bounded");
+        let kept_of_1 = early.iter().filter(|(h, _)| *h == 8).count();
+        assert_eq!(kept_of_1, 20, "the table's frames stay; the seat that held the most gave its own up");
     }
 }
 
