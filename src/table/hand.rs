@@ -11087,10 +11087,10 @@ impl Hand {
     }
 
     /// `S1-KA`: whether this hand, as it ends, is still carried by a strict
-    /// majority of the seats with chips at its start -- the seats dealt in that
-    /// hold chips at its boundary and that no certificate of the hand certified
-    /// out. What puts a seat out of the table for good (a flood, a proof that
-    /// does not hold, the fourth absence) does so only in such a hand.
+    /// majority of the seats with chips at its boundary -- the seats dealt in
+    /// that hold chips there and that no certificate of the hand certified out.
+    /// What puts a seat out of the table for good (a flood, a proof that does
+    /// not hold, the fourth absence) does so only in such a hand.
     ///
     /// **Why.** A certificate about a seat takes it out of every later voter
     /// set of the hand, so two rogues of four, once the table had certified a
@@ -11103,8 +11103,8 @@ impl Hand {
     ///
     /// **Why from these and nothing else.** A seat's being out for good goes
     /// into the next hand's genesis, so every seat must read it alike: from the
-    /// opening's stacks, the seats dealt in, the stacks at the boundary and the
-    /// seats certified out, which `R(k+1)` already asks every seat to agree on.
+    /// seats dealt in, the stacks at the boundary and the seats certified out,
+    /// which `R(k+1)` already asks every seat to agree on.
     /// Not from a certificate's voters: a copy may carry more of them than
     /// another (`on_timeout_cert` takes a copy whose voters hold the ones it
     /// derives), and a count of a copy's voters parted honest seats by the copy
@@ -11122,7 +11122,12 @@ impl Hand {
             .iter()
             .filter(|s| at_end.get(usize::from(**s)).copied().unwrap_or(0) > 0 && !self.certified.contains(s))
             .count();
-        carrying * 2 > self.seats_with_chips()
+        // Of the seats with chips at the boundary: a seat the hand busted
+        // counts on neither side. Counted against the seats with chips at the
+        // start, a seat busted in the very hand a fourth absence was certified
+        // in kept it from being out for good at an honest table of four.
+        let with_chips = at_end.iter().filter(|s| **s > 0).count();
+        carrying * 2 > with_chips
     }
 
     /// `S1-KA`: how many seats had chips at this hand's start -- the opening's
@@ -11137,7 +11142,11 @@ impl Hand {
     /// once it is over. Mid-hand the count [`Hand::out_for_good`] rests on can
     /// still fall -- a seat certified later is a seat the hand no longer carries
     /// -- and what the node does with the answer (the group's word for good,
-    /// this client leaving) cannot be taken back.
+    /// this client leaving) cannot be taken back. Over, it is final but for a
+    /// certificate banked after an abort terminal (`S1-BS`), which may still
+    /// certify a seat until the next hand's opening closes; the seat it takes
+    /// the majority from is kept out all the same, by D-032's limit, the flood
+    /// meters or the proof checks of the seats that named it.
     pub fn out_for_good_decided(&self) -> Vec<SeatIdx> {
         if self.over() {
             self.out_for_good()
@@ -19279,11 +19288,15 @@ mod tests {
             assert!(h.bank(&about(2, cause), [2; 32], b"two"));
             assert!(h.out_for_good().is_empty(), "{cause:?}: counted against the seats with chips");
 
-            // A seat that ends the hand without chips carries it no more.
+            // A seat that ends the hand without chips counts on neither side:
+            // two of the three with chips at the boundary is a majority.
             let mut h = fresh();
             h.mine.stacks[3] = 0;
             assert!(h.bank(&about(2, cause), [2; 32], b"two"));
-            assert!(h.out_for_good().is_empty(), "{cause:?}: a seat without chips at the boundary");
+            assert_eq!(h.out_for_good(), vec![2], "{cause:?}: a seat busted in the hand");
+            // ... and with seat 1 certified out too, one of three is none.
+            assert!(h.bank(&about(1, None), [1; 32], b"one"));
+            assert!(h.out_for_good().iter().all(|s| *s != 2), "{cause:?}: one of three");
 
             // A seat without chips at the hand's start is no seat of the count:
             // two of three is a majority.
@@ -19291,6 +19304,7 @@ mod tests {
             if let Some(s) = h.open.seats.iter_mut().find(|s| s.0 == 3) {
                 s.2 = 0;
             }
+            h.mine.stacks[3] = 0;
             h.mine.dealt_in.retain(|s| *s != 3);
             assert_eq!(h.seats_with_chips(), 3);
             assert!(h.bank(&about(2, cause), [2; 32], b"two"));

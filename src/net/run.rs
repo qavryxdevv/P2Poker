@@ -4083,7 +4083,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // which puts the chips out at the boundary -- and so only once the
             // hand is over: read at the first sight of the seat certified, a seat
             // certified later took the majority away after the word for good,
-            // which is not taken back, had gone to the group.
+            // which is not taken back, had gone to the group. (A certificate
+            // banked after an abort terminal can still do so, `S1-BS`; the seat is
+            // kept out all the same.) Said for the hand the deal is about to put
+            // behind it too (`deal_the_next_hand`): a hand this client gave up on
+            // its own budget is followed by the deal 800 ms later, before any tick.
             if $h.over() {
                 for seat in $h.certified_seats().to_vec() {
                     let flooded = $h.named_for_flooding(seat);
@@ -5470,19 +5474,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // takes no absence.
                                             let held = t.alone_hand.filter(|(hand, _, _)| w.hand_id >= *hand);
                                             let returns = held.map_or(0, |(_, returns, _)| returns);
-                                            // `S1-KA`: **and carried by a majority of the
-                                            // seats with chips**, as the engine counts it in
-                                            // the hand: at the hand this client was in as it
-                                            // began to hear nobody -- a later hand has no more
-                                            // -- or, holding no such hand, every seat of the
-                                            // roster. Two rogues of four, the third seat
-                                            // certified out first, were the whole voter set
-                                            // about the fourth and named it a flooder. The
-                                            // voters here are every signature the certificate
-                                            // carries, a few more than the engine counts
-                                            // (a voter certified out or named silent in the
-                                            // hand): each is a seat that signed, and rogues
-                                            // are no more of them than there are rogues.
+                                            // `S1-KA`: **and signed by a majority of the seats
+                                            // with chips**: at the hand this client was in as it
+                                            // began to hear nobody -- a later hand has no more --
+                                            // or, holding no such hand, every seat of the roster.
+                                            // Two rogues of four, the third seat certified out
+                                            // first, were the whole voter set about the fourth
+                                            // and named it a flooder. Counted from the
+                                            // certificate's own voters, each a seat that signed:
+                                            // stricter than the engine, which counts a seat named
+                                            // silent in the hand as carrying it -- a client the
+                                            // table did put out for good may not take the word
+                                            // here then, and is told the table may not be safe
+                                            // instead (`S1-JR`).
                                             let with_chips = held.map_or(roster.seats().len(), |(_, _, n)| n);
                                             if voters.len() * 2 <= with_chips {
                                                 return None;
@@ -11312,7 +11316,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // does at its fourth absence.
                     let out_myself = t.hand.as_ref().and_then(|h| {
                         let me = h.my_seat();
-                        h.out_for_good_decided().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))
+                        // `S1-KA`: why, from the hand that decided it -- this one
+                        // once over, or the one the deal just put behind it.
+                        let why = if h.over() { Some(h) } else { t.previous.as_ref() };
+                        let flooded = why.is_some_and(|p| p.named_for_flooding(me));
+                        let cheated = why.is_some_and(|p| p.named_for_cheating(me));
+                        h.out_for_good_decided().contains(&me).then_some((me, flooded, cheated))
                     });
                     if let Some((me, flooded, cheated)) = out_myself {
                         if !t.out_told {
@@ -13363,6 +13372,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     h.hand_id()
                                 )))
                                 .await;
+                            // `S1-KA`: and its word for good, before it goes.
+                            if let Some(h) = t.hand.as_ref() {
+                                remove_by_the_word!(t, h);
+                            }
                             t.previous = t.hand.take();
                             continue;
                         }
@@ -13480,6 +13493,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(h) = t.hand.as_ref() {
                     t.unsettled_abort_here =
                         (h.aborted().is_some() && !h.late_settled()).then_some(h.hand_id());
+                }
+                // `S1-KA`: the word for good about the hand going behind, before it
+                // goes -- a hand this client gave up on its own budget is dealt on
+                // 800 ms later, before any tick has read it over.
+                if let Some(h) = t.hand.as_ref() {
+                    remove_by_the_word!(t, h);
                 }
                 // Retained, not dropped: a certificate about this hand that
                 // arrives during the next one still banks here (`S1-BS`).
@@ -22488,7 +22507,10 @@ mod a_joiner_before_the_first_hand {
             code.contains("if $h.over() { for seat in $h.certified_seats().to_vec() { let flooded = $h.named_for_flooding(seat); let cheated = $h.named_for_cheating(seat); let at_the_limit ="),
             "the group's word for good, once the hand is over"
         );
-        assert!(code.contains("h.out_for_good_decided().contains(&me).then_some((me, h.named_for_flooding(me), h.named_for_cheating(me)))"), "this client, once decided");
+        assert!(code.contains("h.out_for_good_decided().contains(&me).then_some((me, flooded, cheated))"), "this client, once decided");
+        assert!(code.contains("let why = if h.over() { Some(h) } else { t.previous.as_ref() };"), "and why, from the hand that decided it");
+        let behind = code.find("// Retained, not dropped: a certificate about this hand that").expect("the deal");
+        assert!(code[behind - 400..behind].contains("if let Some(h) = t.hand.as_ref() { remove_by_the_word!(t, h); }"), "the word before the deal puts the hand behind");
         assert!(code.contains("if !alone || !(flooded || cheated || absent) { return None; }"), "the lobby word");
     }
 
