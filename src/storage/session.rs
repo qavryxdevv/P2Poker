@@ -105,6 +105,13 @@ pub struct Record {
     /// by. Absent from a record written before it, which reads as `None`.
     #[n(18)]
     pub in_game: Option<Vec<u8>>,
+    /// `S1-KF` (`D-088`): the stacks this client's hand, and the one retained
+    /// before it, held by its own derivation -- each indexed by seat, at the
+    /// hand's start and at its settlement once over -- which a copy half the
+    /// table signed must name for a client started again to take it up.
+    /// Absent from a record written before it, which reads as `None`.
+    #[n(19)]
+    pub stacks: Option<Vec<Vec<u64>>>,
 }
 
 pub fn session_path(dir: &Path) -> PathBuf {
@@ -226,6 +233,7 @@ mod tests {
             founder_seed: [5; 32],
             roster_list: vec![0xCC; 180],
             in_game: Some(vec![0, 2, 4]),
+            stacks: Some(vec![vec![1_000, 0, 2_000, 0, 12_350], vec![900, 0, 2_100, 0, 12_350]]),
         }
     }
 
@@ -235,6 +243,7 @@ mod tests {
     fn a_record_from_before_the_seats_in_the_game_reads_with_none() {
         let mut old = a_record();
         old.in_game = None;
+        old.stacks = None;
         let bytes = minicbor::to_vec(&old).expect("encodes");
         let back: Record = minicbor::decode(&bytes).expect("decodes");
         assert_eq!(back.in_game, None);
@@ -266,6 +275,37 @@ mod tests {
         let legacy = e.into_writer();
         let back: Record = minicbor::decode(&legacy).expect("the older build's record reads");
         assert_eq!(back, old);
+        // And one with the seats in the game and without the stacks: the
+        // stacks read as none.
+        let mut first = a_record();
+        first.stacks = None;
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(19).unwrap();
+        e.u8(first.version).unwrap();
+        e.bytes(&first.table_id).unwrap();
+        e.bytes(&first.session_id).unwrap();
+        e.bytes(&first.table_key).unwrap();
+        e.encode(&first.founder_peer_id).unwrap();
+        e.str(&first.table_name).unwrap();
+        e.u8(first.my_seat).unwrap();
+        e.u64(first.hand_id).unwrap();
+        e.bytes(&first.terminal).unwrap();
+        e.u64(first.my_stack).unwrap();
+        e.u64(first.written_unix_ms).unwrap();
+        e.encode(&first.advert).unwrap();
+        e.bytes(&first.advert_hash).unwrap();
+        e.encode(&first.ratification).unwrap();
+        e.bytes(&first.hand_secret).unwrap();
+        e.u64(first.secret_hand_id).unwrap();
+        e.bytes(&first.founder_seed).unwrap();
+        e.encode(&first.roster_list).unwrap();
+        e.encode(&first.in_game).unwrap();
+        let nineteen = e.into_writer();
+        let back: Record = minicbor::decode(&nineteen).expect("a record with the seats and no stacks reads");
+        assert_eq!(back, first);
+        let with = a_record();
+        let back: Record = minicbor::decode(&minicbor::to_vec(&with).expect("encodes")).expect("decodes");
+        assert_eq!(back.stacks, with.stacks, "and one with them keeps them");
     }
 
     /// What is written is what is read, field by field, and it is the only

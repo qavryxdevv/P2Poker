@@ -208,6 +208,16 @@ impl std::fmt::Display for Failed {
 ///
 /// Passed as one struct rather than nine arguments, and every field is
 /// something the table already agreed on before the hand began.
+/// `S1-KF` (`D-088`): what one group of copies of a hand's opening offers
+/// the client that would take it up -- the seats other than its own that
+/// signed exactly it, the seats it deals in, and its stacks by seat (none
+/// where the body does not carry one per occupied seat).
+pub struct Offer<'a> {
+    pub signers: &'a [SeatIdx],
+    pub dealt_in: &'a [SeatIdx],
+    pub stacks: &'a [(SeatIdx, Chips)],
+}
+
 #[derive(Debug, Clone)]
 pub struct Opening {
     pub table_id: Hash,
@@ -453,20 +463,53 @@ impl Opening {
     pub fn adopt_with_signers(base: Opening, copies: &[Vec<u8>]) -> Result<(Opening, Vec<SeatIdx>), Failed> {
         let my_seat = base.my_seat;
         let others = base.seats.iter().filter(|(s, _, _)| *s != my_seat).count();
-        Self::adopt_with_signers_where(base, copies, |signers| {
-            signers.iter().filter(|s| **s != my_seat).count() * 2 > others
-        })
+        Self::adopt_with_signers_where(base, copies, |o: &Offer<'_>| o.signers.len() * 2 > others)
     }
 
-    /// [`Opening::adopt_with_signers`], the copies taken where `enough` says
-    /// the seats that signed the most-signed of them are enough -- `S1-KF`
-    /// (`D-088`): the node's count of the table, as `D-066` counts it, where
-    /// the one above is a strict majority of every other seat of the roster.
+    /// [`Opening::adopt_with_signers`], the copies taken where `accept` says
+    /// the group is the table's -- `S1-KF` (`D-088`): the node's count of the
+    /// table, as `D-066` counts it, where the one above is a strict majority
+    /// of every other seat of the roster. **Among the groups it accepts, the
+    /// one the most seats signed**: the count was asked of the most-signed
+    /// group alone, and two seats outside the count that signed one body
+    /// hid the table's own, which it took.
     pub fn adopt_with_signers_where(
         base: Opening,
         copies: &[Vec<u8>],
-        enough: impl Fn(&[SeatIdx]) -> bool,
+        accept: impl Fn(&Offer<'_>) -> bool,
     ) -> Result<(Opening, Vec<SeatIdx>), Failed> {
+        let mut first = None;
+        for (genesis, signers, body) in Self::accepted_groups(&base, copies, &accept) {
+            match Self::adopt_group(base.clone(), genesis, signers, body) {
+                Ok(taken) => return Ok(taken),
+                Err(e) => {
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        Err(first.unwrap_or(Failed::NotYet))
+    }
+
+    /// `S1-KF` (`D-088`): how many seats other than the adopter signed the
+    /// most-signed group of `copies` that `accept` takes -- the pick's measure,
+    /// as the adoption's; `None` where it takes none.
+    pub fn accepted_signers(base: &Opening, copies: &[Vec<u8>], accept: impl Fn(&Offer<'_>) -> bool) -> Option<usize> {
+        Self::accepted_groups(base, copies, &accept)
+            .first()
+            .map(|(_, s, _)| s.iter().filter(|x| **x != base.my_seat).count())
+    }
+
+    /// The copies of the opening, grouped by `(parent, body bytes)` -- the
+    /// parent of a stage-0 event is `GENESIS(k)` and the body is the
+    /// derivation's whole output -- those `accept` takes, the most-signed
+    /// first. `S1-JX`: the others' signatures decide, in the choice and in
+    /// the count -- the adopter's own copy of a previous life (`D-033`) says
+    /// nothing the table agreed to; and no signer other than it is never enough.
+    fn accepted_groups(
+        base: &Opening,
+        copies: &[Vec<u8>],
+        accept: &impl Fn(&Offer<'_>) -> bool,
+    ) -> Vec<(Hash, BTreeSet<SeatIdx>, HandInit)> {
         use std::collections::BTreeMap;
         // (parent, body bytes) -> (seats that signed exactly this, the body)
         let mut groups: BTreeMap<(Hash, Vec<u8>), (BTreeSet<SeatIdx>, HandInit)> = BTreeMap::new();
@@ -502,25 +545,38 @@ impl Opening {
                 .or_insert_with(|| (BTreeSet::new(), body));
             entry.0.insert(seat);
         }
-        // `S1-JX`: the others' signatures decide, in the choice and in the count
-        // below -- the adopter's own copy of a previous life (`D-033`) says
-        // nothing the table agreed to.
         let others_in = |s: &BTreeSet<SeatIdx>| s.iter().filter(|x| **x != base.my_seat).count();
-        let Some(((genesis, _), (signers, body))) = groups.into_iter().max_by_key(|(_, (s, _))| others_in(s))
-        else {
-            return Err(Failed::NotYet);
-        };
-        // Enough seats **other than the adopter's** (`enough`): the adopter is
-        // not a seat that could have agreed. Heads-up that is the one other
-        // seat, which is what lets a restarted client come back to a two-seat
-        // table at all (`S1-CX`). Its own signature among the copies is not
-        // counted (`S1-JX`): counted, the other seat said an old opening of this
-        // client's own again and it was adopted on nothing but that, with no
-        // look at its stacks.
-        let signed: Vec<SeatIdx> = signers.iter().copied().filter(|s| *s != base.my_seat).collect();
-        if signed.is_empty() || !enough(&signed) {
-            return Err(Failed::NotYet);
-        }
+        let mut taken: Vec<(Hash, BTreeSet<SeatIdx>, HandInit)> = groups
+            .into_iter()
+            .filter(|(_, (signers, body))| {
+                let signed: Vec<SeatIdx> = signers.iter().copied().filter(|s| *s != base.my_seat).collect();
+                if signed.is_empty() {
+                    return false;
+                }
+                // A body without one stack per occupied seat offers none; the
+                // adoption says why it is refused, if the count takes it.
+                let stacks: Vec<(SeatIdx, Chips)> = if body.stacks.len() == base.seats.len() {
+                    base.seats.iter().zip(body.stacks.iter()).map(|((s, _, _), st)| (*s, *st)).collect()
+                } else {
+                    Vec::new()
+                };
+                accept(&Offer { signers: &signed, dealt_in: &body.dealt_in, stacks: &stacks })
+            })
+            .map(|((genesis, _), (signers, body))| (genesis, signers, body))
+            .collect();
+        // The most-signed first; a tie keeps the groups' own order.
+        taken.sort_by_key(|(_, s, _)| std::cmp::Reverse(others_in(s)));
+        taken
+    }
+
+    /// One group of copies taken as the opening, once the count has taken it:
+    /// its stacks, its roster hash, its chips and its blinds checked.
+    fn adopt_group(
+        base: Opening,
+        genesis: Hash,
+        signers: BTreeSet<SeatIdx>,
+        body: HandInit,
+    ) -> Result<(Opening, Vec<SeatIdx>), Failed> {
         if body.stacks.len() != base.seats.len() {
             return Err(Failed::Elsewhere {
                 seat: base.my_seat,
@@ -1883,7 +1939,8 @@ pub struct Hand {
     /// `LONG_GONE_S`, as the node reads it ([`Hand::note_line_down_recently`]).
     /// A seat named by a certificate only half the table carries takes it then:
     /// it may really have been gone. With its line up all along it was here,
-    /// and it does not.
+    /// and it does not. `S1-KF` (`D-088`): and then it seals and votes toward
+    /// no such certificate of its own (`admissible_for`).
     line_down_recently: bool,
     /// `D-051`: the seats this client has voted about at the stage now open,
     /// whatever the cause -- one vote about one seat at one stage, so a
@@ -1910,6 +1967,9 @@ pub struct Hand {
     /// fewer carry, naming it -- the table may go on without it. Read by the
     /// node, which tells the player if nothing moves for it afterwards.
     half_refused: bool,
+    /// `S1-KF` (`D-088`): the seats that signed such a certificate -- the half
+    /// that went on apart from this client.
+    half_refused_by: BTreeSet<SeatIdx>,
     /// `D-084`: set by a handler that took a frame and did nothing with it --
     /// a further proof from a seat whose proof failed here -- and read once
     /// where frames are kept, so that frame is not kept either: each re-signed
@@ -2510,6 +2570,7 @@ impl Hand {
                 cheat_named: BTreeSet::new(),
                 pending_cheat: None,
                 half_refused: false,
+                half_refused_by: BTreeSet::new(),
                 unkept: false,
                 proven_cheat: None,
                 cert_ended: false,
@@ -6419,6 +6480,18 @@ impl Hand {
         self.half_refused
     }
 
+    /// `S1-KF` (`D-088`): the seats that signed the certificate this client
+    /// refused as half the table's -- the half that went on without it.
+    pub fn half_refused_by(&self) -> Vec<SeatIdx> {
+        self.half_refused_by.iter().copied().collect()
+    }
+
+    /// `S1-KF` (`D-088`): the seats outside this hand that opened its number
+    /// at a genesis this client does not hold -- their own game's hand.
+    pub fn foreign_outside_seats(&self) -> Vec<SeatIdx> {
+        self.foreign_outside.iter().copied().collect()
+    }
+
     /// `S1-JR`: the seat whose proof voided this hand, the cause (2 a shuffle,
     /// 3 a reveal share), and whether this client's own check found it or it
     /// checked another seat's evidence -- `None` for any other hand.
@@ -7039,6 +7112,17 @@ impl Hand {
     /// words it holds and its own reading of who is long gone. `silent`: the
     /// seats of `named` that are voters named silent (`D-065`), which are not
     /// waited on and so neither relax the floor nor keep it.
+    ///
+    /// `S1-KF` (`D-088`): **and not by half the table, while this client's own
+    /// line was down within `LONG_GONE_S`.** It may have been the one cut off:
+    /// it takes a certificate half the table carries naming it then (`D-066`
+    /// point 4), and it seals and votes toward none against the other half.
+    /// Two seats holding the lowest seat, back from an outage together, put
+    /// the half that had stayed out on their stale stage -- and that half, its
+    /// line sound all along, refused the certificate and played on apart: two
+    /// games, where the half that stayed calls its hands off at their openings
+    /// and this client comes back to it by `D-038`. A majority, the long gone,
+    /// and the seats that resigned are counted as ever.
     fn admissible_for(&self, voters: &[SeatIdx], named: &[SeatIdx], silent: &[SeatIdx]) -> bool {
         let resigned: Vec<SeatIdx> = named.iter().copied().filter(|s| self.leave_words.contains_key(s)).collect();
         let waited: Vec<SeatIdx> = named
@@ -7047,7 +7131,12 @@ impl Hand {
             .filter(|s| !silent.contains(s) && !resigned.contains(s))
             .collect();
         let relaxed = !waited.is_empty() && waited.iter().all(|s| self.long_gone.contains(s));
-        Self::floor_holds_for(voters, named, &resigned, relaxed)
+        if !Self::floor_holds_for(voters, named, &resigned, relaxed) {
+            return false;
+        }
+        let quiet = named.iter().filter(|s| !resigned.contains(s)).count();
+        let by_half_alone = !relaxed && quiet > 0 && !Self::admissible(voters.len(), quiet);
+        !(by_half_alone && self.line_down_recently)
     }
 
     /// The floor, told to the player once per hand when it is what holds
@@ -7288,16 +7377,12 @@ impl Hand {
         self.cert_ended && matches!(self.phase, Phase::Aborted(_))
     }
 
-    /// `S1-JR`: the seats still in the game at this boundary -- at the table,
-    /// with chips, not out for good -- whoever the running hand deals in. A
-    /// hand of two at a table of three such seats is no heads-up game: the
-    /// third seat, certified out and kept out, is a player all the same --
-    /// unless its player left by its own word.
     /// `S1-KF` (`D-088`): the seats this client counts as the table in
     /// `D-038` -- the hand's required and returned seats and this client,
-    /// less those this hand certified out or put out for good, and, once the
-    /// hand is over, those it left without chips. Read from this client's own
-    /// hand, which no other seat's copy can shrink.
+    /// less those this hand certified out or put out for good, those whose
+    /// player left by its own signed word, and, once the hand is over, those
+    /// it left without chips. Read from this client's own hand, which no
+    /// other seat's copy can shrink.
     pub fn table_for_the_count(&self) -> Vec<SeatIdx> {
         let out = self.out_for_good();
         let over = self.over();
@@ -7308,7 +7393,7 @@ impl Hand {
             .iter()
             .chain(self.returned.iter())
             .copied()
-            .filter(|s| !self.certified.contains(s) && !out.contains(s))
+            .filter(|s| !self.certified.contains(s) && !out.contains(s) && !self.leave_words.contains_key(s))
             .filter(|s| !over || self.boundary_stack_of(*s) > 0)
             .chain(std::iter::once(me))
             .collect();
@@ -7317,6 +7402,11 @@ impl Hand {
         table
     }
 
+    /// `S1-JR`: the seats still in the game at this boundary -- at the table,
+    /// with chips, not out for good -- whoever the running hand deals in. A
+    /// hand of two at a table of three such seats is no heads-up game: the
+    /// third seat, certified out and kept out, is a player all the same --
+    /// unless its player left by its own word.
     pub fn seats_in_the_game(&self) -> usize {
         let out = self.out_for_good();
         self.open
@@ -9015,6 +9105,7 @@ impl Hand {
         let takes = !c.subject.names_silent(me) && self.line_down_recently && !for_good;
         if !Self::admissible(voter_seats.len(), named.len()) && named.contains(&me) && !takes {
             self.half_refused = true;
+            self.half_refused_by.extend(voter_seats.iter().copied());
             if self.shortfall_said.insert(c.subject.digest()) {
                 self.cert_note.push(format!(
                     "cert: from seat {seat} about {}, carried by {} voter(s) -- half the table or fewer -- names this client, which is here: not taken (D-066)",
@@ -17596,16 +17687,57 @@ mod tests {
     fn copies_are_taken_where_the_count_given_says_their_signers_are_enough() {
         let (hands, keys) = a_table_after_hand_one();
         let (copies, _) = hand_two_copies(&hands, &keys);
-        let three = |s: &[SeatIdx]| s.len() >= 3;
+        let three = |o: &Offer<'_>| o.signers.len() >= 3;
         assert!(
             matches!(Opening::adopt_with_signers_where(adopter_base(), &copies[..2], three), Err(Failed::NotYet)),
             "two signers where the count asks three"
         );
         let (_, signers) = Opening::adopt_with_signers_where(adopter_base(), &copies[..3], three).expect("three signers");
         assert_eq!(signers.len(), 3);
-        let never_mine = |s: &[SeatIdx]| !s.contains(&3) && !s.is_empty();
+        let never_mine = |o: &Offer<'_>| !o.signers.contains(&3) && !o.signers.is_empty();
         assert!(Opening::adopt_with_signers_where(adopter_base(), &copies[..1], never_mine).is_ok(), "the count's own word");
-        assert!(matches!(Opening::adopt_with_signers_where(adopter_base(), &[], |_| true), Err(Failed::NotYet)), "no signer is never enough");
+        assert!(
+            matches!(Opening::adopt_with_signers_where(adopter_base(), &[], |_: &Offer<'_>| true), Err(Failed::NotYet)),
+            "no signer is never enough"
+        );
+    }
+
+    /// `S1-KF` (`D-088`): of the groups of copies, the one the count takes --
+    /// the count was asked of the most-signed group alone, and two seats'
+    /// copies of the hand at another genesis tied the table's own and hid it.
+    /// The count sees the stacks by seat and the seats dealt in.
+    #[test]
+    fn the_group_the_count_takes_is_taken_not_the_most_signed_alone() {
+        let (hands, keys) = a_table_after_hand_one();
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        let forged: Vec<Vec<u8>> = [1usize, 2]
+            .iter()
+            .map(|m| {
+                let mut o = hands[*m].next_hand().expect("hand 2");
+                o.genesis = [0xFF; 32];
+                let (_, sends) = Hand::open(o, &keys[*m], NOW, 30_000).unwrap();
+                bytes_of(&sends).remove(0)
+            })
+            .collect();
+        let all = vec![copies[0].clone(), copies[1].clone(), forged[0].clone(), forged[1].clone()];
+        let with_seat_0 = |o: &Offer<'_>| o.signers.len() >= 2 && o.signers.contains(&0);
+        let (adopted, signers) =
+            Opening::adopt_with_signers_where(adopter_base(), &all, with_seat_0).expect("the table's own group");
+        assert_eq!(signers, vec![0, 1]);
+        assert_ne!(adopted.genesis, [0xFF; 32], "not the group at the other genesis");
+        assert_eq!(Opening::accepted_signers(&adopter_base(), &all, with_seat_0), Some(2));
+        let only_forged = |o: &Offer<'_>| o.signers == [1, 2];
+        let (adopted, _) = Opening::adopt_with_signers_where(adopter_base(), &all, only_forged).expect("the count's word");
+        assert_eq!(adopted.genesis, [0xFF; 32]);
+        assert_eq!(Opening::accepted_signers(&adopter_base(), &all, |_: &Offer<'_>| false), None);
+        // What the count is offered.
+        let control = hands[3].next_hand().expect("the control derives hand 2");
+        let sees = |o: &Offer<'_>| {
+            o.stacks.iter().map(|(s, _)| *s).collect::<Vec<_>>() == vec![0, 1, 2, 3]
+                && o.stacks.iter().all(|(s, st)| control.seats.iter().any(|(x, _, c)| x == s && c == st))
+                && !o.dealt_in.is_empty()
+        };
+        assert!(Opening::adopt_with_signers_where(adopter_base(), &copies, sees).is_ok(), "stacks by seat, and the seats dealt in");
     }
 
     /// `S1-KF` (`D-088`): a hand counts as the table its required and returned
@@ -18476,6 +18608,30 @@ mod tests {
         let (a, b) = (hands[0].next_hand().expect("next"), hands[1].next_hand().expect("next"));
         assert_eq!(a.required, vec![0, 1]);
         assert_eq!(a.genesis, b.genesis, "one GENESIS(k+1)");
+    }
+
+    /// `S1-KF` (`D-088`): a seat whose own line was down within `LONG_GONE_S`
+    /// may have been the one cut off -- it casts no vote toward a certificate
+    /// only half the table carries, and the stage's deadline ends the hand;
+    /// a majority's it casts as ever.
+    #[test]
+    fn a_seat_back_from_an_outage_does_not_certify_the_other_half() {
+        let t1 = NOW + 30_000;
+        let (mut hands, keys) = present_and_quiet(4, 2);
+        hands[0].note_line_down_recently(true);
+        assert!(
+            hands[0].vote_on_timeouts(&keys[0], t1, 0).unwrap().is_empty(),
+            "no vote toward half the table's certificate"
+        );
+        assert!(hands[0].may_abandon(t1 + 1_000), "no certificate possible: the deadline ends the hand");
+        assert!(!bytes_of_sends(hands[1].vote_on_timeouts(&keys[1], t1, 0).unwrap()).is_empty(), "its line sound, seat 1 votes");
+        let (mut hands, keys) = present_and_quiet(4, 3);
+        hands[0].note_line_down_recently(true);
+        assert_eq!(
+            bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], t1, 0).unwrap()).len(),
+            1,
+            "a majority's vote, as ever"
+        );
     }
 
     /// `D-066`: the half without the lowest seat cannot certify the half with
