@@ -16745,7 +16745,10 @@ fn stash_for_resume(
             copies.iter().filter_map(|b| signer_of(b)).collect()
         };
         if !inits.contains_key(&hand_id) {
-            // A seat alone at a hand id gives it up for its next one.
+            // A seat alone at a hand id gives it up for its next one -- the
+            // opening it signed, and not the hand's other frames, which other
+            // seats may have signed: a rogue that opened the running hand first
+            // and then another wiped the hand a client restarted into.
             let alone: Vec<u64> = inits
                 .iter()
                 .filter(|(_, c)| {
@@ -16755,7 +16758,7 @@ fn stash_for_resume(
                 .map(|(h, _)| *h)
                 .collect();
             for h in alone {
-                drop_hand(inits, early, h);
+                inits.remove(&h);
             }
             if inits.len() >= RESUME_INIT_HANDS {
                 // Not reached while each seat holds one alone and two are
@@ -21628,6 +21631,17 @@ mod late_roster_tests {
             assert!(stash_for_resume(&seal(EventType::HandInit, h, 0, 3), &mut inits, &mut early));
         }
         assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![6, 7, 1_009], "one hand id of its own");
+        // ... and giving an opening up takes none of the hand's other frames
+        // with it: seat 3 opened hand 2, others' frames of hand 2 came, seat 3
+        // opened another.
+        assert!(stash_for_resume(&seal(EventType::HandInit, 2, 0, 3), &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::DeckInit, 2, 5, 1), &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::HandInit, 1_010, 0, 3), &mut inits, &mut early));
+        assert!(!inits.contains_key(&2), "its opening given up");
+        assert!(early.iter().any(|(h, _)| *h == 2), "the hand's other frames kept");
+        early.clear();
+        assert!(stash_for_resume(&seal(EventType::HandInit, 1_009, 0, 3), &mut inits, &mut early));
+        inits.remove(&1_010);
         // ... and the table's next hand still comes in.
         assert!(stash_for_resume(&seal(EventType::HandInit, 8, 0, 0), &mut inits, &mut early));
         assert!(stash_for_resume(&seal(EventType::HandInit, 8, 0, 2), &mut inits, &mut early));
