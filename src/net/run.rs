@@ -3301,7 +3301,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // two hand ids, one copy per seat, `RESUME_EARLY_CAP`
                                         // other frames -- so an ordinary table's pause skew costs
                                         // a few frames of memory and nothing else.
-                                        if hand_id > $h.hand_id() {
+                                        // `S1-JX`: a roster seat's frame only -- a key that
+                                        // holds no seat signed openings of hands far ahead
+                                        // and evicted the table's own copies.
+                                        if hand_id > $h.hand_id() && seat.is_some() {
                                             let _ = stash_for_resume($bytes, &mut $t.resume_inits, &mut $t.resume_early);
                                         }
                                         // `S1-CX`: the next hand's opening from a seat one
@@ -15150,14 +15153,22 @@ fn stood_too_long(stood: std::time::Duration, turn_allowance: Option<std::time::
 fn watch_progress(t: &mut TableRun) {
     let now = std::time::Instant::now();
     // `S1-JY`: a certificate only half the table carried named this client, and
-    // it did not take it -- noted once a hand; forgotten once a later hand is
-    // being played with it.
-    if let Some(h) = t.hand.as_ref() {
-        if h.refused_half_certificate() && t.half_refused.map_or(true, |(k, _)| k != h.hand_id()) {
-            t.half_refused = Some((h.hand_id(), now));
-        } else if t.half_refused.is_some_and(|(k, _)| h.hand_id() > k && h.street().is_some()) {
-            t.half_refused = None;
+    // it did not take it -- in the running hand or the one retained before it
+    // -- noted once a hand; forgotten once a later hand is being played with it.
+    let refused = t
+        .hand
+        .iter()
+        .chain(t.previous.iter())
+        .filter(|h| h.refused_half_certificate())
+        .map(|h| h.hand_id())
+        .max();
+    if let Some(k) = refused {
+        if t.half_refused.map_or(true, |(seen, _)| seen < k) {
+            t.half_refused = Some((k, now));
         }
+    }
+    if t.half_refused.is_some_and(|(k, _)| t.hand.as_ref().is_some_and(|h| h.hand_id() > k && h.street().is_some())) {
+        t.half_refused = None;
     }
     t.stands = match t.hand.as_ref().filter(|h| !h.over()) {
         Some(h) => {
@@ -20766,7 +20777,11 @@ mod tests {
         let src = include_str!("run.rs");
         let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
         let watch = code.find("fn watch_progress(t: &mut TableRun) {").expect("the watch");
-        assert!(code[watch..watch + 900].contains("h.refused_half_certificate()"), "noted where progress is watched");
+        assert!(
+            code[watch..watch + 1_200].contains(".chain(t.previous.iter())\n        .filter(|h| h.refused_half_certificate())"),
+            "noted where progress is watched, the retained hand's too"
+        );
+        assert!(code.contains("if hand_id > $h.hand_id() && seat.is_some() {"), "a later hand's frames kept from roster seats only");
         let reason = code.find("fn no_progress_reason(").expect("the reasons");
         assert!(
             code[reason..reason + 4_000].contains("    if t.half_refused.is_some_and(|(_, at)| now.duration_since(at) >= HALF_REFUSED_LIMIT) {\n        return Some("),
