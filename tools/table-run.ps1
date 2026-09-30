@@ -328,6 +328,12 @@ param(
     [ValidateRange(0, 9)][int]$DeafToSeat = 3,
     [ValidateRange(0, 3600)][int]$DeafToAt = 0,
     [ValidateRange(0, 3600)][int]$DeafToFor = 0,
+    # `-DeafToActions` (S1-KB's bed): with `-DeafToFor`, only that seat's betting
+    # actions go unheard -- the writer before a seat keeping its action from it.
+    [switch]$DeafToActions,
+    # `-NoSayAgain` (S1-KB's control): no node says another seat's betting action
+    # again. Needs `--features fault-harness`.
+    [switch]$NoSayAgain,
     # `-OfflineNodes <list>`: `-OfflineAt`'s outage for several nodes at once (the
     # far end of a table losing its line together, D-066) instead of `-OfflineNode`.
     [string]$OfflineNodes = '',
@@ -467,6 +473,10 @@ Write-Host ''
 # -RedirectStandardOutput` would be shorter and would lose the timing, which is
 # the half of the measurement that says WHERE a hand's time goes.
 $t0 = Get-Date
+# `S1-KB`: for every node -- the jobs, and the nodes they start, take this
+# process's environment -- and cleared otherwise, so no run inherits the last.
+if ($DeafToActions) { $env:P2P_POKER_DEAF_TO_ACTIONS = '1' } else { Remove-Item Env:P2P_POKER_DEAF_TO_ACTIONS -ErrorAction SilentlyContinue }
+if ($NoSayAgain) { $env:P2P_POKER_NO_SAY_AGAIN = '1' } else { Remove-Item Env:P2P_POKER_NO_SAY_AGAIN -ErrorAction SilentlyContinue }
 $jobs = @()
 for ($i = 0; $i -lt $nodeCount; $i++) {
     $profileDir = Join-Path $work "n$i"
@@ -727,7 +737,10 @@ if ($noAnswerList.Count -gt 0) {
     Write-Host "==> $(if ($noAnswerList -contains 'all') { 'every node' } else { 'n' + ($noAnswerList -join ', n') }) answer(s) no vote with the frame it lacks (D-065 off, a contrast run; needs --features fault-harness)"
 }
 if ($DeafToFor -gt 0) {
-    Write-Host "==> n$DeafToNode hears nothing seat $DeafToSeat's member delivers itself from $DeafToAt s for $DeafToFor s, and what the others say again (D-065's bed; needs --features fault-harness)"
+    Write-Host "==> n$DeafToNode hears nothing seat $DeafToSeat's member delivers itself$(if ($DeafToActions) { ' of its betting actions' }) from $DeafToAt s for $DeafToFor s, and what the others say again (D-065's bed$(if ($DeafToActions) { ", S1-KB's" }); needs --features fault-harness)"
+}
+if ($NoSayAgain) {
+    Write-Host "==> no node says another seat's betting action again (S1-KB's control; needs --features fault-harness)"
 }
 if ($offList.Count -gt 0 -and $OfflineAt -gt 0) {
     Write-Host "==> n$($offList -join ', n') lose their INTERNET together at $OfflineAt s for $OfflineFor s, at the socket (D-066)"

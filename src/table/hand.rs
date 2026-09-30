@@ -1002,6 +1002,14 @@ pub const NEXT_EARLY_BYTES: usize =
 /// highest sequence, never the oldest arrival.
 pub const EARLY_CAP: usize = 100;
 
+/// `S1-KB`: the largest frame said again for another seat -- a betting action
+/// is a few hundred bytes (`ACTION_CAP` and its envelope).
+const SAID_AGAIN_MAX: usize = 512;
+
+/// `S1-KB`: how many actions wait to be said again before the node drains
+/// them -- a bound, not a rate: the node drains after every frame and tick.
+const SAID_AGAIN_CAP: usize = 64;
+
 /// And the bytes, because a slot without a ceiling is a `FRAME_CAP` slot.
 ///
 /// Twice the pre-open buffer's budget: `begin_hand_with` pours both pre-open
@@ -2130,6 +2138,9 @@ pub struct Hand {
     /// said again by the node beside its own frames.
     transcript: Vec<Vec<u8>>,
     transcript_seen: BTreeSet<Hash>,
+    /// `S1-KB`: another seat's betting actions this hand took, each the first
+    /// time it took it, for the node to say again once (`take_said_again`).
+    said_again: Vec<Vec<u8>>,
     params: std::sync::Arc<DeckParams>,
     /// Events for a stage this client has not reached. Held rather than
     /// refused, because GossipSub does not order two messages and a peer that
@@ -2440,6 +2451,7 @@ impl Hand {
                 muck_held_until_ms: None,
                 transcript: Vec::new(),
                 transcript_seen: BTreeSet::new(),
+                said_again: Vec::new(),
                 voice,
                 own_init,
                 abort_hold_said: None,
@@ -2584,6 +2596,11 @@ impl Hand {
             let digest: Hash = *blake3::hash(bytes).as_bytes();
             if self.transcript_seen.insert(digest) {
                 self.transcript.push(bytes.to_vec());
+                // `S1-KB`: another seat's betting action, taken now for the
+                // first time -- verified, in its slot, the hand moved by it.
+                if self.says_again(kind, bytes) {
+                    self.said_again.push(bytes.to_vec());
+                }
             }
         }
         // **Caught here, because here is where the frame still exists.** A
@@ -9531,6 +9548,50 @@ impl Hand {
         }
     }
 
+    /// `S1-KB`: whether a frame this hand has just taken, for the first time,
+    /// is one the node says again to the table's group: another seat's betting
+    /// action, at a hand dealt to three seats or more.
+    ///
+    /// **The writer before a seat can keep its action from that seat alone.** A
+    /// Tox group message goes from its sender to each member, and nothing passes
+    /// it on; a rogue's client can leave one member out, or send to it late. The
+    /// others took the action and started the next seat's clock, the next seat
+    /// never saw its turn, and at its deadline every other seat -- the rogue with
+    /// them -- certified it: its chips in the pot forfeited, hand after hand, by
+    /// one rogue. Said again by every seat that takes it, the action reaches the
+    /// seat from any honest one a hop later.
+    ///
+    /// **Once, and only what the hand took.** Asked where the frame enters the
+    /// transcript -- verified, in its slot, the hand moved by it -- so a copy of
+    /// a stage the hand has left, which `on_event` answers `Ok` and nothing, is
+    /// never said again: said again, every copy made more (`run053626-4`, 13 300
+    /// in six seconds at four seats); and a frame taken on the replay of held
+    /// ones is said like any other. This client's own actions leave through
+    /// `say`, never through here -- but for one taken back from the table's
+    /// copies after a restart, said again as harmlessly as any other seat's.
+    /// Heads-up there is nobody else to say it to. Not a cryptographic frame:
+    /// those are large, and what keeping one from a seat costs it is written in
+    /// `S1-KB`'s row.
+    fn says_again(&self, kind: EventType, bytes: &[u8]) -> bool {
+        self.mine.dealt_in.len() >= 3
+            && matches!(
+                kind,
+                EventType::ActionCheck
+                    | EventType::ActionCall
+                    | EventType::ActionBet
+                    | EventType::ActionRaise
+                    | EventType::ActionFold
+            )
+            && bytes.len() <= SAID_AGAIN_MAX
+            && self.said_again.len() < SAID_AGAIN_CAP
+    }
+
+    /// `S1-KB`: the betting actions of other seats this hand has taken since
+    /// the last call, to be said again once to the table's group.
+    pub fn take_said_again(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.said_again)
+    }
+
     /// How many events are being held for a stage this client has not reached.
     pub fn held(&self) -> usize {
         self.early.len()
@@ -14846,6 +14907,36 @@ mod tests {
             pending = next;
         }
         ([a, b, c], keys)
+    }
+
+    /// `S1-KB`: another seat's betting action, the first time the hand takes
+    /// it, is handed to the node to say again -- once: a copy after it is
+    /// nothing; what this client says itself it does not queue; heads-up nothing is.
+    #[test]
+    fn another_seats_action_is_said_again_once() {
+        let (mut hands, keys) = three_to_the_bet();
+        for h in hands.iter_mut() {
+            let _ = h.take_said_again();
+        }
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let sends = hands[up].act(Action::Fold, &keys[up], NOW).expect("a fold is always legal");
+        let frames = bytes_of(&sends);
+        assert!(hands[up].take_said_again().is_empty(), "what it says itself leaves through `say`");
+        for i in (0..3).filter(|i| *i != up) {
+            let _ = deliver(&mut hands[i], &sends, &keys[i]);
+            let again = hands[i].take_said_again();
+            assert_eq!(again.len(), 1, "seat {i}: the action, once");
+            assert!(frames.contains(&again[0]), "seat {i}: the very bytes");
+            let _ = deliver(&mut hands[i], &sends, &keys[i]);
+            assert!(hands[i].take_said_again().is_empty(), "seat {i}: a copy after it is nothing");
+        }
+
+        let (mut hu, hu_keys, _, _, _) = heads_up_to_the_first_bet();
+        let up = usize::from(hu[0].turn().expect("somebody is to act").seat);
+        let sends = hu[up].act(Action::Fold, &hu_keys[up], NOW).expect("a fold is always legal");
+        let other = 1 - up;
+        let _ = deliver(&mut hu[other], &sends, &hu_keys[other]);
+        assert!(hu[other].take_said_again().is_empty(), "heads-up there is nobody else to say it to");
     }
 
     /// **One peer cannot take the action from a player who was about to act.**

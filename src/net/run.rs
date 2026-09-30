@@ -2966,6 +2966,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             say_the_cards!($t, $h);
         }};
     }
+    // `S1-KB`: another seat's betting actions the hand took, said again once
+    // to the table's group -- the writer before a seat can keep its action
+    // from that seat alone (`Hand::take_said_again`). After every frame the
+    // hand judges, and on the tick for what a replay elsewhere took.
+    macro_rules! say_again {
+        ($t:ident, $h:expr) => {{
+            let again = $h.take_said_again();
+            if !again.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() && !no_saying_again() {
+                for b in &again {
+                    if $t.tox_sink.try_broadcast(b) && cfg!(feature = "fault-harness") {
+                        let n = SAID_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n == 1 || n % 50 == 0 {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "fault-harness: {n} betting action(s) of other seats said again (S1-KB)"
+                                )))
+                                .await;
+                        }
+                    }
+                }
+            }
+        }};
+    }
     macro_rules! hand_event {
         ($t:ident, $h:expr, $bytes:expr) => {{
             use crate::table::hand::Failed;
@@ -3064,6 +3087,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // hears out-of-order messages as a matter
                                 // of course rather than as an exception.
                                 let (mut more, held_failures) = $h.replay_early(&app_key, now);
+                                // `S1-KB`: and the betting actions of other seats
+                                // the hand took, the held ones too, said again.
+                                say_again!($t, $h);
                                 let mut sends = sends;
                                 sends.append(&mut more);
                                 for e in held_failures {
@@ -11275,7 +11301,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // `D-045`: and on the tick, for a word the moment missed.
-                    if let Some(h) = t.hand.as_ref() {
+                    // `S1-KB`: and the actions a replay elsewhere took, said again.
+                    if let Some(h) = t.hand.as_mut() {
+                        say_again!(t, h);
                         remove_by_the_word!(t, h);
                     }
                     // `D-047`: this seat itself, certified out for the fourth time, is
@@ -16589,7 +16617,34 @@ fn deaf_to_member(member: [u8; 32], bytes: &[u8], h: &crate::table::hand::Hand) 
         }
         return false;
     }
-    age >= at && age < at.saturating_add(dur) && *learnt == Some(member)
+    // `-DeafToActions` (`S1-KB`'s bed): its betting actions alone -- the
+    // writer before a seat that keeps its action from that seat.
+    static ACTIONS_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let only_actions = *ACTIONS_ONLY.get_or_init(|| std::env::var("P2P_POKER_DEAF_TO_ACTIONS").is_ok());
+    age >= at
+        && age < at.saturating_add(dur)
+        && *learnt == Some(member)
+        && (!only_actions
+            || crate::net::chained::peek(bytes, TABLE_FRAME_PEEK).is_ok_and(|(kind, _, _)| is_betting_action(kind)))
+}
+
+/// A betting action's event type -- the five a betting stage takes.
+fn is_betting_action(kind: crate::protocol::messages::EventType) -> bool {
+    use crate::protocol::messages::EventType as E;
+    matches!(kind, E::ActionCheck | E::ActionCall | E::ActionBet | E::ActionRaise | E::ActionFold)
+}
+
+/// fault-harness: the betting actions of other seats said again, for the log.
+static SAID_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// fault-harness: `P2P_POKER_NO_SAY_AGAIN` -- `S1-KB`'s control: no betting
+/// action is said again. Read once; `false` in every build without the feature.
+fn no_saying_again() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static NO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO.get_or_init(|| std::env::var("P2P_POKER_NO_SAY_AGAIN").is_ok())
 }
 
 /// fault-harness: `P2P_POKER_NO_VOTE` -- this client says no `TIMEOUT_VOTE`
@@ -21338,6 +21393,27 @@ mod late_roster_tests {
             })
             .collect();
         assert_eq!(kinds, vec![(EventType::HandAbort, 7), (EventType::StateHash, 7)]);
+    }
+
+    /// `S1-KB`: the node says again what the hand hands it -- after every frame
+    /// the hand judges, the held ones replayed with it, and on the tick -- and
+    /// nothing of its own choosing.
+    #[test]
+    fn the_node_says_again_what_the_hand_took() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let judged = code
+            .find("let (mut more, held_failures) = $h.replay_early(&app_key, now);")
+            .expect("the held replayed");
+        let said = code[judged..].find("say_again!($t, $h);").expect("said again after the replay");
+        assert!(said < 200, "right after it");
+        assert!(
+            code.contains("let again = $h.take_said_again(); if !again.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() && !no_saying_again() {"),
+            "what the hand took, and nothing else"
+        );
+        let tick = code.find("// `D-045`: and on the tick, for a word the moment missed.").expect("the tick");
+        assert!(code[tick..tick + 400].contains("say_again!(t, h);"), "and on the tick");
     }
 
     /// Ties deal on, with this client's own seat counted on its side.
