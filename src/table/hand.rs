@@ -1003,8 +1003,11 @@ pub const NEXT_EARLY_BYTES: usize =
 pub const EARLY_CAP: usize = 100;
 
 /// `S1-KB`: the largest frame said again for another seat -- a betting action
-/// is a few hundred bytes (`ACTION_CAP` and its envelope).
-const SAID_AGAIN_MAX: usize = 512;
+/// is some two hundred bytes (`ACTION_CAP` and its envelope).
+const SAID_AGAIN_MAX: usize = 256;
+
+/// `S1-KB`: how many seats dealt in after an action's writer say it again.
+const SAYERS: usize = 3;
 
 /// `S1-KB`: how many actions wait to be said again before the node drains
 /// them -- a bound, not a rate: the node drains after every frame and tick.
@@ -2141,6 +2144,10 @@ pub struct Hand {
     /// `S1-KB`: another seat's betting actions this hand took, each the first
     /// time it took it, for the node to say again once (`take_said_again`).
     said_again: Vec<Vec<u8>>,
+    /// `S1-KB`: the seat whose frame `on_action` just applied as a betting
+    /// action -- whatever type its writer signed it under -- read where the
+    /// frame enters the transcript.
+    took_action: Option<SeatIdx>,
     params: std::sync::Arc<DeckParams>,
     /// Events for a stage this client has not reached. Held rather than
     /// refused, because GossipSub does not order two messages and a peer that
@@ -2452,6 +2459,7 @@ impl Hand {
                 transcript: Vec::new(),
                 transcript_seen: BTreeSet::new(),
                 said_again: Vec::new(),
+                took_action: None,
                 voice,
                 own_init,
                 abort_hold_said: None,
@@ -2592,13 +2600,15 @@ impl Hand {
         // the survivor said only its own frames again). `D-084`: not a frame
         // the handler took and did nothing with.
         let unkept = std::mem::take(&mut self.unkept);
+        let took = self.took_action.take();
         if out.is_ok() && !unkept {
             let digest: Hash = *blake3::hash(bytes).as_bytes();
             if self.transcript_seen.insert(digest) {
                 self.transcript.push(bytes.to_vec());
                 // `S1-KB`: another seat's betting action, taken now for the
-                // first time -- verified, in its slot, the hand moved by it.
-                if self.says_again(kind, bytes) {
+                // first time -- verified, in its slot, applied, the hand moved
+                // by it.
+                if took.is_some_and(|writer| self.says_again(writer, bytes)) {
                     self.said_again.push(bytes.to_vec());
                 }
             }
@@ -4120,7 +4130,13 @@ impl Hand {
                 });
             }
         }
-        self.apply_action(seat, action, kind, opened.event_hash, key, now_ms)
+        let out = self.apply_action(seat, action, kind, opened.event_hash, key, now_ms)?;
+        // `S1-KB`: applied as a betting action, whatever type it was signed
+        // under -- every type this path is reached by but a bet, a raise, a
+        // fold and a check is taken as a call, and a writer that signed its
+        // call under another kept it from being said again.
+        self.took_action = Some(seat);
+        Ok(out)
     }
 
     /// Apply an action that has been checked into place, and move the hand on.
@@ -9549,8 +9565,9 @@ impl Hand {
     }
 
     /// `S1-KB`: whether a frame this hand has just taken, for the first time,
-    /// is one the node says again to the table's group: another seat's betting
-    /// action, at a hand dealt to three seats or more.
+    /// and applied as `writer`'s betting action, is one this client says again
+    /// to the table's group: at a hand dealt to three seats or more, when this
+    /// client is one of the `SAYERS` seats dealt in after the writer.
     ///
     /// **The writer before a seat can keep its action from that seat alone.** A
     /// Tox group message goes from its sender to each member, and nothing passes
@@ -9558,32 +9575,34 @@ impl Hand {
     /// others took the action and started the next seat's clock, the next seat
     /// never saw its turn, and at its deadline every other seat -- the rogue with
     /// them -- certified it: its chips in the pot forfeited, hand after hand, by
-    /// one rogue. Said again by every seat that takes it, the action reaches the
-    /// seat from any honest one a hop later.
+    /// one rogue. Said again by the seats after the writer, the action reaches
+    /// the seat from any honest one of them a hop later.
     ///
     /// **Once, and only what the hand took.** Asked where the frame enters the
     /// transcript -- verified, in its slot, the hand moved by it -- so a copy of
     /// a stage the hand has left, which `on_event` answers `Ok` and nothing, is
     /// never said again: said again, every copy made more (`run053626-4`, 13 300
     /// in six seconds at four seats); and a frame taken on the replay of held
-    /// ones is said like any other. This client's own actions leave through
-    /// `say`, never through here -- but for one taken back from the table's
-    /// copies after a restart, said again as harmlessly as any other seat's.
-    /// Heads-up there is nobody else to say it to. Not a cryptographic frame:
-    /// those are large, and what keeping one from a seat costs it is written in
-    /// `S1-KB`'s row.
-    fn says_again(&self, kind: EventType, bytes: &[u8]) -> bool {
-        self.mine.dealt_in.len() >= 3
-            && matches!(
-                kind,
-                EventType::ActionCheck
-                    | EventType::ActionCall
-                    | EventType::ActionBet
-                    | EventType::ActionRaise
-                    | EventType::ActionFold
-            )
-            && bytes.len() <= SAID_AGAIN_MAX
-            && self.said_again.len() < SAID_AGAIN_CAP
+    /// ones is said like any other. **What `on_action` applied, not the type the
+    /// writer signed:** that path takes every type but a bet, a raise, a fold and
+    /// a check as a call, and a call signed as another type was never said again.
+    ///
+    /// **Three seats, not all.** At ten seats every seat saying every action
+    /// again is nine copies of each where one was; the three dealt in after the
+    /// writer are one rogue's partners at most two of, and the seat kept from the
+    /// action, if it is one of them, has the other two. Heads-up there is nobody
+    /// else to say it to. Not a cryptographic frame: what keeping one from a seat
+    /// costs it is written in `S1-KB`'s row.
+    fn says_again(&self, writer: SeatIdx, bytes: &[u8]) -> bool {
+        let mut dealt = self.mine.dealt_in.clone();
+        dealt.sort_unstable();
+        if dealt.len() < 3 || bytes.len() > SAID_AGAIN_MAX || self.said_again.len() >= SAID_AGAIN_CAP {
+            return false;
+        }
+        let Some(at) = dealt.iter().position(|s| *s == writer) else {
+            return false;
+        };
+        (1..=SAYERS.min(dealt.len() - 1)).any(|i| dealt[(at + i) % dealt.len()] == self.open.my_seat)
     }
 
     /// `S1-KB`: the betting actions of other seats this hand has taken since
@@ -14946,6 +14965,46 @@ mod tests {
         let other = 1 - up;
         let _ = deliver(&mut hu[other], &sends, &hu_keys[other]);
         assert!(hu[other].take_said_again().is_empty(), "heads-up there is nobody else to say it to");
+
+        // What the hand applied, not the type the writer signed: a call signed
+        // as a private deal share is taken as a call, and said again.
+        let (mut hands, keys) = three_to_the_bet();
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let genuine = bytes_of(&hands[up].act(Action::Call, &keys[up], NOW).expect("the big blind is faced: a call"));
+        let table_id = hands[up].open.table_id;
+        let hand_id = hands[up].open.hand_id;
+        let opened = chained::open_in_hand(&genuine[0], FRAME_CAP, EventType::ActionCall, &table_id, hand_id).unwrap();
+        let head: ActionHead = chained::payload(&opened, ACTION_CAP).unwrap();
+        let slot = chained::Slot {
+            table_id,
+            hand_id,
+            sequence: opened.envelope.sequence,
+            previous_event_hash: opened.envelope.previous_event_hash,
+        };
+        let disguised = chained::seal(EventType::DealPrivate, &slot, &head, &keys[up], NOW, 30_000, ACTION_CAP).unwrap();
+        for i in (0..3).filter(|i| *i != up) {
+            let _ = hands[i].take_said_again();
+            hands[i].on_event(&disguised, &keys[i], NOW).expect("taken as a call");
+            assert_eq!(hands[i].take_said_again(), vec![disguised.clone()], "seat {i}: said again as what it was taken for");
+        }
+    }
+
+    /// `S1-KB`: the three seats dealt in after an action's writer say it again,
+    /// and no other.
+    #[test]
+    fn the_three_seats_after_the_writer_say_it_again() {
+        let (mut hands, _keys) = three_to_the_bet();
+        let h = &mut hands[0];
+        assert_eq!(h.my_seat(), 0);
+        h.mine.dealt_in = vec![0, 1, 2, 3, 4, 5];
+        let frame = vec![0u8; 200];
+        assert!(h.says_again(5, &frame), "seat 0 is the first after seat 5");
+        assert!(h.says_again(3, &frame), "and the third after seat 3");
+        assert!(!h.says_again(2, &frame), "not one of the three after seat 2");
+        assert!(!h.says_again(1, &frame), "nor after seat 1");
+        assert!(!h.says_again(5, &vec![0u8; 300]), "nothing larger than an action");
+        h.mine.dealt_in = vec![0, 1];
+        assert!(!h.says_again(1, &frame), "heads-up: nobody to say it to");
     }
 
     /// **One peer cannot take the action from a player who was about to act.**
