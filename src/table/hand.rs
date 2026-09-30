@@ -294,6 +294,11 @@ pub struct Opening {
     /// boundary that put them here, so every rule treats them as busted:
     /// not dealt in, no blinds, no return. Carried like `returns`.
     pub out: Vec<SeatIdx>,
+    /// `S1-KD`: when each seat ratified the table, by its own clock -- a
+    /// leave word it said before that is about an earlier sitting. From the
+    /// ratifications every seat holds alike, carried from hand to hand;
+    /// empty where they are not held, and then no word is held to it.
+    pub ratified_at: Vec<(SeatIdx, u64)>,
     /// How long the whole hand may take before any peer may end it.
     ///
     /// `PROTOCOL.md` §8: the only terminus a stalled **cryptographic** stage
@@ -386,6 +391,7 @@ impl Opening {
             out: Vec::new(),
             // The first hand of a table: nothing has decided the button yet.
             button: None,
+            ratified_at: f.ratified_at(),
         })
     }
 
@@ -8232,13 +8238,20 @@ impl Hand {
         }
         let mut resignations: Vec<(SeatIdx, Vec<u8>)> = Vec::new();
         for word in &body.resignations {
-            let (who, _) = crate::net::tabletalk::verify_leave_word(word, &self.open.table_id).map_err(|_| {
+            let (who, said_ms) = crate::net::tabletalk::verify_leave_word(word, &self.open.table_id).map_err(|_| {
                 Failed::Elsewhere {
                     seat: emitter,
                     what: "every resignation were the seat's own signed leave for this table",
                 }
             })?;
             let seat = self.seat_of(&who)?;
+            // `S1-KD`: and said in the seat's present sitting.
+            if !self.leave_word_current(seat, said_ms) {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "every resignation were said after its seat ratified the table",
+                });
+            }
             if resignations.iter().any(|(s, _)| *s == seat) {
                 return Err(Failed::Elsewhere {
                     seat: emitter,
@@ -10378,6 +10391,7 @@ impl Hand {
             returns,
             out,
             button: Some(positions.button),
+            ratified_at: self.open.ratified_at.clone(),
         })
     }
 
@@ -11246,6 +11260,23 @@ impl Hand {
         self.gone_by_word = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
     }
 
+    /// `S1-KD`: whether a leave word `seat` said at `said_ms` is about its
+    /// present sitting: said no earlier than the seat ratified the table. Both
+    /// are the seat's own clock, so no skew between two clients stands between
+    /// them, and the ratification is the same at every seat, so every seat
+    /// judges a word alike. A player that left a forming table by its word and
+    /// sat down again before the table was set holds a seat, and the old word --
+    /// which `S1-GA` refuses before the start -- put the seat out for good in any
+    /// certificate that carried it, with no majority asked (`D-063`). Where the
+    /// ratifications are not held, no word is held to them, as before.
+    fn leave_word_current(&self, seat: SeatIdx, said_ms: u64) -> bool {
+        self.open
+            .ratified_at
+            .iter()
+            .find(|(s, _)| *s == seat)
+            .is_none_or(|(_, at)| said_ms >= *at)
+    }
+
     /// `D-063`: the signed words of the players that left, as the node holds
     /// them -- the whole set each time; kept only where the word is the seat's
     /// own for this table, checked here as a certificate's reader checks it.
@@ -11255,9 +11286,12 @@ impl Hand {
             if *seat == self.open.my_seat || self.leave_words.contains_key(seat) {
                 continue;
             }
-            let Ok((who, _)) = crate::net::tabletalk::verify_leave_word(word, &self.open.table_id) else {
+            let Ok((who, said_ms)) = crate::net::tabletalk::verify_leave_word(word, &self.open.table_id) else {
                 continue;
             };
+            if !self.leave_word_current(*seat, said_ms) {
+                continue;
+            }
             if self.open.seats.iter().any(|(s, k, _)| s == seat && *k == who) {
                 self.leave_words.insert(*seat, word.clone());
             }
@@ -12201,6 +12235,7 @@ mod tests {
             returns: vec![0; 3],
             out: Vec::new(),
             button: None,
+            ratified_at: Vec::new(),
         }
     }
 
@@ -12244,6 +12279,7 @@ mod tests {
             returns: vec![0; 5],
             out: Vec::new(),
             button: None,
+            ratified_at: Vec::new(),
         }
     }
 
@@ -12340,6 +12376,7 @@ mod tests {
             returns: vec![0; 3],
             out: Vec::new(),
             button: None,
+            ratified_at: Vec::new(),
         }
     }
 
@@ -17598,6 +17635,55 @@ mod tests {
         assert!(!a.took_part(1) && !a.took_part(2), "both leave the roster");
         assert_eq!(a.out_for_good(), vec![1, 2], "resigned: out for good, not absent");
         assert!(a.next_hand().is_none(), "one seat left: the tournament is over, and there is no next hand");
+    }
+
+    /// `S1-KD`: a leave word counts only when its seat said it after it
+    /// ratified the table -- a player that left a forming table by its word and
+    /// sat down again holds a seat, and the old word put it out for good in any
+    /// certificate that carried it. Held by the node as nothing, and refused in
+    /// a peer's certificate.
+    #[test]
+    fn a_leave_word_from_an_earlier_sitting_counts_for_nothing() {
+        let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+        let make = |seat: u8, ratified: u64| {
+            let mut o = opening_n(3, seat);
+            o.ratified_at = vec![(0, ratified), (1, ratified), (2, ratified)];
+            Hand::open(o, &keys[usize::from(seat)], NOW, 30_000).unwrap().0
+        };
+        let table = make(0, NOW).open.table_id;
+        let w1 = crate::net::tabletalk::leave_word(&keys[1], &table, NOW).unwrap();
+        let w2 = crate::net::tabletalk::leave_word(&keys[2], &table, NOW).unwrap();
+
+        // The seats ratified after they said it: an earlier sitting's words.
+        let mut a = make(0, NOW + 5_000);
+        a.note_gone_by_their_word(&[1, 2]);
+        a.note_leave_words(&[(1, w1.clone()), (2, w2.clone())]);
+        assert!(
+            a.vote_on_timeouts(&keys[0], NOW + 1_000, 0).unwrap().is_empty(),
+            "old words are no consent: the floor holds as without them"
+        );
+
+        // Said after the seats ratified: `D-063`'s certificate.
+        let mut b = make(0, NOW - 5_000);
+        b.note_gone_by_their_word(&[1, 2]);
+        b.note_leave_words(&[(1, w1), (2, w2)]);
+        let out = bytes_of_sends(b.vote_on_timeouts(&keys[0], NOW + 1_000, 0).unwrap());
+        assert_eq!(b.out_for_good(), vec![1, 2], "their own words: out for good");
+        let cert = out
+            .iter()
+            .find(|f| chained::peek(f, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::TimeoutCert))
+            .cloned()
+            .expect("the certificate");
+
+        // A seat that holds the ratifications as later than the words refuses
+        // the certificate that carries them.
+        let mut c = make(1, NOW + 5_000);
+        assert!(
+            matches!(c.on_event(&cert, &keys[1], NOW + 1_500), Err(Failed::Elsewhere { .. })),
+            "a resignation said before its seat ratified the table"
+        );
+        let mut d = make(1, NOW - 5_000);
+        assert!(!matches!(d.on_event(&cert, &keys[1], NOW + 1_500), Err(Failed::Elsewhere { .. })), "and taken when it was not");
     }
 
     /// `D-063`: at five seats with two present, one quiet seat and two that

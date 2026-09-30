@@ -739,6 +739,28 @@ impl Formation {
         self.session
     }
 
+    /// `S1-KD`: when each seat that ratified the table said so, by its own
+    /// clock -- the sitting a leave word must be later than to be about it.
+    /// Empty where the ratifications are not held (a formation taken up from
+    /// a record).
+    pub fn ratified_at(&self) -> Vec<(u8, u64)> {
+        let mut out: Vec<(u8, u64)> = self
+            .ratified_bytes
+            .iter()
+            .filter_map(|(seat, bytes)| joinwire::table_ready_said_at(bytes).map(|at| (*seat, at)))
+            .collect();
+        // This client's own, which does not travel to itself: the bytes it said.
+        if let (Some(me), Some(bytes)) = (self.my_seat(), self.said.ready.as_ref()) {
+            if self.ratified.contains_key(&me) && !out.iter().any(|(s, _)| *s == me) {
+                if let Some(at) = joinwire::table_ready_said_at(bytes) {
+                    out.push((me, at));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// `TERMINAL(0)`: the hash of the `TABLE_READY` stage.
     ///
     /// Formation is itself a collective stage — a fixed set of seats each
@@ -1913,6 +1935,14 @@ mod tests {
         assert_eq!(o.big_blind, 2 * o.small_blind);
         assert_eq!(o.level, 1);
 
+        // `S1-KD`: when each seat ratified, the same at every seat -- its own
+        // included, which does not travel to itself -- and carried to hand one.
+        let at = t.founder.ratified_at();
+        assert_eq!(at.iter().map(|(s, _)| *s).collect::<Vec<_>>(), t.founder.ratifiers(), "every seat that ratified");
+        for j in &t.joiners {
+            assert_eq!(j.ratified_at(), at, "a seat read the ratifications' times differently");
+        }
+        assert_eq!(o.ratified_at, at);
     }
 
     /// A joiner names the copy of the advertisement **it** heard, and a founder

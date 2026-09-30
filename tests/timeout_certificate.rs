@@ -62,6 +62,7 @@ fn opening3_with_bank(my_seat: u8, time_bank_ms: u32) -> Opening {
         returns: vec![0; 3],
         out: Vec::new(),
         button: None,
+        ratified_at: Vec::new(),
     }
 }
 
