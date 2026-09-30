@@ -281,6 +281,41 @@ fn count_by_member() -> bool {
     false
 }
 
+/// fault-harness, `S1-KH`: `P2P_POKER_NO_INVITES_AT=<s>` -- from that second
+/// this client, where it is the founder, offers the table's group to nobody:
+/// a rogue founder that keeps a seat out of the group without locking
+/// anything.
+#[cfg(feature = "fault-harness")]
+fn no_invites_at() -> Option<Duration> {
+    use std::sync::OnceLock;
+    static AT: OnceLock<Option<Duration>> = OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("P2P_POKER_NO_INVITES_AT")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+    })
+}
+
+/// fault-harness: set once `P2P_POKER_NO_INVITES_AT`'s second is reached.
+#[cfg(feature = "fault-harness")]
+static NO_INVITES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this client's invitations as the founder have stopped -- the
+/// harness's rogue founder (`S1-KH`); never in a build without the harness.
+fn founder_stopped_offering() -> bool {
+    #[cfg(feature = "fault-harness")]
+    {
+        NO_INVITES.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "fault-harness"))]
+    {
+        false
+    }
+}
+
 /// fault-harness: the stranger's instance and how far it got.
 #[cfg(feature = "fault-harness")]
 struct Stranger {
@@ -2453,6 +2488,14 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             }
                             continue;
                         }
+                        // `S1-KH`: and only for an invitation into the group
+                        // this table's advertisement named. An invitation says
+                        // which group it is for, and one into another -- the
+                        // founder's other table, where this seat sits too --
+                        // left a copy that would have come back by itself.
+                        if !invite_names(&invite, wanted_chat(t)) {
+                            continue;
+                        }
                         if let Some(g) = t.group.take() {
                             let _ = tox.leave(g);
                             t.self_joined = false;
@@ -2699,6 +2742,16 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
         #[cfg(feature = "fault-harness")]
         {
             let now = started.elapsed();
+            if let Some(at) = no_invites_at() {
+                if now >= at && !NO_INVITES.swap(true, Ordering::Relaxed) {
+                    if tables.values().any(|t| !matches!(t.setup.role, Role::Joiner { .. })) {
+                        println!(
+                            "fault-harness: this client offers the table's group to nobody from {} s, as P2P_POKER_NO_INVITES_AT asked (S1-KH)",
+                            at.as_secs()
+                        );
+                    }
+                }
+            }
             if let Some((at, rate, kind)) = flood_plan() {
                 if let Some(since) = now.checked_sub(at) {
                     if !flood_said {
@@ -3140,6 +3193,12 @@ fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {
     }
 }
 
+/// `S1-KH`: whether an invitation is into the group `chat` names -- an
+/// invitation's first bytes are the group's id.
+fn invite_names(invite: &[u8], chat: Option<[u8; 32]>) -> bool {
+    chat.is_some_and(|c| invite.get(..c.len()) == Some(&c[..]))
+}
+
 /// The group an invitation is for, if a table of this client wants one.
 fn wanted_chat(t: &TableState) -> Option<[u8; 32]> {
     match &t.setup.role {
@@ -3213,6 +3272,9 @@ fn invite_pending(
     connected: &std::collections::HashSet<u32>,
 ) {
     let Some(g) = t.group else { return };
+    if founder_stopped_offering() {
+        return;
+    }
     if let Some((at, confirmed_then)) = t.last_invite {
         if seats_here(t) <= confirmed_then && at.elapsed() < INVITE_GAP {
             return;
@@ -3751,6 +3813,19 @@ mod tests {
         assert!(!offers_the_group(&back, true, true, false), "a copy still settling");
         assert!(!offers_the_group(&back, true, false, true), "a join not finished");
         assert!(!offers_the_group(&member, true, true, true));
+    }
+
+    /// `S1-KH`: a copy held empty is left for an invitation into the group
+    /// its table's advertisement named, and for no other.
+    #[test]
+    fn an_invitation_names_the_group_it_is_into() {
+        let chat = [7u8; 32];
+        let mut invite = chat.to_vec();
+        invite.extend_from_slice(&[1, 2, 3]);
+        assert!(invite_names(&invite, Some(chat)));
+        assert!(!invite_names(&invite, Some([8u8; 32])), "another group");
+        assert!(!invite_names(&invite[..10], Some(chat)), "too short to name one");
+        assert!(!invite_names(&invite, None), "no group advertised");
     }
 
     /// `S1-FE`: the group's counts are of OTHER seats, as the roster the driver

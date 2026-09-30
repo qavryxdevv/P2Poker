@@ -347,6 +347,10 @@ param(
     # can, for measuring what that does to a seat whose line drops. Needs
     # `--features fault-harness`.
     [ValidateRange(0, 3600)][int]$LockGroupAt = 0,
+    # `-NoInvitesAt <s>` (S1-KH): from that second the founder offers the table's
+    # group to nobody, as a rogue founder can without locking anything. Needs
+    # `--features fault-harness`.
+    [ValidateRange(0, 3600)][int]$NoInvitesAt = 0,
     # `-OfflineNodes <list>`: `-OfflineAt`'s outage for several nodes at once (the
     # far end of a table losing its line together, D-066) instead of `-OfflineNode`.
     [string]$OfflineNodes = '',
@@ -495,6 +499,7 @@ if ($Puppets -gt 0) { $env:P2P_POKER_PUPPETS = "$Puppets" } else { Remove-Item E
 if ($CountByMember) { $env:P2P_POKER_COUNT_BY_MEMBER = '1' } else { Remove-Item Env:P2P_POKER_COUNT_BY_MEMBER -ErrorAction SilentlyContinue }
 # `S1-KH`: every node reads it; only the founder's acts.
 if ($LockGroupAt -gt 0) { $env:P2P_POKER_LOCK_GROUP_AT = "$LockGroupAt" } else { Remove-Item Env:P2P_POKER_LOCK_GROUP_AT -ErrorAction SilentlyContinue }
+if ($NoInvitesAt -gt 0) { $env:P2P_POKER_NO_INVITES_AT = "$NoInvitesAt" } else { Remove-Item Env:P2P_POKER_NO_INVITES_AT -ErrorAction SilentlyContinue }
 $jobs = @()
 for ($i = 0; $i -lt $nodeCount; $i++) {
     $profileDir = Join-Path $work "n$i"
@@ -768,6 +773,9 @@ if ($CountByMember) {
 }
 if ($LockGroupAt -gt 0) {
     Write-Host "==> the founder locks the table's group at $LockGroupAt s: peer limit one, a password, public (S1-KH; needs --features fault-harness)"
+}
+if ($NoInvitesAt -gt 0) {
+    Write-Host "==> the founder offers the table's group to nobody from $NoInvitesAt s (S1-KH; needs --features fault-harness)"
 }
 if ($offList.Count -gt 0 -and $OfflineAt -gt 0) {
     Write-Host "==> n$($offList -join ', n') lose their INTERNET together at $OfflineAt s for $OfflineFor s, at the socket (D-066)"
