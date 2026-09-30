@@ -319,6 +319,19 @@ extern "C" {
         password_length: usize,
         error: *mut c_int,
     ) -> u32;
+    /// `tox.h:5307`. The founder's peer limit. The client never sets it; the
+    /// harness's rogue founder does (`S1-KH`).
+    pub fn tox_group_set_peer_limit(tox: *mut Tox, group_number: u32, peer_limit: u16, error: *mut c_int) -> bool;
+    /// `tox.h:5074`. The founder's password; see `tox_group_set_peer_limit`.
+    pub fn tox_group_set_password(
+        tox: *mut Tox,
+        group_number: u32,
+        password: *const u8,
+        length: usize,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:5254`. The founder's privacy state; see `tox_group_set_peer_limit`.
+    pub fn tox_group_set_privacy_state(tox: *mut Tox, group_number: u32, privacy_state: c_int, error: *mut c_int) -> bool;
     /// `tox.h:5393`
     pub fn tox_group_kick_peer(
         tox: *const Tox,

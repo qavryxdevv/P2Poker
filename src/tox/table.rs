@@ -405,6 +405,9 @@ pub enum Command {
     /// fault-harness: the founder kicks this seat without the table's word,
     /// for measuring that nobody honours it (`D-045`).
     KickWithoutWord([u8; 32]),
+    /// fault-harness (`S1-KH`): the founder locks the group -- the peer limit
+    /// to one, a password, public -- as a rogue founder can.
+    LockGroup,
     /// **`patches/0011`. Ask this seat for the message a stage is waiting on.**
     ///
     /// A lost group message is normally repaired in one round trip: the
@@ -2159,6 +2162,16 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         Command::Noise { member_key, points } => {
                             if let Some(g) = t.group {
                                 score_noise(&mut tox, t, g, member_key, points);
+                            }
+                        }
+                        Command::LockGroup => {
+                            #[cfg(feature = "fault-harness")]
+                            if let Some(g) = t.group {
+                                let took = tox.lock_group(g);
+                                println!(
+                                    "fault-harness: the founder locked the group: peer limit {}, password {}, public {} (S1-KH)",
+                                    took[0], took[1], took[2]
+                                );
                             }
                         }
                         Command::KickWithoutWord(key) => {

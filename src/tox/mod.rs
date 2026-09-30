@@ -1196,6 +1196,26 @@ impl Tox {
         }
     }
 
+    /// fault-harness (`S1-KH`): the founder locks its group -- the peer limit to
+    /// one, a password, public -- as a rogue founder would. Whether toxcore took
+    /// each of the three.
+    #[cfg(feature = "fault-harness")]
+    pub fn lock_group(&mut self, group: u32) -> [bool; 3] {
+        let mut e1: c_int = 0;
+        let mut e2: c_int = 0;
+        let mut e3: c_int = 0;
+        let password = b"rogue";
+        // SAFETY: valid pointer; the group number is toxcore's own handle and
+        // the password a live slice of its stated length.
+        unsafe {
+            [
+                sys::tox_group_set_peer_limit(self.ptr, group, 1, &mut e1) && e1 == 0,
+                sys::tox_group_set_password(self.ptr, group, password.as_ptr(), password.len(), &mut e2) && e2 == 0,
+                sys::tox_group_set_privacy_state(self.ptr, group, sys::TOX_GROUP_PRIVACY_STATE_PUBLIC, &mut e3) && e3 == 0,
+            ]
+        }
+    }
+
     /// Remove a peer the roster no longer seats. Founder only.
     pub fn kick(&mut self, group: u32, peer: u32) -> Result<(), Failed> {
         let mut err: c_int = 0;

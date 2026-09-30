@@ -334,6 +334,11 @@ param(
     # `-NoSayAgain` (S1-KB's control): no node says another seat's betting action
     # again. Needs `--features fault-harness`.
     [switch]$NoSayAgain,
+    # `-LockGroupAt <s>` (S1-KH): at that second the founder locks the table's
+    # group -- the peer limit to one, a password, public -- as a rogue founder
+    # can, for measuring what that does to a seat whose line drops. Needs
+    # `--features fault-harness`.
+    [ValidateRange(0, 3600)][int]$LockGroupAt = 0,
     # `-OfflineNodes <list>`: `-OfflineAt`'s outage for several nodes at once (the
     # far end of a table losing its line together, D-066) instead of `-OfflineNode`.
     [string]$OfflineNodes = '',
@@ -477,6 +482,8 @@ $t0 = Get-Date
 # process's environment -- and cleared otherwise, so no run inherits the last.
 if ($DeafToActions) { $env:P2P_POKER_DEAF_TO_ACTIONS = '1' } else { Remove-Item Env:P2P_POKER_DEAF_TO_ACTIONS -ErrorAction SilentlyContinue }
 if ($NoSayAgain) { $env:P2P_POKER_NO_SAY_AGAIN = '1' } else { Remove-Item Env:P2P_POKER_NO_SAY_AGAIN -ErrorAction SilentlyContinue }
+# `S1-KH`: every node reads it; only the founder's acts.
+if ($LockGroupAt -gt 0) { $env:P2P_POKER_LOCK_GROUP_AT = "$LockGroupAt" } else { Remove-Item Env:P2P_POKER_LOCK_GROUP_AT -ErrorAction SilentlyContinue }
 $jobs = @()
 for ($i = 0; $i -lt $nodeCount; $i++) {
     $profileDir = Join-Path $work "n$i"
@@ -741,6 +748,9 @@ if ($DeafToFor -gt 0) {
 }
 if ($NoSayAgain) {
     Write-Host "==> no node says another seat's betting action again (S1-KB's control; needs --features fault-harness)"
+}
+if ($LockGroupAt -gt 0) {
+    Write-Host "==> the founder locks the table's group at $LockGroupAt s: peer limit one, a password, public (S1-KH; needs --features fault-harness)"
 }
 if ($offList.Count -gt 0 -and $OfflineAt -gt 0) {
     Write-Host "==> n$($offList -join ', n') lose their INTERNET together at $OfflineAt s for $OfflineFor s, at the socket (D-066)"

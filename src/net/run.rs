@@ -10457,6 +10457,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    // fault-harness: `P2P_POKER_LOCK_GROUP_AT=<s>`: the founder locks its
+                    // group -- the peer limit to one, a password, public -- as a rogue
+                    // founder can, for measuring what that does to a seat whose line
+                    // drops (`S1-KH`: it keeps it out).
+                    if lock_group_due() && t.table.as_ref().is_some_and(|f| f.is_founder()) {
+                        println!("fault-harness: locking the table's group, as P2P_POKER_LOCK_GROUP_AT asked");
+                        t.tox_sink.tell(super::toxsink::Seat::LockGroup);
+                    }
                     // fault-harness: `P2P_POKER_LEAVE_TABLE_AT=<s>` leaves the table at
                     // that second, as the window's button would -- for measuring how
                     // the others' lobbies learn that a table is gone (D-040).
@@ -16450,6 +16458,27 @@ fn kick_without_word_due() -> bool {
     static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let at = AT.get_or_init(|| {
         std::env::var("P2P_POKER_KICK_WITHOUT_WORD_AT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match (at, PROCESS_STARTED.get()) {
+        (Some(s), Some(since)) => {
+            since.elapsed().as_secs() >= *s && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        }
+        _ => false,
+    }
+}
+
+/// fault-harness: whether `P2P_POKER_LOCK_GROUP_AT` names a second this process
+/// has reached -- once (`S1-KH`).
+fn lock_group_due() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        std::env::var("P2P_POKER_LOCK_GROUP_AT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
     });

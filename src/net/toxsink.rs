@@ -71,6 +71,8 @@ pub enum Seat {
     },
     /// fault-harness: a founder's kick without the word (`D-045`).
     KickWithoutWord([u8; 32]),
+    /// fault-harness: a founder that locks its group (`S1-KH`).
+    LockGroup,
     /// It is back after a restart and needs the group offered again. See
     /// `tox::table::Command::Rejoined` for why nothing else notices.
     Back([u8; 32]),
@@ -938,6 +940,7 @@ impl TableSink {
                     Seat::Roster(keys) => Command::Roster(keys),
                     Seat::Remove { app_key, tox_key, for_good } => Command::Remove { app_key, tox_key, for_good },
                     Seat::KickWithoutWord(k) => Command::KickWithoutWord(k),
+                    Seat::LockGroup => Command::LockGroup,
                     Seat::Back(k) => Command::Rejoined(k),
                     Seat::Away(on) => Command::Away(on),
                     Seat::KnownAs {
