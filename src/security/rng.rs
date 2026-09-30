@@ -179,13 +179,17 @@ mod tests {
     fn fill_writes_every_requested_byte() {
         // A short buffer is the case a partial write would hide in.
         for len in [1usize, 7, 32, 64, 129] {
-            let mut buf = vec![0u8; len];
-            fill(&mut buf).expect("the OS CSPRNG must be available");
             // Not a randomness test - just that something was written at all.
-            assert!(
-                buf.iter().any(|&b| b != 0),
-                "a {len}-byte buffer came back all zero"
-            );
+            // One random byte is zero once in 256 draws, and a single draw of
+            // the one-byte buffer failed this test by chance (2026-09-29); a
+            // buffer never written stays zero every time, and eight honest
+            // draws all zero is once in 2^64.
+            let written = (0..8).any(|_| {
+                let mut buf = vec![0u8; len];
+                fill(&mut buf).expect("the OS CSPRNG must be available");
+                buf.iter().any(|&b| b != 0)
+            });
+            assert!(written, "a {len}-byte buffer came back all zero eight times");
         }
     }
 
