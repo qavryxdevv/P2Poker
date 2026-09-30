@@ -1461,6 +1461,8 @@ struct TableRun {
     /// the table carried, naming it, and when -- until a later hand is played
     /// with it (`HALF_REFUSED_LIMIT`).
     half_refused: Option<(u64, std::time::Instant)>,
+    /// `S1-JY`: the latest hand whose refusal was noted, so it is noted once.
+    half_seen: u64,
     /// `S1-JT`: since when this client has heard no other seat of the table --
     /// out of its group, or cut off -- the only time a word in a lobby answer
     /// about it being out for good is taken.
@@ -1941,6 +1943,7 @@ impl TableRun {
             stacks_refused: false,
             rejoin_floor: None,
             half_refused: None,
+            half_seen: 0,
             ever_on_line: false,
             nobody_said: false,
             readmitted: Vec::new(),
@@ -4322,6 +4325,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.stacks_refused = false;
             $t.rejoin_floor = None;
             $t.half_refused = None;
+            $t.half_seen = 0;
             $t.ever_on_line = false;
             $t.nobody_said = false;
             $t.taught.clear();
@@ -15163,7 +15167,10 @@ fn watch_progress(t: &mut TableRun) {
         .map(|h| h.hand_id())
         .max();
     if let Some(k) = refused {
-        if t.half_refused.map_or(true, |(seen, _)| seen < k) {
+        // Once a hand: a refusal already noted -- and perhaps already cleared
+        // by a later hand played -- is not noted again from the retained hand.
+        if k > t.half_seen {
+            t.half_seen = k;
             t.half_refused = Some((k, now));
         }
     }

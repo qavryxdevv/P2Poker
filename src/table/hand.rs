@@ -6100,17 +6100,6 @@ impl Hand {
         Ok(Vec::new())
     }
 
-    /// `S1-JY`: the seats in the game as this hand opened -- a stack to play
-    /// with, not out for good -- whoever the hand deals in: the same at every
-    /// seat of the hand, whenever a certificate is banked there.
-    fn seats_in_the_game_at_open(&self) -> usize {
-        self.open
-            .seats
-            .iter()
-            .filter(|(s, _, stack)| *stack > 0 && !self.open.out.contains(s))
-            .count()
-    }
-
     /// `S1-JY`: whether this client refused, in this hand, a certificate that
     /// only half the table or fewer carry and that names it -- see
     /// `on_timeout_cert`. The table may go on without it.
@@ -7773,7 +7762,7 @@ impl Hand {
         }
         let bytes = self.seal_certificate(&subject, &voters, key, now_ms)?;
         let hash = self.opened(&bytes, EventType::TimeoutCert)?.event_hash;
-        self.note_own_certificate(hash, &bytes, &subject, voters.len());
+        self.note_own_certificate(hash, &bytes, &subject);
         // `D-065`: a voter's missing copy is measured from here.
         self.sealed_at = Some(now_ms);
         let complete = match self.certifying.as_mut() {
@@ -7905,11 +7894,11 @@ impl Hand {
     /// Its own copy wins over any peer's for `proof`, because §4.10 asks the
     /// emitter of an abort to have *verified that certificate itself* and a
     /// copy this client sealed is the strongest form of that.
-    fn note_own_certificate(&mut self, hash: Hash, bytes: &[u8], subject: &CertSubject, voters: usize) {
+    fn note_own_certificate(&mut self, hash: Hash, bytes: &[u8], subject: &CertSubject) {
         // The roster effect, on the same evidence a receiver banks on: this
         // client holds a complete unanimous set of votes, which is what a
         // certificate *is*.
-        self.bank(subject, hash, bytes, voters);
+        self.bank(subject, hash, bytes);
         // And its own copy wins as the proof an abort carries, because §4.10
         // asks the emitter to have verified that certificate itself.
         self.proof = Some((hash, bytes.to_vec()));
@@ -8431,7 +8420,7 @@ impl Hand {
     /// [`MAX_CONSECUTIVE_AUTO_ACTIONS`] counts — and those two must count twice
     /// while a redelivery of either counts once.
     fn bank_certificate(&mut self, c: &VerifiedCert) -> bool {
-        self.bank(&c.subject, c.event_hash, &c.raw, c.voters.len())
+        self.bank(&c.subject, c.event_hash, &c.raw)
     }
 
     /// The same, from the pieces, for a certificate this client sealed itself.
@@ -8461,7 +8450,7 @@ impl Hand {
             || (self.aborted().is_some() && self.late.as_ref().is_some_and(|l| l.closed.is_some()))
     }
 
-    fn bank(&mut self, subject: &CertSubject, event_hash: Hash, raw: &[u8], voters: usize) -> bool {
+    fn bank(&mut self, subject: &CertSubject, event_hash: Hash, raw: &[u8]) -> bool {
         // The roster freezes with a settled terminal. After an abort terminal
         // a certificate still banks — and says so, so the node re-derives the
         // next hand (`late_roster`). `S1-BS`: eight seats banked a certificate
@@ -8499,16 +8488,6 @@ impl Hand {
         }
         // D-036: every seat named leaves R(k+1); one strike per seat per
         // stage, however many sets at this stage name it.
-        //
-        // `S1-JY`: **out for good only by a strict majority of the seats still in
-        // the game.** An earlier certificate in the hand shrinks every later voter
-        // set, so two rogues of four -- once the table had certified a third seat
-        // out of the hand, a seat they had kept a frame from -- were a plain
-        // majority about the fourth and named it a flooder: out of the table for
-        // good. Short of that majority a flood or cheat cause certifies the seat
-        // out of the hand, as any other, and it may come back. Counted as the
-        // hand opened, so every seat of it counts alike whenever it banks.
-        let for_good = voters * 2 > self.seats_in_the_game_at_open();
         for seat in &subject.subject_seats {
             // `D-065`: but a voter named silent about the round loses its veto
             // for the rest of the hand and nothing else.
@@ -8518,12 +8497,12 @@ impl Hand {
             }
             // `D-051`: named with the flood cause by every voter -- the digest
             // commits to it -- the seat is out of the table for good.
-            if for_good && subject.cause_of(*seat) == Some(CAUSE_FLOOD) {
+            if subject.cause_of(*seat) == Some(CAUSE_FLOOD) {
                 self.flood_named.insert(*seat);
             }
             // `D-084`: named with the cheat cause by every voter -- each found the
             // seat's proof failing on its own chain -- out for good.
-            if for_good && subject.cause_of(*seat) == Some(CAUSE_CHEAT) {
+            if subject.cause_of(*seat) == Some(CAUSE_CHEAT) {
                 self.cheat_named.insert(*seat);
             }
             if !self.certified.contains(seat) {
@@ -17824,38 +17803,6 @@ mod tests {
         }
         assert!(same[2].aborted().is_none(), "nor on its own identical vote: it knows it voted");
         assert!(same[2].refused_half_certificate(), "and it is told the table may have split");
-    }
-
-    /// `S1-JY`: a flood or cheat cause puts a seat out for good only when the
-    /// certificate's voters are a strict majority of the seats in the game as
-    /// the hand opened. An earlier certificate in the hand shrinks every later
-    /// voter set, and two rogues of four -- once the table had certified a
-    /// third seat out of the hand -- named the fourth a flooder by themselves.
-    /// Short of it, the seat is certified out of the hand as any other.
-    #[test]
-    fn half_the_table_puts_no_seat_out_for_good_through_a_shrunken_voter_set() {
-        let (hands, _) = with_present(4, &[0, 1, 2]);
-        let subject = |cause: u16| CertSubject {
-            subject_sequence: 3,
-            subject_seats: vec![2],
-            subject_event_type: ACTION_GROUP,
-            parent_event_hash: [7; 32],
-            deadline_ms: 30_000,
-            kind: 1,
-            causes: vec![Some(cause)],
-        };
-        let mut two = hands.into_iter().next().expect("seat 0");
-        two.bank(&subject(CAUSE_FLOOD), [1; 32], b"two voters", 2);
-        assert!(!two.named_for_flooding(2), "two voters of four seats: not out for good");
-        assert!(!two.took_part(2), "but certified out of the hand, as any seat named");
-        let (hands, _) = with_present(4, &[0, 1, 2]);
-        let mut three = hands.into_iter().next().expect("seat 0");
-        three.bank(&subject(CAUSE_FLOOD), [2; 32], b"three voters", 3);
-        assert!(three.named_for_flooding(2), "three of four: out for good, as `D-051` has it");
-        let (hands, _) = with_present(4, &[0, 1, 2]);
-        let mut cheat = hands.into_iter().next().expect("seat 0");
-        cheat.bank(&subject(CAUSE_CHEAT), [3; 32], b"two voters", 2);
-        assert!(!cheat.named_for_cheating(2), "nor the cheat cause, by two of four");
     }
 
     /// `S1-JY`: a betting certificate acts for the seat to act and for no other

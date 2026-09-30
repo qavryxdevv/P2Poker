@@ -3688,9 +3688,7 @@ certificate that clears the floor only by `D-066` while its own line was sound f
 the last `LONG_GONE_S` — it was here, which such a certificate may not overrule —
 and a seat named waited on takes it when its line was down within that time, since
 then it may really have been gone -- unless it names that seat with `cause = 1` or
-`5`; a seat named `cause = 2` never takes it; a `cause = 1` or `5` puts a seat out of the
-table for good only where the certificate's voters are a strict majority of the seats
-in the game as the hand opened, and short of that certifies it out of the hand (`D-086`); a `kind = 1` certificate acts only for the seat to act;
+`5`; a seat named `cause = 2` never takes it; a `kind = 1` certificate acts only for the seat to act;
 every certificate names at least one seat
 without `cause = 2` -- a seat its stage waits on -- and a `kind = 1` certificate
 names exactly one, the seat to act, with any voters named `cause = 2` beside it
