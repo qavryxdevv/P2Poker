@@ -2880,7 +2880,11 @@ the disposition of J2, and the clause it replaces is deleted (D-013):**
 > keys, and takes the road above from the table's copies: it adopts the running hand as a bystander and asks to sit
 > in at its boundary (§4.10, §8.3.1). Nothing of the table's rests on the dropped branch, since no other seat signed a
 > frame of it; a seat outside those sets is not evidence of where the table is, and two seats are not the table.
-> The return counts under D-032.
+> The return counts under D-032. **Amended by D-088:** the majority is of the table the receiver's own hand counts,
+> the receiver among it, or exactly half holding its lowest seat where the receiver comes back from away; the
+> copies are counted the same way, and a receiver back from away also takes up a hand half the table without the
+> lowest seat signed where the copy deals the whole table in at stacks it knows. A table that splits all the
+> same is told to its players.
 >
 The deleted clause read *"every seat that will be `dealt_in`, plus every occupied
 seat that is absent or sitting out and therefore posts dead money"*. It defined the
@@ -7751,7 +7755,9 @@ D-007 at every table size. Wherever an earlier draft of this document said "at
 > of the table that lost its line together rejoins. **The price, accepted by the
 > owner:** a real partition of the network that lasts past `LONG_GONE_S` while both
 > sides keep their lines splits the table in two, each half going on without the
-> other.
+> other. **D-088:** a seat whose own line was down within `LONG_GONE_S` casts no
+> vote toward a certificate that clears the floor only by the half rule -- it may
+> have been the one cut off.
 >
 > **Being voted against is not exclusion.** A `TIMEOUT_VOTE` is one peer's
 > unilateral assertion, this section concedes below that a lying voter is
