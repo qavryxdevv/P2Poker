@@ -2133,6 +2133,12 @@ pub struct Hand {
     /// than being made here; [`Hand::restore_done`] ends it and makes whatever
     /// the current stage still wants from this seat.
     restoring: bool,
+    /// `S1-KK`: this hand was taken up from a previous life's (`D-033`) -- set
+    /// for good, where `restoring` ends at the stall tick with only part of the
+    /// table's re-send in. A stage that opens later and finds this seat's own
+    /// frame for it held -- its previous life's, said again, come early -- takes
+    /// that frame and signs no other.
+    restored: bool,
     /// `D-033`: the previous process's deck secret, from the session record,
     /// until the deck stage takes it.
     restored_secret: Option<HandSecret>,
@@ -2472,6 +2478,7 @@ impl Hand {
             sit_in_asked: false,
             return_refused: BTreeSet::new(),
                 restoring,
+                restored: restoring,
                 restored_secret,
                 fold_only,
                 hold_muck: false,
@@ -2670,6 +2677,25 @@ impl Hand {
             }
             other => other,
         }
+    }
+
+    /// `S1-KK`: whether this hand, taken up from a previous life's, holds a
+    /// frame of this seat's own for the stage now open -- the previous life
+    /// signed it, the table said it again, and it came before the stage
+    /// opened. Such a stage takes that frame when the held are replayed, and
+    /// this seat signs no other: a second one is a second version of its step
+    /// at every seat that took the first (`S1-KJ`), and a fork of this seat
+    /// from the rest where the two differ.
+    fn own_frame_held(&self) -> bool {
+        if !self.restored {
+            return false;
+        }
+        let me = self.open.seats[self.seat_index()].1;
+        let (hand, sequence) = (self.open.hand_id, self.slot.sequence);
+        self.early.iter().any(|b| {
+            chained::sender_of(b, FRAME_CAP) == Some(me)
+                && chained::peek(b, PEEK_CAP).is_ok_and(|(_, h, s)| h == hand && s == sequence)
+        })
     }
 
     /// `S1-KJ`: the writer's seat, when `bytes` -- at a stage this hand has
@@ -3173,10 +3199,12 @@ impl Hand {
     /// are single-writer and it holds every input to them: it does not have to
     /// wait to hear its own step back before it can seal the proof.
     fn shuffle_if_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        // `S1-KK`: the previous life's step is held, and its proof with it.
+        let held = self.own_frame_held();
         let Phase::Shuffling { deal, chain, .. } = &mut self.phase else {
             return Ok(Vec::new());
         };
-        if self.restoring || chain.whose_turn() != Some(self.open.my_seat) {
+        if self.restoring || held || chain.whose_turn() != Some(self.open.my_seat) {
             return Ok(Vec::new());
         }
         // `S1-JR` harness: a rogue that never takes its step.
@@ -3565,6 +3593,10 @@ impl Hand {
     /// This seat's commitment to the final deck, said and heard; the stage
     /// closes here if this was the last one owed.
     fn commit_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        // `S1-KK`: the previous life's commitment is held.
+        if self.own_frame_held() {
+            return Ok(Vec::new());
+        }
         let me = self.open.my_seat;
         let mine = match &self.phase {
             Phase::Committing { stage, mine, .. } if stage.heard(me).is_none() => mine.clone(),
@@ -3684,7 +3716,9 @@ impl Hand {
         )
         .ok_or(Failed::NotInThisStage)?;
         let mut dealing = Dealing::new(table.map.clone(), self.mine.dealt_in.clone());
-        if self.restoring {
+        // `S1-KK`: and after the restore, where the previous life's shares are
+        // held -- as while restoring, they come from the wire.
+        if self.restoring || self.own_frame_held() {
             // `D-033`: this seat's shares for the others' cards come from the
             // wire; the shares for its own two cards it makes here, with the kept
             // secret, so the cards can be read when the stage closes.
@@ -3726,7 +3760,8 @@ impl Hand {
     /// made twice; a hand with no secret makes none.
     fn deal_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let me = self.open.my_seat;
-        if self.fold_only {
+        // `S1-KK`: nor where the previous life's shares are held.
+        if self.fold_only || self.own_frame_held() {
             return Ok(Vec::new());
         }
         let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
@@ -4407,6 +4442,10 @@ impl Hand {
     /// street opens here if this was the last share owed. A hand with no secret
     /// makes none, and says so once.
     fn board_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        // `S1-KK`: the previous life's shares for this street are held.
+        if self.own_frame_held() {
+            return Ok(Vec::new());
+        }
         let me = self.open.my_seat;
         let street = match &self.phase {
             Phase::Playing { play, .. } => match &play.step {
@@ -4693,7 +4732,8 @@ impl Hand {
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
         // `D-033`: restoring, what this seat said at the showdown comes from the wire.
-        if self.restoring {
+        // `S1-KK`: and after, where the previous life's word is held.
+        if self.restoring || self.own_frame_held() {
             return Ok(Vec::new());
         }
         let me = self.open.my_seat;
@@ -4993,6 +5033,13 @@ impl Hand {
         } else {
             let body: ShowdownReveal =
                 chained::payload(&opened, SHOWDOWN_REVEAL_CAP).map_err(Failed::Wire)?;
+            // `S1-KK`: this seat's own reveal, its previous life's said again
+            // (`D-033`): its shares for its own two cards are in already -- made
+            // here with the kept secret when the cards were dealt -- and the
+            // reveal proves the same shares once more under the showdown's
+            // context. Taken as a second share of each, it was refused, and the
+            // restored seat's showdown never closed.
+            let own_shares_in = seat == me && self.restored && !self.fold_only;
             let cards = {
                 let Phase::Playing { deal, table, play } = &mut self.phase else {
                     return Err(Failed::NothingFurther);
@@ -5005,7 +5052,7 @@ impl Hand {
                         why: "not exactly this seat's own two hole cards",
                     });
                 }
-                for entry in &body.entries {
+                for entry in body.entries.iter().filter(|_| !own_shares_in) {
                     let index =
                         table
                             .map
@@ -5110,7 +5157,13 @@ impl Hand {
         // accepts, and `stage.hear` answered `Uninvited` for its own copy, so
         // the stage could never complete here and the settlement — and with it
         // the boundary checkpoint §4.9 readmits on — was unreachable.
-        if !self.open.required.contains(&self.open.my_seat) {
+        //
+        // `S1-KK`: and a hand taken up from a previous life's (`D-033`) seals
+        // none while restoring, nor where the previous life's is held: that
+        // settlement comes from the wire, and one sealed here besides was a
+        // second version of it -- `restore_done` seals it where the table did
+        // not say it again (`settle_mine`).
+        if !self.open.required.contains(&self.open.my_seat) || self.restoring || self.own_frame_held() {
             // It still DERIVES the settlement — from pots, stacks and a board
             // that are public by construction — because `on_hand_complete`
             // compares every arriving copy against its own and that comparison
@@ -5154,6 +5207,35 @@ impl Hand {
             return Err(Failed::NothingFurther);
         };
         play.step = Step::Settling { stage, mine };
+        let mut out = vec![Send::Broadcast(bytes)];
+        out.append(&mut self.close_settlement_if_done()?);
+        Ok(out)
+    }
+
+    /// `S1-KK`: this seat's settlement, sealed now -- a hand taken up from a
+    /// previous life's opened the stage without one (`begin_settlement`), and
+    /// the table did not say the previous life's again by the time the restore
+    /// ended. Nothing where the seat is in no stage of this hand, where the
+    /// stage has its settlement already, or where the previous life's is held.
+    fn settle_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        if !self.open.required.contains(&me) || self.own_frame_held() {
+            return Ok(Vec::new());
+        }
+        let mine = match &self.phase {
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Settling { stage, mine } if stage.heard(me).is_none() => mine.clone(),
+                _ => return Ok(Vec::new()),
+            },
+            _ => return Ok(Vec::new()),
+        };
+        let bytes = self.say(EventType::HandComplete, mine.as_ref(), HAND_COMPLETE_CAP, key, now_ms)?;
+        let hash = self.opened(&bytes, EventType::HandComplete)?.event_hash;
+        if let Phase::Playing { play, .. } = &mut self.phase {
+            if let Step::Settling { stage, .. } = &mut play.step {
+                stage.hear(me, hash);
+            }
+        }
         let mut out = vec![Send::Broadcast(bytes)];
         out.append(&mut self.close_settlement_if_done()?);
         Ok(out)
@@ -9630,9 +9712,16 @@ impl Hand {
         let mut sends = Vec::new();
         let mut failures = Vec::new();
         loop {
-            let waiting: Vec<Vec<u8>> = self.early.drain(..).collect();
+            // `S1-KK`: one at a time, the rest still held while each is taken --
+            // a stage that opens on one of them asks what else is held (whether
+            // this seat's own frame for it is, `own_frame_held`), and a queue
+            // drained up front answered *nothing*.
+            let waiting = self.early.len();
             let mut applied = false;
-            for bytes in waiting {
+            for _ in 0..waiting {
+                let Some(bytes) = self.early.pop_front() else {
+                    break;
+                };
                 match self.on_event(&bytes, key, now_ms) {
                     Ok(mut out) => {
                         applied = true;
@@ -10697,6 +10786,9 @@ impl Hand {
             Phase::Playing { play, .. } => match &play.step {
                 Step::Opening { .. } => 5,
                 Step::Showdown { .. } => 6,
+                // `S1-KK`: a settlement opened while restoring holds none of this
+                // seat's own yet.
+                Step::Settling { .. } => 7,
                 _ => 0,
             },
             _ => 0,
@@ -10708,6 +10800,7 @@ impl Hand {
             4 => self.deal_mine(key, now_ms),
             5 => self.board_mine(key, now_ms),
             6 => self.speak_at_showdown(key, now_ms),
+            7 => self.settle_mine(key, now_ms),
             _ => Ok(Vec::new()),
         }
     }
@@ -10739,7 +10832,8 @@ impl Hand {
             Phase::Deck { stage, .. } => stage.heard(me).is_some(),
             _ => return Ok(Vec::new()),
         };
-        if heard || !self.mine.dealt_in.contains(&me) {
+        // `S1-KK`: nor where the previous life's key is held, still to come.
+        if heard || !self.mine.dealt_in.contains(&me) || self.own_frame_held() {
             return Ok(Vec::new());
         }
         let me_key = self.open.seats[self.seat_index()].1;
@@ -19830,6 +19924,176 @@ mod tests {
         assert!(a.over() && b2.over(), "played out on both sides");
         assert_eq!(a.terminal(), b2.terminal(), "one settlement");
         assert_eq!(a.stacks(), b2.stacks());
+    }
+
+    /// `S1-KK`: the restore ends on the stall tick with part of the table's
+    /// re-send in -- the survivor's own frames come last, and its opening is
+    /// in before the tick while its later frames come after it. Every stage
+    /// that then completes wants this seat's frame, which its previous life
+    /// signed and the table has; the restored seat signs nothing again, the
+    /// survivor finds no second version, and the hand ends at one settlement.
+    #[test]
+    fn a_seat_back_from_a_restart_signs_nothing_its_previous_life_signed() {
+        let ([a, b], keys, transcript, a_said, kept) = heads_up_to_the_first_bet();
+        let copies: Vec<Vec<u8>> = transcript[..2].to_vec();
+        let o = Opening::adopt(heads_up_opening(1), &copies).expect("both openings");
+        let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, Some(&kept)).unwrap();
+        // The survivor's transcript -- the previous life's frames -- and its
+        // own opening, then the tick.
+        let mut first: Vec<Vec<u8>> = a.transcript().to_vec();
+        first.push(a_said[0].clone());
+        replay(&mut b2, &first, &keys[1]);
+        let mut said_by_b2: Vec<Vec<u8>> = bytes_of(&b2.restore_done(&keys[1], NOW + 60_000).unwrap());
+        // The rest of the survivor's own frames, after the tick.
+        for bytes in &a_said[1..] {
+            match b2.on_event(bytes, &keys[1], NOW + 60_000) {
+                Ok(sends) => said_by_b2.extend(bytes_of(&sends)),
+                Err(Failed::NotYet) => {
+                    let _ = b2.hold(bytes.clone());
+                }
+                Err(e) => panic!("the survivor's own frame: {e}"),
+            }
+            let (more, failures) = b2.replay_early(&keys[1], NOW + 60_000);
+            let said: Vec<(EventType, u64)> = said_by_b2
+                .iter()
+                .chain(bytes_of(&more).iter())
+                .filter_map(|b| chained::peek(b, FRAME_CAP).ok().map(|(k, _, s)| (k, s)))
+                .collect();
+            assert!(failures.is_empty(), "{failures:?}; the restored seat said {said:?}");
+            said_by_b2.extend(bytes_of(&more));
+        }
+        // Nothing the restored seat said is another version of a frame the
+        // survivor took from its previous life.
+        let mut a = a;
+        let mut again: Vec<(EventType, u64)> = Vec::new();
+        for bytes in &said_by_b2 {
+            if let Err(Failed::Equivocation { .. }) = a.on_event(bytes, &keys[0], NOW + 60_000) {
+                let (kind, _, seq) = chained::peek(bytes, FRAME_CAP).unwrap();
+                again.push((kind, seq));
+            }
+        }
+        assert!(again.is_empty(), "steps signed again, which the survivor names: {again:?}");
+        assert_eq!(b2.street(), b.street(), "the same street as the previous life");
+        assert_eq!(b2.cards(), b.cards(), "and the same cards");
+    }
+
+    /// `S1-KK`: a hand taken up after its previous life had settled it -- the
+    /// replay, still restoring, crosses into the settlement. The seat seals no
+    /// settlement of its own (its previous life's comes from the wire) and ends
+    /// at the table's terminal; before this it sealed a second one and its
+    /// terminal was its own.
+    #[test]
+    fn a_restored_hand_takes_its_settlement_from_the_wire() {
+        restored_after_the_end(Action::Fold);
+    }
+
+    /// `S1-KK`: the same, the hand played to a showdown: the seat's own reveal,
+    /// its previous life's, is taken -- its shares for its own cards are in
+    /// already -- where it was refused as a second share of each.
+    #[test]
+    fn a_restored_hand_takes_its_showdown_from_the_wire() {
+        restored_after_the_end(Action::Check);
+    }
+
+    /// `S1-KK`: where the table's re-send lacks the previous life's settlement,
+    /// the restore's end seals one -- the settlement stage waits on this seat,
+    /// and a hand left there would never end.
+    #[test]
+    fn a_restored_hand_settles_where_the_table_did_not_say_its_settlement_again() {
+        let ([a, b], keys, transcript, a_said, kept) = heads_up_to_the_first_bet();
+        let mut hands = [a, b];
+        let mut said: [Vec<Vec<u8>>; 2] = [a_said, Vec::new()];
+        let turn = hands[0].turn().or_else(|| hands[1].turn()).expect("somebody is to act");
+        let actor = usize::from(turn.seat);
+        let sends = hands[actor].act(Action::Fold, &keys[actor], NOW).unwrap();
+        let mut queue: Vec<(usize, Vec<Send>)> = vec![(actor, sends)];
+        while !queue.is_empty() {
+            let (from, sends) = queue.remove(0);
+            if sends.is_empty() {
+                continue;
+            }
+            said[from].extend(bytes_of(&sends));
+            let to = 1 - from;
+            let more = deliver(&mut hands[to], &sends, &keys[to]);
+            queue.push((to, more));
+        }
+        let [a, _b] = hands;
+        assert!(a.over());
+        let is_settlement = |b: &Vec<u8>| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::HandComplete);
+        // The survivor's re-send, its own settlement in and the previous life's out.
+        let mut frames: Vec<Vec<u8>> = a.transcript().iter().filter(|b| !is_settlement(b)).cloned().collect();
+        frames.extend(said[0].iter().cloned());
+        let copies: Vec<Vec<u8>> = transcript[..2].to_vec();
+        let o = Opening::adopt(heads_up_opening(1), &copies).expect("both openings");
+        let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, Some(&kept)).unwrap();
+        replay(&mut b2, &frames, &keys[1]);
+        assert!(!b2.over(), "the settlement waits on this seat");
+        let sealed = bytes_of(&b2.restore_done(&keys[1], NOW + 60_000).unwrap());
+        assert_eq!(sealed.iter().filter(|b| is_settlement(b)).count(), 1, "sealed at the restore's end");
+        assert!(b2.over(), "and the hand ends");
+    }
+
+    /// A heads-up hand played to its end by `how` (a fold, or checks and calls
+    /// to a showdown), then taken up by the second seat's next life from the
+    /// survivor's re-send alone, restoring throughout.
+    fn restored_after_the_end(how: Action) {
+        let ([a, b], keys, transcript, a_said, kept) = heads_up_to_the_first_bet();
+        let mut hands = [a, b];
+        let mut said: [Vec<Vec<u8>>; 2] = [a_said, Vec::new()];
+        for _ in 0..40 {
+            if hands[0].over() && hands[1].over() {
+                break;
+            }
+            let Some(turn) = hands[0].turn().or_else(|| hands[1].turn()) else {
+                break;
+            };
+            let actor = usize::from(turn.seat);
+            let action = match how {
+                Action::Fold => Action::Fold,
+                _ if turn.legal.can_check => Action::Check,
+                _ => Action::Call,
+            };
+            let sends = hands[actor].act(action, &keys[actor], NOW).unwrap();
+            let mut queue: Vec<(usize, Vec<Send>)> = vec![(actor, sends)];
+            while !queue.is_empty() {
+                let (from, sends) = queue.remove(0);
+                if sends.is_empty() {
+                    continue;
+                }
+                said[from].extend(bytes_of(&sends));
+                let to = 1 - from;
+                let more = deliver(&mut hands[to], &sends, &keys[to]);
+                queue.push((to, more));
+            }
+        }
+        let [a, _b] = hands;
+        assert!(a.over() && a.terminal().is_some(), "settled at the survivor");
+        let copies: Vec<Vec<u8>> = transcript[..2].to_vec();
+        let o = Opening::adopt(heads_up_opening(1), &copies).expect("both openings");
+        let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, Some(&kept)).unwrap();
+        let mut frames: Vec<Vec<u8>> = a.transcript().to_vec();
+        frames.extend(said[0].iter().cloned());
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for bytes in &frames {
+            match b2.on_event(bytes, &keys[1], NOW + 60_000) {
+                Ok(sends) => out.extend(bytes_of(&sends)),
+                Err(Failed::NotYet) => {
+                    let _ = b2.hold(bytes.clone());
+                }
+                Err(e) => panic!("a frame the table accepted: {e}"),
+            }
+        }
+        let (more, failures) = b2.replay_early(&keys[1], NOW + 60_000);
+        assert!(failures.is_empty(), "{failures:?}");
+        out.extend(bytes_of(&more));
+        out.extend(bytes_of(&b2.restore_done(&keys[1], NOW + 60_000).unwrap()));
+        let settlements = out
+            .iter()
+            .filter(|b| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::HandComplete))
+            .count();
+        assert_eq!(settlements, 0, "no settlement of its own sealed again");
+        assert!(b2.over(), "the hand is over at the restored seat too");
+        assert_eq!(b2.terminal(), a.terminal(), "at the table's terminal");
     }
 
     /// `D-033`: the same restart with no secret kept -- or one of another hand.
