@@ -2963,7 +2963,9 @@ produces; the absent half is gone with the status.
 **D-051 (2026-09-13).** A seat that a certificate names with `cause = 1` -- every voter's own
 client cut it off for flooding the table's carrier group, and the subject digest commits to
 it -- is out of the table for good at that hand's boundary in the way D-047's paragraph below
-states: its chips leave the table, and every client removes it from the carrier group for good.
+states: its chips leave the table, and every client removes it from the carrier group for good --
+in a hand that, as it ends, a strict majority of the seats with chips at its boundary still carries
+(S1-KA, D-047's paragraph below).
 The flooding seats' own votes are never needed, because they are the seats named; one voter's
 cause alone completes nothing, because a vote with a cause and a vote without one are about two
 subjects.
@@ -2974,6 +2976,16 @@ times is out of the table for good at that hand's boundary: its chips leave the 
 as busted -- not dealt in, no blinds, no return -- and every client removes it from the
 table's group for good (D-045). Every seat derives the same from the same certificates;
 nothing new is said on the wire. The paragraph below is the dead seat short of that limit.
+
+**S1-KA (D-087, 2026-09-30).** The fourth absence, the flood (`cause = 1`) and the proof that does
+not hold (`cause = 5`) put a seat out for good only in a hand that, as it ends, a strict majority of
+the seats with chips at its boundary still carries: `2 × |{s ∈ dealt_in : stack_at_boundary(s) > 0,
+s not certified out in the hand}| > |{s : stack_at_boundary(s) > 0}|`. Short of that the seat is
+certified out of the hand and no further -- the dead seat below. Read from nothing but what `R(k+1)`
+already asks every seat to agree on: not from a certificate's voters, which one copy may carry more
+of than another, and not from the voters named silent (`cause = 2`), which a seat named so by a
+certificate half the table carries does not take (D-086). A client gives the group's word for good
+and leaves on the word about itself only once the hand is over: mid-hand the count can still fall.
 
 A seat outside `dealt_in` keeps its stack, pays its blinds and antes as dead money,
 takes no cards, and is not a party to the cryptography. That is D-005 and it is
@@ -3438,6 +3450,19 @@ published Illustration Addendum examples for rule 47. [RULES A5]
 
 An illegal action is a protocol violation attributable to its signer — **it is not
 a state transition, and it never becomes one.** The receiver does not "correct" it.
+
+**Said again by every seat that takes it (`S1-KB`, 2026-09-30).** At a hand dealt to three seats or more, a client
+that takes another seat's betting action -- applies it as that seat's action, whatever type it was signed under, since
+every type but a bet, a raise, a fold and a check is taken as a call, and enters it in its transcript for the first
+time -- broadcasts the same bytes once more to the table's carrier group. A Tox group message goes from its sender to
+each member and nothing passes it on, so the writer before a seat could keep its action from that seat alone: the
+others took it and started the seat's clock, the seat never saw its turn, and at its deadline every other seat -- the
+writer with them -- certified it (§4.8), its chips in the pot forfeited, hand after hand, by one rogue. Said again,
+the action reaches the seat from any honest seat a hop later; a writer that keeps it from every honest seat is itself
+the seat the table waits on. A copy of a stage already left is nothing and is never said again, and no frame over 256
+bytes is. Nothing is new to a receiver -- a copy is the same signed bytes, and its signer, not its carrier, is who
+wrote it. A cryptographic frame is not said again: a seat kept from one is answered by D-065's vote-as-question at its
+own deadline.
 
 ### 4.8 Group 6 — deadlines (channel: table mesh)
 
@@ -4563,7 +4588,8 @@ where the floor holds for the shuffler, keeps the evidence and votes about the s
 step and proof last, so that a seat the shuffler sent nothing to -- or kept its deck share from --
 catches up, checks them on its own chain and votes too. Every client that found the same proof failing builds the
 same subject, and the certificate, `kind = 2`, ends the hand by the certified-subject path above
-and takes the seat out of the table for good. The abort with the evidence goes -- and the hand
+and takes the seat out of the table for good (in a hand a majority of the seats with chips still
+carries, S1-KA). The abort with the evidence goes -- and the hand
 ends as it ended before -- `CHEAT_CERT_MS` (10 s) after the finding if no certificate has
 completed; on the next tick when another seat's frame of a later stage shows that some seat took a
 good proof and went on -- a frame the shuffler cannot sign; and in place of any bare abort this
@@ -6829,7 +6855,11 @@ table's word about seats out for good from the tables the answerer sits at, each
 `n(3) hand_id: u64`, `n(4) cert: bytes` (a complete `TIMEOUT_CERT` of that hand, ≤ `FRAME_CAP`);
 at most `SNAPSHOT_MAX_OUT` = 4 an answer, absent when there is none. The receiver verifies
 each certificate from its bytes against the table's roster and reads only the word about
-its own seat; the answerer's authority is not what it rests on.
+its own seat; the answerer's authority is not what it rests on. Since S1-KA it asks the shape a
+certificate has in a hand -- each vote sealed at the stage it names, one cause per seat, one voter
+set for every seat named and none of them named, the digest the votes hash to -- and voters that
+are a strict majority of the seats with chips at the last hand it was in while it heard the table,
+or of the whole roster.
 
 The response is a container of independently signed adverts. **The responder is
 not trusted for anything.** Each embedded advert is validated by §7.2's full
