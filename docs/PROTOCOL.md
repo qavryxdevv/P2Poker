@@ -5711,7 +5711,7 @@ is stale.
 | What | The check that carries it | Where | Disposition |
 |---|---|---|---|
 | A chained event at the wrong chain, hand, stage or parent | `table_id`, `hand_id`, `sequence`, `previous_event_hash` compared field by field, then `verify_strict` over the **bytes as received** | `net/chained.rs` `open_inner` | rejected and named |
-| **Replay of any ordinary chained event of a stage the hand has left** — the principal bound | the monotone stage cursor: `sequence < slot.sequence` | `table/hand.rs` `on_event` | dropped silently; the mesh redelivers as a matter of course |
+| **Replay of any ordinary chained event of a stage the hand has left** — the principal bound | the monotone stage cursor: `sequence < slot.sequence` | `table/hand.rs` `on_event` | dropped silently; the mesh redelivers as a matter of course -- **unless** it is another event than the one the hand took at that stage from the same writer, and verifies: `Failed::Equivocation{seat}`, once per stage and writer (`S1-KJ`, `Hand::another_version`) |
 | An event of a stage not yet reached | `sequence > slot.sequence` | same | **held** in a FIFO bounded at 64, re-judged on every later event |
 | **A duplicate contribution at a collective stage** | the per-stage `heard` map: an identical `event_hash` from a seat already heard | `table/stage.rs` `Collective::hear` → `Heard::Again` | idempotent, and pre-checked by `heard(seat)` before anything is spent |
 | **A second, different body from one seat at one collective stage** — the equivocation the corpus cares about | the same map: a **differing** hash from a seat already heard | `table/stage.rs` `Collective::hear` → `Heard::Equivocation`; nine call sites in `table/hand.rs` | the **first** stands, the second is `Failed::Equivocation{seat}`; the stage hash is taken over the first |
@@ -5736,6 +5736,16 @@ to be inferred.**
    stage is not named, because the second body arrives under the cursor and is
    dropped without comparison. §5.2.1's key would have named it. Naming it buys
    nothing today, because of point 3.
+   **Amended 2026-09-30 (`S1-KJ`).** The hand keeps, for the hand's life, which event it
+   took at each stage from each writer (`taken_from`, no more than its transcript
+   holds), so a second body at a stage already left -- single-writer or collective --
+   is named when it arrives, once per stage and writer. A copy of the event taken, the
+   same body signed again among them, is read as a copy without a signature check; a
+   second body that does not verify is nothing. The cursor is unchanged: a passed
+   stage still applies nothing. A writer that signs two versions of a step and sends
+   one to some seats and the other to the rest parts the table, and each seat sees the
+   other version only after it has moved on -- in another seat's say-again (§4.7) or
+   answer (`D-065`) -- which is where this looks.
 2. **The equivocation detector is per-receiver and arrival-ordered.** `hear`
    keeps whichever body reached this client first. Two honest peers that received
    different copies each name the other's, and their stage hashes differ. The
@@ -5748,6 +5758,11 @@ to be inferred.**
    state: a proof ends no hand, moves no chip and evicts nobody. It is recorded
    here because a reader who assumes otherwise will over-value both this section
    and §5.2.1.
+   **Amended (`S1-JR`, `S1-KJ`).** Detection has one consumer now, and it is the
+   players': the node keeps each seat named by `Failed::Equivocation` with the hands it
+   was named in, and a seat named in two of the last ten hands is `S1-JR`'s question
+   whether the table is safe to stay at. It still ends no hand, moves no chip and
+   evicts nobody (`D-014`: no removal on an equivocation).
 
 **Prerequisites a future wire-in of §5.2.1 must satisfy, all of them findings
 against the tree rather than opinions:**

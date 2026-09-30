@@ -3103,6 +3103,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let mut sends = sends;
                                 sends.append(&mut more);
                                 for e in held_failures {
+                                    // `S1-KJ`: a held frame that turned out another
+                                    // version of a step counts as one that came late.
+                                    if let Failed::Equivocation { seat } = &e {
+                                        if let Some(k) = $h.key_of(*seat) {
+                                            $t.equivocators
+                                                .entry(k)
+                                                .or_insert_with(|| (*seat, std::collections::BTreeSet::new()))
+                                                .1
+                                                .insert($h.hand_id());
+                                        }
+                                    }
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
                                             "a held event was refused: {e}"
@@ -12223,6 +12234,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // moment when nothing else is happening.
                     let (replayed, held_failures) = h.replay_early(&app_key, now);
                     for e in held_failures {
+                        // `S1-KJ`: counted as the frame's own arrival would be.
+                        if let crate::table::hand::Failed::Equivocation { seat } = &e {
+                            if let Some(k) = h.key_of(*seat) {
+                                t.equivocators
+                                    .entry(k)
+                                    .or_insert_with(|| (*seat, std::collections::BTreeSet::new()))
+                                    .1
+                                    .insert(h.hand_id());
+                            }
+                        }
                         let _ = events
                             .send(NodeEvent::Warning(format!("a held event: {e}")))
                             .await;
@@ -21637,6 +21658,22 @@ mod late_roster_tests {
         assert!(code.contains("$t.left_by_own_word.insert(f.table_id(), tokio::time::Instant::now());"));
         assert!(code.contains("&& f.ratified_at().iter().any(|(s, at)| *s == seat && said_ms < *at) => {}"), "an older sitting's word");
         assert!(code.contains("is_ok_and(|(_, at)| at > said_ms)"), "the newest word");
+    }
+
+    /// `S1-KJ`: a seat named for another version of a step is counted for
+    /// `S1-JR` whichever road found it -- the frame's own arrival, or the
+    /// replay of a frame held for a stage not reached then.
+    #[test]
+    fn another_version_is_counted_on_every_road_that_finds_it() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let counted = ".or_insert_with(|| (*seat, std::collections::BTreeSet::new())) .1 .insert(";
+        assert_eq!(code.matches(counted).count(), 3, "the arrival, and both replays of what was held");
+        for held in ["for e in held_failures { // `S1-KJ`: a held frame", "for e in held_failures { // `S1-KJ`: counted as"] {
+            let at = code.find(held).unwrap_or_else(|| panic!("{held}"));
+            assert!(code[at..at + 600].contains(counted), "{held}: counted");
+        }
     }
 
     /// Ties deal on, with this client's own seat counted on its side.

@@ -2155,6 +2155,13 @@ pub struct Hand {
     /// `S1-KG`: the transcript's frames by their event hash -- the hash of
     /// the signed body, which a copy signed again shares.
     transcript_seen: BTreeSet<Hash>,
+    /// `S1-KJ`: the event this hand took at each stage from each writer --
+    /// `(sequence, sender key)` to its event hash -- for telling a copy of it
+    /// from another version of it once the stage is left.
+    taken_from: BTreeMap<(u64, [u8; 32]), Hash>,
+    /// `S1-KJ`: the stages and writers another version was found of, each said
+    /// once.
+    versions_said: BTreeSet<(u64, [u8; 32])>,
     /// `S1-KB`: another seat's betting actions this hand took, each the first
     /// time it took it, for the node to say again once (`take_said_again`).
     said_again: Vec<Vec<u8>>,
@@ -2472,6 +2479,8 @@ impl Hand {
                 muck_held_until_ms: None,
                 transcript: Vec::new(),
                 transcript_seen: BTreeSet::new(),
+                taken_from: BTreeMap::new(),
+                versions_said: BTreeSet::new(),
                 said_again: Vec::new(),
                 took_action: None,
                 voice,
@@ -2593,7 +2602,12 @@ impl Hand {
         if sequence < self.slot.sequence {
             // A stage this hand has left. Not a fault and not worth a word: the
             // mesh delivers a message more than once as a matter of course.
-            return Ok(Vec::new());
+            // `S1-KJ`: unless it is another version of what this hand took
+            // there from the same writer -- said once, and nothing else done.
+            return match self.another_version(bytes, kind, sequence) {
+                Some(seat) => Err(Failed::Equivocation { seat }),
+                None => Ok(Vec::new()),
+            };
         }
         if sequence > self.slot.sequence {
             return Err(Failed::NotYet);
@@ -2622,11 +2636,16 @@ impl Hand {
             // its bytes, every copy signed again was kept -- a rogue grew a
             // hand's transcript without limit, and the re-sends of `D-033` and
             // the answers of `D-065` walked all of it.
-            let digest: Hash = chained::open_in_hand(bytes, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id)
-                .map(|o| o.event_hash)
-                .unwrap_or_else(|_| *blake3::hash(bytes).as_bytes());
+            //
+            // Read, not checked again: the handler opened this very frame, its
+            // signature among it, before it answered `Ok`.
+            let digest: Hash = chained::event_hash_of(bytes, FRAME_CAP).unwrap_or_else(|| *blake3::hash(bytes).as_bytes());
             if self.transcript_seen.insert(digest) {
                 self.transcript.push(bytes.to_vec());
+                // `S1-KJ`: what this hand took at this stage from this writer.
+                if let Some(sender) = chained::sender_of(bytes, FRAME_CAP) {
+                    self.taken_from.entry((sequence, sender)).or_insert(digest);
+                }
                 // `S1-KB`: another seat's betting action, taken now for the
                 // first time -- verified, in its slot, applied, the hand moved
                 // by it.
@@ -2651,6 +2670,39 @@ impl Hand {
             }
             other => other,
         }
+    }
+
+    /// `S1-KJ`: the writer's seat, when `bytes` -- at a stage this hand has
+    /// left -- is another version of the event this hand took there from the
+    /// same writer: another event, validly signed by it for this table, hand
+    /// and stage. Said once per stage and writer.
+    ///
+    /// **Found where it was dropped unseen.** A collective stage finds a
+    /// second version only while this client is still at the stage (`Heard::
+    /// Equivocation`); a stage already left dropped every later copy without
+    /// a look. A writer that signs two versions of a step and sends one to
+    /// some seats and the other to the rest parts the table in two, and every
+    /// seat moves on with the version it had -- so each saw the other only
+    /// after, as another seat's say-again (`S1-KB`) or answer (`D-065`) of a
+    /// stage it had left. Nothing in the hand is changed by the finding and
+    /// nobody is removed for it (`D-014`: no removal on an equivocation); the
+    /// node counts it towards `S1-JR`'s question to the player. A copy of the
+    /// same event -- the same bytes, or the same body signed again -- is read
+    /// as a copy without checking a signature; only a different body is
+    /// opened, and one that does not verify is nothing.
+    fn another_version(&mut self, bytes: &[u8], kind: EventType, sequence: u64) -> Option<SeatIdx> {
+        let sender = chained::sender_of(bytes, FRAME_CAP)?;
+        let taken = *self.taken_from.get(&(sequence, sender))?;
+        if self.versions_said.contains(&(sequence, sender)) || chained::event_hash_of(bytes, FRAME_CAP)? == taken {
+            return None;
+        }
+        let opened = chained::open_in_hand(bytes, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id).ok()?;
+        if opened.event_hash == taken || opened.envelope.sequence != sequence {
+            return None;
+        }
+        let seat = self.seat_of(&sender).ok()?;
+        self.versions_said.insert((sequence, sender));
+        Some(seat)
     }
 
     /// The phase's own handler for an event that passed the guards.
@@ -19526,6 +19578,58 @@ mod tests {
         assert!(hands[0].transcript.contains(&original), "the opening is kept");
         hands[0].on_event(&again, &keys[0], NOW + 1).expect("a valid frame, and nothing new");
         assert_eq!(hands[0].transcript.len(), before, "the copy signed again is not kept a second time");
+    }
+
+    /// `S1-KJ`: another version of a step, reaching a seat after it has left
+    /// that step with the version it took, is found -- once -- and names its
+    /// writer; a copy of the version taken, the same body signed again, and a
+    /// version whose signature does not verify are nothing. The hand goes on.
+    #[test]
+    fn another_version_of_a_step_already_taken_is_found_once() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let call = bytes_of(&hands[up].act(Action::Call, &keys[up], NOW).expect("the big blind is faced: a call"));
+        let table_id = hands[up].open.table_id;
+        let hand_id = hands[up].open.hand_id;
+        let opened = chained::open_in_hand(&call[0], FRAME_CAP, EventType::ActionCall, &table_id, hand_id).unwrap();
+        let head: ActionHead = chained::payload(&opened, ACTION_CAP).unwrap();
+        let slot = chained::Slot {
+            table_id,
+            hand_id,
+            sequence: opened.envelope.sequence,
+            previous_event_hash: opened.envelope.previous_event_hash,
+        };
+        // The same call at the same step, stamped a millisecond later: another event.
+        let other = chained::seal(EventType::ActionCall, &slot, &head, &keys[up], NOW + 1, 30_000, ACTION_CAP).unwrap();
+        let mut forged = other.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        for i in (0..3).filter(|i| *i != up) {
+            let _ = deliver(&mut hands[i], &[Send::Broadcast(call[0].clone())], &keys[i]);
+            let at = hands[i].stage_sequence();
+            assert!(at > opened.envelope.sequence, "seat {i} took the call and moved on");
+            assert!(
+                hands[i].on_event(&forged, &keys[i], NOW + 2).is_ok_and(|s| s.is_empty()),
+                "seat {i}: a version that does not verify is nothing"
+            );
+            assert!(
+                hands[i].on_event(&call[0], &keys[i], NOW + 2).is_ok_and(|s| s.is_empty()),
+                "seat {i}: the version taken, again, is a copy"
+            );
+            assert!(
+                hands[i].on_event(&signed_again(&call[0], &keys[up]), &keys[i], NOW + 2).is_ok_and(|s| s.is_empty()),
+                "seat {i}: signed again, it is the same event"
+            );
+            match hands[i].on_event(&other, &keys[i], NOW + 2) {
+                Err(Failed::Equivocation { seat }) => assert_eq!(usize::from(seat), up, "seat {i}: its writer"),
+                other => panic!("seat {i}: another version is a finding, not {other:?}"),
+            }
+            assert!(
+                hands[i].on_event(&other, &keys[i], NOW + 3).is_ok_and(|s| s.is_empty()),
+                "seat {i}: said once"
+            );
+            assert_eq!(hands[i].stage_sequence(), at, "seat {i}: the hand is where it was");
+        }
     }
 
     /// `S1-KA`: a lobby answer's certificate is read with the shape the hand's

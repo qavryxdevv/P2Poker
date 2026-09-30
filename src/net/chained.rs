@@ -199,7 +199,14 @@ pub fn open(
 ///   in the hand is changed by it; the answer is frames this receiver already
 ///   accepted under their own authors' signatures, said again.
 ///
-/// No fifth caller may be added without a clause of its own.
+/// * `Hand::another_version` (`S1-KJ`): a frame of a stage this receiver has
+///   left whose event is not the one it took there from the same writer. The
+///   stage is behind, so there is no position to hold it to; its sequence is
+///   compared with the stage's own after the open. Nothing in the hand is
+///   changed by it: a second version that verifies is a finding the node
+///   counts, and one that does not is nothing.
+///
+/// No sixth caller may be added without a clause of its own.
 pub fn open_in_hand(
     bytes: &[u8],
     cap: usize,
@@ -307,6 +314,14 @@ pub fn peek(bytes: &[u8], cap: usize) -> Result<(EventType, u64, u64), WireError
         .check_envelope()
         .map_err(|_| WireError::Envelope("the envelope is not what the catalogue says"))?;
     Ok((kind, envelope.hand_id, envelope.sequence))
+}
+
+/// `S1-KG`, `S1-KJ`: an event's hash -- of its signed body, which a copy
+/// signed again with another nonce shares -- read, not checked, like
+/// [`peek`]: it tells a copy from another event, and believes neither.
+pub fn event_hash_of(bytes: &[u8], cap: usize) -> Option<Hash> {
+    let signed: SignedEvent = from_canonical(bytes, cap).ok()?;
+    Some(event_hash(&signed.body))
 }
 
 /// The key an event claims to be signed by -- read, not checked, like
