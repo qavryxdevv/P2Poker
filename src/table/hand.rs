@@ -2138,6 +2138,8 @@ pub struct Hand {
     /// accepted, for a seat back from a restart to take the hand up from --
     /// said again by the node beside its own frames.
     transcript: Vec<Vec<u8>>,
+    /// `S1-KG`: the transcript's frames by their event hash -- the hash of
+    /// the signed body, which a copy signed again shares.
     transcript_seen: BTreeSet<Hash>,
     /// `S1-KB`: another seat's betting actions this hand took, each the first
     /// time it took it, for the node to say again once (`take_said_again`).
@@ -2600,7 +2602,15 @@ impl Hand {
         let unkept = std::mem::take(&mut self.unkept);
         let took = self.took_action.take();
         if out.is_ok() && !unkept {
-            let digest: Hash = *blake3::hash(bytes).as_bytes();
+            // `S1-KG`: kept by the event, not the bytes. A signature is its
+            // signer's to make again with a fresh nonce, and a collective stage
+            // takes a second copy of a frame it holds as nothing (`Ok`): kept by
+            // its bytes, every copy signed again was kept -- a rogue grew a
+            // hand's transcript without limit, and the re-sends of `D-033` and
+            // the answers of `D-065` walked all of it.
+            let digest: Hash = chained::open_in_hand(bytes, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id)
+                .map(|o| o.event_hash)
+                .unwrap_or_else(|_| *blake3::hash(bytes).as_bytes());
             if self.transcript_seen.insert(digest) {
                 self.transcript.push(bytes.to_vec());
                 // `S1-KB`: another seat's betting action, taken now for the
@@ -19371,6 +19381,57 @@ mod tests {
             assert!(!h.over());
             assert!(h.out_for_good_decided().is_empty(), "{cause:?}: not while the hand is played");
         }
+    }
+
+    /// The same event signed again under `key` with a nonce of its own -- a
+    /// valid Ed25519 signature, and other bytes. Ed25519 signing is
+    /// deterministic, so a second signature needs a nonce the signer chose.
+    fn signed_again(frame: &[u8], key: &SigningKey) -> Vec<u8> {
+        use curve25519_dalek::edwards::EdwardsPoint;
+        use curve25519_dalek::scalar::{clamp_integer, Scalar};
+        use sha2::{Digest, Sha512};
+        let signed: crate::protocol::messages::SignedEvent =
+            crate::protocol::serialization::from_canonical(frame, FRAME_CAP).expect("a signed event");
+        let message = crate::protocol::signatures::to_be_signed(&signed.body);
+        let expanded: [u8; 64] = Sha512::digest(key.to_bytes()).into();
+        let mut lower = [0u8; 32];
+        lower.copy_from_slice(&expanded[..32]);
+        let a = Scalar::from_bytes_mod_order(clamp_integer(lower));
+        let nonce: [u8; 64] = Sha512::new()
+            .chain_update(&expanded[32..])
+            .chain_update(&message)
+            .chain_update(b"signed again")
+            .finalize()
+            .into();
+        let r = Scalar::from_bytes_mod_order_wide(&nonce);
+        let big_r = EdwardsPoint::mul_base(&r).compress();
+        let k: [u8; 64] = Sha512::new()
+            .chain_update(big_r.as_bytes())
+            .chain_update(key.verifying_key().as_bytes())
+            .chain_update(&message)
+            .finalize()
+            .into();
+        let s = r + Scalar::from_bytes_mod_order_wide(&k) * a;
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(big_r.as_bytes());
+        signature[32..].copy_from_slice(s.as_bytes());
+        crate::protocol::serialization::to_canonical(&crate::protocol::messages::SignedEvent { body: signed.body, signature })
+            .expect("encodes")
+    }
+
+    /// `S1-KG`: a frame signed again with a fresh nonce is the frame the
+    /// transcript already holds -- kept once, by its event, not by its bytes.
+    #[test]
+    fn a_frame_signed_again_is_the_frame_already_kept() {
+        let (mut hands, keys) = present_and_quiet(4, 3);
+        let (_, from_1) = Hand::open(opening_n(4, 1), &keys[1], NOW, 30_000).unwrap();
+        let original = bytes_of(&from_1).into_iter().next().expect("seat 1's opening");
+        let again = signed_again(&original, &keys[1]);
+        assert_ne!(again, original, "other bytes");
+        let before = hands[0].transcript.len();
+        assert!(hands[0].transcript.contains(&original), "the opening is kept");
+        hands[0].on_event(&again, &keys[0], NOW + 1).expect("a valid frame, and nothing new");
+        assert_eq!(hands[0].transcript.len(), before, "the copy signed again is not kept a second time");
     }
 
     /// `S1-KA`: a lobby answer's certificate is read with the shape the hand's
