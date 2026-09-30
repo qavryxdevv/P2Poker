@@ -451,8 +451,23 @@ impl Opening {
     /// certify anybody, no stage 0 ever closed, and the hands aborted on their
     /// budget for the rest of the run (`run175510-4`).
     pub fn adopt_with_signers(base: Opening, copies: &[Vec<u8>]) -> Result<(Opening, Vec<SeatIdx>), Failed> {
+        let my_seat = base.my_seat;
+        let others = base.seats.iter().filter(|(s, _, _)| *s != my_seat).count();
+        Self::adopt_with_signers_where(base, copies, |signers| {
+            signers.iter().filter(|s| **s != my_seat).count() * 2 > others
+        })
+    }
+
+    /// [`Opening::adopt_with_signers`], the copies taken where `enough` says
+    /// the seats that signed the most-signed of them are enough -- `S1-KF`
+    /// (`D-088`): the node's count of the table, as `D-066` counts it, where
+    /// the one above is a strict majority of every other seat of the roster.
+    pub fn adopt_with_signers_where(
+        base: Opening,
+        copies: &[Vec<u8>],
+        enough: impl Fn(&[SeatIdx]) -> bool,
+    ) -> Result<(Opening, Vec<SeatIdx>), Failed> {
         use std::collections::BTreeMap;
-        let occupied: Vec<SeatIdx> = base.seats.iter().map(|(s, _, _)| *s).collect();
         // (parent, body bytes) -> (seats that signed exactly this, the body)
         let mut groups: BTreeMap<(Hash, Vec<u8>), (BTreeSet<SeatIdx>, HandInit)> = BTreeMap::new();
         for raw in copies {
@@ -495,15 +510,15 @@ impl Opening {
         else {
             return Err(Failed::NotYet);
         };
-        // A strict majority of the occupied seats **other than the adopter's**:
-        // the adopter is not a seat that could have agreed. Heads-up that is the
-        // one other seat, which is what lets a restarted client come back to a
-        // two-seat table at all (`S1-CX`). Its own signature among the copies is
-        // not counted (`S1-JX`): counted, the other seat said an old opening of
-        // this client's own again and it was adopted on nothing but that, with no
+        // Enough seats **other than the adopter's** (`enough`): the adopter is
+        // not a seat that could have agreed. Heads-up that is the one other
+        // seat, which is what lets a restarted client come back to a two-seat
+        // table at all (`S1-CX`). Its own signature among the copies is not
+        // counted (`S1-JX`): counted, the other seat said an old opening of this
+        // client's own again and it was adopted on nothing but that, with no
         // look at its stacks.
-        let others = occupied.iter().filter(|s| **s != base.my_seat).count();
-        if others_in(&signers) * 2 <= others {
+        let signed: Vec<SeatIdx> = signers.iter().copied().filter(|s| *s != base.my_seat).collect();
+        if signed.is_empty() || !enough(&signed) {
             return Err(Failed::NotYet);
         }
         if body.stacks.len() != base.seats.len() {
@@ -7250,6 +7265,30 @@ impl Hand {
     /// hand of two at a table of three such seats is no heads-up game: the
     /// third seat, certified out and kept out, is a player all the same --
     /// unless its player left by its own word.
+    /// `S1-KF` (`D-088`): the seats this client counts as the table in
+    /// `D-038` -- the hand's required and returned seats and this client,
+    /// less those this hand certified out or put out for good, and, once the
+    /// hand is over, those it left without chips. Read from this client's own
+    /// hand, which no other seat's copy can shrink.
+    pub fn table_for_the_count(&self) -> Vec<SeatIdx> {
+        let out = self.out_for_good();
+        let over = self.over();
+        let me = self.open.my_seat;
+        let mut table: Vec<SeatIdx> = self
+            .open
+            .required
+            .iter()
+            .chain(self.returned.iter())
+            .copied()
+            .filter(|s| !self.certified.contains(s) && !out.contains(s))
+            .filter(|s| !over || self.boundary_stack_of(*s) > 0)
+            .chain(std::iter::once(me))
+            .collect();
+        table.sort_unstable();
+        table.dedup();
+        table
+    }
+
     pub fn seats_in_the_game(&self) -> usize {
         let out = self.out_for_good();
         self.open
@@ -17475,6 +17514,46 @@ mod tests {
         assert!(!opened[0].dealt(), "stage 0 is open without seat 3: {:?}", opened[0].waiting_for());
         opened[0].on_event(&mine[0], &keys[0], NOW + 2_000).expect("seat 3's copy");
         assert!(opened[0].dealt(), "and closes on it");
+    }
+
+    /// `S1-KF` (`D-088`): the copies are taken where the count the node gives
+    /// says the seats that signed them are enough -- the adopter's own seat
+    /// never among them.
+    #[test]
+    fn copies_are_taken_where_the_count_given_says_their_signers_are_enough() {
+        let (hands, keys) = a_table_after_hand_one();
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        let three = |s: &[SeatIdx]| s.len() >= 3;
+        assert!(
+            matches!(Opening::adopt_with_signers_where(adopter_base(), &copies[..2], three), Err(Failed::NotYet)),
+            "two signers where the count asks three"
+        );
+        let (_, signers) = Opening::adopt_with_signers_where(adopter_base(), &copies[..3], three).expect("three signers");
+        assert_eq!(signers.len(), 3);
+        let never_mine = |s: &[SeatIdx]| !s.contains(&3) && !s.is_empty();
+        assert!(Opening::adopt_with_signers_where(adopter_base(), &copies[..1], never_mine).is_ok(), "the count's own word");
+        assert!(matches!(Opening::adopt_with_signers_where(adopter_base(), &[], |_| true), Err(Failed::NotYet)), "no signer is never enough");
+    }
+
+    /// `S1-KF` (`D-088`): a hand counts as the table its required and returned
+    /// seats and this client, less the seats it certified out.
+    #[test]
+    fn a_hand_counts_the_table_without_the_seats_it_certified_out() {
+        let (mut hands, keys, mut said) = n_seats_to_the_bet(4);
+        assert_eq!(hands[0].table_for_the_count(), vec![0, 1, 2, 3], "the whole table");
+        let z = hands[0].turn().expect("somebody is to act").seat;
+        let voters: Vec<usize> = (0..4).filter(|s| *s != usize::from(z)).collect();
+        let late = NOW + 60_000;
+        let mut pending: Vec<(usize, Vec<Send>)> = Vec::new();
+        for v in &voters {
+            pending.push((*v, hands[*v].vote_on_timeouts(&keys[*v], late, 0).unwrap()));
+        }
+        flood_among(&mut hands, &keys, &mut said, pending);
+        let s = voters[0];
+        assert!(hands[s].certified_seats().contains(&z), "the silent seat certified");
+        let counted = hands[s].table_for_the_count();
+        assert!(!counted.contains(&z) && counted.len() == 3, "counted without it: {counted:?}");
+        assert!(counted.contains(&hands[s].my_seat()), "this client among it");
     }
 
     /// A strict majority of the occupied seats, at one genesis: two of four

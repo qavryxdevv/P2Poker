@@ -99,6 +99,12 @@ pub struct Record {
     /// table key like any list. Empty for a seat that joined.
     #[n(17)]
     pub roster_list: Vec<u8>,
+    /// `S1-KF` (`D-088`): the seats this client counted as the table when the
+    /// record was written -- its hand's seats still in the game, itself among
+    /// them -- for the count a client started again takes the table's hand up
+    /// by. Absent from a record written before it, which reads as `None`.
+    #[n(18)]
+    pub in_game: Option<Vec<u8>>,
 }
 
 pub fn session_path(dir: &Path) -> PathBuf {
@@ -219,7 +225,47 @@ mod tests {
             secret_hand_id: 6,
             founder_seed: [5; 32],
             roster_list: vec![0xCC; 180],
+            in_game: Some(vec![0, 2, 4]),
         }
+    }
+
+    /// `S1-KF` (`D-088`): a record written before the seats in the game were
+    /// kept reads with none, and one written with them keeps them.
+    #[test]
+    fn a_record_from_before_the_seats_in_the_game_reads_with_none() {
+        let mut old = a_record();
+        old.in_game = None;
+        let bytes = minicbor::to_vec(&old).expect("encodes");
+        let back: Record = minicbor::decode(&bytes).expect("decodes");
+        assert_eq!(back.in_game, None);
+        let with = a_record();
+        let back: Record = minicbor::decode(&minicbor::to_vec(&with).expect("encodes")).expect("decodes");
+        assert_eq!(back.in_game, Some(vec![0, 2, 4]));
+        // A version 4 record as the build before this wrote it: eighteen
+        // fields, the last the roster list.
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(18).unwrap();
+        e.u8(old.version).unwrap();
+        e.bytes(&old.table_id).unwrap();
+        e.bytes(&old.session_id).unwrap();
+        e.bytes(&old.table_key).unwrap();
+        e.encode(&old.founder_peer_id).unwrap();
+        e.str(&old.table_name).unwrap();
+        e.u8(old.my_seat).unwrap();
+        e.u64(old.hand_id).unwrap();
+        e.bytes(&old.terminal).unwrap();
+        e.u64(old.my_stack).unwrap();
+        e.u64(old.written_unix_ms).unwrap();
+        e.encode(&old.advert).unwrap();
+        e.bytes(&old.advert_hash).unwrap();
+        e.encode(&old.ratification).unwrap();
+        e.bytes(&old.hand_secret).unwrap();
+        e.u64(old.secret_hand_id).unwrap();
+        e.bytes(&old.founder_seed).unwrap();
+        e.encode(&old.roster_list).unwrap();
+        let legacy = e.into_writer();
+        let back: Record = minicbor::decode(&legacy).expect("the older build's record reads");
+        assert_eq!(back, old);
     }
 
     /// What is written is what is read, field by field, and it is the only

@@ -1465,6 +1465,14 @@ struct TableRun {
     /// `S1-JX`: the highest hand this client dropped to rejoin, or abandoned
     /// for a newer one -- none at or below it is adopted again. Only rises.
     rejoin_floor: Option<u64>,
+    /// `S1-KF` (`D-088`): the seats the hand this client dropped to rejoin
+    /// counted as the table (`Hand::table_for_the_count`) -- what the copies
+    /// it takes the table's hand up from are counted against, until it is
+    /// back in the roster.
+    rejoin_table: Option<Vec<u8>>,
+    /// `S1-KF` (`D-088`): the table as the hand this client holds counted it
+    /// on the last stall tick -- what the session record keeps.
+    table_counted: Option<Vec<u8>>,
     /// `S1-JY`: the hand in which this client refused a certificate only half
     /// the table carried, naming it, and when -- until a later hand is played
     /// with it (`HALF_REFUSED_LIMIT`).
@@ -1960,6 +1968,8 @@ impl TableRun {
             rejoin_stacks: None,
             stacks_refused: false,
             rejoin_floor: None,
+            rejoin_table: None,
+            table_counted: None,
             half_refused: None,
             half_seen: 0,
             ever_on_line: false,
@@ -2420,6 +2430,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             Vec::new()
                         },
+                        // `S1-KF` (`D-088`): the table as this client's hand counts it.
+                        in_game: $t.table_counted.clone(),
                     };
                     match crate::storage::session::save(&profile_dir, &record) {
                         Ok(()) => {
@@ -3386,6 +3398,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             seat,
                                             &mut $t.ahead,
                                             &mut $t.adrift,
+                                            line_down_within($t.line_down_at),
                                         );
                                         // **A certificate about the hand just
                                         // finished, arriving during the next
@@ -4226,6 +4239,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
             // And never back to the hand it dropped, or one before it.
             $t.rejoin_floor = $t.rejoin_floor.max(Some(dead));
+            // `S1-KF` (`D-088`): and the table as that hand counted it, which
+            // the copies it comes back by are counted against.
+            if let Some(h) = $t.hand.as_ref() {
+                $t.rejoin_table = Some(h.table_for_the_count());
+            }
             $t.previous = None;
             $t.hand = None;
             $t.pending_repair = None;
@@ -4412,6 +4430,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.rejoin_stacks = None;
             $t.stacks_refused = false;
             $t.rejoin_floor = None;
+            $t.rejoin_table = None;
+            $t.table_counted = None;
             $t.half_refused = None;
             $t.half_seen = 0;
             $t.ever_on_line = false;
@@ -8836,6 +8856,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning("already at a table; leave it before rejoining another".into())).await;
                             continue;
                         }
+                        // `S1-KF` (`D-088`): a client started again was away from its
+                        // table, as one whose line went down was -- for `D-038`'s
+                        // count, and for `D-066`'s certificate that named it then.
+                        t.line_down_at = Some(tokio::time::Instant::now());
                         // `D-037`: the founder's own record. There is no founder to
                         // ask, so the roster is rebuilt from the list it signed, the
                         // group is re-entered on a member's invitation, and the
@@ -9701,6 +9725,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         &item.bytes,
                                         &mut t.ahead,
                                         &mut t.adrift,
+                                        line_down_within(t.line_down_at),
                                     );
                                 } else if !boundary_event(
                                     &item.bytes,
@@ -11677,13 +11702,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             (bystander || undealt).then_some(h.hand_id())
                         });
                         if let (Some(current), Some(f)) = (stuck, t.table.as_ref()) {
-                            let occupied = f.roster().len();
-                            // `S1-JX`: counted by the others' copies, as the pick is.
+                            // `S1-JX`: counted by the others' copies, as the pick is --
+                            // `S1-KF` (`D-088`): against the same table.
                             let mine = app_key.verifying_key().to_bytes();
+                            let me = f.my_seat().unwrap_or(0);
+                            let own_key = if f.is_founder() { Some(f.table_id()) } else { t.joined_key };
+                            let recorded = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key).and_then(|r| r.in_game.as_deref());
+                            let table = table_to_count(t.rejoin_table.as_deref(), recorded, f, me);
                             let newer = t
                                 .resume_inits
                                 .iter()
-                                .any(|(hid, copies)| *hid > current && others_signed(copies, f, *hid, &mine) * 2 > occupied.saturating_sub(1));
+                                .any(|(hid, copies)| *hid > current && the_table_signed(&others_signing(copies, f, *hid, &mine), &table, me));
                             if newer {
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
@@ -11913,11 +11942,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let record = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key);
                                 let floor = adoption_floor(t.rejoin_floor, record);
                                 let mine = app_key.verifying_key().to_bytes();
+                                // `S1-KF` (`D-088`): the copies are counted against the table
+                                // as this client last knew it -- the hand it dropped, or its
+                                // record -- as `D-066` counts it: a strict majority of that
+                                // table, this client among it, or exactly half holding its
+                                // lowest seat. A strict majority of the others let two rogues
+                                // of four hand it any copy they liked.
+                                let me = f.my_seat().unwrap_or(0);
+                                let table = table_to_count(t.rejoin_table.as_deref(), record.and_then(|r| r.in_game.as_deref()), f, me);
+                                let heads_up = heads_up || table.len() == 2;
                                 let pick = t.resume_inits
                                     .iter()
                                     .rev()
                                     .filter(|(h, _)| floor.map_or(true, |f| **h > f))
-                                    .find(|(h, copies)| others_signed(copies, f, **h, &mine) * 2 > occupied.saturating_sub(1))
+                                    .find(|(h, copies)| the_table_signed(&others_signing(copies, f, **h, &mine), &table, me))
                                     .map(|(h, c)| (*h, c.clone()));
                                 if let Some((hid, copies)) = pick {
                                     // `D-039`: whether the set that signed is exact is asked
@@ -11933,7 +11971,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         || t.resume_early.iter().any(|(h, _)| *h == hid);
                                     if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
                                         let now = super::node::now_unix_ms();
-                                        match crate::table::hand::Opening::adopt_with_signers(base, &copies) {
+                                        let enough = |signers: &[u8]| {
+                                            the_table_signed(&signers.iter().copied().collect(), &table, me)
+                                        };
+                                        match crate::table::hand::Opening::adopt_with_signers_where(base, &copies, enough) {
                                             Ok((mut o, signers)) => {
                                                 // `D-033`: a copy of this seat's own opening among
                                                 // the table's means the previous life signed this
@@ -12224,6 +12265,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     let Some(h) = t.hand.as_mut() else { continue };
+                    // `S1-KF` (`D-088`): the table this hand counts, for the record.
+                    let counted = h.table_for_the_count();
+                    t.table_counted = Some(counted);
 
                     // **A message parked on a clock has to be re-judged by a
                     // clock.** `replay_early` had exactly one caller in the tree —
@@ -13531,6 +13575,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         t.resuming = false;
+                        t.rejoin_table = None;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "back in the roster from hand #{} on; deriving hands again",
@@ -18191,9 +18236,10 @@ fn note_the_table_moved_on(
     bytes: &[u8],
     ahead: &mut std::collections::HashMap<u8, u64>,
     adrift: &mut Option<(u64, u64)>,
+    away: bool,
 ) {
     if let Some((hand_id, seat)) = h.another_hand(bytes) {
-        note_a_hand_ahead(h, hand_id, seat, ahead, adrift);
+        note_a_hand_ahead(h, hand_id, seat, ahead, adrift, away);
     }
 }
 
@@ -18203,6 +18249,7 @@ fn note_a_hand_ahead(
     seat: Option<u8>,
     ahead: &mut std::collections::HashMap<u8, u64>,
     adrift: &mut Option<(u64, u64)>,
+    away: bool,
 ) {
     // A hand *behind* this client is an ordinary late delivery, and a seat with
     // no place in the roster is not evidence of anything.
@@ -18217,14 +18264,9 @@ fn note_a_hand_ahead(
         return;
     }
     let me = h.my_seat();
-    let others: std::collections::BTreeSet<u8> = h
-        .required()
-        .iter()
-        .chain(h.returned().iter())
-        .copied()
-        .filter(|s| *s != me)
-        .collect();
-    let others: Vec<u8> = others.into_iter().collect();
+    // `S1-KF` (`D-088`): the table as this client's own hand counts it.
+    let table = h.table_for_the_count();
+    let others: Vec<u8> = table.iter().copied().filter(|s| *s != me).collect();
     // `S1-JR`: one other seat is the table only where two are left in the
     // game. At a hand of two at a table of three -- the third seat kept out
     // -- the other seat alone sent this client adrift with one signed frame
@@ -18232,7 +18274,7 @@ fn note_a_hand_ahead(
     if others.len() == 1 && h.seats_in_the_game() >= 3 {
         return;
     }
-    if let Some(out) = adrift_now(mine, ahead, &others) {
+    if let Some(out) = adrift_now(mine, ahead, &table, me, away) {
         *adrift = Some(out);
     }
 }
@@ -18242,18 +18284,37 @@ fn note_a_hand_ahead(
 /// `note_a_hand_ahead` needs a whole `Hand` and a live table to be called; this
 /// is the part that decides, and a test that had to rebuild the caller would
 /// end up restating the rule instead of checking it.
-fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>, others: &[u8]) -> Option<(u64, u64)> {
-    // **A majority of the others, and two hands each.** One hand of margin is
-    // what a table looks like while somebody is still inside `Ended::pause`;
-    // a seat outside `others` is not in the game as this client knows it, and
-    // its word about where the table is counts for nothing.
-    let saying: Vec<u64> = others
+fn adrift_now(
+    mine: u64,
+    ahead: &std::collections::HashMap<u8, u64>,
+    table: &[u8],
+    me: u8,
+    away: bool,
+) -> Option<(u64, u64)> {
+    // **Two hands each.** One hand of margin is what a table looks like while
+    // somebody is still inside `Ended::pause`; a seat outside `table` is not
+    // in the game as this client knows it, and its word about where the table
+    // is counts for nothing.
+    let others: Vec<u8> = table.iter().copied().filter(|s| *s != me).collect();
+    let saying: Vec<(u8, u64)> = others
         .iter()
-        .filter_map(|s| ahead.get(s).copied())
-        .filter(|k| *k >= mine.saturating_add(ADRIFT_MARGIN))
+        .filter_map(|s| ahead.get(s).map(|k| (*s, *k)))
+        .filter(|(_, k)| *k >= mine.saturating_add(ADRIFT_MARGIN))
         .collect();
-    let furthest = saying.iter().copied().max()?;
-    (saying.len() * 2 > others.len()).then_some((furthest, mine))
+    let furthest = saying.iter().map(|(_, k)| *k).max()?;
+    // Heads-up the one other seat is the whole table.
+    if others.len() == 1 {
+        return Some((furthest, mine));
+    }
+    // `S1-KF` (`D-088`): **the table as `D-066` counts it**, this client among
+    // it: a strict majority of it -- or exactly half holding its lowest seat,
+    // and only where this client's own line was down (`D-066` point 4: a seat
+    // that was here is not put out by half the table). A strict majority of
+    // the others let two rogues of four send an honest seat adrift at will,
+    // and hand it a copy of their own to take the table's hand up from.
+    let n = table.len();
+    let lowest_ahead = table.iter().min().is_some_and(|m| saying.iter().any(|(s, _)| s == m));
+    (saying.len() * 2 > n || (saying.len() * 2 == n && lowest_ahead && away)).then_some((furthest, mine))
 }
 
 /// `S1-JX`: whether a frame a client with no hand keeps for its return is one
@@ -18268,13 +18329,18 @@ fn a_seats_own_frame(bytes: &[u8], f: &Formation) -> bool {
         .is_some_and(|o| f.roster().seat_of(&o.sender).is_some())
 }
 
-/// `S1-JX`: how many roster seats other than this client signed the copies of
+/// `S1-JX`: the roster seats other than this client that signed the copies of
 /// hand `hand_id`'s opening among `copies` -- each copy opened and its
 /// signature checked, as the adoption checks it, and each seat counted once. A
 /// count of the copies by the sender they claim let one seat's forged copies of
 /// a hand far ahead make a majority, and keep a client coming back from ever
 /// taking the table's hand up.
-fn others_signed(copies: &[Vec<u8>], f: &Formation, hand_id: u64, mine: &[u8; 32]) -> usize {
+fn others_signing(
+    copies: &[Vec<u8>],
+    f: &Formation,
+    hand_id: u64,
+    mine: &[u8; 32],
+) -> std::collections::BTreeSet<u8> {
     let table_id = f.table_id();
     copies
         .iter()
@@ -18291,7 +18357,33 @@ fn others_signed(copies: &[Vec<u8>], f: &Formation, hand_id: u64, mine: &[u8; 32
         .filter(|o| o.sender != *mine)
         .filter_map(|o| f.roster().seat_of(&o.sender))
         .collect::<std::collections::BTreeSet<u8>>()
-        .len()
+}
+
+/// `S1-KF` (`D-088`): whether the seats that signed a copy are the table, as
+/// `D-066` counts it: of `table` -- the seats this client counts, itself among
+/// them -- a strict majority, or exactly half holding its lowest seat; at a
+/// table of two, the one other seat. Seats outside `table` count for nothing.
+fn the_table_signed(signers: &std::collections::BTreeSet<u8>, table: &[u8], me: u8) -> bool {
+    let n = table.len();
+    let s = signers.iter().filter(|x| **x != me && table.contains(x)).count();
+    if n <= 2 {
+        return s >= 1;
+    }
+    s * 2 > n || (s * 2 == n && table.iter().min().is_some_and(|m| signers.contains(m)))
+}
+
+/// `S1-KF` (`D-088`): the table the copies a client comes back by are counted
+/// against -- the one the hand it dropped counted, or its record's, the roster's
+/// seats among them and this client with them; the roster where it knows none.
+fn table_to_count(rejoin: Option<&[u8]>, recorded: Option<&[u8]>, f: &Formation, me: u8) -> Vec<u8> {
+    let roster: Vec<u8> = f.roster().seats().iter().map(|e| e.seat).collect();
+    let known: Option<std::collections::BTreeSet<u8>> = rejoin.or(recorded).map(|t| {
+        t.iter().copied().filter(|s| roster.contains(s)).chain(std::iter::once(me)).collect()
+    });
+    match known {
+        Some(t) if t.len() >= 2 => t.into_iter().collect(),
+        _ => roster,
+    }
 }
 
 /// `S1-JX`: the highest hand a client coming back may not adopt -- the one it
@@ -20999,36 +21091,37 @@ mod tests {
         let at = |pairs: &[(u8, u64)]| -> HashMap<u8, u64> {
             pairs.iter().copied().collect()
         };
-        let three = [1u8, 2, 3];
-        let two = [1u8, 2];
+        // This client is seat 0 of the table it counts (`S1-KF`, `D-088`).
+        let three = [0u8, 1, 2, 3];
+        let two = [0u8, 1, 2];
 
         // Three seats, one hand ahead: the showdown-pause skew, and the shape of
         // thirty-six of the thirty-seven real evictions.
         assert_eq!(
-            adrift_now(mine, &at(&[(1, mine + 1), (2, mine + 1), (3, mine + 1)]), &three),
+            adrift_now(mine, &at(&[(1, mine + 1), (2, mine + 1), (3, mine + 1)]), &three, 0, false),
             None,
             "three seats one hand ahead is a pause, not a divergence"
         );
 
         // Two hands is past any pause.
         assert_eq!(
-            adrift_now(mine, &at(&[(1, mine + 2), (2, mine + 2)]), &two),
+            adrift_now(mine, &at(&[(1, mine + 2), (2, mine + 2)]), &two, 0, false),
             Some((mine + 2, mine)),
             "two hands behind is adrift"
         );
 
         // The one true positive on record: five hands, run212350-4.
         assert_eq!(
-            adrift_now(6, &at(&[(1, 11), (2, 11), (3, 10)]), &three),
+            adrift_now(6, &at(&[(1, 11), (2, 11), (3, 10)]), &three, 0, false),
             Some((11, 6)),
             "the case this mechanism exists for still fires"
         );
 
         // One seat of two is never the table, whatever the margin.
-        assert_eq!(adrift_now(mine, &at(&[(1, mine + 9)]), &two), None, "one seat of two is not the table");
+        assert_eq!(adrift_now(mine, &at(&[(1, mine + 9)]), &two, 0, true), None, "one seat of two is not the table");
 
         // And a table nobody is ahead of says nothing.
-        assert_eq!(adrift_now(mine, &at(&[(1, mine), (2, mine - 1)]), &two), None);
+        assert_eq!(adrift_now(mine, &at(&[(1, mine), (2, mine - 1)]), &two, 0, true), None);
     }
 
     /// `S1-IX`: a frozen table's game ends on either of the corpus's two ends
@@ -21162,9 +21255,20 @@ mod tests {
             code[pick - 400..pick].contains("let record = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key);"),
             "the record only where it is this table's"
         );
-        assert!(code[pick..pick + 900].contains(".filter(|(h, _)| floor.map_or(true, |f| **h > f))"), "above the floor only");
-        assert!(code[pick..pick + 900].contains("others_signed(copies, f, **h, &mine) * 2"), "the others' signatures counted, verified");
-        assert!(code.contains("*hid > current && others_signed(copies, f, *hid, &mine) * 2"), "and so at the abandon");
+        assert!(code[pick..pick + 1600].contains(".filter(|(h, _)| floor.map_or(true, |f| **h > f))"), "above the floor only");
+        // `S1-KF` (`D-088`): counted against the table as `D-066` counts it.
+        assert!(
+            code[pick..pick + 1600].contains("the_table_signed(&others_signing(copies, f, **h, &mine), &table, me)"),
+            "the others' signatures counted, verified"
+        );
+        assert!(
+            code.contains("*hid > current && the_table_signed(&others_signing(copies, f, *hid, &mine), &table, me)"),
+            "and so at the abandon"
+        );
+        assert!(
+            code.contains("crate::table::hand::Opening::adopt_with_signers_where(base, &copies, enough)"),
+            "and the engine takes the copies by the same count"
+        );
         let foreign = code.find("let foreign = heads_up").expect("the check");
         assert!(code[foreign..foreign + 300].contains("&& !signed_before"), "not for a hand this seat signed itself");
         assert!(code[foreign..foreign + 600].contains("!known.iter().any(|k| stacks_agree(&o.seats, k))"), "against what the hand holds");
@@ -21225,6 +21329,7 @@ mod tests {
             secret_hand_id,
             founder_seed: [0; 32],
             roster_list: Vec::new(),
+            in_game: None,
         };
         assert_eq!(adoption_floor(None, None), None);
         assert_eq!(adoption_floor(None, Some(&record(7, 0))), Some(7), "hand 7 ended: 8 on");
@@ -21245,31 +21350,59 @@ mod tests {
         let at = |pairs: &[(u8, u64)]| -> HashMap<u8, u64> {
             pairs.iter().copied().collect()
         };
-        let eight: Vec<u8> = (1u8..=8).collect();
+        // This client is seat 0 of nine.
+        let nine: Vec<u8> = (0u8..=8).collect();
 
         // Two of eight, five and two hands on: a private branch, not the table.
-        assert_eq!(adrift_now(mine, &at(&[(1, 6), (6, 3)]), &eight), None, "two of eight is a minority");
+        assert_eq!(adrift_now(mine, &at(&[(1, 6), (6, 3)]), &nine, 0, true), None, "two of eight is a minority");
         // Four of eight is not a strict majority either.
-        assert_eq!(adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3)]), &eight), None, "four of eight is half");
+        assert_eq!(adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3)]), &nine, 0, true), None, "four of nine is short of half");
         // Five of eight, two hands on, is the table gone on without this seat.
         assert_eq!(
-            adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3), (5, 4)]), &eight),
+            adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3), (5, 4)]), &nine, 0, false),
             Some((4, mine)),
-            "five of eight two hands on is the table"
+            "five of nine two hands on is the table, this client here or not"
         );
         // A seat that is one hand on does not count towards the majority.
         assert_eq!(
-            adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3), (5, 2)]), &eight),
+            adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3), (5, 2)]), &nine, 0, true),
             None,
             "a seat one hand on is inside the pause"
         );
         // A seat outside the game as this client knows it -- certified out, still
         // dealing alone -- is not evidence, however far it has got.
-        assert_eq!(adrift_now(mine, &at(&[(9, 40), (10, 40), (11, 40)]), &eight), None, "strangers are not the table");
+        assert_eq!(adrift_now(mine, &at(&[(9, 40), (10, 40), (11, 40)]), &nine, 0, true), None, "strangers are not the table");
         // Heads-up the one other seat is the whole table.
-        assert_eq!(adrift_now(mine, &at(&[(1, 3)]), &[1u8]), Some((3, mine)), "heads-up the other seat is the table");
+        assert_eq!(adrift_now(mine, &at(&[(1, 3)]), &[0u8, 1], 0, false), Some((3, mine)), "heads-up the other seat is the table");
         // And with nobody else in the game there is no table to be behind.
-        assert_eq!(adrift_now(mine, &at(&[(1, 3)]), &[]), None);
+        assert_eq!(adrift_now(mine, &at(&[(1, 3)]), &[0u8], 0, true), None);
+        // `S1-KF` (`D-088`): exactly half of a table of four -- this client seat 3.
+        let four = [0u8, 1, 2, 3];
+        let half_with_the_lowest = at(&[(0, 3), (1, 3)]);
+        assert_eq!(adrift_now(mine, &half_with_the_lowest, &four, 3, true), Some((3, mine)), "half holding the lowest seat, this client away");
+        assert_eq!(adrift_now(mine, &half_with_the_lowest, &four, 3, false), None, "a seat that was here is not put out by half the table");
+        let half_without = at(&[(1, 3), (2, 3)]);
+        assert_eq!(adrift_now(mine, &half_without, &four, 3, true), None, "half without the lowest seat is not the table");
+        assert_eq!(adrift_now(mine, &at(&[(0, 3), (1, 3), (2, 3)]), &four, 3, false), Some((3, mine)), "three of four is the table");
+    }
+
+    /// `S1-KF` (`D-088`): the copies a client comes back by are the table's
+    /// where their signers are a strict majority of the table it counts, itself
+    /// among it, or exactly half holding its lowest seat -- at a table of two the
+    /// one other seat -- and seats outside it count for nothing.
+    #[test]
+    fn a_copy_is_the_tables_where_a_d066_count_of_the_table_signed_it() {
+        let set = |s: &[u8]| s.iter().copied().collect::<std::collections::BTreeSet<u8>>();
+        let four = [0u8, 1, 2, 3];
+        assert!(the_table_signed(&set(&[0, 1, 2]), &four, 3), "three of four");
+        assert!(the_table_signed(&set(&[0, 1]), &four, 3), "half, holding seat 0");
+        assert!(!the_table_signed(&set(&[1, 2]), &four, 3), "half without seat 0: two rogues of four");
+        assert!(!the_table_signed(&set(&[1, 2]), &four, 0), "nor where this client holds it");
+        assert!(!the_table_signed(&set(&[1, 2, 3]), &four, 3), "its own copy is no signature");
+        assert!(the_table_signed(&set(&[1]), &[1u8, 3], 3), "heads-up, the one other seat");
+        assert!(the_table_signed(&set(&[0, 1]), &[0u8, 1, 3], 3), "two of three, the busted seat not counted");
+        assert!(!the_table_signed(&set(&[0, 7]), &[0u8, 1, 3], 3), "a seat outside the table counts for nothing");
+        assert!(!the_table_signed(&set(&[]), &four, 3));
     }
 
     /// **And IPv6, on the same port, on both transports.**
