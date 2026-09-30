@@ -1712,6 +1712,12 @@ struct TableRun {
     /// `D-062`: tables that refused this client lately, not gone on at until
     /// `AVOID_FOR` has passed; the slot's own.
     avoided: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
+    /// `S1-KD`: tables this client's player left by its own signed word after
+    /// this client had said it was ready there -- a seat such a table answers
+    /// *already seated* is not taken again: it is the sitting the word is
+    /// about, and any seat can carry the word into a certificate that puts it
+    /// out for good. The slot's own, for `LEFT_OWN_WORD_FOR`.
+    left_by_own_word: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
     /// `D-064`: this slot was opened by the automatic search and holds, or asks
     /// for, one of its reservations. The slot's own, like its number: a leave
     /// does not clear it, or a seat given back and asked for again (`S1-FY`)
@@ -1786,6 +1792,9 @@ const RECONVENE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 const LOOK_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// `D-062`: a table that refused this client is not gone on at for this long.
 const AVOID_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+/// `S1-KD`: how long a table this client's player left by its own word is not
+/// sat at again through *already seated* -- past any tournament's life.
+const LEFT_OWN_WORD_FOR: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
 /// `S1-GS`: a founder that answered the lobby's question this recently, naming the
 /// table, is alive: its silence in the group is the group's or this client's line,
 /// not its absence.
@@ -2028,6 +2037,7 @@ impl TableRun {
             silence_peak: std::collections::BTreeMap::new(),
             origin: None,
             avoided: std::collections::HashMap::new(),
+            left_by_own_word: std::collections::HashMap::new(),
             search: false,
             reconvened_at: None,
             unoffered_since: None,
@@ -3827,7 +3837,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     macro_rules! say_the_leave {
         ($t:ident) => {{
             if let Some(f) = $t.table.as_ref().filter(|f| f.my_seat().is_some()) {
-                if let Ok(bytes) = super::tabletalk::leave_word(&app_key, &f.table_id(), super::node::now_unix_ms()) {
+                // `S1-KD`: a word counts only when said no earlier than its seat
+                // ratified, both by this client's own clock -- stamped no
+                // earlier than that, so a clock set back since (`S1-JB`) does not
+                // make the player's own word count for nothing, and the table wait
+                // for a seat that is gone.
+                let ratified = f
+                    .my_seat()
+                    .and_then(|me| f.ratified_at().into_iter().find(|(s, _)| *s == me))
+                    .map(|(_, at)| at);
+                // And a table left after this client said it was ready is not
+                // sat at again through *already seated*: that is the sitting the
+                // word is about.
+                if ratified.is_some() {
+                    $t.left_by_own_word.retain(|_, at| at.elapsed() < LEFT_OWN_WORD_FOR);
+                    $t.left_by_own_word.insert(f.table_id(), tokio::time::Instant::now());
+                }
+                let said_ms = super::node::now_unix_ms().max(ratified.unwrap_or(0));
+                if let Ok(bytes) = super::tabletalk::leave_word(&app_key, &f.table_id(), said_ms) {
                     let _ = $t.tox_sink.try_broadcast(&bytes);
                     if f.session().is_none() {
                         // `S1-GP`: and to the founder itself, over the join's own
@@ -5690,6 +5717,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // client is a founder of something.
                                     continue;
                                 };
+                                // `S1-KD`: a seat whose player left this set table by its
+                                // own word asks to sit again -- refused as out for good.
+                                // Answered *already seated*, its client took its own old
+                                // ratification back (`D-060`), and that is the sitting the
+                                // word is about: any seat could carry the word into a
+                                // certificate and put it out for good, at the first wait
+                                // on it, rogue or not. Before the carrier is told the seat
+                                // is back below, which would offer it the group again.
+                                if let Ok((_, sender, _)) = super::joinwire::receive_join_request(&request) {
+                                    let left = f.session().is_some()
+                                        && f.roster().seats().iter().any(|e| e.app_public_key == sender && t.left_by_word.contains_key(&e.seat));
+                                    if left {
+                                        if let Ok(bytes) = f.refuse_out(&request, now) {
+                                            let _ = swarm.behaviour_mut().join.send_response(channel, bytes);
+                                        }
+                                        let _ = events
+                                            .send(NodeEvent::Warning(
+                                                "a seat whose player left this table by its own word asked to sit again and was refused: the word stands (S1-KD)".into(),
+                                            ))
+                                            .await;
+                                        continue;
+                                    }
+                                }
                                 // **A seat asking to join a table it already
                                 // sits at has restarted**, and this is the only
                                 // signal that says so. A client that is playing
@@ -5886,6 +5936,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     //
                                     // So: keep the table, keep the group, and
                                     // wait for the roster that is on its way.
+                                    // `S1-KD`: unless this client's player left this
+                                    // table by its own word after saying it was ready
+                                    // there. The seat held is that sitting -- the one
+                                    // the word is about -- and a founder that seats it
+                                    // again anyway leaves the word good in any
+                                    // certificate: not taken, and not asked for again.
+                                    Err(Failed::Refused { reason, .. })
+                                        if reason == crate::table::join::RejectReason::AlreadySeated.code()
+                                            && t.left_by_own_word.contains_key(&f.table_id()) =>
+                                    {
+                                        t.rejoin_key = None;
+                                        join_failed!(
+                                            t,
+                                            "this table still holds the seat its player left by its own word, and the word stands: the seat is not taken again (S1-KD)"
+                                                .to_string()
+                                        );
+                                    }
                                     Err(Failed::Refused { reason, .. })
                                         if reason
                                             == crate::table::join::RejectReason::AlreadySeated
@@ -9368,10 +9435,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Ok((seat, key, said_ms)) if Some(seat) != f.my_seat() && f.session().is_none() => {
                                 before_the_start = Some((seat, key, said_ms));
                             }
-                            Ok((seat, _, _)) if Some(seat) != f.my_seat() => {
+                            // `S1-KD`: a word said before its seat ratified the
+                            // table is about an earlier sitting: the hand refuses it
+                            // in a certificate, and it is not a player gone here.
+                            Ok((seat, _, said_ms))
+                                if Some(seat) != f.my_seat()
+                                    && f.ratified_at().iter().any(|(s, at)| *s == seat && said_ms < *at) => {}
+                            Ok((seat, _, said_ms)) if Some(seat) != f.my_seat() => {
                                 // `S1-GK`: its turns and stages are not waited out.
-                                // `D-063`: with the word itself, for the certificate.
-                                t.left_by_word.insert(seat, (tokio::time::Instant::now(), false, item.bytes.clone()));
+                                // `D-063`: with the word itself, for the certificate --
+                                // the newest the seat said: an older one said again by
+                                // anybody does not stand in for it.
+                                let newer_held = t.left_by_word.get(&seat).is_some_and(|(_, _, held)| {
+                                    super::tabletalk::verify_leave_word(held, &f.table_id()).is_ok_and(|(_, at)| at > said_ms)
+                                });
+                                if !newer_held {
+                                    t.left_by_word.insert(seat, (tokio::time::Instant::now(), false, item.bytes.clone()));
+                                }
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
                                         "seat {seat} left the table: its own signed word (S1-FQ)"
@@ -21527,6 +21607,36 @@ mod late_roster_tests {
         assert!(code[tick..tick + 400].contains("say_again!(t, h);"), "and on the tick");
     }
 
+    /// `S1-KD`: a seat whose player left a set table by its own word is not sat
+    /// again under the ratification the word came after -- its founder refuses
+    /// it as out for good before the carrier offers it the group, and its own
+    /// client does not take a seat answered *already seated* there -- and the
+    /// word is stamped no earlier than the seat ratified, whatever the clock
+    /// did since; the node keeps a seat's newest word and none from before its
+    /// sitting.
+    #[test]
+    fn a_table_left_by_the_players_word_is_not_sat_at_again() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let refused = code
+            .find("a seat whose player left this table by its own word asked to sit again and was refused")
+            .expect("the founder refuses");
+        let back = code.find("t.tox_sink.tell(super::toxsink::Seat::Back(k));").expect("the carrier told");
+        assert!(refused < back, "refused before the carrier offers it the group");
+        assert!(
+            code.contains("if reason == crate::table::join::RejectReason::AlreadySeated.code() && t.left_by_own_word.contains_key(&f.table_id()) =>"),
+            "the client does not take the seat back"
+        );
+        assert!(
+            code.contains("let said_ms = super::node::now_unix_ms().max(ratified.unwrap_or(0));"),
+            "no earlier than its ratification"
+        );
+        assert!(code.contains("$t.left_by_own_word.insert(f.table_id(), tokio::time::Instant::now());"));
+        assert!(code.contains("&& f.ratified_at().iter().any(|(s, at)| *s == seat && said_ms < *at) => {}"), "an older sitting's word");
+        assert!(code.contains("is_ok_and(|(_, at)| at > said_ms)"), "the newest word");
+    }
+
     /// Ties deal on, with this client's own seat counted on its side.
     #[test]
     fn the_boundary_waits_only_for_a_strict_majority_elsewhere() {
@@ -23079,6 +23189,9 @@ mod back_at_the_table {
             "origin",
             "avoided",
             "tox_down_at",
+            // `S1-KD`: a table its player left by its own word is not sat at
+            // again, whatever table the slot holds next.
+            "left_by_own_word",
             // `D-064`: the search's slot stays the search's across a seat given
             // back and asked for again.
             "search",

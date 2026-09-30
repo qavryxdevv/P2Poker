@@ -753,15 +753,6 @@ pub fn publish_table_ready(
 /// that is precisely the fork D-013 exists to refuse — it is refused here,
 /// before the payload is read, rather than surfacing later as a collective stage
 /// that never completes.
-/// `S1-KD`: when the seat that signed a ratification says it said it -- its
-/// own clock, inside the body the session is computed over, so the same at
-/// every seat that holds the table's ratifications.
-pub fn table_ready_said_at(bytes: &[u8]) -> Option<u64> {
-    open(bytes, JOIN_RESP_MAX, EventType::TableReady)
-        .ok()
-        .map(|o| o.envelope.emitted_at_unix_ms)
-}
-
 pub fn receive_table_ready(
     bytes: &[u8],
     table_id: &Hash,
@@ -793,6 +784,15 @@ pub fn receive_table_ready(
         o.sender,
         o.event_hash,
     ))
+}
+
+/// `S1-KD`: when the seat that signed a ratification says it said it -- its
+/// own clock, inside the body the session is computed over, so the same at
+/// every seat that holds the table's ratifications.
+pub fn table_ready_said_at(bytes: &[u8]) -> Option<u64> {
+    open(bytes, JOIN_RESP_MAX, EventType::TableReady)
+        .ok()
+        .map(|o| o.envelope.emitted_at_unix_ms)
 }
 
 #[cfg(test)]

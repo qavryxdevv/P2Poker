@@ -296,8 +296,11 @@ pub struct Opening {
     pub out: Vec<SeatIdx>,
     /// `S1-KD`: when each seat ratified the table, by its own clock -- a
     /// leave word it said before that is about an earlier sitting. From the
-    /// ratifications every seat holds alike, carried from hand to hand;
-    /// empty where they are not held, and then no word is held to it.
+    /// ratifications every seat holds alike, carried from hand to hand; every
+    /// ratifier's, from a set formation (`from_formation` asserts it). A seat
+    /// with no time here is held to nothing, which only a test's opening has:
+    /// a client holding no time where the others hold one would take a word
+    /// they refuse.
     pub ratified_at: Vec<(SeatIdx, u64)>,
     /// How long the whole hand may take before any peer may end it.
     ///
@@ -349,6 +352,11 @@ impl Opening {
     /// **is** the signers of `TABLE_READY` for the first hand.
     pub fn from_formation(f: &crate::net::formation::Formation, hand_id: u64) -> Option<Self> {
         let ad = f.advert();
+        let ratified_at = f.ratified_at();
+        debug_assert!(
+            f.session().is_none() || f.ratifiers().iter().all(|s| ratified_at.iter().any(|(r, _)| r == s)),
+            "S1-KD: a set formation holds every ratifier's ratification, and so its time"
+        );
         Some(Opening {
             table_id: f.table_id(),
             hand_id,
@@ -391,7 +399,7 @@ impl Opening {
             out: Vec::new(),
             // The first hand of a table: nothing has decided the button yet.
             button: None,
-            ratified_at: f.ratified_at(),
+            ratified_at,
         })
     }
 
