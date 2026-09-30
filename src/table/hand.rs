@@ -1648,6 +1648,21 @@ struct PendingCheat {
 /// budget, cut by patience to ten seconds.
 pub const CHEAT_CERT_MS: u64 = 10_000;
 
+/// `S1-KK`: how long a hand taken up from a previous life's (`D-033`) takes
+/// this seat's frames from the wire before the restore ends
+/// (`Hand::restore_due`). The table's re-send is on its way when the hand is
+/// adopted -- the adoption reads its first frames -- and a restore ended at
+/// once made this seat's part of a stage whose previous-life frame was a
+/// moment behind: a second version of it.
+pub const RESTORE_SETTLE_MS: u64 = 3_000;
+
+/// `S1-KK`: how long a stage of a hand taken up from a previous life's may
+/// wait on this seat, with nothing of this seat's own held for it, before
+/// this seat's part is made afresh (`Hand::restored_stage_owed`). Well
+/// inside the least clock another seat runs on a stage -- a cryptographic
+/// step's budget cut by patience to ten seconds.
+pub const RESTORED_OWED_AFTER_MS: u64 = 5_000;
+
 /// The deck every stage from `DECK_COMMIT` onwards is about.
 ///
 /// The final deck and the index map travel together from here to showdown
@@ -2020,6 +2035,11 @@ pub struct Hand {
     /// open here, which is what a voter's missing copy is measured from.
     /// Cleared in `mark_stage`.
     sealed_at: Option<u64>,
+    /// `S1-KK`: since when a hand taken up from a previous life's has held
+    /// back its copy of the certificate now open -- one its previous life
+    /// voted for, whose copy the table says again (`restored_stage_owed`).
+    /// Cleared in `mark_stage`.
+    cert_owed_since: Option<u64>,
     /// `D-065`: the voters a certificate this hand named with
     /// `CAUSE_SILENT_VOTER`. Their veto is gone for the rest of the hand -- no
     /// certificate here needs their vote or their copy -- and nothing else is:
@@ -2501,6 +2521,7 @@ impl Hand {
                 own_vote_at: None,
                 quiet_vote_at: None,
                 sealed_at: None,
+                cert_owed_since: None,
                 vetoless: BTreeSet::new(),
                 certifying: None,
                 certified: Vec::new(),
@@ -2679,23 +2700,49 @@ impl Hand {
         }
     }
 
-    /// `S1-KK`: whether this hand, taken up from a previous life's, holds a
-    /// frame of this seat's own for the stage now open -- the previous life
-    /// signed it, the table said it again, and it came before the stage
+    /// `S1-KK`: whether this hand, taken up from a previous life's, holds this
+    /// seat's own part of the stage now open -- a frame of one of `kinds`, at
+    /// the stage's sequence, chained from the stage's parent: the previous
+    /// life signed it, the table said it again, and it came before the stage
     /// opened. Such a stage takes that frame when the held are replayed, and
     /// this seat signs no other: a second one is a second version of its step
     /// at every seat that took the first (`S1-KJ`), and a fork of this seat
     /// from the rest where the two differ.
-    fn own_frame_held(&self) -> bool {
-        if !self.restored {
+    ///
+    /// **By kind and parent, not by place alone** (this row's refuter): a vote
+    /// or a certificate is sealed at the stage's own sequence and is no part
+    /// of it, and a frame of another parent is never taken there -- read as
+    /// this seat's part, either left the stage waiting on it for good.
+    fn own_frame_held(&self, kinds: &[EventType]) -> bool {
+        if !self.restored || kinds.is_empty() {
             return false;
         }
         let me = self.open.seats[self.seat_index()].1;
-        let (hand, sequence) = (self.open.hand_id, self.slot.sequence);
+        let (hand, sequence, parent) = (self.open.hand_id, self.slot.sequence, self.slot.previous_event_hash);
         self.early.iter().any(|b| {
             chained::sender_of(b, FRAME_CAP) == Some(me)
-                && chained::peek(b, PEEK_CAP).is_ok_and(|(_, h, s)| h == hand && s == sequence)
+                && chained::peek(b, PEEK_CAP).is_ok_and(|(k, h, s)| h == hand && s == sequence && kinds.contains(&k))
+                && chained::parent_of(b, FRAME_CAP) == Some(parent)
         })
+    }
+
+    /// `S1-KK`: the kinds of this seat's part of the stage now open, for
+    /// [`Hand::own_frame_held`] -- none where the stage is a turn, which is
+    /// its player's, or no stage.
+    fn stage_kinds(&self) -> &'static [EventType] {
+        match &self.phase {
+            Phase::Deck { .. } => &[EventType::DeckInit],
+            Phase::Shuffling { .. } => &[EventType::ShuffleStep],
+            Phase::Committing { .. } => &[EventType::DeckCommit],
+            Phase::Dealing { .. } => &[EventType::DealPrivate],
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Opening { .. } => &[EventType::BoardReveal],
+                Step::Showdown { .. } => &[EventType::ShowdownReveal, EventType::ShowdownMuck],
+                Step::Settling { .. } => &[EventType::HandComplete],
+                _ => &[],
+            },
+            _ => &[],
+        }
     }
 
     /// `S1-KJ`: the writer's seat, when `bytes` -- at a stage this hand has
@@ -2954,7 +3001,14 @@ impl Hand {
         // `D-033`: restoring, this seat's key comes from the wire and the secret
         // from the session record; the stage opens with this seat's slot open.
         // A fresh secret nothing is encrypted to stands in when none was kept.
-        if self.restoring {
+        // `S1-KK`: and after the restore, in a hand taken up from a previous
+        // life's. The restore can end at stage 0, the table's own opening
+        // still to come -- at four seats the adoption needs two openings of
+        // three -- and a key made here besides the previous life's, held, was
+        // a second version of it and a deck no other seat shuffles: the key is
+        // the previous life's where that is held, and made where it is not
+        // (`deck_mine`).
+        if self.restoring || self.restored {
             let (fresh, _, _) = self.params.keygen(&ctx);
             let secret = match self.restored_secret.take() {
                 Some(s) => s,
@@ -2976,7 +3030,10 @@ impl Hand {
                 keys: Vec::new(),
                 secret,
             };
-            return Ok(Vec::new());
+            if self.restoring {
+                return Ok(Vec::new());
+            }
+            return self.deck_mine(key, now_ms);
         }
         // The key is generated either way: `Phase::Deck` needs a `HandSecret`,
         // and a secret nothing is encrypted to is inert.
@@ -3073,10 +3130,11 @@ impl Hand {
         })?;
         // `D-033`: this seat's own key, said again by the table, must be the
         // one the kept secret answers for; otherwise the secret is another
-        // hand's and this one can only be followed and folded.
-        if seat == self.open.my_seat && self.restoring && !self.fold_only {
-            if let Phase::Deck { secret, .. } = &self.phase {
-                if secret.wire_key().encode() != wire_key.encode() {
+        // hand's and this one can only be followed and folded. `S1-KK`: after
+        // the restore too, while this seat's key is still owed here.
+        if seat == self.open.my_seat && (self.restoring || self.restored) && !self.fold_only {
+            if let Phase::Deck { secret, stage, .. } = &self.phase {
+                if stage.heard(seat).is_none() && secret.wire_key().encode() != wire_key.encode() {
                     self.fold_only = true;
                 }
             }
@@ -3200,7 +3258,7 @@ impl Hand {
     /// wait to hear its own step back before it can seal the proof.
     fn shuffle_if_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         // `S1-KK`: the previous life's step is held, and its proof with it.
-        let held = self.own_frame_held();
+        let held = self.own_frame_held(&[EventType::ShuffleStep]);
         let Phase::Shuffling { deal, chain, .. } = &mut self.phase else {
             return Ok(Vec::new());
         };
@@ -3594,7 +3652,7 @@ impl Hand {
     /// closes here if this was the last one owed.
     fn commit_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         // `S1-KK`: the previous life's commitment is held.
-        if self.own_frame_held() {
+        if self.own_frame_held(&[EventType::DeckCommit]) {
             return Ok(Vec::new());
         }
         let me = self.open.my_seat;
@@ -3718,7 +3776,7 @@ impl Hand {
         let mut dealing = Dealing::new(table.map.clone(), self.mine.dealt_in.clone());
         // `S1-KK`: and after the restore, where the previous life's shares are
         // held -- as while restoring, they come from the wire.
-        if self.restoring || self.own_frame_held() {
+        if self.restoring || self.own_frame_held(&[EventType::DealPrivate]) {
             // `D-033`: this seat's shares for the others' cards come from the
             // wire; the shares for its own two cards it makes here, with the kept
             // secret, so the cards can be read when the stage closes.
@@ -3761,7 +3819,7 @@ impl Hand {
     fn deal_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let me = self.open.my_seat;
         // `S1-KK`: nor where the previous life's shares are held.
-        if self.fold_only || self.own_frame_held() {
+        if self.fold_only || self.own_frame_held(&[EventType::DealPrivate]) {
             return Ok(Vec::new());
         }
         let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
@@ -4443,7 +4501,7 @@ impl Hand {
     /// makes none, and says so once.
     fn board_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         // `S1-KK`: the previous life's shares for this street are held.
-        if self.own_frame_held() {
+        if self.own_frame_held(&[EventType::BoardReveal]) {
             return Ok(Vec::new());
         }
         let me = self.open.my_seat;
@@ -4733,7 +4791,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         // `D-033`: restoring, what this seat said at the showdown comes from the wire.
         // `S1-KK`: and after, where the previous life's word is held.
-        if self.restoring || self.own_frame_held() {
+        if self.restoring || self.own_frame_held(&[EventType::ShowdownReveal, EventType::ShowdownMuck]) {
             return Ok(Vec::new());
         }
         let me = self.open.my_seat;
@@ -5163,7 +5221,10 @@ impl Hand {
         // settlement comes from the wire, and one sealed here besides was a
         // second version of it -- `restore_done` seals it where the table did
         // not say it again (`settle_mine`).
-        if !self.open.required.contains(&self.open.my_seat) || self.restoring || self.own_frame_held() {
+        if !self.open.required.contains(&self.open.my_seat)
+            || self.restoring
+            || self.own_frame_held(&[EventType::HandComplete])
+        {
             // It still DERIVES the settlement — from pots, stacks and a board
             // that are public by construction — because `on_hand_complete`
             // compares every arriving copy against its own and that comparison
@@ -5219,7 +5280,7 @@ impl Hand {
     /// stage has its settlement already, or where the previous life's is held.
     fn settle_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let me = self.open.my_seat;
-        if !self.open.required.contains(&me) || self.own_frame_held() {
+        if !self.open.required.contains(&me) || self.own_frame_held(&[EventType::HandComplete]) {
             return Ok(Vec::new());
         }
         let mine = match &self.phase {
@@ -7117,6 +7178,7 @@ impl Hand {
         self.own_vote_at = None;
         self.quiet_vote_at = None;
         self.sealed_at = None;
+        self.cert_owed_since = None;
     }
 
     /// `GENESIS(k)`: what this hand's first stage hangs off.
@@ -7913,6 +7975,18 @@ impl Hand {
         key: &SigningKey,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
+        self.certify_if_unanimous_as(key, now_ms, false)
+    }
+
+    /// [`Hand::certify_if_unanimous`]; `owed` where a hand taken up from a
+    /// previous life's has waited `RESTORED_OWED_AFTER_MS` for its old copy
+    /// and seals one now (`restored_stage_owed`).
+    fn certify_if_unanimous_as(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+        owed: bool,
+    ) -> Result<Vec<Send>, Failed> {
         let Some((subject, voters)) = self.sealable_set() else {
             // Only worth a word when a set that looks complete produced
             // nothing. A partial set is the ordinary state and says nothing.
@@ -7958,6 +8032,18 @@ impl Hand {
         {
             return Ok(Vec::new());
         }
+        // `S1-KK`: a hand taken up from a previous life's seals no copy while
+        // restoring, nor one of a certificate its previous life voted for:
+        // that life sealed its copy the moment the votes were in, the table's
+        // stage holds it, and one sealed here besides was a second copy of
+        // this seat's -- the stage completed on it, and this seat went on
+        // from a parent no other seat holds (this row's refuter). The table
+        // says the old copy again with the hand; where it does not, one is
+        // sealed after `RESTORED_OWED_AFTER_MS` (`restored_stage_owed`).
+        if !owed && self.restored && (self.restoring || self.voted_in_a_previous_life(&subject)) {
+            self.cert_owed_since.get_or_insert(now_ms);
+            return Ok(Vec::new());
+        }
         let bytes = self.seal_certificate(&subject, &voters, key, now_ms)?;
         let hash = self.opened(&bytes, EventType::TimeoutCert)?.event_hash;
         self.note_own_certificate(hash, &bytes, &subject);
@@ -7998,6 +8084,17 @@ impl Hand {
             out.append(&mut self.apply_certificate(key, now_ms)?);
         }
         Ok(out)
+    }
+
+    /// `S1-KK`: whether a vote of this seat's about a seat `subject` names is
+    /// held here that this client did not cast -- its previous life's, come
+    /// in another voter's copy of the certificate.
+    fn voted_in_a_previous_life(&self, subject: &CertSubject) -> bool {
+        let me = self.open.my_seat;
+        subject.subject_seats.iter().any(|seat| {
+            let digest = subject.vote_about(*seat).subject_digest();
+            !self.voted.contains(&digest) && self.votes.get(&digest).is_some_and(|m| m.contains_key(&me))
+        })
     }
 
     /// One certificate, from the votes this client holds about every seat
@@ -8935,9 +9032,10 @@ impl Hand {
         // Two things this does not repair, measured in the same run: a
         // client that is behind because an EARLIER event was lost never
         // reaches the sequence at all, and holding changes nothing for it;
-        // and the held FIFO is 64 deep, so a client 64 events behind loses
-        // the copies before it could replay them. Both are the carrier's
-        // loss, not the certificate's disposition.
+        // and the held queue is `EARLY_CAP` deep and gives up its highest
+        // sequences first, so a client far enough behind loses the copies
+        // before it could replay them. Both are the carrier's loss, not the
+        // certificate's disposition.
         if c.subject.kind == 1 && self.slot.sequence < c.subject.subject_sequence {
             if banked {
                 self.cert_note.push(format!(
@@ -9038,7 +9136,18 @@ impl Hand {
             };
             if cur.stage.heard(seat) != Some(c.event_hash) {
                 match cur.stage.hear(seat, c.event_hash) {
-                    Heard::Counted | Heard::Bystander | Heard::Again => {}
+                    Heard::Counted | Heard::Bystander | Heard::Again => {
+                        // `S1-KK`: kept with the hand's frames, so that the
+                        // table says it again to a seat back from a restart
+                        // (`D-033`). A certificate stage's parent is its every
+                        // voter's copy, and a voter's next life that had not
+                        // its own sealed another: a fork of it from the table
+                        // at the certificate (this row's refuter).
+                        let digest = chained::event_hash_of(bytes, FRAME_CAP).unwrap_or(c.event_hash);
+                        if self.transcript_seen.insert(digest) {
+                            self.transcript.push(bytes.to_vec());
+                        }
+                    }
                     Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
                     // The stage here was built from this client's own voter
                     // set, and an emitter outside it means the two peers
@@ -9574,18 +9683,29 @@ impl Hand {
         if bytes.len() > frame_ceiling(kind) {
             return Holding::Malformed;
         }
+        // `S1-KK`: in a hand taken up from a previous life's, this seat's own
+        // frames -- that life's, which no other seat can sign -- are never
+        // given up for room, and one arriving takes another's: given up, the
+        // stage it was for was signed again, and another seat that filled the
+        // queue with frames of its own below them could have it so (this
+        // row's refuter, a hundred of them). Bounded: one per step this seat
+        // took in this hand.
+        let me = self.open.seats[self.seat_index()].1;
+        let keep_own = self.restored;
+        let arriving_own = keep_own && opened.sender == me;
         let held_bytes: usize = self.early.iter().map(Vec::len).sum();
         if self.early.len() >= EARLY_CAP || held_bytes + bytes.len() > EARLY_BYTES {
             let highest = self
                 .early
                 .iter()
                 .enumerate()
+                .filter(|(_, b)| !(keep_own && chained::sender_of(b, FRAME_CAP) == Some(me)))
                 .filter_map(|(i, b)| {
                     chained::peek(b, PEEK_CAP).ok().map(|(_, _, q)| (i, q))
                 })
                 .max_by_key(|(_, q)| *q);
             match highest {
-                Some((i, q)) if q > opened.envelope.sequence => {
+                Some((i, q)) if q > opened.envelope.sequence || arriving_own => {
                     self.early.remove(i);
                 }
                 _ => return Holding::Kept,
@@ -9602,10 +9722,11 @@ impl Hand {
                     .early
                     .iter()
                     .enumerate()
+                    .filter(|(_, b)| !(keep_own && chained::sender_of(b, FRAME_CAP) == Some(me)))
                     .filter_map(|(i, b)| chained::peek(b, PEEK_CAP).ok().map(|(_, _, q)| (i, q)))
                     .max_by_key(|(_, q)| *q);
                 match next {
-                    Some((i, q)) if q > opened.envelope.sequence => {
+                    Some((i, q)) if q > opened.envelope.sequence || arriving_own => {
                         self.early.remove(i);
                     }
                     _ => return Holding::Kept,
@@ -9728,7 +9849,8 @@ impl Hand {
                         sends.append(&mut out);
                     }
                     // Still ahead of this client. Held again, and the hold is
-                    // still bounded - `hold` drops the oldest at 64.
+                    // still bounded - `hold` gives up the highest sequence at
+                    // `EARLY_CAP`.
                     // It was verified on the way in, so re-holding it cannot
                     // fail for any reason worth acting on.
                     Err(Failed::NotYet) => {
@@ -10778,6 +10900,56 @@ impl Hand {
         self.restoring = false;
         // `S1-FS`: from here this client can show the hand's turns to its player.
         self.taken_up_ms = now_ms;
+        let mut out = self.stage_mine(key, now_ms)?;
+        // `S1-KK`: and a certificate held back while restoring, where its
+        // previous life voted for none of it.
+        if self.cert_owed_since.is_some() && self.certifying.as_ref().is_some_and(|c| !self.voted_in_a_previous_life(&c.subject)) {
+            self.cert_owed_since = None;
+            out.append(&mut self.certify_if_unanimous(key, now_ms)?);
+        }
+        Ok(out)
+    }
+
+    /// `S1-KK`: whether a hand taken up from a previous life's has taken this
+    /// seat's frames from the wire for `RESTORE_SETTLE_MS` -- the restore
+    /// ends on the stall tick after it, the table's re-send in.
+    pub fn restore_due(&self, now_ms: u64) -> bool {
+        self.restoring && now_ms.saturating_sub(self.opened_at_ms) >= RESTORE_SETTLE_MS
+    }
+
+    /// `S1-KK`: a hand taken up from a previous life's (`D-033`) whose open
+    /// stage -- or the certificate the table seals about it -- has waited on
+    /// this seat `RESTORED_OWED_AFTER_MS`, nothing of this seat's own held
+    /// for it, gets this seat's part now, as the restore's end would have made
+    /// it. The previous life's frame for it was pushed out, refused or never
+    /// said again, and a stage that took no part of this seat's on the
+    /// strength of it was asked again by nothing (this row's refuter: a vote
+    /// of that life's held at the stage read as its share, and the board
+    /// waited on this seat for good). Called on the stall tick.
+    pub fn restored_stage_owed(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        if !self.restored || self.restoring {
+            return Ok(Vec::new());
+        }
+        let me = self.open.my_seat;
+        let mut out = Vec::new();
+        if self.cert_owed_since.is_some_and(|at| now_ms.saturating_sub(at) >= RESTORED_OWED_AFTER_MS)
+            && self.certifying.as_ref().is_some_and(|c| c.stage.heard(me).is_none())
+        {
+            self.cert_owed_since = None;
+            out.append(&mut self.certify_if_unanimous_as(key, now_ms, true)?);
+        }
+        if now_ms.saturating_sub(self.stage_at_ms) >= RESTORED_OWED_AFTER_MS
+            && self.waiting_for().contains(&me)
+            && !self.own_frame_held(self.stage_kinds())
+        {
+            out.append(&mut self.stage_mine(key, now_ms)?);
+        }
+        Ok(out)
+    }
+
+    /// `D-033`, `S1-KK`: this seat's part of the stage now open, made here --
+    /// whatever of it the stage has not heard.
+    fn stage_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let which = match &self.phase {
             Phase::Deck { .. } => 1,
             Phase::Shuffling { .. } => 2,
@@ -10833,7 +11005,7 @@ impl Hand {
             _ => return Ok(Vec::new()),
         };
         // `S1-KK`: nor where the previous life's key is held, still to come.
-        if heard || !self.mine.dealt_in.contains(&me) || self.own_frame_held() {
+        if heard || !self.mine.dealt_in.contains(&me) || self.own_frame_held(&[EventType::DeckInit]) {
             return Ok(Vec::new());
         }
         let me_key = self.open.seats[self.seat_index()].1;
@@ -20218,5 +20390,377 @@ mod tests {
         let next = next.expect("the seat that came back is to act again");
         assert!(!next.taken_up, "a turn given after the take-up did not stand at it");
         assert_eq!(next.shown_unix_ms, at, "shown when it was heard");
+    }
+
+    /// `S1-KK`: an opening with the roster hash its stacks make.
+    fn hashed_opening(mut o: Opening) -> Opening {
+        let roster: Vec<crate::protocol::transcript::RosterSeat> = o
+            .seats
+            .iter()
+            .map(|(seat, key, stack)| crate::protocol::transcript::RosterSeat {
+                seat: *seat,
+                app_public_key: *key,
+                stack_at_hand_start: *stack,
+            })
+            .collect();
+        o.roster_hash = crate::protocol::transcript::roster_hash(&roster);
+        o
+    }
+
+    /// `S1-KK`: every send to every other hand until nothing more is said,
+    /// what each seat said kept in `said`.
+    fn flood_among(hands: &mut [Hand], keys: &[SigningKey], said: &mut [Vec<Vec<u8>>], mut pending: Vec<(usize, Vec<Send>)>) {
+        for _ in 0..512 {
+            if pending.is_empty() {
+                return;
+            }
+            let mut next = Vec::new();
+            for (from, sends) in std::mem::take(&mut pending) {
+                if sends.is_empty() {
+                    continue;
+                }
+                said[from].extend(bytes_of(&sends));
+                for to in 0..hands.len() {
+                    if to == from {
+                        continue;
+                    }
+                    let out = deliver(&mut hands[to], &sends, &keys[to]);
+                    if !out.is_empty() {
+                        next.push((to, out));
+                    }
+                }
+            }
+            pending = next;
+        }
+        panic!("the flood never settled");
+    }
+
+    /// `S1-KK`: `n` seats played to the first bet, and what each said.
+    fn n_seats_to_the_bet(n: u8) -> (Vec<Hand>, Vec<SigningKey>, Vec<Vec<Vec<u8>>>) {
+        let keys: Vec<SigningKey> = (0..n).map(|s| key(10 + s)).collect();
+        let mut hands: Vec<Hand> = Vec::new();
+        let mut said: Vec<Vec<Vec<u8>>> = vec![Vec::new(); usize::from(n)];
+        let mut pending: Vec<(usize, Vec<Send>)> = Vec::new();
+        for seat in 0..n {
+            let (h, from) = Hand::open(hashed_opening(opening_n(n, seat)), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            pending.push((usize::from(seat), from));
+        }
+        flood_among(&mut hands, &keys, &mut said, pending);
+        (hands, keys, said)
+    }
+
+    /// `S1-KK`: `frames` into a restored hand in order, the early held and the
+    /// held replayed after each, as the node does; what it said.
+    fn feed_restored(y2: &mut Hand, frames: &[Vec<u8>], key: &SigningKey, at: u64) -> Vec<Vec<u8>> {
+        let mut said_by = Vec::new();
+        for b in frames {
+            match y2.on_event(b, key, at) {
+                Ok(s) => said_by.extend(bytes_of(&s)),
+                Err(Failed::NotYet) => {
+                    let _ = y2.hold(b.clone());
+                }
+                Err(_) => {}
+            }
+            let (more, _) = y2.replay_early(key, at);
+            said_by.extend(bytes_of(&more));
+        }
+        said_by
+    }
+
+    fn kinds_of(frames: &[Vec<u8>]) -> Vec<(EventType, u64)> {
+        frames
+            .iter()
+            .filter_map(|b| chained::peek(b, FRAME_CAP).ok().map(|(k, _, s)| (k, s)))
+            .collect()
+    }
+
+    /// `S1-KK` (its refuter's first finding): four seats, and the adoption
+    /// needs two openings of the three others -- the restore ends at stage 0,
+    /// the re-sayer's own opening still to come after everything its
+    /// transcript holds. The deck stage that opens on it takes this seat's
+    /// key from the wire, as while restoring: a key made there besides was a
+    /// second version of the previous life's, named at every seat, and a
+    /// deck no other seat shuffled.
+    #[test]
+    fn a_restore_ended_at_stage_zero_takes_its_deck_key_from_the_wire() {
+        let (mut hands, keys, said) = n_seats_to_the_bet(4);
+        let y = 3usize;
+        let kept = hands[y].secret().expect("dealt in").keep();
+        let back = NOW + 60_000;
+        let is_init = |b: &Vec<u8>| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::HandInit);
+        let mut burst: Vec<Vec<u8>> = hands[0].transcript().to_vec();
+        burst.extend(said[0].iter().cloned());
+        let copies: Vec<Vec<u8>> = hands[0].transcript().iter().filter(|b| is_init(b)).cloned().collect();
+        assert_eq!(copies.len(), 3);
+        let o = Opening::adopt(hashed_opening(opening_n(4, 3)), &copies).expect("two of three others");
+        let mut y2 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        for c in &copies {
+            y2.on_event(c, &keys[y], back).expect("a copy");
+        }
+        assert_eq!(y2.waiting_for(), vec![0], "stage 0 waits on the re-sayer's own opening");
+        assert!(y2.restore_done(&keys[y], back).unwrap().is_empty());
+        let rest: Vec<Vec<u8>> = burst.iter().filter(|b| !copies.contains(b)).cloned().collect();
+        let said_by_y2 = feed_restored(&mut y2, &rest, &keys[y], back);
+        let mut named = Vec::new();
+        for b in &said_by_y2 {
+            if let Err(Failed::Equivocation { seat }) = hands[1].on_event(b, &keys[1], back) {
+                named.push(seat);
+            }
+        }
+        assert!(named.is_empty() && said_by_y2.is_empty(), "nothing said again, nobody named: {:?}", kinds_of(&said_by_y2));
+        assert_eq!(y2.slot(), hands[y].slot(), "where its previous life stood");
+        assert!(y2.can_play_on(), "with the kept secret, its own key's");
+    }
+
+    /// `S1-KK` (its refuter's second finding): three seats; the seat to act is
+    /// silent and certified by the other two, and one of them restarts in the
+    /// same hand. The re-sayer's frames carry the restarted voter's copy of the
+    /// certificate -- kept with the hand's frames -- and its next life seals no
+    /// copy of its own: one sealed besides completed the certificate on a
+    /// parent no other seat holds, and the seat forked from the table there.
+    #[test]
+    fn a_restored_voter_takes_its_copy_of_the_certificate_from_the_wire() {
+        let (mut hands, keys, mut said) = n_seats_to_the_bet(3);
+        let z = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let voters: Vec<usize> = (0..3).filter(|s| *s != z).collect();
+        let (s, y) = (voters[0], voters[1]);
+        let kept = hands[y].secret().expect("dealt in").keep();
+        let late = NOW + 60_000;
+        let mut pending: Vec<(usize, Vec<Send>)> = Vec::new();
+        for v in &voters {
+            let out = hands[*v].vote_on_timeouts(&keys[*v], late, 0).unwrap();
+            assert_eq!(out.len(), 1);
+            pending.push((*v, out));
+        }
+        flood_among(&mut hands, &keys, &mut said, pending);
+        assert_ne!(hands[s].turn().map(|t| usize::from(t.seat)), Some(z), "the table acted for the silent seat");
+        assert_eq!(hands[s].slot(), hands[y].slot(), "one chain after the certificate");
+        let back = late + 60_000;
+        let is_init = |b: &Vec<u8>| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::HandInit);
+        let is_cert = |b: &Vec<u8>| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::TimeoutCert);
+        assert!(hands[s].transcript().iter().any(is_cert), "the other voter's copy kept with the hand's frames");
+        let mut burst: Vec<Vec<u8>> = hands[s].transcript().to_vec();
+        burst.extend(said[s].iter().cloned());
+        let copies: Vec<Vec<u8>> = burst.iter().filter(|b| is_init(b)).cloned().collect();
+        let o = Opening::adopt(hashed_opening(opening_n(3, y as u8)), &copies).expect("both others");
+        let mut y2 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        let mut said_by_y2 = feed_restored(&mut y2, &burst, &keys[y], back);
+        said_by_y2.extend(bytes_of(&y2.restore_done(&keys[y], back).unwrap()));
+        assert!(said_by_y2.is_empty(), "no copy sealed again: {:?}", kinds_of(&said_by_y2));
+        assert_eq!(y2.slot(), hands[y].slot(), "on the table's chain past the certificate");
+        // Its old copy last, after the other voter's: the other copy leaves the
+        // certificate owing this seat's, and none is sealed for it here.
+        let own_copy: Vec<Vec<u8>> = burst.iter().filter(|b| is_cert(b) && chained::sender_of(b, FRAME_CAP) == Some(hands[y].open.seats[hands[y].seat_index()].1)).cloned().collect();
+        assert_eq!(own_copy.len(), 1, "the previous life's copy, in the re-sayer's frames");
+        let mut late_own: Vec<Vec<u8>> = burst.iter().filter(|b| !own_copy.contains(b)).cloned().collect();
+        late_own.extend(own_copy);
+        let o = Opening::adopt(hashed_opening(opening_n(3, y as u8)), &copies).expect("both others");
+        let mut y3 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        let mut said_by_y3 = feed_restored(&mut y3, &late_own, &keys[y], back);
+        said_by_y3.extend(bytes_of(&y3.restore_done(&keys[y], back).unwrap()));
+        assert!(said_by_y3.is_empty(), "no copy sealed while its own was to come: {:?}", kinds_of(&said_by_y3));
+        assert_eq!(y3.slot(), hands[y].slot(), "on the table's chain, its own copy come last");
+    }
+
+    /// `S1-KK` (its refuter's third finding): three seats to the flop's board
+    /// stage; seat y's previous life voted there about the seat whose share it
+    /// still waited on, then took it. Its next life takes the hand up from a
+    /// re-send that lacks its old flop share, its old vote held: a vote is
+    /// sealed at the stage's own sequence and is no share of it -- read as the
+    /// share, the board waited on this seat for good.
+    #[test]
+    fn a_vote_of_the_previous_life_is_no_part_of_its_stage() {
+        let (mut hands, keys, mut said) = n_seats_to_the_bet(3);
+        let is_kind = |b: &Vec<u8>, k: EventType| chained::peek(b, FRAME_CAP).is_ok_and(|(x, _, _)| x == k);
+        let mut aside: Vec<(usize, Vec<u8>)> = Vec::new();
+        for _ in 0..12 {
+            let Some(turn) = hands[0].turn() else {
+                break;
+            };
+            let actor = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = bytes_of(&hands[actor].act(action, &keys[actor], NOW).unwrap());
+            said[actor].extend(sends.iter().cloned());
+            let (acts, reveals): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+                sends.into_iter().partition(|b| !is_kind(b, EventType::BoardReveal));
+            for r in reveals {
+                aside.push((actor, r));
+            }
+            for to in 0..3 {
+                if to == actor {
+                    continue;
+                }
+                for b in &acts {
+                    for o in bytes_of(&hands[to].on_event(b, &keys[to], NOW).unwrap()) {
+                        said[to].push(o.clone());
+                        aside.push((to, o));
+                    }
+                }
+            }
+            if !aside.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(aside.len(), 3, "the three flop shares, set aside");
+        let (s, y) = (0usize, 2usize);
+        let kept = hands[y].secret().expect("dealt in").keep();
+        let share_of = |seat: usize| aside.iter().find(|(x, _)| *x == seat).map(|(_, b)| b.clone()).unwrap();
+        hands[y].on_event(&share_of(s), &keys[y], NOW).unwrap();
+        let late = NOW + 60_000;
+        let y_votes = bytes_of(&hands[y].vote_on_timeouts(&keys[y], late, 0).unwrap());
+        assert!(!y_votes.is_empty(), "y votes about the seat it waits on, at the flop's board stage");
+        let old_share = share_of(y);
+        for (from, b) in &aside {
+            for to in 0..3 {
+                if to == *from || (to == y && *from == s) {
+                    continue;
+                }
+                let _ = hands[to].on_event(b, &keys[to], NOW).unwrap();
+            }
+        }
+        assert!(hands.iter().all(|h| h.turn().is_some()), "the flop's betting is open everywhere");
+        let is_init = |b: &Vec<u8>| is_kind(b, EventType::HandInit);
+        let back = late + 60_000;
+        let transcript: Vec<Vec<u8>> = hands[s].transcript().iter().filter(|b| **b != old_share).cloned().collect();
+        let copies: Vec<Vec<u8>> = transcript.iter().chain(said[s].iter()).filter(|b| is_init(b)).cloned().collect();
+        let o = Opening::adopt(hashed_opening(opening_n(3, y as u8)), &copies).expect("both others");
+        let mut y2 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        let mut first = transcript.clone();
+        first.push(said[s][0].clone());
+        let _ = feed_restored(&mut y2, &first, &keys[y], back);
+        let _ = y2.restore_done(&keys[y], back).unwrap();
+        for v in &y_votes {
+            assert!(matches!(y2.on_event(v, &keys[y], back), Err(Failed::NotYet)), "early");
+            let _ = y2.hold(v.clone());
+        }
+        let _ = feed_restored(&mut y2, &said[s][1..], &keys[y], back);
+        assert!(y2.turn().is_some(), "the flop's betting is open: the board did not wait on this seat, {:?}", y2.waiting_for());
+    }
+
+    /// `S1-KK` (its refuter's fourth finding): three seats to the first bet;
+    /// seat 2 restarts and takes the hand up from seat 0's re-send, while
+    /// seat 1, a rogue, fills the restored hand's held queue with frames of its
+    /// own, validly signed, below the restored seat's own old steps. Those
+    /// steps are never given up for room, and nothing is signed again.
+    #[test]
+    fn a_restored_hand_never_gives_up_its_own_held_frames() {
+        let (mut hands, keys, said) = n_seats_to_the_bet(3);
+        let (s, r, y) = (0usize, 1usize, 2usize);
+        let kept = hands[y].secret().expect("dealt in").keep();
+        let back = NOW + 60_000;
+        let is_init = |b: &Vec<u8>| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::HandInit);
+        let transcript: Vec<Vec<u8>> = hands[s].transcript().to_vec();
+        let copies: Vec<Vec<u8>> = transcript.iter().chain(said[s].iter()).filter(|b| is_init(b)).cloned().collect();
+        let o = Opening::adopt(hashed_opening(opening_n(3, y as u8)), &copies).expect("both others");
+        let mut y2 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        let mut first = transcript.clone();
+        first.push(said[s][0].clone());
+        let mut out = feed_restored(&mut y2, &first, &keys[y], back);
+        out.extend(bytes_of(&y2.restore_done(&keys[y], back).unwrap()));
+        let me = hands[y].open.seats[hands[y].seat_index()].1;
+        let own_held = |h: &Hand| h.early.iter().filter(|b| chained::sender_of(b, FRAME_CAP) == Some(me)).count();
+        let own_before = own_held(&y2);
+        assert!(own_before > 0, "the previous life's steps are held");
+        let (table_id, hand_id) = (y2.table_id(), y2.hand_id());
+        for i in 0..150u32 {
+            let slot = chained::Slot {
+                table_id,
+                hand_id,
+                sequence: 5,
+                previous_event_hash: [(i % 251) as u8; 32],
+            };
+            let junk = chained::seal(
+                EventType::ShowdownMuck,
+                &slot,
+                &ShowdownMuck { forfeit: true },
+                &keys[r],
+                back + u64::from(i),
+                30_000,
+                SHOWDOWN_MUCK_CAP,
+            )
+            .unwrap();
+            let _ = y2.hold(junk);
+        }
+        assert_eq!(own_held(&y2), own_before, "none of this seat's own given up for the rogue's");
+        out.extend(feed_restored(&mut y2, &said[s][1..], &keys[y], back));
+        let mut named = Vec::new();
+        for b in &out {
+            if let Err(Failed::Equivocation { seat }) = hands[s].on_event(b, &keys[s], back) {
+                named.push(seat);
+            }
+        }
+        assert!(named.is_empty(), "nothing of this seat's signed again: {named:?}, {:?}", kinds_of(&out));
+    }
+
+    /// `S1-KK`: a stage of a restored hand that took no part of this seat's --
+    /// the previous life's frame for it held -- and then lost that frame waits
+    /// on this seat; `RESTORED_OWED_AFTER_MS` on, with nothing of this seat's
+    /// own held for it, the stall tick makes its part. Not before.
+    #[test]
+    fn a_stage_left_waiting_on_a_restored_seat_is_given_its_part() {
+        let (hands, keys, said) = n_seats_to_the_bet(4);
+        let y = 3usize;
+        let kept = hands[y].secret().expect("dealt in").keep();
+        let back = NOW + 60_000;
+        let is_init = |b: &Vec<u8>| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::HandInit);
+        let copies: Vec<Vec<u8>> = hands[0].transcript().iter().filter(|b| is_init(b)).cloned().collect();
+        let o = Opening::adopt(hashed_opening(opening_n(4, 3)), &copies).expect("two of three others");
+        let mut y2 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        for c in &copies {
+            y2.on_event(c, &keys[y], back).expect("a copy");
+        }
+        assert!(y2.restore_done(&keys[y], back).unwrap().is_empty(), "stage 0 waits on the re-sayer");
+        // The rest of the transcript: every frame early, held.
+        for b in hands[0].transcript().iter().filter(|b| !copies.contains(b)) {
+            if matches!(y2.on_event(b, &keys[y], back), Err(Failed::NotYet)) {
+                let _ = y2.hold(b.clone());
+            }
+        }
+        // The re-sayer's opening: the deck stage opens, this seat's old key held.
+        let opening = said[0].iter().find(|b| is_init(b)).expect("the re-sayer's opening").clone();
+        assert!(y2.on_event(&opening, &keys[y], back).unwrap().is_empty(), "no key made: the old one is held");
+        // Lost before it was taken.
+        let me = hands[y].open.seats[hands[y].seat_index()].1;
+        y2.early.retain(|b| {
+            !(chained::sender_of(b, FRAME_CAP) == Some(me)
+                && chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::DeckInit))
+        });
+        // The re-sayer's own key, which its transcript does not hold.
+        let theirs = said[0]
+            .iter()
+            .find(|b| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::DeckInit))
+            .expect("the re-sayer's key")
+            .clone();
+        let _ = y2.on_event(&theirs, &keys[y], back);
+        let _ = y2.replay_early(&keys[y], back);
+        assert_eq!(y2.waiting_for(), vec![3], "the deck stage waits on this seat alone");
+        assert!(y2.restored_stage_owed(&keys[y], back + RESTORED_OWED_AFTER_MS - 1).unwrap().is_empty(), "not before");
+        let made = bytes_of(&y2.restored_stage_owed(&keys[y], back + RESTORED_OWED_AFTER_MS).unwrap());
+        assert!(
+            kinds_of(&made).first().is_some_and(|(k, _)| *k == EventType::DeckInit),
+            "its key made on the tick: {:?}",
+            kinds_of(&made)
+        );
+        assert!(!y2.waiting_for().contains(&3), "the stage no longer waits on it");
+    }
+
+    /// `S1-KK`: a restored hand ends its restore `RESTORE_SETTLE_MS` after it
+    /// was taken up, and only then.
+    #[test]
+    fn a_restore_ends_once_the_table_has_said_the_hand_again() {
+        let (hands, keys, said) = n_seats_to_the_bet(3);
+        let y = 2usize;
+        let kept = hands[y].secret().expect("dealt in").keep();
+        let back = NOW + 60_000;
+        let is_init = |b: &Vec<u8>| chained::peek(b, FRAME_CAP).is_ok_and(|(k, _, _)| k == EventType::HandInit);
+        let copies: Vec<Vec<u8>> = hands[0].transcript().iter().chain(said[0].iter()).filter(|b| is_init(b)).cloned().collect();
+        let o = Opening::adopt(hashed_opening(opening_n(3, y as u8)), &copies).expect("both others");
+        let mut y2 = Hand::open_restoring(o, &keys[y], back, 30_000, Some(&kept)).unwrap();
+        assert!(!y2.restore_due(back + RESTORE_SETTLE_MS - 1));
+        assert!(y2.restore_due(back + RESTORE_SETTLE_MS));
+        let _ = y2.restore_done(&keys[y], back + RESTORE_SETTLE_MS).unwrap();
+        assert!(!y2.restore_due(back + RESTORE_SETTLE_MS + 60_000), "once");
+        assert!(!hands[0].restore_due(back + 60_000), "a hand never taken up is never due");
     }
 }

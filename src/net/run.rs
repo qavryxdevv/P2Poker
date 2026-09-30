@@ -12034,17 +12034,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                                 .send(NodeEvent::Warning(format!("a held frame was refused by the adopted hand #{hid}: {e}")))
                                                                 .await;
                                                         }
-                                                        // `D-033`: the table's frames are in; whatever the
-                                                        // stage still wants from this seat is made now.
+                                                        // `D-033`: the table's frames come in from here; the
+                                                        // restore ends on the stall tick once they have
+                                                        // (`S1-KK`, `Hand::restore_due`), and whatever the
+                                                        // stage still wants from this seat is made then.
+                                                        // Ended here at once, a stage whose previous-life
+                                                        // frame was a moment behind was signed again.
+                                                        // `S1-KJ`: and this seat's own old frames, refused
+                                                        // where it made its part again, count against no seat.
                                                         if signed_before {
-                                                            match h.restore_done(&app_key, now) {
-                                                                Ok(sends) => publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink),
-                                                                Err(e) => {
-                                                                    let _ = events
-                                                                        .send(NodeEvent::Warning(format!("the taken-up hand #{hid} could not go on: {e}")))
-                                                                        .await;
-                                                                }
-                                                            }
+                                                            note_back_from_restart(&mut t.equivocators, &mut t.back_from_restart, app_key.verifying_key().to_bytes(), hid);
                                                         }
                                                         let first = h.first_held().and_then(|b| {
                                                             let (kind, _, seq) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok()?;
@@ -12582,6 +12581,43 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(_) => {}
                         Err(e) => {
                             let _ = events.send(NodeEvent::Warning(format!("the proven cheat's evidence: {e}"))).await;
+                        }
+                    }
+                    // `S1-KK`: a hand taken up from a previous life's (`D-033`) ends
+                    // its restore once the table's re-send is in, and a stage it
+                    // leaves waiting on this seat, with nothing of this seat's own
+                    // held for it, is given this seat's part.
+                    let restore_ends = h.restore_due(now);
+                    let owed = if restore_ends {
+                        h.restore_done(&app_key, now)
+                    } else {
+                        h.restored_stage_owed(&app_key, now)
+                    };
+                    match owed {
+                        Ok(sends) => {
+                            if restore_ends || !sends.is_empty() {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "hand #{}: {} ({} frame(s) of this seat's own made now; D-033, S1-KK)",
+                                        h.hand_id(),
+                                        if restore_ends {
+                                            "the hand taken up from the table's copies is this seat's to play again"
+                                        } else {
+                                            "a stage of the hand taken up from the table's copies waited on this seat with nothing of its previous life's to take"
+                                        },
+                                        sends.len()
+                                    )))
+                                    .await;
+                            }
+                            if !sends.is_empty() {
+                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                hand_may_have_ended!(t, h);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("the taken-up hand #{} could not go on: {e}", h.hand_id())))
+                                .await;
                         }
                     }
                     // Two seats have signed this hand at a genesis this client
@@ -22786,6 +22822,28 @@ mod a_joiner_before_the_first_hand {
         watch_progress(&mut t);
         assert_eq!(t.voided_recent.0, 0b0_1101, "a long one: dropped");
         assert_eq!(t.voided_pending, (0, 0));
+    }
+
+    /// `S1-KK`: a hand taken up from a previous life's ends its restore on the
+    /// stall tick once the table's re-send is in, not at the adoption; the tick
+    /// gives a stage left waiting on this seat its part; and this seat's own
+    /// old frames, refused where it made its part again, count against no seat.
+    #[test]
+    fn a_restored_hand_ends_its_restore_on_the_tick() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(code.matches("h.restore_done(&app_key, now)").count(), 1, "one place ends a restore");
+        let fallback = code.find("match h.cheat_fallback(&app_key, now) {").expect("the tick");
+        let due = code.find("let restore_ends = h.restore_due(now);").expect("the tick asks");
+        assert!(fallback < due, "on the stall tick");
+        assert!(
+            code[due..due + 200].contains("h.restore_done(&app_key, now) } else { h.restored_stage_owed(&app_key, now) }"),
+            "the restore's end, or the stage owed"
+        );
+        assert!(code.contains(
+            "if signed_before { note_back_from_restart(&mut t.equivocators, &mut t.back_from_restart, app_key.verifying_key().to_bytes(), hid); }"
+        ));
     }
 
     /// `D-084`: a proven cheat's certificate is sought, and the hand given up

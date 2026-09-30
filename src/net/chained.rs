@@ -332,6 +332,14 @@ pub fn sender_of(bytes: &[u8], cap: usize) -> Option<[u8; 32]> {
     Some(envelope.sender_public_key)
 }
 
+/// `S1-KK`: the hash an event claims to be chained from -- read, not
+/// checked, like [`peek`]: use it to route, never to decide.
+pub fn parent_of(bytes: &[u8], cap: usize) -> Option<Hash> {
+    let signed: SignedEvent = from_canonical(bytes, cap).ok()?;
+    let envelope: EventBody = from_canonical(&signed.body, cap).ok()?;
+    Some(envelope.previous_event_hash)
+}
+
 /// The payload of an opened event, decoded under its own cap.
 pub fn payload<'a, T: Decode<'a, ()> + Encode<()>>(
     o: &'a Opened,
