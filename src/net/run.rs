@@ -12070,16 +12070,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 };
                                 // The hand the most seats of the table signed, and of those
                                 // the newest: taken newest first, a copy half the table signed
-                                // of a hand far ahead won over the table's own.
-                                let pick = t.resume_inits
+                                // of a hand far ahead won over the table's own. The first of
+                                // them whose copies adopt, and the best where none does -- a
+                                // group the count took and the adoption refused held the next
+                                // hand up for as long as it was the best (its refusal is said
+                                // below).
+                                let mut ranked: Vec<(usize, u64)> = t.resume_inits
                                     .iter()
                                     .filter(|(h, _)| floor.map_or(true, |f| **h > f))
                                     .filter_map(|(h, copies)| {
                                         let base = crate::table::hand::Opening::from_formation(f, *h)?;
                                         crate::table::hand::Opening::accepted_signers(&base, copies, accept).map(|n| (n, *h))
                                     })
-                                    .max()
-                                    .map(|(_, h)| (h, t.resume_inits[&h].clone()));
+                                    .collect();
+                                ranked.sort_unstable_by(|a, b| b.cmp(a));
+                                let adopts = |h: u64| {
+                                    crate::table::hand::Opening::from_formation(f, h).is_some_and(|base| {
+                                        crate::table::hand::Opening::adopt_with_signers_where(base, &t.resume_inits[&h], accept).is_ok()
+                                    })
+                                };
+                                let pick = ranked
+                                    .iter()
+                                    .find(|(_, h)| adopts(*h))
+                                    .or(ranked.first())
+                                    .map(|(_, h)| (*h, t.resume_inits[h].clone()));
                                 if let Some((hid, copies)) = pick {
                                     // `D-039`: whether the set that signed is exact is asked
                                     // after the adoption, which reads the table's own word on
@@ -17320,15 +17334,17 @@ fn stop_on_turn_due(since: tokio::time::Instant) -> bool {
 /// pushed the table's out of the rest; ten openings of one hand, each signed
 /// by it, filled that hand's copies. Now a seat is the only signer of one hand
 /// id at most -- its next opening of a hand nobody else has opened takes that
-/// one's place -- and the hands two seats or more opened are the newest two;
-/// a hand's copies are one per signer; and when the rest is full, the seat
-/// that holds the most of it gives its oldest up. A rogue keeps one hand id and
-/// its share of the rest, and the table's hands stay.
+/// one's place -- and the hands two seats or more opened are the newest two
+/// and, `S1-KF` (`D-088`), the one the most seats opened; a hand's copies are
+/// one per signer; and when the rest is full, the seat that holds the most of
+/// it gives its oldest up. A rogue keeps one hand id and its share of the
+/// rest, and the table's hands stay.
 const RESUME_EARLY_CAP: usize = 1_024;
 
 /// `S1-KE`: the hand ids whose openings are kept -- one for each seat alone,
-/// and two that two seats or more opened.
-const RESUME_INIT_HANDS: usize = crate::protocol::constants::MAX_SEATS as usize + 2;
+/// and the newest two that two seats or more opened, and the one of those the
+/// most seats opened (`S1-KF`, `D-088`).
+const RESUME_INIT_HANDS: usize = crate::protocol::constants::MAX_SEATS as usize + 3;
 
 fn stash_for_resume(
     bytes: &[u8],
@@ -17384,21 +17400,26 @@ fn stash_for_resume(
         {
             slot.push(bytes.to_vec());
         }
-        // The hands two seats or more opened: the two the most seats opened,
-        // then those the lowest seat of the table (`lowest`) opened, then the
-        // newest (`S1-KF`, `D-088`) -- kept newest first, two seats' openings
-        // of two hands far ahead put the table's own copies out.
-        let mut shared: Vec<(usize, bool, u64)> = inits
+        // The hands two seats or more opened: the newest two, and the one the
+        // most seats opened -- of those, the lowest seat of the table's
+        // (`lowest`), then the newest (`S1-KF`, `D-088`). The newest two alone
+        // let two seats' openings of two hands far ahead put the table's own
+        // copies out; the most-signed alone put the table's running hand out,
+        // its stage 0 still closing, for the two before it.
+        let shared: Vec<(u64, (usize, bool, u64))> = inits
             .iter()
             .filter_map(|(h, c)| {
                 let s = signers(c);
-                (s.len() >= 2).then(|| (s.len(), lowest.is_some_and(|k| s.contains(&k)), *h))
+                (s.len() >= 2).then(|| (*h, (s.len(), lowest.is_some_and(|k| s.contains(&k)), *h)))
             })
             .collect();
         if shared.len() > 2 {
-            shared.sort_unstable();
-            for (_, _, h) in &shared[..shared.len() - 2] {
-                drop_hand(inits, early, *h);
+            let best = shared.iter().max_by_key(|(_, rank)| *rank).map(|(h, _)| *h);
+            let newest: Vec<u64> = shared.iter().rev().take(2).map(|(h, _)| *h).collect();
+            for (h, _) in &shared {
+                if !newest.contains(h) && Some(*h) != best {
+                    drop_hand(inits, early, *h);
+                }
             }
         }
         return true;
@@ -18795,6 +18816,11 @@ fn catch_up_by_copies(
     let mine = h.hand_id();
     let me = h.my_seat();
     let table: Vec<u8> = h.table_for_the_count().into_iter().filter(|s| *s == me || !gone.contains(s)).collect();
+    // `S1-JR`, as `note_a_hand_ahead` keeps it: one other seat is the table
+    // only where two are left in the game.
+    if table.len() <= 2 && h.seats_in_the_game() >= 3 {
+        return None;
+    }
     let roster = f.roster().len();
     inits.iter().rev().filter(|(hid, _)| **hid >= mine.saturating_add(ADRIFT_MARGIN)).find_map(|(hid, copies)| {
         let base = crate::table::hand::Opening::from_formation(f, *hid)?;
@@ -18816,11 +18842,15 @@ fn lowest_key(f: &Formation, table: Option<&[u8]>) -> Option<[u8; 32]> {
 }
 
 /// `S1-KF` (`D-088`): whether the stall tick's clock says this client was not
-/// running -- `gap` since the tick before, or a time of day that moved on
-/// `by_ms` further than the time counted (a machine asleep, where the
-/// monotonic clock stops).
+/// running -- `gap` since the tick before, `ASLEEP_GAP` or more: a machine
+/// asleep where the monotonic clock counts it, or an event loop that heard
+/// nothing for as long, which is as far from the table; or a time of day that
+/// moved on `by_ms` further than the time counted, by a jump the window is
+/// told of (`crate::clock::is_jump`): a machine asleep where the monotonic
+/// clock stops. A time of day set on by less, a correction, is no sleep; one
+/// set back never is.
 fn was_asleep(gap: Option<std::time::Duration>, by_ms: i64) -> bool {
-    gap.is_some_and(|g| g >= ASLEEP_GAP) || by_ms >= i64::try_from(ASLEEP_GAP.as_millis()).unwrap_or(i64::MAX)
+    gap.is_some_and(|g| g >= ASLEEP_GAP) || (by_ms > 0 && crate::clock::is_jump(by_ms))
 }
 
 /// `S1-KF` (`D-088`): a stall tick this long after the last -- ten times its
@@ -21993,6 +22023,7 @@ mod tests {
         assert!(!was_asleep(Some(s(9)), 1_500), "a tick late");
         assert!(was_asleep(Some(s(40)), 0), "a machine asleep, the monotonic clock counting it");
         assert!(was_asleep(Some(s(2)), 40_000), "or not counting it");
+        assert!(!was_asleep(Some(s(2)), 25_000), "a correction under the jump the window is told of");
         assert!(!was_asleep(Some(s(2)), -40_000), "a time of day set back is no sleep");
     }
 
@@ -22724,18 +22755,45 @@ mod late_roster_tests {
             }
         }
         assert!(inits.contains_key(&20), "three seats' hand stays");
-        assert!(inits.contains_key(&501) && !inits.contains_key(&500), "of two seats' hands, the newest");
+        assert!(inits.contains_key(&500) && inits.contains_key(&501), "and the newest two");
+        for by in [2usize, 3] {
+            assert!(stash_for_resume(&seal(EventType::HandInit, 502, 0, by), &mut inits, &mut early, lowest));
+        }
+        assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![20, 501, 502], "the most-signed and the newest two");
         let mut inits = std::collections::BTreeMap::new();
         for by in [0usize, 1] {
             assert!(stash_for_resume(&seal(EventType::HandInit, 21, 0, by), &mut inits, &mut early, lowest));
         }
-        for h in [600u64, 601] {
+        for h in [600u64, 601, 602] {
             for by in [2usize, 3] {
                 assert!(stash_for_resume(&seal(EventType::HandInit, h, 0, by), &mut inits, &mut early, lowest));
             }
         }
-        assert!(inits.contains_key(&21) && inits.contains_key(&601), "the lowest seat's hand stays over a newer one without it");
-        assert!(!inits.contains_key(&600));
+        assert_eq!(
+            inits.keys().copied().collect::<Vec<_>>(),
+            vec![21, 601, 602],
+            "of hands as many seats opened, the lowest seat's stays over newer ones without it"
+        );
+        // ... and the table's running hand, its stage 0 still closing, stays
+        // beside the two before it that more seats opened.
+        let mut inits = std::collections::BTreeMap::new();
+        for h in [28u64, 29] {
+            for by in [0usize, 1, 2] {
+                assert!(stash_for_resume(&seal(EventType::HandInit, h, 0, by), &mut inits, &mut early, lowest));
+            }
+        }
+        for by in [0usize, 1] {
+            assert!(stash_for_resume(&seal(EventType::HandInit, 30, 0, by), &mut inits, &mut early, lowest));
+        }
+        assert_eq!(
+            inits.keys().copied().collect::<Vec<_>>(),
+            vec![29, 30],
+            "the running hand stays; of the two before it, the newer"
+        );
+        for by in [0usize, 1] {
+            assert!(stash_for_resume(&seal(EventType::HandInit, 31, 0, by), &mut inits, &mut early, lowest));
+        }
+        assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![29, 30, 31], "the running hands and the best before them");
     }
 }
 
