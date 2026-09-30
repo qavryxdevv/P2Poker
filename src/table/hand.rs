@@ -5877,6 +5877,11 @@ impl Hand {
         self.open.table_id
     }
 
+    /// The game at that table this hand belongs to.
+    pub fn session_id(&self) -> Hash {
+        self.open.session_id
+    }
+
     /// Which seat this client sits in.
     pub fn my_seat(&self) -> SeatIdx {
         self.open.my_seat

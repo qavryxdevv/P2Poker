@@ -1254,6 +1254,9 @@ struct TableState {
     barred: std::collections::HashSet<[u8; 32]>,
     /// `D-051`: the same seats by the Tox key of the line their members came
     /// in over, where this client invited them: offered the group no more.
+    /// `S1-KL`: and every seat the table's word removed for good (`D-047`), by
+    /// its own line -- never taken back into the roster, never offered the
+    /// group, no invitation of its taken, for the table's life.
     barred_lines: std::collections::HashSet<[u8; 32]>,
     /// `D-051`: each member's traffic, by member key.
     meters: HashMap<[u8; 32], crate::table::membership::Meter>,
@@ -1314,7 +1317,7 @@ impl TableState {
     /// joiner its founder.
     fn needs(&self, key: &[u8; 32]) -> bool {
         self.roster.contains(key)
-            || matches!(&self.setup.role, Role::Joiner { founder, .. } if founder == key)
+            || matches!(&self.setup.role, Role::Joiner { founder, .. } if founder == key && !self.barred_lines.contains(key))
     }
 }
 
@@ -1626,6 +1629,11 @@ fn close_table(
     if let Role::Joiner { founder, .. } = &t.setup.role {
         keys.push(*founder);
     }
+    // `S1-KL`: and a seat removed for good, which the roster no longer names --
+    // its friendship idles out with the others no table needs (`D-047`).
+    keys.extend(t.barred_lines.iter().copied());
+    keys.sort_unstable();
+    keys.dedup();
     for key in keys {
         if tables.values().any(|o| o.needs(&key)) {
             continue;
@@ -1875,7 +1883,7 @@ fn sweep_table(
     // offered while the founder sat in the group. A founder out of the roster
     // for good (`D-047`) is offered nothing.
     if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
-        if t.self_joined && t.roster.contains(founder) {
+        if t.self_joined && t.roster.contains(founder) && !t.barred_lines.contains(founder) {
             if let Some(n) = friend_number(friends, founder) {
                 let here = t.peer_lines.iter().any(|(p, l)| l == founder && t.confirmed.contains(p));
                 let absent = !here && group_short(seats_here(t), t.roster.len());
@@ -2187,6 +2195,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         // This client. Not a friend of itself and not a peer
                         // of itself; see `me` above.
                         Command::Seated(key) if key == me => {}
+                        // `S1-KL`: a seat removed for good is seated here no more.
+                        Command::Seated(key) if t.barred_lines.contains(&key) => {}
                         Command::Seated(key) => {
                             if !t.roster.contains(&key) {
                                 t.roster.push(key);
@@ -2265,6 +2275,17 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                 if key == me {
                                     continue;
                                 }
+                                // `S1-KL`: nor a seat the table's word removed for
+                                // good (`D-047`). The roster names it still -- its
+                                // chips left the table, its seat did not -- and is
+                                // said again at every change: each saying took it
+                                // back in, and a founder put out for good was
+                                // offered the group by every member every
+                                // `REINVITE_EVERY`, came in under a fresh key and
+                                // was cut off again, for as long as the table ran.
+                                if t.barred_lines.contains(&key) {
+                                    continue;
+                                }
                                 if !t.roster.contains(&key) {
                                     t.roster.push(key);
                                 }
@@ -2290,18 +2311,27 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                         t.trouble.removed.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                // `D-047`: for good is for good -- off this table's roster
-                                // too, so the founder never offers the group to it again
-                                // (a fresh key needs an invitation) and its friendship
-                                // idles out with the others no table needs.
-                                if for_good {
-                                    if let Some(k) = tox_key {
-                                        t.roster.retain(|r| *r != k);
-                                    }
-                                    // `D-051`: and barred by its application key, so a
-                                    // fresh member key bound to it is cut off on sight.
-                                    if let Some(a) = app_key {
-                                        bar_seat(&mut tox, t, g, a);
+                            }
+                            // `D-047`: for good is for good -- off this table's roster
+                            // too, so nobody here offers the group to it again (a fresh
+                            // key needs an invitation) and its friendship idles out with
+                            // the others no table needs. `S1-KL`: and its line barred for
+                            // the table's life, so no roster said again takes it back,
+                            // and whether or not this client holds a group this moment:
+                            // a word that came while it held none was lost.
+                            if for_good {
+                                if let Some(k) = tox_key {
+                                    t.roster.retain(|r| *r != k);
+                                    t.barred_lines.insert(k);
+                                }
+                                // `D-051`: and barred by its application key, so a
+                                // fresh member key bound to it is cut off on sight.
+                                if let Some(a) = app_key {
+                                    match t.group {
+                                        Some(g) => bar_seat(&mut tox, t, g, a),
+                                        None => {
+                                            t.barred.insert(a);
+                                        }
                                     }
                                 }
                             }
@@ -2347,6 +2377,9 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                 }
                             }
                         }
+                        // `S1-KL`: a seat removed for good asking back is no seat
+                        // back: nothing is offered it.
+                        Command::Rejoined(key) if t.barred_lines.contains(&key) => {}
                         Command::Rejoined(key) if key != me => {
                             // A seat back after a restart needs the group
                             // offered afresh; a friendship that is down is
@@ -2427,7 +2460,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         // restarted has the same key and no group. One still
                         // in the group refuses the offer.
                         if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
-                            if t.self_joined && friends.get(&friend) == Some(founder) {
+                            // `S1-KL`: never a founder the table's word removed for good.
+                            if t.self_joined && friends.get(&friend) == Some(founder) && !t.barred_lines.contains(founder) {
                                 t.invited.retain(|f| *f != friend);
                                 if tox.invite(g, friend).is_ok() {
                                     t.invited.push(friend);
@@ -3182,6 +3216,11 @@ fn held_empty(t: &TableState) -> bool {
 /// (`D-037`); and only a table whose advertisement named a group, since an
 /// invitation says nothing about which group it is for (see `Role`).
 fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {
+    // `S1-KL`: nothing is taken from a seat this table put out for good (`D-047`)
+    // or cut off for flooding (`D-051`) -- not into the group it was put out of.
+    if from.is_some_and(|k| t.barred_lines.contains(&k)) {
+        return false;
+    }
     match (&t.setup.role, from) {
         (Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => k == *founder,
         (Role::Back { chat_id: Some(_) }, Some(k)) => t.roster.contains(&k),
@@ -3798,6 +3837,94 @@ mod tests {
         let every = Some((s(100), s(30), s(200)));
         assert!(offline_in(every, s(310)) && !offline_in(every, s(340)), "again every period, for as long");
         assert!(!offline_in(None, s(110)), "no window, no outage");
+    }
+
+    /// `S1-KL`: a seat the table's word removed for good (`D-047`) never comes
+    /// back into the table's group from here, founder or not: its line is barred
+    /// for the table's life whether or not a group is held, no roster said again
+    /// takes it back, nobody offers it the group -- a member its founder, the
+    /// founder its seats -- and no invitation of its is taken. Measured
+    /// (2026-09-30, the owner's table of three): a founder put out after its
+    /// fourth absence was offered the group by both other seats every
+    /// `REINVITE_EVERY`, came in under a fresh key and was cut off again, eleven
+    /// times in fifteen minutes.
+    #[test]
+    fn a_seat_removed_for_good_is_never_offered_the_group_again() {
+        let src = include_str!("table.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let remove = code.find("Command::Remove { app_key, tox_key, for_good } => {").expect("the word's removal");
+        let barred = remove
+            + code[remove..]
+                .find("if for_good { if let Some(k) = tox_key { t.roster.retain(|r| *r != k); t.barred_lines.insert(k); }")
+                .expect("the line barred");
+        let group = remove + code[remove..].find("if let Some(g) = t.group {").expect("the group's entries");
+        let group_end = group + code[group..].find("// `D-047`: for good is for good").expect("its end");
+        assert!(barred > group_end, "barred outside the group's own block: whether or not a group is held");
+        assert!(
+            code.contains("match t.group { Some(g) => bar_seat(&mut tox, t, g, a), None => { t.barred.insert(a); } }"),
+            "and its application key barred all the same"
+        );
+        let roster = code.find("Command::Roster(keys) => {").expect("the roster said again");
+        let skip = roster + code[roster..].find("if t.barred_lines.contains(&key) { continue; }").expect("a barred line skipped");
+        let push = roster + code[roster..].find("t.roster.push(key);").expect("the roster taken");
+        assert!(skip < push, "before it is taken back in");
+        assert!(code.contains("Command::Seated(key) if t.barred_lines.contains(&key) => {}"), "not seated again");
+        assert!(code.contains("Command::Rejoined(key) if t.barred_lines.contains(&key) => {}"), "not offered the group on asking back");
+        assert!(
+            code.contains("if t.self_joined && t.roster.contains(founder) && !t.barred_lines.contains(founder) {"),
+            "a member's offer to its founder, on the sweep"
+        );
+        assert!(
+            code.contains("if t.self_joined && friends.get(&friend) == Some(founder) && !t.barred_lines.contains(founder) {"),
+            "and on the founder's friendship coming up"
+        );
+        assert!(
+            code.contains("let wanted: Vec<[u8; 32]> = t.roster.iter().copied().filter(|k| !t.barred_lines.contains(k)).collect();"),
+            "the founder's own invitations"
+        );
+        let fits = code.find("fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {").expect("an invitation's fit");
+        let refused = fits
+            + code[fits..]
+                .find("if from.is_some_and(|k| t.barred_lines.contains(&k)) { return false; }")
+                .expect("an invitation from a barred line refused");
+        let by_role = fits + code[fits..].find("match (&t.setup.role, from) {").expect("the roles' fits");
+        assert!(refused < by_role, "and no invitation of its taken, whatever the role");
+        // Its friendship idles out when the table closes, and no table needs it
+        // as a founder any more.
+        assert!(
+            code.contains("|| matches!(&self.setup.role, Role::Joiner { founder, .. } if founder == key && !self.barred_lines.contains(key))"),
+            "a founder removed for good is needed by nobody"
+        );
+        assert!(code.contains("keys.extend(t.barred_lines.iter().copied());"), "idled with the table's others");
+        // The node names a seat's line only when no other seat names it: a line
+        // is declared, and a rogue declaring an honest seat's would have it barred.
+        let run_src = include_str!("../net/run.rs");
+        let run_code = &run_src[..run_src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let run_code = run_code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(run_code.matches(".map(|e| (e.app_public_key, own_line(f, e.seat)))").count(), 3, "every removal by its own line");
+        assert_eq!(run_code.matches(".map(|e| (e.app_public_key, e.tox_key))").count(), 0, "and never by a declared line as such");
+        assert!(
+            run_code.contains("let shared = seats.iter().any(|e| e.seat != seat && e.tox_key == Some(line)); (!shared).then_some(line)"),
+            "a line another seat names is nobody's"
+        );
+    }
+
+    /// `S1-KL`: the node's own count of this client's returns belongs to one
+    /// table and one game, noted on the tick and at the boundary.
+    #[test]
+    fn this_clients_own_returns_are_counted_at_one_table_and_one_game() {
+        let src = include_str!("../net/run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(code.matches("note_own_returns(t);").count(), 2, "on the tick and at the boundary");
+        let note = code.find("fn note_own_returns(t: &mut TableRun) {").expect("the count");
+        let reset = note
+            + code[note..]
+                .find("let of = t.table.as_ref().map(|f| (f.table_id(), f.session())); if of != t.own_returns_of { t.own_returns.clear(); t.own_returns_of = of; }")
+                .expect("started again at another table or game");
+        let hands = note + code[note..].find("for h in [t.previous.as_ref(), t.hand.as_ref()].into_iter().flatten() {").expect("the hands held");
+        assert!(reset < hands, "before any hand is read");
     }
 
     /// `S1-FR`: the founder offers the group always; the founder back after a

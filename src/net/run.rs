@@ -1451,6 +1451,17 @@ struct TableRun {
     /// Kept through a silence, whatever the library says meanwhile. `S1-KA`:
     /// and how many seats had chips there, which a later hand never exceeds.
     alone_hand: Option<(u64, u8, usize)>,
+    /// `S1-KL`: this client's own returns at this table -- the hand each took it
+    /// back in at, and how many seats had chips there -- counted at the boundary
+    /// each was banked at, whatever the hands' openings say: an opening adopted
+    /// from the others' copies counts nobody's returns (`D-038`), and a seat
+    /// that came back three times, twice by adoption, read one and turned the
+    /// table's word about its fourth absence down. Only for that word: nothing
+    /// the table does rests on what this client remembers.
+    own_returns: std::collections::BTreeMap<u64, usize>,
+    /// `S1-KL`: the table and the game those returns were counted at: another
+    /// starts the count again, whatever path it came by.
+    own_returns_of: Option<([u8; 32], Option<[u8; 32]>)>,
     /// `S1-JR`: since when this client, resuming, has held no hand of the
     /// table's.
     resuming_since: Option<std::time::Instant>,
@@ -1990,6 +2001,8 @@ impl TableRun {
             heard_nobody_since: None,
             voided_pending: (0, 0),
             alone_hand: None,
+            own_returns: std::collections::BTreeMap::new(),
+            own_returns_of: None,
             resuming_since: None,
             rejoin_stacks: None,
             stacks_refused: false,
@@ -3302,7 +3315,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .seats()
                                             .iter()
                                             .find(|e| e.seat == seat)
-                                            .map(|e| (e.app_public_key, e.tox_key))
+                                            .map(|e| (e.app_public_key, own_line(f, e.seat)))
                                     });
                                     if let Some((app, line)) = entry {
                                         let quiet = [
@@ -4140,7 +4153,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .seats()
                         .iter()
                         .find(|e| e.seat == seat)
-                        .map(|e| (e.app_public_key, e.tox_key))
+                        .map(|e| (e.app_public_key, own_line(f, e.seat)))
                 });
                 if let Some((app, line)) = entry {
                     let quiet = [
@@ -4208,7 +4221,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .seats()
                             .iter()
                             .find(|e| e.seat == seat)
-                            .map(|e| (e.app_public_key, e.tox_key))
+                            .map(|e| (e.app_public_key, own_line(f, e.seat)))
                     });
                     let Some((app, line)) = entry else { continue };
                     if $t.out_keys.contains(&app) {
@@ -4478,6 +4491,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.heard_nobody_since = None;
             $t.voided_pending = (0, 0);
             $t.alone_hand = None;
+            $t.own_returns.clear();
+            $t.own_returns_of = None;
             $t.resuming_since = None;
             $t.rejoin_stacks = None;
             $t.stacks_refused = false;
@@ -5593,6 +5608,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // takes no absence.
                                             let held = t.alone_hand.filter(|(hand, _, _)| w.hand_id >= *hand);
                                             let returns = held.map_or(0, |(_, returns, _)| returns);
+                                            // `S1-KL`: **or by this client's own count of the
+                                            // returns it banked**, which an adoption does not
+                                            // reset: the word about a hand its third return took
+                                            // it back in at, or a later one. The count above is
+                                            // the hand's opening's, and an opening adopted from
+                                            // the others' copies counts no returns (`D-038`) --
+                                            // a seat that came back twice by adoption read one --
+                                            // while a client cut off runs ahead alone and the hand
+                                            // it last heard a seat in moves past the word with it.
+                                            // A rogue's replay of an earlier genuine absence is
+                                            // before that hand, and refused as it was.
+                                            let counted_here = t.own_returns_of == Some((f.table_id(), f.session()));
+                                            let fourth = fourth_absence_from(&t.own_returns).filter(|(hand, _)| counted_here && w.hand_id >= *hand);
                                             // `S1-KA`: **and signed by a majority of the seats
                                             // with chips**: at the hand this client was in as it
                                             // began to hear nobody -- a later hand has no more --
@@ -5605,12 +5633,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // silent in the hand as carrying it -- a client the
                                             // table did put out for good may not take the word
                                             // here then, and is told the table may not be safe
-                                            // instead (`S1-JR`).
-                                            let with_chips = held.map_or(roster.seats().len(), |(_, _, n)| n);
+                                            // instead (`S1-JR`). `S1-KL`: short of that hand, the
+                                            // one the third return took it back in at, which is
+                                            // no later than the word's.
+                                            let with_chips = held
+                                                .map(|(_, _, n)| n)
+                                                .or(fourth.map(|(_, n)| n))
+                                                .unwrap_or(roster.seats().len());
                                             if voters.len() * 2 <= with_chips {
                                                 return None;
                                             }
-                                            let absent = returns >= crate::protocol::constants::MAX_RETURNS
+                                            let absent = (returns >= crate::protocol::constants::MAX_RETURNS || fourth.is_some())
                                                 && !causes.is_empty()
                                                 && causes.iter().all(|c| {
                                                     matches!(c, None | Some(crate::table::handwire::CAUSE_LONG_GONE))
@@ -13806,6 +13839,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let next = t.hand.as_ref().and_then(|h| h.next_hand());
+                // `S1-KL`: this client's own returns, the hand seen whole.
+                note_own_returns(t);
                 // `S1-JR`: the hands voided one after another, and the
                 // boundaries at which this client asked to be dealt in again
                 // and was not -- each counted once per hand, and read by
@@ -15437,6 +15472,19 @@ async fn report_params(events: &Events, f: &Formation) {
 /// that refuses and changes nothing. Diffing instead would mean keeping a
 /// second copy of the roster in this loop to diff against, which is a second
 /// answer to the same question.
+/// `S1-KL`: a seat's own Tox line, for the driver to remove it by -- `None` when
+/// another seat of the roster names the same key. A line is declared by its seat
+/// and checked against nothing: a rogue declaring an honest seat's key, then put
+/// out for good, had that seat's entries dropped by line, and would now have its
+/// line barred from the group for the table's life. By its application key alone
+/// then, which its own signature binds.
+fn own_line(f: &Formation, seat: u8) -> Option<[u8; 32]> {
+    let seats = f.roster().seats();
+    let line = seats.iter().find(|e| e.seat == seat)?.tox_key?;
+    let shared = seats.iter().any(|e| e.seat != seat && e.tox_key == Some(line));
+    (!shared).then_some(line)
+}
+
 fn seat_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
     if !tox.is_on_tox() {
         return;
@@ -15586,6 +15634,45 @@ const VOIDED_WINDOW_MASK: u8 = 0b1_1111;
 /// `S1-JT`: how long this client must have heard no other seat of the table
 /// before a lobby answer's word that it is out for good is taken.
 const LOBBY_WORD_ALONE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `S1-KL`: this client's own returns at this table, noted from the hands it
+/// holds -- a return certificate about its seat banked at a hand's boundary,
+/// taking it back in at the next: an adopted hand banks one like any other,
+/// though its opening counts none. **Only the certificate.** Not §4.9's set `A`
+/// (`Opening::readmitted`), which this client puts its own seat in by its own
+/// sit-in request or its own bystander checkpoint whether or not a return
+/// follows: a rogue withholding its return vote twice made two entries of
+/// asks that failed, and a genuine second absence read as the fourth.
+fn note_own_returns(t: &mut TableRun) {
+    // At this table and this game only: a count carried to another would take
+    // a first absence there for a fourth.
+    let of = t.table.as_ref().map(|f| (f.table_id(), f.session()));
+    if of != t.own_returns_of {
+        t.own_returns.clear();
+        t.own_returns_of = of;
+    }
+    let Some((table, Some(session))) = of else {
+        return;
+    };
+    for h in [t.previous.as_ref(), t.hand.as_ref()].into_iter().flatten() {
+        if h.table_id() != table || h.session_id() != session {
+            continue;
+        }
+        let me = h.my_seat();
+        if h.returned().contains(&me) {
+            t.own_returns.entry(h.hand_id().saturating_add(1)).or_insert(h.seats_with_chips());
+        }
+    }
+}
+
+/// `S1-KL`: the hand from which an absence the table certifies about this
+/// client is its fourth -- the one its `MAX_RETURNS`-th return took it back in
+/// at, by its own count (`TableRun::own_returns`) -- and how many seats had
+/// chips there, which no later hand exceeds. `None` short of that many returns.
+fn fourth_absence_from(own_returns: &std::collections::BTreeMap<u64, usize>) -> Option<(u64, usize)> {
+    let nth = usize::from(crate::protocol::constants::MAX_RETURNS).checked_sub(1)?;
+    own_returns.iter().nth(nth).map(|(hand, with_chips)| (*hand, *with_chips))
+}
 /// `S1-JR`: a running hand standing at one cryptographic stage this long makes
 /// the table not safe -- longer than `D-066`'s five minutes. Nothing an honest
 /// table does stands this long: a cryptographic stage ends within three budgets,
@@ -15899,6 +15986,10 @@ fn watch_progress(t: &mut TableRun) {
         let unheard = seats_unheard(f, &t.tox_sink);
         f.roster().seats().iter().any(|e| Some(e.seat) != me && !unheard.contains(&e.seat))
     });
+    // `S1-KL`: and this client's own returns, on the tick as at the boundary --
+    // a return banked late re-derives the next hand, which a client cut off in
+    // it never sees end.
+    note_own_returns(t);
     if heard_someone {
         // `S1-JT`: the hand this client is in while it hears the table, and its
         // own count of returns there -- kept through any silence after: a
@@ -23718,17 +23809,34 @@ mod a_joiner_before_the_first_hand {
             .find("let alone = t .heard_nobody_since .is_some_and(|since| since.elapsed() >= LOBBY_WORD_ALONE); if !alone || !(flooded || cheated || absent) { return None; }")
             .expect("taken only while alone, as a flood or a fourth absence");
         assert!(
-            code.contains("let absent = returns >= crate::protocol::constants::MAX_RETURNS && !causes.is_empty()"),
+            code.contains("let absent = (returns >= crate::protocol::constants::MAX_RETURNS || fourth.is_some()) && !causes.is_empty()"),
             "a fourth absence by this client's own count of its returns"
         );
         assert!(
             code.contains("let held = t.alone_hand.filter(|(hand, _, _)| w.hand_id >= *hand); let returns = held.map_or(0, |(_, returns, _)| returns);"),
             "about the hand the silence began in or a later one, by its count there"
         );
+        // `S1-KL`: or about the hand its own third return took it back in at, or
+        // a later one, by the count this client kept of the returns it banked.
+        assert!(
+            code.contains("let counted_here = t.own_returns_of == Some((f.table_id(), f.session())); let fourth = fourth_absence_from(&t.own_returns).filter(|(hand, _)| counted_here && w.hand_id >= *hand);"),
+            "the hand of the third return by this client's own count, at this table and game"
+        );
+        assert!(
+            code.contains("if h.returned().contains(&me) { t.own_returns.entry(h.hand_id().saturating_add(1)).or_insert(h.seats_with_chips()); }"),
+            "counted at the boundary each was banked at, adopted hand or not"
+        );
+        // Only by a return certificate banked: §4.9's set `A` is this client's
+        // own asking, and a rogue withholding its vote made asks that failed
+        // count as returns.
+        let note = code.find("fn note_own_returns(t: &mut TableRun) {").expect("the count");
+        let note_end = note + code[note..].find("fn fourth_absence_from(").expect("its end");
+        assert!(!code[note..note_end].contains(".readmitted()"), "never the set A");
+        assert!(code.contains("$t.own_returns.clear();"), "forgotten with the table");
         // `S1-KA`: carried by a majority of the seats with chips there, or of
         // the whole roster when this client holds no such hand.
         let majority = code
-            .find("let with_chips = held.map_or(roster.seats().len(), |(_, _, n)| n); if voters.len() * 2 <= with_chips { return None; }")
+            .find("let with_chips = held .map(|(_, _, n)| n) .or(fourth.map(|(_, n)| n)) .unwrap_or(roster.seats().len()); if voters.len() * 2 <= with_chips { return None; }")
             .expect("a majority of the seats with chips");
         assert!(majority < alone, "before the word is taken");
         assert!(
@@ -23748,6 +23856,28 @@ mod a_joiner_before_the_first_hand {
                 && code.contains("f.session().is_some() && !others.is_empty() && others.iter().all(|s| unheard.contains(s))"),
             "with its own library on the network, at a table that was set"
         );
+    }
+
+    /// `S1-KL`: the hand from which an absence is the fourth is the one this
+    /// client's `MAX_RETURNS`-th own return took it back in at -- by the order of
+    /// the hands, whichever order they were counted in -- and there is none
+    /// short of that many returns.
+    #[test]
+    fn the_fourth_absence_counts_from_the_hand_of_the_third_return() {
+        let mut own = std::collections::BTreeMap::new();
+        assert_eq!(fourth_absence_from(&own), None, "no return, no fourth absence");
+        own.insert(32u64, 3usize);
+        own.insert(4, 3);
+        assert_eq!(fourth_absence_from(&own), None, "two returns are not three");
+        own.insert(9, 3);
+        assert_eq!(fourth_absence_from(&own), Some((32, 3)), "the third return's hand, counted in any order");
+        own.insert(40, 2);
+        assert_eq!(fourth_absence_from(&own), Some((32, 3)), "a later entry moves nothing");
+        // Counted twice, at the boundary that banked it and at the opening it
+        // took the seat back in at: one return.
+        own.entry(32).or_insert(9);
+        assert_eq!(own.len(), 4);
+        assert_eq!(fourth_absence_from(&own), Some((32, 3)));
     }
 
     /// `S1-JJ`: a client keeps on disk that its table was set to start the moment
