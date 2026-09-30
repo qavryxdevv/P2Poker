@@ -764,7 +764,7 @@ pub struct PokerBehaviour {
     pub kademlia: kad::Behaviour<MemoryStore>,
     /// The **public** Kademlia, where the relays are and where the lobby is.
     ///
-    /// `kademlia` above speaks `/p2p-poker/kad/1`, which is right: this
+    /// `kademlia` above speaks `/p2p-poker/kad/2`, which is right: this
     /// project's records are its own and have no business in anybody else's
     /// routing table. But it also means this client is invisible to, and blind
     /// to, the network where relays actually advertise themselves — and a peer
@@ -982,7 +982,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<ShapedBehaviour>, Box<dyn std::
         .with_behaviour(|key, relay_client| {
             let gossipsub = build_gossipsub(key)?;
 
-            let mut kad_cfg = kad::Config::new(StreamProtocol::new("/p2p-poker/kad/1"));
+            let mut kad_cfg = kad::Config::new(StreamProtocol::new("/p2p-poker/kad/2"));
             kad_cfg.set_query_timeout(Duration::from_secs(60));
             let kademlia = kad::Behaviour::with_config(
                 local_peer_id,

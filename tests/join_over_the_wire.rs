@@ -6,7 +6,7 @@
 //! two clients arrive at the **same `session_id`** — the value every subsequent
 //! hand's genesis contains.
 //!
-//! Everything here travels: the join RPC over `/p2p-poker/join/1` on a QUIC
+//! Everything here travels: the join RPC over `/p2p-poker/join/2` on a QUIC
 //! connection, and `PLAYER_LIST` and `TABLE_READY` over the table's own
 //! GossipSub topic. Nothing is handed between the two `Formation` values in
 //! memory.

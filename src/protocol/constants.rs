@@ -24,23 +24,30 @@ use crate::poker::state::Chips;
 // Identity and protocol strings
 // ---------------------------------------------------------------------------
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const PROTOCOL_MAJOR: u16 = 1;
+/// `D-089`: 2 since 0.2.0, on the owner's word -- a client of version 1 and
+/// one of version 2 never see each other. The table's rules changed since
+/// version 1 (`D-084` to `D-088`), and two versions at one table part at their
+/// first difference. Every protocol string, table topic and DHT key carries
+/// the major (`PROTOCOL.md` §1.1), so the two never meet; and every signed
+/// envelope carries `protocol_version`, which a receiver holds to its own
+/// (`EventBody::check_envelope`), should any road cross all the same.
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_MAJOR: u16 = 2;
 
 /// The libp2p identify protocol name.
 ///
 /// Held here and used from `net::swarm`, which defined its own copy of this
 /// string under the name `PROTOCOL_VERSION` — a third meaning for a name that
 /// already had two.
-pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/1";
-pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/1";
-pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/1";
+pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/2";
+pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/2";
+pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/2";
 /// `D-064`: the queue of clients searching for a game, beside the lobby and
 /// sliced like it (`PROTOCOL.md` §7.13).
-pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/1";
-pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/1";
-pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/1";
-pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/1";
+pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/2";
+pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/2";
+pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/2";
+pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/2";
 
 // **The two Mainline infohashes and their derivation strings are gone.**
 // `56b0b50` took BitTorrent out of the binary and the lobby became a libp2p

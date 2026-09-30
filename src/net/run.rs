@@ -362,7 +362,7 @@ fn relay_namespace() -> libp2p::kad::RecordKey {
 /// reachable player and the unreachable one, and that is the difference between
 /// a lobby most people can be seen in and a lobby only a minority can.
 fn lobby_namespace() -> libp2p::kad::RecordKey {
-    namespace(b"p2p-poker/main-lobby/v1")
+    namespace(b"p2p-poker/main-lobby/v2")
 }
 
 /// `S1-EX`: the DHT key the peers of **one slice** of the lobby find each other
@@ -380,7 +380,7 @@ fn lobby_namespace() -> libp2p::kad::RecordKey {
 /// asks who else is there, and its connections stop being arbitrary: ten or
 /// twelve of them per slice, which is what `mesh_n` wants.
 fn shard_namespace(slice: &str) -> libp2p::kad::RecordKey {
-    namespace(format!("p2p-poker/main-lobby/v1/{slice}").as_bytes())
+    namespace(format!("p2p-poker/main-lobby/v2/{slice}").as_bytes())
 }
 
 /// `D-070`: the lobby's key for one hour of the clock -- where the clients that
@@ -413,7 +413,7 @@ fn shard_namespace(slice: &str) -> libp2p::kad::RecordKey {
 /// cannot answer. A clock an hour wrong announces where nobody looks, and that
 /// client is met under the lobby's own key as it always was.
 fn hour_namespace(hour: u64) -> libp2p::kad::RecordKey {
-    namespace(format!("p2p-poker/main-lobby/v1/hour/{hour}").as_bytes())
+    namespace(format!("p2p-poker/main-lobby/v2/hour/{hour}").as_bytes())
 }
 
 /// `S1-IY`: the failed dials whose own words are sent to the window. The window
@@ -20884,8 +20884,8 @@ mod tests {
     fn the_lobby_rendezvous_key_is_the_published_one() {
         assert_eq!(
             hex(lobby_namespace().to_vec().as_slice()),
-            "12207e342925602a7c6558d6ac574207bcc56f7989e17ad52b7694f2c964d772c4b6",
-            "sha2-256 of \"p2p-poker/main-lobby/v1\" under the 0x12 0x20 multihash prefix"
+            "122010ff86e6a7b7c62abd79a9c00a863630417d412bc0c5f1f124185730057de280",
+            "sha2-256 of \"p2p-poker/main-lobby/v2\" under the 0x12 0x20 multihash prefix (protocol major 2, `D-089`)"
         );
         assert_eq!(
             hex(relay_namespace().to_vec().as_slice()),
@@ -20991,12 +20991,12 @@ mod tests {
     fn an_hours_lobby_key_is_the_published_one() {
         assert_eq!(
             hex(hour_namespace(494_000).to_vec().as_slice()),
-            "12203d1090829c32d410fe8d89a9e211ed600d696b9650ea4216739698e23ba923be",
-            "sha2-256 of \"p2p-poker/main-lobby/v1/hour/494000\" under the 0x12 0x20 multihash prefix"
+            "12207d615682a47342be0b0e540323dd6738f5dd2802c196acfa73a29277ca0a8919",
+            "sha2-256 of \"p2p-poker/main-lobby/v2/hour/494000\" under the 0x12 0x20 multihash prefix"
         );
         assert_eq!(
             hex(hour_namespace(494_001).to_vec().as_slice()),
-            "12203b2f620ac121b4d3cb333e4b80fe5095a517469197bf1d583873b3e6cb0c162f",
+            "1220679e1be313fd1ebd127c806b4b821cbca1db6595ab58fdb120c3140b0769b5dc",
             "and the hour after it is another key altogether"
         );
         assert_eq!(lobby_hour(494_000 * 3_600), 494_000);
@@ -23121,8 +23121,9 @@ mod a_joiner_before_the_first_hand {
 
     /// What `the_closest_nodes_to_a_key_say_how_big_the_dht_is` derives from its
     /// fixed five thousand. Written out rather than recomputed: a test that
-    /// recomputes the thing it checks passes whatever the code does.
-    const THE_ESTIMATE_OF_THIS_DRAW: u64 = 6_234;
+    /// recomputes the thing it checks passes whatever the code does. The key
+    /// is the lobby's of protocol major 2 (`D-089`); under major 1's it was 6 234.
+    const THE_ESTIMATE_OF_THIS_DRAW: u64 = 3_920;
 
     /// `S1-HZ`: a founder's lobby answer keeps it alive through its silence in the
     /// group only when it came after the silence began -- within one gap between

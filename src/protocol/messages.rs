@@ -624,11 +624,15 @@ mod tests {
         }
     }
 
+    /// `D-089`: and version 1 is one of them since protocol major 2 -- a client
+    /// of 0.1.x at a table of this one is refused at its first envelope.
     #[test]
     fn a_version_this_build_does_not_speak_is_rejected() {
         let mut body = chained_body(EventType::ActionFold);
-        body.protocol_version = 2;
-        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(2)));
+        body.protocol_version = PROTOCOL_VERSION + 1;
+        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(PROTOCOL_VERSION + 1)));
+        body.protocol_version = 1;
+        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(1)), "version 1, 0.1.x's");
     }
 
     #[test]

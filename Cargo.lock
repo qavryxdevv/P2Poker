@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "p2p-poker"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "ark-ec",
