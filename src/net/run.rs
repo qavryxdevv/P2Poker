@@ -2294,6 +2294,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         super::toxsink::TableSink::none(),
     )];
     let mut active: usize = 0;
+    // `S1-KN`: the tables this client was told cannot take its seat back -- a
+    // founder put out of it for good -- and the words it was told: a join of
+    // one of them is refused with them, by any slot, for the life of the
+    // process (`S1-KO`).
+    let mut no_return: Vec<([u8; 32], String)> = Vec::new();
     // The next slot's number, and the last `AtTable` the window was told.
     let mut next_slot: u8 = 1;
     let mut marked: Option<(u8, Option<[u8; 32]>)> = None;
@@ -2484,6 +2489,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         in_game: $t.table_counted.clone(),
                         // `S1-KF` (`D-088`): and the stacks it holds.
                         stacks: $t.stacks_held.clone(),
+                        // `S1-KN`: and the seats it put out for good.
+                        out: Some(recorded_out(f, &$t.out_keys)),
                     };
                     match crate::storage::session::save(&profile_dir, &record) {
                         Ok(()) => {
@@ -5040,6 +5047,34 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
+    // `S1-KN`: the seats the session record says this table put out for good,
+    // barred again the moment a client started again opens the table's group
+    // -- told to the driver right behind the table's opening, on the one queue,
+    // before anything it does there -- and refused a seat by the node.
+    macro_rules! restore_recorded_out {
+        ($t:ident, $key:expr) => {{
+            let key: [u8; 32] = $key;
+            let seats: Vec<crate::storage::session::OutSeat> =
+                $t.resume.as_ref().filter(|r| r.table_key == key).and_then(|r| r.out.clone()).unwrap_or_default();
+            for s in &seats {
+                $t.out_keys.insert(s.app_key);
+                $t.tox_sink.tell(super::toxsink::Seat::Remove {
+                    app_key: Some(s.app_key),
+                    tox_key: s.line_key(),
+                    for_good: true,
+                });
+            }
+            if !seats.is_empty() {
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "{} seat(s) this table put out for good, from the session record: barred from its group again (S1-KN)",
+                        seats.len()
+                    )))
+                    .await;
+            }
+        }};
+    }
+
     // `S1-IT`: a dial of this peer matters -- the founder being asked for a seat,
     // a player the lobby named. It is let through this client's own connection
     // limit, and the relays the records route it through are noted for the same
@@ -5865,6 +5900,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         continue;
                                     }
                                 }
+                                // `D-047`: a seat out of this table for good asks again --
+                                // refused with the reason, whatever else the request says.
+                                // `S1-KN`: and before the carrier is told the seat is back
+                                // below, which would offer it the group again -- as `S1-KD`'s
+                                // word is (a seat recorded without a line of its own is not
+                                // barred by line in the driver).
+                                if let Ok((_, sender, _)) = super::joinwire::receive_join_request(&request) {
+                                    if t.out_keys.contains(&sender) {
+                                        if let Ok(bytes) = f.refuse_out(&request, now) {
+                                            let _ = swarm.behaviour_mut().join.send_response(channel, bytes);
+                                        }
+                                        let _ = events
+                                            .send(NodeEvent::Warning(
+                                                "a seat out of this table for good asked to sit again and was refused (D-047)".into(),
+                                            ))
+                                            .await;
+                                        continue;
+                                    }
+                                }
                                 // **A seat asking to join a table it already
                                 // sits at has restarted**, and this is the only
                                 // signal that says so. A client that is playing
@@ -5906,21 +5960,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 )))
                                                 .await;
                                         }
-                                        continue;
-                                    }
-                                }
-                                // `D-047`: a seat out of this table for good asks again --
-                                // refused with the reason, whatever else the request says.
-                                if let Ok((_, sender, _)) = super::joinwire::receive_join_request(&request) {
-                                    if t.out_keys.contains(&sender) {
-                                        if let Ok(bytes) = f.refuse_out(&request, now) {
-                                            let _ = swarm.behaviour_mut().join.send_response(channel, bytes);
-                                        }
-                                        let _ = events
-                                            .send(NodeEvent::Warning(
-                                                "a seat out of this table for good asked to sit again and was refused (D-047)".into(),
-                                            ))
-                                            .await;
                                         continue;
                                     }
                                 }
@@ -8385,6 +8424,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             t.origin = None;
                         }
                         t.lost_key = None;
+                        // `S1-KN`: a table founded afresh has no seat out for good --
+                        // those of a table this slot held before, or of a resume that
+                        // came to nothing, are not this table's.
+                        t.out_keys.clear();
                         // A fresh key per table, and that freshness is the only
                         // thing making two tables with the same players and the
                         // same rules different games (§4.3's `session_id`).
@@ -8719,6 +8762,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             join_not_started!(t, key, why, here);
                             continue;
                         }
+                        // `S1-KN`: nor a table this client was told cannot take its seat
+                        // back -- its founder put out of it for good. The window sends
+                        // this right behind the resume that said so, with the record gone
+                        // by then, and a headless client asks for its table again and
+                        // again; asking that founder is the one road back into the group
+                        // for it (`S1-KO`).
+                        if let Some((_, why)) = no_return.iter().find(|(k, _)| *k == key) {
+                            let why = why.clone();
+                            join_not_started!(t, key, why, false);
+                            continue;
+                        }
+                        // `S1-KN`: and a slot that holds no table starts with no seat out
+                        // for good -- those of a table it held before, or of a resume that
+                        // came to nothing, are not this table's; a resume's own come back
+                        // from its record once the table's group opens, below.
+                        t.out_keys.clear();
                         // `S1-FY`: nor over a seat this slot asks for again at another table
                         // -- `D-062`: unless that table is of the same game, one the slot's
                         // origin's roster founded: the player joining the continuation the
@@ -8742,6 +8801,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             join_not_started!(t, key, why, false);
                             continue;
                         };
+                        // `S1-KN`: and the table of this client's own record, joined from the
+                        // lobby with the resume's question left unanswered: its founder out
+                        // of it for good by the record is not asked either -- before its
+                        // group is opened for that founder to offer.
+                        if t.resume.as_ref().is_some_and(|r| {
+                            r.table_key == key && r.out.iter().flatten().any(|s| s.app_key == held.ad.founder_app_key)
+                        }) {
+                            let why = format!(
+                                "{} cannot take this seat back: its founder was put out of the table for good, and a seat back from a restart returns through its founder (S1-KO)",
+                                held.ad.table_name
+                            );
+                            no_return.retain(|(k, _)| *k != key);
+                            no_return.push((key, why.clone()));
+                            join_not_started!(t, key, why, false);
+                            continue;
+                        }
                         // `D-062`: a player joining a table that is no continuation of the
                         // one its slot first sat at starts afresh there.
                         if t.origin.as_ref().is_some_and(|o| origin_rank(o, &key, &held.ad).is_none()) {
@@ -8833,6 +8908,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         };
+                        // `S1-KN`: a seat back from a restart bars again the seats its
+                        // record says this table put out for good -- in the driver right
+                        // behind its opening, and at the node whether or not it came up.
+                        restore_recorded_out!(t, key);
                         match Formation::join(
                             app_key.clone(),
                             held.ad.clone(),
@@ -8964,6 +9043,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 r.my_stack,
                                 r.hand_id,
                             );
+                            // `S1-KN`: the seats the record says this table put out for
+                            // good are no members to befriend or offer the group to.
+                            let (table_key, out_apps): ([u8; 32], Vec<[u8; 32]>) =
+                                (r.table_key, r.out.iter().flatten().map(|s| s.app_key).collect());
                             let ad = match super::advert::from_body_bytes(&r.advert) {
                                 Ok(ad) => ad,
                                 Err(e) => {
@@ -8979,7 +9062,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // The members' Tox keys, from the founder's own list:
                             // the friendships a member's invitation rides on.
                             let members: Vec<[u8; 32]> = joinwire::receive_player_list_at(&list)
-                                .map(|(l, _, _)| l.roster.iter().filter(|e| e.seat != 0).filter_map(|e| e.tox_key).collect())
+                                .map(|(l, _, _)| {
+                                    l.roster
+                                        .iter()
+                                        .filter(|e| e.seat != 0 && !out_apps.contains(&e.app_public_key))
+                                        .filter_map(|e| e.tox_key)
+                                        .collect()
+                                })
                                 .unwrap_or_default();
                             if ad.founder_tox_key.is_some() {
                                 match t.tox_sink.start(
@@ -9005,6 +9094,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
+                            // `S1-KN`: the seats out for good, from the record -- barred in
+                            // the driver right behind its opening, before the roster is said
+                            // again below, and refused a seat by the node whether or not
+                            // the group came up.
+                            t.out_keys.clear();
+                            restore_recorded_out!(t, table_key);
                             match Formation::found_back(
                                 app_key.clone(),
                                 seed,
@@ -9072,6 +9167,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // finds it like any other and the ordinary road follows --
                         // *already seated*, the roster, the group, the ratification.
                         match super::advert::from_body_bytes(&r.advert) {
+                            // `S1-KN`: a table whose founder this seat's own table put out
+                            // for good. A seat back from a restart returns through its
+                            // founder -- the founder answers its request and offers it the
+                            // group -- and a founder out for good is never offered the group
+                            // nor taken an invitation from (`S1-KL`): there is nobody to
+                            // take this seat back, and asking the founder would be the one
+                            // road back into the group for it. Said, not tried (`S1-KO`).
+                            Ok(ad) if r.out.iter().flatten().any(|s| s.app_key == ad.founder_app_key) => {
+                                let why = format!(
+                                    "{} cannot take this seat back: its founder was put out of the table for good, and a seat back from a restart returns through its founder (S1-KO)",
+                                    ad.table_name
+                                );
+                                // Kept past the record: the join the window sends right
+                                // behind this is refused with the same words.
+                                let table_key = r.table_key;
+                                no_return.retain(|(k, _)| *k != table_key);
+                                no_return.push((table_key, why.clone()));
+                                forget_the_resumed_record(&profile_dir, t.resume.as_ref());
+                                t.resume = None;
+                                let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                let _ = events.send(NodeEvent::SessionGaveUp { why }).await;
+                            }
                             Ok(ad) => {
                                 let now = super::node::now_unix_ms();
                                 let params = super::advert::table_params_hash(&ad);
@@ -15483,6 +15600,23 @@ fn own_line(f: &Formation, seat: u8) -> Option<[u8; 32]> {
     let line = seats.iter().find(|e| e.seat == seat)?.tox_key?;
     let shared = seats.iter().any(|e| e.seat != seat && e.tox_key == Some(line));
     (!shared).then_some(line)
+}
+
+/// `S1-KN`: the seats this client's table put out for good, as its session
+/// record keeps them -- each by its application key, and by its own line where
+/// it has one -- so that a client started again bars them before it offers the
+/// table's group to anybody.
+fn recorded_out(
+    f: &Formation,
+    out_keys: &std::collections::BTreeSet<[u8; 32]>,
+) -> Vec<crate::storage::session::OutSeat> {
+    out_keys
+        .iter()
+        .map(|app| crate::storage::session::OutSeat {
+            app_key: *app,
+            line: f.roster().seat_of(app).and_then(|seat| own_line(f, seat)).map(|l| l.to_vec().into()),
+        })
+        .collect()
 }
 
 fn seat_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
@@ -21914,6 +22048,7 @@ mod tests {
             roster_list: Vec::new(),
             in_game: None,
             stacks: None,
+            out: None,
         };
         assert_eq!(adoption_floor(None, None), None);
         assert_eq!(adoption_floor(None, Some(&record(7, 0))), Some(7), "hand 7 ended: 8 on");
@@ -23856,6 +23991,75 @@ mod a_joiner_before_the_first_hand {
                 && code.contains("f.session().is_some() && !others.is_empty() && others.iter().all(|s| unheard.contains(s))"),
             "with its own library on the network, at a table that was set"
         );
+    }
+
+    /// `S1-KN`: the seats a table put out for good outlive a client started
+    /// again: the session record keeps them, a founder back from a restart
+    /// neither befriends nor offers the group to them and bars them the moment
+    /// its group opens, a seat back from a restart bars them the same way -- and
+    /// one whose founder is among them is told there is nobody to take it back,
+    /// rather than asking that founder.
+    #[test]
+    fn the_seats_out_for_good_are_barred_again_by_a_client_started_again() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(code.contains("out: Some(recorded_out(f, &$t.out_keys)),"), "the record keeps them");
+        assert!(
+            code.contains("line: f.roster().seat_of(app).and_then(|seat| own_line(f, seat)).map(|l| l.to_vec().into()),"),
+            "each by its own line only"
+        );
+        let mac = code.find("macro_rules! restore_recorded_out {").expect("the restore");
+        let body = &code[mac..mac + 900];
+        assert!(body.contains("$t.resume.as_ref().filter(|r| r.table_key == key).and_then(|r| r.out.clone())"), "this table's record only");
+        assert!(body.contains("$t.out_keys.insert(s.app_key);"), "refused a seat");
+        assert!(
+            body.contains("Seat::Remove { app_key: Some(s.app_key), tox_key: s.line_key(), for_good: true, }"),
+            "barred from the group"
+        );
+        // The founder back from a restart: no member it befriends, and barred
+        // right behind the opening -- before the roster it signs again.
+        let back = code.find("super::toxsink::Role::Back { chat_id: ad.tox_chat_id },").expect("the founder's driver");
+        let members = code[..back].rfind(".filter(|e| e.seat != 0 && !out_apps.contains(&e.app_public_key))").expect("its members");
+        assert!(back - members < 1200, "the members it opens with");
+        let restored = back + code[back..].find("t.out_keys.clear(); restore_recorded_out!(t, table_key);").expect("barred");
+        let found = back + code[back..].find("Formation::found_back(").expect("the roster again");
+        assert!(restored < found, "before the roster is said again, and whether or not the group came up");
+        // The seat back from a restart: barred behind its driver's opening,
+        // before its request is sealed, whether or not the group came up.
+        let joiner = code.find("super::toxsink::Role::Joiner { founder: founder_tox,").expect("the joiner's driver");
+        let barred = joiner + code[joiner..].find("restore_recorded_out!(t, key); match Formation::join(").expect("barred");
+        assert!(barred - joiner < 3000, "right behind the opening");
+        assert!(
+            code.contains("Ok(ad) if r.out.iter().flatten().any(|s| s.app_key == ad.founder_app_key) => {"),
+            "and a founder out for good is not asked"
+        );
+        // Not behind the record either: the join sent right after the resume is
+        // refused with the same words.
+        assert!(code.contains("no_return.retain(|(k, _)| *k != table_key); no_return.push((table_key, why.clone()));"));
+        assert!(code.contains("let mut no_return: Vec<([u8; 32], String)> = Vec::new();"), "the client's, not one slot's");
+        let join = code.find("NodeCommand::JoinTable { key, buyin, seat, password } => {").expect("the join");
+        let held_here = join + code[join..].find("if let Some(f) = t.table.as_ref() {").expect("a slot that holds a table");
+        let refused = join + code[join..].find("if let Some((_, why)) = no_return.iter().find(|(k, _)| *k == key) {").expect("refused");
+        let cleared = join + code[join..].find("t.out_keys.clear();").expect("a fresh slot");
+        let lobby = join + code[join..].find("let Some(held) = state.lobby.get(&key).cloned() else {").expect("the advert");
+        assert!(held_here < refused && refused < cleared && cleared < lobby, "a slot holding no table, before the advert is looked up");
+        // Joined from the lobby, the resume's question left unanswered: refused
+        // before the driver opens for that founder.
+        let unanswered = join
+            + code[join..]
+                .find("if t.resume.as_ref().is_some_and(|r| { r.table_key == key && r.out.iter().flatten().any(|s| s.app_key == held.ad.founder_app_key) }) {")
+                .expect("the record's founder out");
+        let opened = join + code[join..].find("let my_tox_key = match held.ad.founder_tox_key {").expect("the driver");
+        assert!(lobby < unanswered && unanswered < opened, "before the group is opened for that founder");
+        let create = code.find("NodeCommand::CreateTable { kind, name, seats, min_players, buyin, password, } => {").expect("a founding");
+        let guard = create + code[create..].find("if t.table.is_some() || t.rejoin_key.is_some() {").expect("its guard");
+        let fresh = create + code[create..].find("t.out_keys.clear();").expect("a table founded afresh has none");
+        assert!(guard < fresh && fresh - create < 2500, "past the guard: a founding refused clears nothing");
+        // The node's refusal comes before the carrier is told a seat is back.
+        let out_word = code.find("if t.out_keys.contains(&sender) {").expect("the refusal");
+        let told_back = code.find("t.tox_sink.tell(super::toxsink::Seat::Back(k));").expect("told back");
+        assert!(out_word < told_back, "refused before it is offered the group");
     }
 
     /// `S1-KL`: the hand from which an absence is the fourth is the one this

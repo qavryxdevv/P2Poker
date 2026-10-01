@@ -113,6 +113,32 @@ pub struct Record {
     /// Absent from a record written before it, which reads as `None`.
     #[n(19)]
     pub stacks: Option<Vec<Vec<u64>>>,
+    /// `S1-KN`: the seats this client's table put out for good, as it knew them
+    /// when the record was written -- so that a client started again bars them
+    /// from the table's group before it offers that group to anybody, and
+    /// refuses their requests to sit again. Absent from a record written before
+    /// it, which reads as `None`.
+    #[n(20)]
+    pub out: Option<Vec<OutSeat>>,
+}
+
+/// `S1-KN`: a seat a table put out for good (`D-047`, `D-051`, `D-084`) -- its
+/// application key, and its Tox line when no other seat of the roster names the
+/// same one (`S1-KL`: a line is declared and checked against nothing).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
+pub struct OutSeat {
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub app_key: [u8; 32],
+    #[n(1)]
+    pub line: Option<minicbor::bytes::ByteVec>,
+}
+
+impl OutSeat {
+    /// The line as a key, when it is one.
+    pub fn line_key(&self) -> Option<[u8; 32]> {
+        self.line.as_ref().and_then(|l| <[u8; 32]>::try_from(l.as_slice()).ok())
+    }
 }
 
 pub fn session_path(dir: &Path) -> PathBuf {
@@ -235,7 +261,53 @@ mod tests {
             roster_list: vec![0xCC; 180],
             in_game: Some(vec![0, 2, 4]),
             stacks: Some(vec![vec![1_000, 0, 2_000, 0, 12_350], vec![900, 0, 2_100, 0, 12_350]]),
+            out: Some(vec![
+                OutSeat { app_key: [6; 32], line: Some(vec![9u8; 32].into()) },
+                OutSeat { app_key: [7; 32], line: None },
+            ]),
         }
+    }
+
+    /// `S1-KN`: the seats out for good are kept, line or none, and a record
+    /// written before them -- twenty fields -- reads with none.
+    #[test]
+    fn the_seats_out_for_good_are_kept_and_an_older_record_reads_with_none() {
+        let with = a_record();
+        let back: Record = minicbor::decode(&minicbor::to_vec(&with).expect("encodes")).expect("decodes");
+        assert_eq!(back.out, with.out);
+        let out = back.out.expect("kept");
+        assert_eq!(out[0].line_key(), Some([9; 32]), "a line is a key");
+        assert_eq!(out[1].line_key(), None, "and a seat with none keeps none");
+        let mut old = a_record();
+        old.out = None;
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(20).unwrap();
+        e.u8(old.version).unwrap();
+        e.bytes(&old.table_id).unwrap();
+        e.bytes(&old.session_id).unwrap();
+        e.bytes(&old.table_key).unwrap();
+        e.encode(&old.founder_peer_id).unwrap();
+        e.str(&old.table_name).unwrap();
+        e.u8(old.my_seat).unwrap();
+        e.u64(old.hand_id).unwrap();
+        e.bytes(&old.terminal).unwrap();
+        e.u64(old.my_stack).unwrap();
+        e.u64(old.written_unix_ms).unwrap();
+        e.encode(&old.advert).unwrap();
+        e.bytes(&old.advert_hash).unwrap();
+        e.encode(&old.ratification).unwrap();
+        e.bytes(&old.hand_secret).unwrap();
+        e.u64(old.secret_hand_id).unwrap();
+        e.bytes(&old.founder_seed).unwrap();
+        e.encode(&old.roster_list).unwrap();
+        e.encode(&old.in_game).unwrap();
+        e.encode(&old.stacks).unwrap();
+        let twenty = e.into_writer();
+        let back: Record = minicbor::decode(&twenty).expect("the record before the seats out for good reads");
+        assert_eq!(back, old);
+        // A line that is not 32 bytes is no line.
+        let odd = OutSeat { app_key: [1; 32], line: Some(vec![1u8; 31].into()) };
+        assert_eq!(odd.line_key(), None);
     }
 
     /// `S1-KF` (`D-088`): a record written before the seats in the game were
@@ -245,6 +317,7 @@ mod tests {
         let mut old = a_record();
         old.in_game = None;
         old.stacks = None;
+        old.out = None;
         let bytes = minicbor::to_vec(&old).expect("encodes");
         let back: Record = minicbor::decode(&bytes).expect("decodes");
         assert_eq!(back.in_game, None);
@@ -280,6 +353,7 @@ mod tests {
         // stacks read as none.
         let mut first = a_record();
         first.stacks = None;
+        first.out = None;
         let mut e = minicbor::Encoder::new(Vec::new());
         e.array(19).unwrap();
         e.u8(first.version).unwrap();
