@@ -7726,3 +7726,9 @@ carry the next version of the protocol -- *"jde mi jenom o to, aby se starý kli
 **Guard.** `the_lobby_rendezvous_key_is_the_published_one` and `an_hours_lobby_key_is_the_published_one` pin the
 keys of major 2; `the_corpus_and_the_code_agree_on_every_published_constant` holds `PROTOCOL.md` §13's
 `PROTOCOL_VERSION` and `PROTOCOL_MAJOR` to the code's.
+
+**Amended 2026-10-01: 0.2.1.** 0.2.0 went to the Store and was withdrawn from its certification before it ended,
+because it carried `S1-KL` (a seat put out for good came back into the table's group, and its client was never told);
+0.2.1 is the same protocol 2 with `S1-KL`, and went to the Store in its place. The release still waits for the
+Store (`D-080`): 0.2.1's GitHub release is a draft until the Store serves 0.2.1, and 0.2.0's draft is never
+published.
