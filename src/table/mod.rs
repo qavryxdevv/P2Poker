@@ -18,6 +18,8 @@ pub mod checkwire;
 /// sequence band they occupy (`PROTOCOL.md` §4.10's hand boundary window).
 pub mod seatwire;
 pub mod returnwire;
+/// `S1-KR`: `CHEAT_VOTE` and `CHEAT_CERT`, and the band they are sealed in.
+pub mod cheatwire;
 pub mod dispute;
 /// Carrying a message over a transport whose packets are smaller than it
 /// (D-019: every Tox channel caps at about 1372 bytes).

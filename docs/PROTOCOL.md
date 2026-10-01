@@ -3276,13 +3276,25 @@ every other.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) entries` | `Vec<RevealEntry>` | **exactly** the hole-card indices of every dealt-in seat *other than the sender*: `2(m-1)` entries |
+| `n(1) deck_tag` | `bytes[32]` | the parent the sender's `DECK_COMMIT` was signed on -- the last `SHUFFLE_PROOF`'s stage hash, which chains every deck key and every deck of the hand (`S1-KR`, D-090) |
 
-*Receiver must validate:* the index set is **exactly** the required set — no
+*Receiver must validate:* `deck_tag` is this receiver's own -- refused before
+anything else is checked otherwise (`S1-KR`); the index set is **exactly** the required set — no
 more, no fewer. Fewer is a failure to cooperate; more means the sender published
 a token for its own card (harmless but wrong) or for a board index (an attempt to
 open the board early, a violation). Then every DLEQ proof verifies against that
 seat's `pk_i` from `DECK_INIT` and against the ciphertext at that index in the
 committed final deck.
+
+**Why the tag (`S1-KR`, D-090).** A reveal is taken only at its own slot, so on
+the live road the tag tells a receiver nothing it does not hold. It is for the
+road out of position: a share carried as evidence -- in a `cause = 3` abort
+(§4.10) or a `CHEAT_CERT` (§4.8) -- is judged by a receiver that may be a stage
+behind the finder, or past the hand, and the tag names the deck the share was
+made against. A share naming this receiver's deck and failing there is the
+signer's; one naming another deck -- another game of the same hand (D-088), a
+refound table, the other half of a forked shuffle -- is evidence of nothing
+here, so an honest share signed elsewhere never proves its signer a cheat.
 
 When the stage completes, each seat holds `m-1` tokens for each of its own two
 indices, adds its own, and reads its cards. Every other seat holds `m-1` tokens
@@ -3314,6 +3326,7 @@ question rather than a cryptographic one.
 |---|---|---|
 | `n(0) street` | `u16` | `3` flop, `4` turn, `5` river — §4.7's street code, which owns the encoding |
 | `n(1) entries` | `Vec<RevealEntry>` | exactly the indices of that street: 3 for the flop, 1 for the turn, 1 for the river |
+| `n(2) deck_tag` | `bytes[32]` | as `DEAL_PRIVATE`'s, the receiver's own (`S1-KR`) |
 
 *Receiver must validate:* the street matches the engine's current street exactly;
 the index set is exactly the street's indices under the committed `index_map`; all
@@ -3340,6 +3353,7 @@ cryptographically unverified card (`SPEC_CS.md` §22).
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) entries` | `Vec<RevealEntry>` | exactly the sender's own two hole-card indices |
+| `n(1) deck_tag` | `bytes[32]` | as `DEAL_PRIVATE`'s, the receiver's own (`S1-KR`) |
 
 *Receiver must validate:* the indices are exactly the sender's own; the proofs
 verify; the sender is in the required-to-show set for this showdown.
@@ -3819,6 +3833,82 @@ none accepts the voters' unanimous word (correction 2). Payload cap
 `RETURN_CERT_CAP = 8 192`. **Effect:** the subject enters `IN(k)`, and
 `R(k+1) = ((R(k) \ OUT(k)) ∪ IN(k)) ∩ ALIVE(k+1)` (§8.3.1). Banked once per
 subject digest; a redelivery is inert.
+
+**`0x0605 CHEAT_VOTE`** — *a voter's word, the shape of `0x0603` (`S1-KR`, D-090)*
+
+*Direction:* one voter, about one subject, once per hand.
+*Legal:* only about a seat dealt in to hand `k` that the voter holds **proven**: a
+reveal frame of the subject's own signing (`DEAL_PRIVATE`, `BOARD_REVEAL`,
+`SHOWDOWN_REVEAL`) whose `deck_tag` is the voter's own and one of whose shares is
+`Invalid` against the voter's own final deck, the subject's verified deck key and
+the context at the frame's own signed `sequence` (§4.5) -- the voter's own
+stage's finding, another seat's `cause = 3` evidence, a seat's accusation of
+itself (§4.10), or a frame another seat's `CHEAT_VOTE` carries. Nothing else is
+evidence: a share that was not due yet, one that does not decode, a verifier
+that could not run. At the deck commitment a seat judges only once every seat
+but the accused has committed there: a last shuffler that signs its proof twice
+-- one deck, two frames -- gives two halves of the table two tags, and a seat
+still owed an honest seat's commitment cannot tell which half it is in. Sealed
+at once, during the hand or after it, and **carrying the frame**, so a seat the
+evidence never reached -- a rogue that accused itself to one seat only, an
+accomplice's abort sent to one -- judges it from the vote. A vote does nothing
+alone.
+*Envelope:* `chain_scope = 1`, `event_class = 1`, `hand_id = k`,
+**`sequence = CHEAT_SEQUENCE_BASE + subject_seat`** and
+**`previous_event_hash = ANCHOR(k)`** -- hand `k`'s abort terminal (§3.2), a
+function of `GENESIS(k)` that every seat of the hand holds whether the hand
+settled or was given up, so a rogue that settles the hand at some seats and has
+it given up at others does not part the votes. The band `8 234 … 8 243` is
+disjoint from the stages, §4.10's window, §4.9's checkpoint band and the return
+band (§13).
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) subject_seat` | `u8` | `< MAX_SEATS`, dealt in to hand `k`, not the voter |
+| `n(1) anchor` | `bytes[32]` | `ANCHOR(k)`, equal to the envelope's parent |
+| `n(2) cause` | `u16` | `3`: a card share that does not hold |
+| `n(3) evidence` | `bytes` | a complete signed reveal frame of the subject's own that the voter holds it proven by -- not in the digest |
+
+*Receiver must validate:* the envelope binding above; `subject_seat` is not the
+sender's seat; `anchor` is this receiver's own `ANCHOR(k)` (another genesis of the
+hand is another game: refused); `cause = 3`; the sender is dealt in to hand `k`;
+and `evidence`, judged as a voter judges: a vote whose frame holds here is
+refused, one this receiver cannot judge yet is held, and a vote counts only once
+the subject is proven here. A voter heard from only after this receiver sealed
+its certificate is answered with it -- nobody says a certificate twice -- and a
+seat says its votes and certificates of hand `k` again while hand `k+1` opens.
+Payload cap `CHEAT_VOTE_CAP = 5 120`.
+
+**`0x0606 CHEAT_CERT`** — *two votes, each with its frame (`S1-KR`, D-090)*
+
+*Direction:* a voter holding the subject proven and the votes of two voters about
+it, its own among them, emits its own copy: its own vote and the lowest other.
+*Envelope:* `chain_scope = 1`, **`event_class = 2`**, the votes' `sequence` and
+parent.
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 cheat-cert", [u8(subject_seat), anchor])` -- the seat and the hand, not the frame: a rogue that sends each judge another broken copy still meets two votes |
+| `n(1) votes` | `Vec<bytes>` | 2 … `MAX_SEATS - 1` complete `SignedEvent`s of `CHEAT_VOTE`s, ascending by voter seat, about one subject |
+
+*Receiver must validate:* every carried vote, as above; one subject; no voter
+twice; every voter dealt in and none the subject; the certificate sealed at the
+slot its votes name; `subject_digest` recomputes; and **the subject is proven at
+this receiver** -- before, or by a frame one of the votes carries, judged now as a
+voter judges. One frame that proves it is enough; a frame this receiver cannot
+judge yet holds the certificate; frames whose shares verify refuse it. A certificate about the receiver's own seat is never taken by it. **No
+floor of §8.3 (D-036), no silent voter (D-065), no majority of the hand
+(D-087):** the judged evidence decides, so the signatures of two rogues about a
+seat whose shares hold bank nowhere honest, and a voter that never votes blocks
+nothing. Payload cap `CHEAT_CERT_CAP = 12 288`. **Effect:** the subject is out of
+the table for good from hand `k+1` -- D-047's road: its chips leave the table, it
+is carried in `out`, it gets no return, the table's group bars it -- and is
+certified out of nothing in hand `k`. Banked once per subject; a bank at a
+settled boundary is allowed (the D-024 point 6 exception, as `RETURN_CERT`'s),
+and a bank after `HAND_INIT(k+1)` was derived is the late-roster repair. No word
+about the subject is kept for its own client's asking: a client learns it is out
+for cheating from nobody's signature.
+
 
 ### 4.9 Group 7 — synchronisation and disputes
 
@@ -4623,7 +4713,7 @@ another subject (§4.8). A `cause = 3` abort goes at once as before: a
 reveal stage closes at a seat the rogue sent a good share to, and a client that stood on it could
 be certified out by that seat and the rogue. Heads-up both go at once: two seats certify nobody.
 
-**A seat that accuses itself (`S1-KQ`, 2026-10-02).** A `cause = 3` abort whose `attributed[0]` is its
+**A seat that accuses itself (`S1-KQ`, 2026-10-01).** A `cause = 3` abort whose `attributed[0]` is its
 own emitter is not taken, at any table size: an honest client never accuses itself, and taken at once
 such an abort voided the hand at any moment of it -- after the showdown too -- on the rogue's own word.
 Where its one frame is a reveal of its own whose share fails at the receiver, the receiver names the seat
@@ -5148,6 +5238,8 @@ means it does not and never can be.
 | `0x0602` | `TIMEOUT_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | **none in version 1 (D-015)** — defined emitter is the required voters |
 | `0x0603` | `RETURN_VOTE` | table mesh | 1 (`event_class = 1`, keyed also on `subject_seat`) | — | `R(k) \ OUT(k)`, the voters of hand `k`'s boundary (§4.8, D-028) |
 | `0x0604` | `RETURN_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | the same voters, each its own copy (§4.8, §8.3.1) |
+| `0x0605` | `CHEAT_VOTE` | table mesh | 1 (`event_class = 1`, keyed also on `subject_seat`) | — | the seats dealt in to hand `k` less the subject, each holding it proven (§4.8, D-090) |
+| `0x0606` | `CHEAT_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | any such voter with two votes, its own copy (§4.8, D-090) |
 | `0x0701` | `STATE_HASH` | table mesh | 1 | collective | required of `P(k-1)` at checkpoints 2–7; `P(0)` at checkpoint 1; **`P(k)` at checkpoint 8, and there accepted and compared from any occupied seat, in-set or not**; in a **reconciliation round**, `R(c) ∪ W` — never fewer than two seats — §4.9 |
 | `0x0702` | `STATE_ACK` | table mesh | 1 | collective | the set of the `STATE_HASH` stage it confirms, at every checkpoint including 8 and in every reconciliation round; **at checkpoint 8 it is accepted until `TERMINAL(k+1)` and not only until `HAND_INIT(k+1)`** — §4.9 |
 | `0x0703` | `DISPUTE` | table mesh | **0** | out-of-stage | any participant |
@@ -5157,7 +5249,7 @@ means it does not and never can be.
 | `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; the one type a seat outside `P(k)` may emit |
 | `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; counts into no `P` (§3.2) |
 
-43 message types. Lobby chat is on `/p2p-poker/lobby-chat/2` and not on the lobby
+45 message types. Lobby chat is on `/p2p-poker/lobby-chat/2` and not on the lobby
 topic, and the search queue's presence is on `/p2p-poker/search-queue/2` (§7.13),
 so §1.4's "a message on the wrong channel is dropped" rule covers them like any
 other.
@@ -8873,6 +8965,15 @@ RETURN_SEQUENCE_BASE            = 8 224         (§4.8's return band, D-028; a
   values 8 224 .. 8 233, above the last reconciliation ack at 8 207 with room
   to spare. The three boundary bands never meet; `returnwire::tests` holds
   that.)
+CHEAT_SEQUENCE_BASE             = 8 234         (§4.8's cheat band, S1-KR,
+  D-090; a CHEAT_VOTE and a CHEAT_CERT about seat s of chain k are sealed at
+  CHEAT_SEQUENCE_BASE + s, parented on ANCHOR(k), hand k's abort terminal, so
+  the band is the ten values 8 234 .. 8 243, right above the return band.
+  `cheatwire::tests` holds that no two boundary bands meet.)
+CHEAT_HOLD_MS                   = 8 000         (client liveness, D-090: how
+  long the next deal is held at a boundary while a seat this client proved
+  cheating is not yet certified out here; under WAIT_FROM_MS, so the holder
+  is never counted a wait at the next opening. Not a wire rule.)
 RETURN_GRACE_MS                 = 6 000         (client liveness, §8.3.1: how
   long the next deal is held at a boundary while a return is in flight; not a
   wire rule, and two clients that disagree about it disagree about nothing on

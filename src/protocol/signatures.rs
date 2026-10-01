@@ -82,6 +82,8 @@ pub enum Domain {
     /// A return vote's subject digest (`S1-BM`), so it can never collide
     /// with a timeout subject's.
     ReturnCert,
+    /// `S1-KR`: the subject digest of a cheat vote.
+    CheatCert,
     /// `D-051`: what a seat's client signs to say which member of the table's
     /// carrier group it is -- the group and its own member key.
     MemberBinding,
@@ -108,12 +110,13 @@ impl Domain {
             Domain::Advert => "p2p-poker v1 advert",
             Domain::TimeoutCert => "p2p-poker v1 timeout-cert",
             Domain::ReturnCert => "p2p-poker v1 return-cert",
+            Domain::CheatCert => "p2p-poker v1 cheat-cert",
             Domain::MemberBinding => "p2p-poker v1 member-binding",
         }
     }
 
     /// Every variant, so tests and audits can enumerate the register.
-    pub const ALL: [Domain; 18] = [
+    pub const ALL: [Domain; 19] = [
         Domain::Transcript,
         Domain::Stage,
         Domain::Genesis,
@@ -131,6 +134,7 @@ impl Domain {
         Domain::Advert,
         Domain::TimeoutCert,
         Domain::ReturnCert,
+        Domain::CheatCert,
         Domain::MemberBinding,
     ];
 }

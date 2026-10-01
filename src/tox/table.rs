@@ -4262,7 +4262,8 @@ mod tests {
         let run_src = include_str!("../net/run.rs");
         let run_code = &run_src[..run_src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
         let run_code = run_code.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert_eq!(run_code.matches(".map(|e| (e.app_public_key, own_line(f, e.seat)))").count(), 3, "every removal by its own line");
+        // `S1-KR`: the fourth, a seat a cheat certificate put out.
+        assert_eq!(run_code.matches(".map(|e| (e.app_public_key, own_line(f, e.seat)))").count(), 4, "every removal by its own line");
         assert_eq!(run_code.matches(".map(|e| (e.app_public_key, e.tox_key))").count(), 0, "and never by a declared line as such");
         assert!(
             run_code.contains("let shared = seats.iter().any(|e| e.seat != seat && e.tox_key == Some(line)); (!shared).then_some(line)"),

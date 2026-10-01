@@ -1203,6 +1203,10 @@ struct TableRun {
     /// The hold for a return in flight: the hand it is about, when it began,
     /// and whether it has been given up on.
     return_hold: Option<(u64, tokio::time::Instant, bool)>,
+    /// `S1-KR`: the hold for a cheat certificate -- the hand it is about and
+    /// when it began -- and the hand whose unbanked proven seats were named.
+    cheat_hold: Option<(u64, tokio::time::Instant)>,
+    cheat_named_for: Option<u64>,
     /// The hand whose boundary phase 1 -- window, checkpoint, sit-in request --
     /// has run. Once per boundary: the arm fires at the terminal and again at
     /// `deal_at`, and on every re-arm the repair, the freeze and the boundary
@@ -1956,6 +1960,8 @@ impl TableRun {
             next_hand_at: None,
             deal_at: None,
             return_hold: None,
+            cheat_hold: None,
+            cheat_named_for: None,
             boundary_done_for: None,
             finish_said_for: None,
             act_by: None,
@@ -3025,9 +3031,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // that forked it can make an honest seat's genuine frame fail there
             // -- the abort still ends the hand, and the hands called off still
             // count (`VOIDED_LIMIT`), but nobody is named on it.
+            // `S1-KR`: a card share where a certificate can form is the cheat
+            // band's to answer first: the seat is named at the boundary if no
+            // certificate put it out (`cheat_hold`).
             if let Some((seat, cause, true)) = $h.proven_cheat() {
-                if let Some(k) = $h.key_of(seat) {
-                    $t.cheats.insert(k, (seat, cause, true));
+                if !(cause == 3 && $h.band_possible(seat)) {
+                    if let Some(k) = $h.key_of(seat) {
+                        $t.cheats.insert(k, (seat, cause, true));
+                    }
                 }
             }
         }};
@@ -3039,7 +3050,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // seat out is not told to the players as a table that is not safe.
     macro_rules! note_a_self_accusation {
         ($t:ident, $h:expr) => {{
-            if let Some(seat) = $h.self_accused() {
+            // `S1-KR`: and where a certificate can form, the band answers first.
+            if let Some(seat) = $h.self_accused().filter(|s| !$h.band_possible(*s)) {
                 if let Some(k) = $h.key_of(seat) {
                     $t.cheats.insert(k, (seat, 3, true));
                 }
@@ -3521,6 +3533,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         let what = match kind {
                                             Some(crate::protocol::messages::EventType::ReturnCert) => "RETURN_CERT",
                                             Some(crate::protocol::messages::EventType::ReturnVote) => "RETURN_VOTE",
+                                            Some(crate::protocol::messages::EventType::CheatCert) => "CHEAT_CERT",
+                                            Some(crate::protocol::messages::EventType::CheatVote) => "CHEAT_VOTE",
                                             _ => "certificate",
                                         };
                                         if hand_id.saturating_add(1) == $h.hand_id()
@@ -3530,6 +3544,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     crate::protocol::messages::EventType::TimeoutCert
                                                         | crate::protocol::messages::EventType::ReturnCert
                                                         | crate::protocol::messages::EventType::ReturnVote
+                                                        | crate::protocol::messages::EventType::CheatCert
+                                                        | crate::protocol::messages::EventType::CheatVote
                                                 )
                                             )
                                         {
@@ -3570,6 +3586,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         $t.late_banked_for = Some(p.hand_id());
                                                         $t.pending_repair = p.next_hand();
                                                     }
+                                                    // `S1-KR`: a seat a late cheat certificate
+                                                    // put out, said to the group now.
+                                                    cheat_out_by_the_word!($t, p);
                                                 }
                                                 _ => {
                                                     if $t.late_cert_said != Some($h.hand_id()) {
@@ -3790,6 +3809,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .send(NodeEvent::Warning(format!("a return vote would not seal: {e}")))
                             .await;
                     }
+                }
+            }
+        }};
+    }
+    // `S1-KR`: this client's votes about the seats it proved cheating in the
+    // hand, and whatever certificate they complete -- on the live hand and on
+    // the retained one, at the tick and at the boundary, so no vote is owed
+    // for want of an event to carry it.
+    macro_rules! vote_on_cheats {
+        ($t:ident, $h:expr) => {{
+            match $h.vote_on_cheats(&app_key, super::node::now_unix_ms()) {
+                Ok(sends) => {
+                    if !sends.is_empty() {
+                        publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
+                    }
+                }
+                Err(e) => {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!("a cheat vote would not seal: {e}")))
+                        .await;
                 }
             }
         }};
@@ -4183,6 +4222,46 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
         }};
     }
+    // `S1-KR`: a seat a cheat certificate put out of the table for good here --
+    // two seats' word and this client's own judgement of its card share. Out of
+    // the table's group by the table's word and never invited again; its chips
+    // leave the table at the boundary. Once the hand is over: mid-hand a seat
+    // removed from the group would stall the very hand it is still in. No word
+    // is kept for its client's asking -- a client learns it is out for cheating
+    // from nobody's signature, so two rogues cannot tell an honest one so.
+    macro_rules! cheat_out_by_the_word {
+        ($t:ident, $h:expr) => {{
+            if $h.over() {
+                for seat in $h.cheat_out() {
+                    let entry = $t.table.as_ref().and_then(|f| {
+                        f.roster()
+                            .seats()
+                            .iter()
+                            .find(|e| e.seat == seat)
+                            .map(|e| (e.app_public_key, own_line(f, e.seat)))
+                    });
+                    let Some((app, line)) = entry else { continue };
+                    if $t.out_keys.contains(&app) {
+                        continue;
+                    }
+                    $t.out_keys.insert(app);
+                    // `S1-KF` (`D-088`): heard playing on after it, it is in another game.
+                    $t.certified_out.insert(seat, $h.hand_id());
+                    $t.tox_sink.tell(super::toxsink::Seat::Remove {
+                        app_key: Some(app),
+                        tox_key: line,
+                        for_good: true,
+                    });
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "seat {seat} is out of the table for good for a card share that does not hold (S1-KR): two seats certified it and this client's own check found it failing; it is removed from the table's group by the table's word and never invited again; its chips leave the table at the boundary"
+                        )))
+                        .await;
+                    let _ = events.send(NodeEvent::SeatLeft { seat, quit: true, removed: true }).await;
+                }
+            }
+        }};
+    }
     macro_rules! remove_by_the_word {
         ($t:ident, $h:expr) => {{
             let id = $h.hand_id();
@@ -4334,6 +4413,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = events.send(NodeEvent::SeatLeft { seat, quit: true, removed: !resigned }).await;
                 }
             }
+            cheat_out_by_the_word!($t, $h);
         }};
     }
     macro_rules! rejoin_from_copies {
@@ -4394,6 +4474,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.next_hand_at = None;
             $t.deal_at = None;
             $t.return_hold = None;
+            $t.cheat_hold = None;
+            $t.cheat_named_for = None;
             $t.boundary_done_for = None;
             $t.finish_said_for = None;
             $t.act_by = None;
@@ -4471,6 +4553,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.next_hand_at = None;
             $t.deal_at = None;
             $t.return_hold = None;
+            $t.cheat_hold = None;
+            $t.cheat_named_for = None;
             $t.boundary_done_for = None;
             $t.finish_said_for = None;
             $t.patience = crate::table::hand::Waits::default();
@@ -12759,6 +12843,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(p) = t.previous.as_mut() {
                         vote_on_returns!(t, p);
                     }
+                    // `S1-KR`: and the cheat votes, on both.
+                    if let Some(h) = t.hand.as_mut() {
+                        vote_on_cheats!(t, h);
+                    }
+                    if let Some(p) = t.previous.as_mut() {
+                        vote_on_cheats!(t, p);
+                    }
                     // `S1-BS`: the retained hand replays what it holds, and a
                     // certificate that banked there re-derives the running hand.
                     if let Some(p) = t.previous.as_mut() {
@@ -12772,6 +12863,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             t.late_banked_for = Some(p.hand_id());
                             t.pending_repair = p.next_hand();
                         }
+                        cheat_out_by_the_word!(t, p);
                     }
                     // Retention ends when the running hand leaves stage 0: from
                     // there its genesis is what the table chained from.
@@ -13737,6 +13829,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let phase1 = t.hand
                     .as_ref()
                     .is_some_and(|h| t.boundary_done_for != Some(h.hand_id()));
+                // `S1-KR`: the cheat hold runs from the hand's end, not from the
+                // deal: the pause before the deal counts toward it, so a seat
+                // holding is never much behind the seats that dealt.
+                if phase1 {
+                    if let Some(h) = t.hand.as_ref() {
+                        let awaiting = h.awaiting_cheat_certificate();
+                        let hid = h.hand_id();
+                        if !awaiting.is_empty() && t.cheat_hold.map(|(id, _)| id) != Some(hid) {
+                            t.cheat_hold = Some((hid, tokio::time::Instant::now()));
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{hid}: holding the next deal for up to {} s from the hand's end while the table certifies seat(s) {awaiting:?} out for a card share that does not hold (S1-KR)",
+                                    crate::protocol::constants::CHEAT_HOLD_MS / 1000
+                                )))
+                                .await;
+                        }
+                    }
+                }
                 // `S1-FL`: the places, the moment the hand is over, whenever no
                 // return still in this boundary's window can change them. Said
                 // later, at the derivation below, they reached a busted seat five
@@ -13746,7 +13856,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // ended (the owner, 2026-09-15). The derivation still says the
                 // places this could not.
                 let my_seat_here = t.table.as_ref().and_then(|f| f.my_seat());
-                if let Some(h) = t.hand.as_ref() {
+                // `S1-KR`: not while a cheat certificate can still put a seat out:
+                // the places then come at the derivation, after the hold.
+                if let Some(h) = t.hand.as_ref().filter(|h| h.awaiting_cheat_certificate().is_empty()) {
                     if t.finish_said_for != Some(h.hand_id()) {
                         if let Some((over, finishes)) = h.finishes_final_at_the_end() {
                             t.finish_said_for = Some(h.hand_id());
@@ -14119,6 +14231,66 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // `S1-KR`: a seat this client proved cheating in hand k -- by its
+                // own check of a card share -- is not certified out here yet, and a
+                // certificate can still form: the next deal waits for it, up to
+                // `CHEAT_HOLD_MS`, and not for a peer that dealt already. Dealt now,
+                // hand k+1 would open with the cheat here while the seats that
+                // banked open it without. A vote alone holds nothing: only this
+                // client's own proof does, so a rogue's vote about an honest seat
+                // costs nobody a second.
+                if let Some(h) = t.hand.as_mut() {
+                    vote_on_cheats!(t, h);
+                }
+                if let Some(h) = t.hand.as_ref() {
+                    let awaiting = h.awaiting_cheat_certificate();
+                    if !awaiting.is_empty() {
+                        let hid = h.hand_id();
+                        let since = match t.cheat_hold {
+                            Some((id, s)) if id == hid => s,
+                            _ => {
+                                let s = tokio::time::Instant::now();
+                                t.cheat_hold = Some((hid, s));
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "hand #{hid}: holding the next deal for up to {} s while the table certifies seat(s) {awaiting:?} out for a card share that does not hold (S1-KR)",
+                                        crate::protocol::constants::CHEAT_HOLD_MS / 1000
+                                    )))
+                                    .await;
+                                s
+                            }
+                        };
+                        if since.elapsed() < std::time::Duration::from_millis(crate::protocol::constants::CHEAT_HOLD_MS) {
+                            t.next_hand_at = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+                            continue;
+                        }
+                    }
+                }
+                // `S1-KR`: what no certificate put out, the player is told of -- the
+                // table is not safe (`S1-JR`) -- once per hand: heads-up, where none
+                // can form, and an honest minority, where none came. Every proven
+                // seat is kept: one a certificate put out is silent while it is out
+                // (`playing`), and told should this client meet it at a table again
+                // (a table adopted after the bank, `D-038`).
+                if let Some(h) = t.hand.as_ref() {
+                    if t.cheat_named_for != Some(h.hand_id()) {
+                        t.cheat_named_for = Some(h.hand_id());
+                        for (seat, cause) in h.proven_seats() {
+                            if let Some(k) = h.key_of(seat) {
+                                t.cheats.insert(k, (seat, cause, true));
+                            }
+                        }
+                        let out = h.cheat_out();
+                        if !out.is_empty() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{}: seat(s) {out:?} certified out of the table for good for a card share that does not hold (S1-KR); the table plays on without them",
+                                    h.hand_id()
+                                )))
+                                .await;
+                        }
+                    }
+                }
                 t.deal_at = None;
 
                 // **This client is on a branch nobody shares.** It cannot
@@ -14421,6 +14593,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     use crate::protocol::messages::EventType;
                     let mut terminal: Option<Vec<u8>> = None;
                     let mut checkpoint: Vec<Vec<u8>> = Vec::new();
+                    let going = t.hand.as_ref().map(|h| h.hand_id());
                     for b in t.said.drain(..) {
                         match crate::net::chained::peek(&b, TABLE_FRAME_PEEK) {
                             Ok((EventType::HandComplete | EventType::HandAbort, _, _)) => {
@@ -14434,6 +14607,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 _,
                                 _,
                             )) => {
+                                checkpoint.push(b)
+                            }
+                            // `S1-KR`: and this seat's cheat votes and certificates
+                            // about the hand going behind, said again while the next
+                            // hand opens: sent once, one missed delivery left a seat
+                            // that could not bank, and the table split at the next
+                            // genesis (the refuter's H1).
+                            Ok((EventType::CheatVote | EventType::CheatCert, hand, _)) if Some(hand) == going => {
                                 checkpoint.push(b)
                             }
                             _ => {}
@@ -17434,6 +17615,8 @@ fn keep_for_next_hand(
         // ended, never about the hand opening, and it has the late-certificate
         // arm for the copy that arrives during the next hand.
         Some(EventType::ReturnVote) | Some(EventType::ReturnCert) => Keep::No,
+        // `S1-KR`: as is the cheat pair, about the hand that ended.
+        Some(EventType::CheatVote) | Some(EventType::CheatCert) => Keep::No,
         // **§4.10's boundary window is not a stage of the hand and must not be
         // replayed into one.** The reachable case is narrow — a boundary event
         // carries the id of the hand that **ended**, so this arm is reached only
@@ -22843,6 +23026,8 @@ mod the_pre_open_buffer {
             (EventType::TimeoutCert, crate::table::hand::TIMEOUT_CERT_CAP),
             (EventType::ReturnVote, crate::table::returnwire::RETURN_VOTE_CAP),
             (EventType::ReturnCert, crate::table::returnwire::RETURN_CERT_CAP),
+            (EventType::CheatVote, crate::table::cheatwire::CHEAT_VOTE_CAP),
+            (EventType::CheatCert, crate::table::cheatwire::CHEAT_CERT_CAP),
             (EventType::HandComplete, crate::table::hand::HAND_COMPLETE_CAP),
             (EventType::StateHash, 512),
         ] {

@@ -103,6 +103,11 @@ pub enum EventType {
     /// `S1-BM`: the grow side of the roster, symmetric with the pair above.
     ReturnVote = 0x0603,
     ReturnCert = 0x0604,
+    /// `S1-KR`: a seat proven here to have signed a card share that does not
+    /// hold, put out of the table for good by two voters' word and every
+    /// receiver's own judgement -- in a band of its own, like the pair above.
+    CheatVote = 0x0605,
+    CheatCert = 0x0606,
 
     StateHash = 0x0701,
     StateAck = 0x0702,
@@ -140,7 +145,7 @@ impl EventType {
     pub const RESERVED: core::ops::RangeInclusive<u16> = 0xF000..=0xFFFF;
 
     /// Every type, in wire-code order.
-    pub const ALL: [EventType; 46] = [
+    pub const ALL: [EventType; 48] = [
         EventType::Hello,
         EventType::Capabilities,
         EventType::LobbyTableAd,
@@ -179,6 +184,8 @@ impl EventType {
         EventType::TimeoutCert,
         EventType::ReturnVote,
         EventType::ReturnCert,
+        EventType::CheatVote,
+        EventType::CheatCert,
         EventType::StateHash,
         EventType::StateAck,
         EventType::Dispute,
@@ -237,13 +244,15 @@ impl EventType {
 
             // One named seat writes it.
             ShuffleStep | ShuffleProof | ActionCheck | ActionCall | ActionBet | ActionRaise
-            | ActionFold | TimeoutVote | ReturnVote | PlayerSitOut | PlayerSitIn | PlayerLeave => {
+            | ActionFold | TimeoutVote | ReturnVote | CheatVote | PlayerSitOut | PlayerSitIn
+            | PlayerLeave => {
                 StageKind::Single
             }
 
             // Every required emitter produces a byte-identical body.
             TableReady | RngCommit | RngReveal | HandInit | DeckInit | DeckCommit | DealPrivate
-            | BoardReveal | ShowdownReveal | ShowdownMuck | TimeoutCert | ReturnCert | StateHash | StateAck
+            | BoardReveal | ShowdownReveal | ShowdownMuck | TimeoutCert | ReturnCert | CheatCert | StateHash
+            | StateAck
             | HandComplete => StageKind::Collective,
         }
     }
@@ -306,6 +315,8 @@ impl EventType {
             TimeoutCert => "TIMEOUT_CERT",
             ReturnVote => "RETURN_VOTE",
             ReturnCert => "RETURN_CERT",
+            CheatVote => "CHEAT_VOTE",
+            CheatCert => "CHEAT_CERT",
             StateHash => "STATE_HASH",
             StateAck => "STATE_ACK",
             Dispute => "DISPUTE",
@@ -467,6 +478,9 @@ impl EventBody {
             // The return pair references the boundary the same way (`S1-BM`).
             EventType::ReturnVote => 1,
             EventType::ReturnCert => 2,
+            // And the cheat pair (`S1-KR`).
+            EventType::CheatVote => 1,
+            EventType::CheatCert => 2,
             _ => 0,
         }
     }
@@ -717,15 +731,15 @@ mod tests {
 
     #[test]
     fn the_catalogue_has_exactly_thirty_nine_types() {
-        assert_eq!(EventType::ALL.len(), 46, "PROTOCOL.md section 4.11 lists 46");
+        assert_eq!(EventType::ALL.len(), 48, "PROTOCOL.md section 4.11 lists 48");
     }
 
     #[test]
     fn every_code_is_distinct_and_every_name_is_distinct() {
         let codes: BTreeSet<u16> = EventType::ALL.iter().map(|t| t.code()).collect();
-        assert_eq!(codes.len(), 46, "two types share a wire code");
+        assert_eq!(codes.len(), 48, "two types share a wire code");
         let names: BTreeSet<&str> = EventType::ALL.iter().map(|t| t.name()).collect();
-        assert_eq!(names.len(), 46, "two types share a name");
+        assert_eq!(names.len(), 48, "two types share a name");
     }
 
     #[test]

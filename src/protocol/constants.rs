@@ -84,6 +84,19 @@ pub const RETURN_SEQUENCE_BASE: u64 = 8_224;
 /// the voters dealt hand k+1, and a heads-up hand leaves stage 0 in a tenth
 /// of a second, so the late-roster repair had nothing left to re-open.
 pub const RETURN_GRACE_MS: u64 = 6_000;
+/// The cheat band (`S1-KR`): a `CHEAT_VOTE` and a `CHEAT_CERT` about seat `s`
+/// are sealed at `CHEAT_SEQUENCE_BASE + s`, parented on `ANCHOR(k)` -- hand
+/// `k`'s abort terminal, a function of its genesis that every seat of the hand
+/// holds whether the hand settled or was given up. Right above the return
+/// band; `cheatwire::tests` holds that no two boundary bands meet.
+pub const CHEAT_SEQUENCE_BASE: u64 = RETURN_SEQUENCE_BASE + MAX_SEATS as u64;
+/// How long a client holds the next deal at a boundary while a seat it proved
+/// cheating in hand `k` -- by its own check -- is not certified out here yet
+/// (`S1-KR`). Under `WAIT_FROM_MS`, so a seat still holding while its peers
+/// dealt is never counted a wait at the next hand's opening (`D-059`). A
+/// client liveness parameter, not a wire rule: past it the table deals on and
+/// the player is told the table is not safe.
+pub const CHEAT_HOLD_MS: u64 = 8_000;
 /// How long a client keeps trying to rejoin an unfinished session (`S1-CR`)
 /// once the table's advertisement is gone and no peer of the session has
 /// answered: ten minutes, counted from the later of the last peer seen and
@@ -711,6 +724,11 @@ const _: () = assert!(
     BOUNDARY_CHECKPOINT_BASE > BOUNDARY_SEQUENCE_BASE + MAX_SEATS as u64
         && BOUNDARY_CHECKPOINT_BASE > MAX_STAGES_PER_HAND
 );
+
+/// `S1-KR`: the cheat band is above the return band, and a seat holding the
+/// next deal for a cheat certificate is never counted a wait (`D-059`).
+const _: () = assert!(CHEAT_SEQUENCE_BASE >= RETURN_SEQUENCE_BASE + MAX_SEATS as u64);
+const _: () = assert!(CHEAT_HOLD_MS < WAIT_FROM_MS);
 
 /// The rated deadline is inside the range every advert must satisfy.
 const _: () = assert!(RATED_HAND_DEADLINE_MS <= HAND_DEADLINE_CAP_MS);

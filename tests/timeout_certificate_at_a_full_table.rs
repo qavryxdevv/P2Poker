@@ -264,6 +264,7 @@ fn a_private_deal_at_its_documented_entry_count_fits_its_cap() {
                 proof: vec![0x55; 98],
             })
             .collect(),
+        deck_tag: [0x66; 32],
     };
     let encoded = canonical(&body).len();
     assert!(

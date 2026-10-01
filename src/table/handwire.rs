@@ -335,6 +335,13 @@ pub struct RevealEntry {
 pub struct DealPrivate {
     #[n(0)]
     pub entries: Vec<RevealEntry>,
+    /// `S1-KR`: the deck the shares are made against -- the parent the
+    /// writer's `DECK_COMMIT` was signed on, the last shuffle proof's stage
+    /// hash, which chains every deck key and every deck of the hand. A
+    /// receiver takes a reveal only where it names the receiver's own deck,
+    /// and a share judged out of position is evidence only where it does.
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub deck_tag: [u8; 32],
 }
 
 impl DealPrivate {
@@ -377,6 +384,13 @@ pub struct BoardReveal {
     pub street: u16,
     #[n(1)]
     pub entries: Vec<RevealEntry>,
+    /// `S1-KR`: the deck the shares are made against -- the parent the
+    /// writer's `DECK_COMMIT` was signed on, the last shuffle proof's stage
+    /// hash, which chains every deck key and every deck of the hand. A
+    /// receiver takes a reveal only where it names the receiver's own deck,
+    /// and a share judged out of position is evidence only where it does.
+    #[cbor(n(2), with = "minicbor::bytes")]
+    pub deck_tag: [u8; 32],
 }
 
 /// `SHOWDOWN_REVEAL 0x0403`: the sender's own two shares, which open its hand.
@@ -390,6 +404,13 @@ pub struct ShowdownReveal {
     /// Exactly the sender's own two hole-card indices, ascending.
     #[n(0)]
     pub entries: Vec<RevealEntry>,
+    /// `S1-KR`: the deck the shares are made against -- the parent the
+    /// writer's `DECK_COMMIT` was signed on, the last shuffle proof's stage
+    /// hash, which chains every deck key and every deck of the hand. A
+    /// receiver takes a reveal only where it names the receiver's own deck,
+    /// and a share judged out of position is evidence only where it does.
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub deck_tag: [u8; 32],
 }
 
 /// `SHOWDOWN_MUCK 0x0404`: the alternative to showing, under D-021's policy.
@@ -1353,6 +1374,7 @@ mod tests {
         let board = BoardReveal {
             street: street_code(Street::Flop),
             entries: vec![entry.clone(), entry.clone(), entry.clone()],
+            deck_tag: [7; 32],
         };
         let bytes = minicbor::to_vec(&board).unwrap();
         assert_eq!(minicbor::decode::<BoardReveal>(&bytes).unwrap(), board);
@@ -1364,6 +1386,7 @@ mod tests {
 
         let show = ShowdownReveal {
             entries: vec![entry.clone(), entry],
+            deck_tag: [7; 32],
         };
         let bytes = minicbor::to_vec(&show).unwrap();
         assert_eq!(minicbor::decode::<ShowdownReveal>(&bytes).unwrap(), show);
