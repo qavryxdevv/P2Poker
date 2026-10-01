@@ -1,11 +1,13 @@
 # Code signing policy
 
-**Status, 2026-09-23.** The `p2p-poker.exe` on the release page is **not** signed with a Windows code-signing
+**Status, 2026-10-01.** The `p2p-poker.exe` on the release page is **not** signed with a Windows code-signing
 certificate, so SmartScreen asks before the first start (*More info*, then *Run anyway*). Two things are being done
 about it, and this page says where each stands.
 
 * **The Microsoft Store** (`D-080`): the same program, wrapped in an MSIX package, which **Microsoft signs itself**
-  after certification -- a player who installs it from the Store is asked nothing. Being prepared; not published yet.
+  after certification -- a player who installs it from the Store is asked nothing. **Published since 2026-09-29**
+  (0.1.5): <https://apps.microsoft.com/detail/9NX3LB832J5L>. A release on GitHub waits for the Store to publish the
+  same version first.
 * **A free certificate for the release page**: the project applied to the [SignPath Foundation](https://signpath.org/),
   which signs open-source releases free of charge, and was **refused on 2026-09-22** for want of public visibility --
   community adoption, outside references, that kind of signal -- with an invitation to apply again as the project

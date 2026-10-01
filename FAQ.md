@@ -28,8 +28,12 @@ same game.
 
 ## Why does Windows warn me before the first start?
 
-The program is not signed with a Windows code-signing certificate, so SmartScreen asks: *More info*, then *Run
-anyway*. What it **is** signed with is a statement from GitHub: every release is built by GitHub from this public
+**Install it from the [Microsoft Store](https://apps.microsoft.com/detail/9NX3LB832J5L) and it does not.** Microsoft
+checks every version before the Store publishes it and signs the package with its own certificate, so Windows installs
+it without a warning, and the Store keeps it up to date. It is the same program, built from this source.
+
+The file from the release page is not signed with a Windows code-signing certificate, so SmartScreen asks: *More
+info*, then *Run anyway*. What it **is** signed with is a statement from GitHub: every release is built by GitHub from this public
 source, and GitHub signs which commit it came from. To check a download yourself:
 
 ```

@@ -8,9 +8,17 @@ Written in Rust. One portable executable.
 
 > ## [Download P2Poker](https://github.com/qavryxdevv/P2Poker/releases/latest)
 >
-> **Windows** — one file, 45 MB: **[p2p-poker.exe](https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe)**.
+> **Windows, from the Microsoft Store** — the safest way:
+>
+> <a href="https://apps.microsoft.com/detail/9NX3LB832J5L?mode=direct"><img src="https://get.microsoft.com/images/en-us%20dark.svg" width="200" alt="Get it from Microsoft"/></a>
+>
+> Microsoft checks every version before the Store publishes it and signs it with its own certificate, so Windows
+> installs it without a warning, and the Store keeps it up to date. It is the same program as the file below, built
+> from this source. A beta; **play money only**.
+>
+> **Windows, one portable file** — 45 MB: **[p2p-poker.exe](https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe)**.
 > Start it and it offers to install itself — a copy in your user folder and a shortcut on the desktop, no
-> administrator rights, nothing in the registry — or runs from the folder it is in. A beta; **play money only**.
+> administrator rights, nothing in the registry — or runs from the folder it is in.
 >
 > **Linux** — x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later): an **AppImage** for
 > any distribution, a **.deb** for Ubuntu, Debian and Mint, and an **.rpm** for Fedora and openSUSE, on the
@@ -19,8 +27,9 @@ Written in Rust. One portable executable.
 > PulseAudio both serve.
 >
 > Every release is built by GitHub from this source and GitHub signs a statement of it:
-> [how to check a download](#and-a-download-can-be-checked-against-this-source). It is not signed with a Windows
-> certificate, so SmartScreen asks before the first start (*More info*, then *Run anyway*).
+> [how to check a download](#and-a-download-can-be-checked-against-this-source). The file from this page is not
+> signed with a Windows certificate, so SmartScreen asks before its first start (*More info*, then *Run anyway*);
+> the copy from the Microsoft Store asks nothing.
 >
 > Questions — real money, fairness without a server, the Windows warning, Mac and Linux — are answered in the
 > **[FAQ](FAQ.md)**.
@@ -199,6 +208,12 @@ profile moved along, so you stay the same player. `D-073` has the reasoning.
 
 ### Download
 
+On Windows the safest way is the **Microsoft Store**:
+<https://apps.microsoft.com/detail/9NX3LB832J5L>. Microsoft checks each version
+before it is published there and signs the package with its own certificate, so
+Windows installs it without a warning and the Store updates it (`D-080`). A
+release here waits for the Store to publish the same version first.
+
 The newest release is always at
 <https://github.com/qavryxdevv/P2Poker/releases/latest>, and the file itself at
 <https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe>.
@@ -219,7 +234,8 @@ Its SHA-256 is on the release page and beside it as `p2p-poker.exe.sha256`.
 That proves *where the file came from* -- this source, that tag -- and not that
 the source is good, which is what reading it is for. It is also **not** a
 Windows code-signing certificate, so SmartScreen still asks before the first
-start. `D-074` has the reasoning.
+start of the file from this page -- the Microsoft Store's copy is signed by
+Microsoft and asks nothing. `D-074` has the reasoning.
 
 The client asks GitHub for the list of releases **when its window opens**, and
 again when you press Settings, About, *Check for a new version*. It sends
