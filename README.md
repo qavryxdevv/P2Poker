@@ -13,12 +13,8 @@ Written in Rust. One portable executable.
 > <a href="https://apps.microsoft.com/detail/9NX3LB832J5L?mode=direct"><img src="https://get.microsoft.com/images/en-us%20dark.svg" width="200" alt="Get it from Microsoft"/></a>
 >
 > Microsoft checks every version before the Store publishes it and signs it with its own certificate, so Windows
-> installs it without a warning, and the Store keeps it up to date. It is the same program as the file below, built
-> from this source. A beta; **play money only**.
->
-> **Windows, one portable file** — 45 MB: **[p2p-poker.exe](https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe)**.
-> Start it and it offers to install itself — a copy in your user folder and a shortcut on the desktop, no
-> administrator rights, nothing in the registry — or runs from the folder it is in.
+> installs it without a warning, and the Store keeps it up to date. It is built from this source. A beta; **play
+> money only**.
 >
 > **Linux** — x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later): an **AppImage** for
 > any distribution, a **.deb** for Ubuntu, Debian and Mint, and an **.rpm** for Fedora and openSUSE, on the
@@ -27,9 +23,7 @@ Written in Rust. One portable executable.
 > PulseAudio both serve.
 >
 > Every release is built by GitHub from this source and GitHub signs a statement of it:
-> [how to check a download](#and-a-download-can-be-checked-against-this-source). The file from this page is not
-> signed with a Windows certificate, so SmartScreen asks before its first start (*More info*, then *Run anyway*);
-> the copy from the Microsoft Store asks nothing.
+> [how to check a download](#and-a-download-can-be-checked-against-this-source).
 >
 > Questions — real money, fairness without a server, the Windows warning, Mac and Linux — are answered in the
 > **[FAQ](FAQ.md)**.
@@ -214,9 +208,8 @@ before it is published there and signs the package with its own certificate, so
 Windows installs it without a warning and the Store updates it (`D-080`). A
 release here waits for the Store to publish the same version first.
 
-The newest release is always at
-<https://github.com/qavryxdevv/P2Poker/releases/latest>, and the file itself at
-<https://github.com/qavryxdevv/P2Poker/releases/latest/download/p2p-poker.exe>.
+The newest release, with the Linux packages, is always at
+<https://github.com/qavryxdevv/P2Poker/releases/latest>.
 
 ### And a download can be checked against this source
 
