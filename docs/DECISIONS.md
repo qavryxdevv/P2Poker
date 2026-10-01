@@ -7873,6 +7873,9 @@ each version at one table would part from the other at the first reveal.
 3. **The price** is `D-089`'s: the lobby of 0.3.0 starts empty and fills as players update; relays that are players'
    clients relay only for their own version.
 
+**Measured.** `run001854-4`: four clients of this build on one machine joined one table and played 21 hands at one
+genesis; the binary carries `/p2p-poker/kad/3` and `p2p-poker/main-lobby/v3` and no string of major 2.
+
 **Guard.** `the_lobby_rendezvous_key_is_the_published_one` and `an_hours_lobby_key_is_the_published_one` pin the keys
 of major 3; `the_corpus_and_the_code_agree_on_every_published_constant` holds §13's `PROTOCOL_VERSION` and
 `PROTOCOL_MAJOR` to the code's; `a_version_this_build_does_not_speak_is_rejected` refuses versions 1 and 2.
