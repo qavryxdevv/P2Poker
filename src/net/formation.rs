@@ -291,6 +291,14 @@ pub struct Formation {
     /// seat and never saying it was ready ([`Formation::stalled_below_the_minimum`]),
     /// and not heard saying it was ready below the minimum since.
     stalled_once: std::collections::BTreeSet<[u8; 32]>,
+    /// `S1-KO`: the last `PLAYER_LIST` this client admitted from its founder,
+    /// verbatim -- signed by the table key, and checked against it again when
+    /// it is taken back. Kept in a seat's session record, so that a seat back
+    /// from a restart whose founder is out of the table for good is taken back
+    /// by the other seats on its own copy of the roster (`joined_back`) rather
+    /// than by asking a founder who is not there. `None` at the founder, whose
+    /// own list is `said.list`.
+    held_list: Option<Vec<u8>>,
 }
 
 /// What this client may need to say again.
@@ -368,6 +376,7 @@ impl Formation {
             seated_before: std::collections::BTreeSet::new(),
             alone_since_ms: None,
             stalled_once: std::collections::BTreeSet::new(),
+            held_list: None,
         })
     }
 
@@ -432,8 +441,74 @@ impl Formation {
             seated_before: std::collections::BTreeSet::new(),
             alone_since_ms: None,
             stalled_once: std::collections::BTreeSet::new(),
+            held_list: None,
         };
         f.said.list = Some(list_bytes.to_vec());
+        let out = f.adopt(&list, now_ms)?;
+        Ok((f, out))
+    }
+
+    /// `S1-KO`: a seat that joined, back after a restart at a table whose
+    /// founder is out of it for good -- rebuilt from its own record, as the
+    /// founder is by `found_back`, since there is no founder to ask: the
+    /// advertisement it joined under, and the last `PLAYER_LIST` it admitted,
+    /// checked against the table key as any list is. It holds the roster and
+    /// its seat in it, and ratifies with the recorded `TABLE_READY` verbatim
+    /// when given (`S1-CR`: the same `event_hash`, so the same session as the
+    /// table's). It answers no join and signs no list: it holds no table key.
+    /// The group and the session it takes up from the other seats like any
+    /// returning seat. Returns the state and what it says at once.
+    pub fn joined_back(
+        app: SigningKey,
+        ad: TableAd,
+        advert_hash: Hash,
+        table_id: Hash,
+        list_bytes: &[u8],
+        recorded_ready: Option<Vec<u8>>,
+        now_ms: u64,
+    ) -> Result<(Self, Vec<Send>), Failed> {
+        let under = JoinedUnder::pin(ad, advert_hash, table_id);
+        let (list, sender, _) = joinwire::receive_player_list_at(list_bytes).map_err(Failed::Wire)?;
+        let roster = admit_list(&list, &sender, None, &under).map_err(Failed::List)?;
+        let me = app.verifying_key().to_bytes();
+        let my_seat = roster
+            .seat_of(&me)
+            .ok_or(Failed::OutOfOrder("the recorded roster does not seat this client"))?;
+        let my_buyin = roster
+            .seats()
+            .iter()
+            .find(|e| e.seat == my_seat)
+            .map(|e| e.buyin)
+            .unwrap_or(0);
+        let mut f = Formation {
+            app,
+            founder: None,
+            under,
+            roster,
+            serial: 0,
+            my_seat: Some(my_seat),
+            my_buyin,
+            pending: None,
+            ratified: BTreeMap::new(),
+            ratified_bytes: BTreeMap::new(),
+            sent_ready: false,
+            session: None,
+            capabilities: vec![DECK_CAPABILITY.to_vec()],
+            said: Said::default(),
+            early: VecDeque::new(),
+            recorded_ready,
+            recorded_refused: false,
+            released: false,
+            named_serial: Some(list.list_serial),
+            // `S1-JI`: a record is kept only for a table that was set.
+            started: true,
+            hold_ready: false,
+            admitted: false,
+            seated_before: std::collections::BTreeSet::new(),
+            alone_since_ms: None,
+            stalled_once: std::collections::BTreeSet::new(),
+            held_list: Some(list_bytes.to_vec()),
+        };
         let out = f.adopt(&list, now_ms)?;
         Ok((f, out))
     }
@@ -447,6 +522,12 @@ impl Formation {
     /// `D-037`: the last `PLAYER_LIST` this founder signed, verbatim.
     pub fn my_list(&self) -> Option<&[u8]> {
         self.said.list.as_deref()
+    }
+
+    /// `S1-KO`: the roster this client's session record keeps, verbatim -- the
+    /// founder's own last list, or the last one a seat that joined admitted.
+    pub fn roster_list(&self) -> Option<&[u8]> {
+        self.said.list.as_deref().or(self.held_list.as_deref())
     }
 
     /// The advertisement this table was joined under, as it stands.
@@ -541,6 +622,7 @@ impl Formation {
                 seated_before: std::collections::BTreeSet::new(),
                 alone_since_ms: None,
                 stalled_once: std::collections::BTreeSet::new(),
+                held_list: None,
             },
             bytes,
         ))
@@ -1366,6 +1448,9 @@ impl Formation {
         }
         let held = if self.serial == 0 { None } else { Some(self.serial) };
         let roster = admit_list(&list, &sender, held, &self.under).map_err(Failed::List)?;
+        // `S1-KO`: kept verbatim for the session record -- the roster a seat
+        // back from a restart is taken back by when its founder is out for good.
+        self.held_list = Some(bytes.to_vec());
         // `S1-DV`: a list that no longer names this client, which an earlier one
         // did. `S1-GB`: earlier by serial -- a list of the seconds before this
         // client sat down, carried late behind its acceptance, is newer than the
@@ -4236,6 +4321,56 @@ mod tests {
             back.serial(),
             out.iter().map(|s| match s { Send::Reply(b) => format!("reply {} B", b.len()), Send::Broadcast(b) => format!("broadcast {} B", b.len()) }).collect::<Vec<_>>()
         );
+    }
+
+    /// `S1-KO`: a seat that joined, restarted at a table whose founder is out
+    /// of it for good, is rebuilt from its own record -- the advertisement it
+    /// joined under and the last list it admitted -- says its recorded
+    /// ratification byte for byte, and computes the table's session from the
+    /// copies another seat holds, with nothing from the founder. A record whose
+    /// list does not seat it, or is checked against another table's key,
+    /// rebuilds nothing.
+    #[test]
+    fn a_seat_comes_back_from_its_own_record_without_its_founder() {
+        let (t, _, hash) = form_three();
+        let table_id = t.founder.table_id();
+        let session = t.founder.session().expect("the table settled");
+        assert_eq!(t.founder.roster_list(), t.founder.my_list(), "the founder's own list at the founder");
+        let me = &t.joiners[0];
+        assert!(me.my_list().is_none(), "a seat that joined signs no list");
+        let list = me.roster_list().expect("the list it admitted").to_vec();
+        let recorded = me.my_ratification().expect("and its ratification").to_vec();
+        let seat = me.my_seat().expect("seated");
+        let ad = me.ad().clone();
+        let advert_hash = me.advert_hash();
+        assert_eq!(advert_hash, hash);
+        // The other seat's copies alone: the founder is out, and says nothing.
+        let others: Vec<Vec<u8>> = t.joiners[1].say_again(NOW);
+        let later = NOW + 60_000;
+
+        let (mut back, said) =
+            Formation::joined_back(key(2), ad.clone(), advert_hash, table_id, &list, Some(recorded.clone()), later)
+                .expect("rebuilt from the record");
+        assert!(!back.is_founder(), "a seat, not the founder");
+        assert_eq!(back.my_seat(), Some(seat));
+        assert_eq!(back.table_id(), table_id);
+        assert_eq!(said, vec![Send::Broadcast(recorded.clone())], "the recorded ratification, byte for byte");
+        assert_eq!(back.roster_list(), Some(list.as_slice()), "and its record keeps the same list");
+        assert!(
+            back.say_again(later).iter().all(|b| joinwire::receive_player_list(b).is_err()),
+            "it says no list: it holds no table key"
+        );
+        for b in others {
+            if joinwire::receive_table_ready(&b, &table_id, &back.genesis()).is_ok() {
+                let _ = back.on_table_ready(&b);
+            }
+        }
+        assert_eq!(back.session(), Some(session), "the same session identity as the table's");
+
+        // A record whose list does not seat this client rebuilds nothing.
+        assert!(Formation::joined_back(key(9), ad.clone(), advert_hash, table_id, &list, None, later).is_err());
+        // Nor one checked against another table's key.
+        assert!(Formation::joined_back(key(2), ad, advert_hash, [77u8; 32], &list, None, later).is_err());
     }
 
     /// `S1-JI`: the same below the table's minimum. A table that starts at

@@ -91,7 +91,22 @@ pub enum Seat {
     },
     /// `D-051`: the application keys of the seats, and whether the roster is
     /// ratified. A member whose binding names none of them is no seat.
-    Seats { apps: Vec<[u8; 32]>, fixed: bool },
+    /// `S1-KO`: and each seat's line -- the Tox key its join declared -- by its
+    /// application key, for a member that offers the group to a seat missing
+    /// from it once the founder is out for good.
+    Seats {
+        apps: Vec<[u8; 32]>,
+        lines: Vec<([u8; 32], [u8; 32])>,
+        fixed: bool,
+    },
+    /// `S1-KO`: the seats still in the game, by application key, this client's
+    /// own among them, those of them playing, and whether its own hand counted
+    /// them; see `tox::table::Command::InGame`.
+    InGame {
+        apps: Vec<[u8; 32]>,
+        present: Vec<[u8; 32]>,
+        from_hand: bool,
+    },
     /// `D-051`: a whole message from this group member was not a signed
     /// event, or did not verify under the key inside it.
     ///
@@ -1012,7 +1027,8 @@ impl TableSink {
                         group_key,
                         app_key,
                     },
-                    Seat::Seats { apps, fixed } => Command::Seats { apps, fixed },
+                    Seat::Seats { apps, lines, fixed } => Command::Seats { apps, lines, fixed },
+                    Seat::InGame { apps, present, from_hand } => Command::InGame { apps, present, from_hand },
                     Seat::Noise { member_key, points } => Command::Noise { member_key, points },
                 });
             }

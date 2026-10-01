@@ -97,7 +97,9 @@ pub struct Record {
     pub founder_seed: [u8; 32],
     /// `D-037`: the founder's last signed `PLAYER_LIST`, verbatim, so the
     /// roster is rebuilt from the founder's own word and checked against the
-    /// table key like any list. Empty for a seat that joined.
+    /// table key like any list. `S1-KO`: for a seat that joined, the last one
+    /// it admitted -- the roster it is taken back by when its founder is out
+    /// of the table for good. Empty in a joiner's record written before that.
     #[n(17)]
     pub roster_list: Vec<u8>,
     /// `S1-KF` (`D-088`): the seats this client counted as the table when the

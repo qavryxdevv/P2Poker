@@ -7413,6 +7413,14 @@ impl Hand {
     /// third seat, certified out and kept out, is a player all the same --
     /// unless its player left by its own word.
     pub fn seats_in_the_game(&self) -> usize {
+        self.seats_still_in_the_game().len()
+    }
+
+    /// `S1-KO`: the seats [`Hand::seats_in_the_game`] counts, by seat -- the
+    /// only seats a member whose founder is out for good offers the table's
+    /// group to: a seat put out for good has no chips in any hand after it,
+    /// whether or not this client saw the word.
+    pub fn seats_still_in_the_game(&self) -> Vec<SeatIdx> {
         let out = self.out_for_good();
         self.open
             .seats
@@ -7421,7 +7429,8 @@ impl Hand {
             // Nor a seat outside the roster whose player left by its own
             // signed word: the window reads it gone, and so does this.
             .filter(|(s, _, _)| !(self.leave_words.contains_key(s) && !self.open.required.contains(s)))
-            .count()
+            .map(|(s, _, _)| *s)
+            .collect()
     }
 
     // ---------------------------------------------------------------------
@@ -11765,6 +11774,14 @@ impl Hand {
         self.cheat_named.contains(&seat)
             && self.certified.contains(&seat)
             && self.carried_by_majority()
+    }
+
+    /// `D-063`, `S1-KO`: whether this hand's certificate named the seat with its
+    /// player's own signed word that it left -- out of the table for good by the
+    /// hand's own count ([`Hand::out_for_good`]), on its own word and nobody's
+    /// majority.
+    pub fn named_by_its_own_word(&self, seat: SeatIdx) -> bool {
+        self.resigned.contains(&seat) && self.certified.contains(&seat)
     }
 
     /// `D-084`: the seats the node holds proven cheats at this table, by this

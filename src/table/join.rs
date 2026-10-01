@@ -326,6 +326,9 @@ pub enum AcceptRefused {
     BuyinNotOurs { asked: u64, given: u64 },
     /// The roster is not well formed.
     Roster(RosterRejected),
+    /// `S1-KO`: the founder's seat names another Tox key than the one the
+    /// advertisement names for it; see [`founder_line_holds`].
+    FounderLine,
     /// Emitted too long ago, or too far ahead of this client's own clock.
     ///
     /// A list carries no time of its own; this is its **envelope's**, which the
@@ -334,6 +337,20 @@ pub enum AcceptRefused {
     /// any serial is admissible and a genuine list from an hour ago is a valid
     /// one.
     Stale,
+}
+
+/// `S1-KO`: whether the founder's seat in a roster, if the roster holds it,
+/// names the Tox key the advertisement names for the founder -- the line the
+/// table tells the founder out by. The advertisement is signed by the table
+/// key, the seat's line only declared; a founder whose seat named a second line
+/// of its own, once put out for good, had that line offered the table's group
+/// and its invitations taken by every member. An honest founder seats itself
+/// with the advertised key (`Formation::found`), so nothing honest is refused.
+pub fn founder_line_holds(roster: &[SeatEntry], ad: &TableAd) -> bool {
+    roster
+        .iter()
+        .filter(|e| e.app_public_key == ad.founder_app_key)
+        .all(|e| e.tox_key == ad.founder_tox_key)
 }
 
 /// The joiner's check on a `JOIN_ACCEPT`.
@@ -368,6 +385,9 @@ pub fn admit_accept(
 
     let roster =
         Roster::form(accept.roster_so_far.clone(), &under.ad, false).map_err(AcceptRefused::Roster)?;
+    if !founder_line_holds(roster.seats(), &under.ad) {
+        return Err(AcceptRefused::FounderLine);
+    }
 
     let ours = roster
         .seats()
@@ -420,6 +440,9 @@ pub enum ListRefused {
     /// against: until the first list arrives a client holds no serial, so any
     /// serial is admissible and a genuine list from an hour ago is a valid one.
     Stale,
+    /// `S1-KO`: the founder's seat names another Tox key than the one the
+    /// advertisement names for it; see [`founder_line_holds`].
+    FounderLine,
 }
 
 /// The joiner's check on a `PLAYER_LIST`.
@@ -442,6 +465,9 @@ pub fn admit_list(
     }
     if list.table_params_hash != under.params {
         return Err(ListRefused::ParametersMismatch);
+    }
+    if !founder_line_holds(&list.roster, &under.ad) {
+        return Err(ListRefused::FounderLine);
     }
     Roster::form(list.roster.clone(), &under.ad, false).map_err(ListRefused::Roster)
 }
@@ -1084,6 +1110,28 @@ mod tests {
             admit_list(&list, &[0xBB; 32], None, &u),
             Err(ListRefused::ParametersMismatch)
         );
+    }
+
+    /// `S1-KO`: a roster whose founder's seat names another Tox key than the
+    /// advertisement names for the founder is refused; one naming the same
+    /// holds, and a roster without the founder's seat says nothing of it.
+    #[test]
+    fn a_founders_seat_under_another_line_than_its_advertisement_is_refused() {
+        let mut a = ad();
+        a.founder_tox_key = Some([0x55; 32]);
+        let u = JoinedUnder::pin(a.clone(), [0xAA; 32], [0xBB; 32]);
+        let mut roster = two();
+        roster[0].app_public_key = a.founder_app_key;
+        roster[0].tox_key = Some([0x55; 32]);
+        assert!(founder_line_holds(&roster, &a));
+        let list = PlayerList { roster: roster.clone(), table_params_hash: u.params, list_serial: 1 };
+        assert!(admit_list(&list, &[0xBB; 32], None, &u).is_ok(), "the advertised line: an honest founder");
+        roster[0].tox_key = Some([0x66; 32]);
+        let list = PlayerList { roster: roster.clone(), table_params_hash: u.params, list_serial: 1 };
+        assert_eq!(admit_list(&list, &[0xBB; 32], None, &u), Err(ListRefused::FounderLine));
+        roster[0].tox_key = None;
+        assert!(!founder_line_holds(&roster, &a), "nor no line where the advertisement names one");
+        assert!(founder_line_holds(&two(), &a), "a roster without the founder's seat");
     }
 
     #[test]
