@@ -42,7 +42,7 @@ pub enum Walk {
     Republish,
     /// Anything else the public DHT's behaviour reported.
     Other,
-    /// A query of the poker clients' own DHT (`/p2p-poker/kad/2`).
+    /// A query of the poker clients' own DHT (`/p2p-poker/kad/3`).
     PrivateDht,
 }
 

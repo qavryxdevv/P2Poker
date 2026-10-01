@@ -7855,3 +7855,24 @@ _meets` and `the_judge_survives_a_give_up` (red under `P2P_POKER_CONTROL=s1kr`, 
 
 **Amends** `D-084` (*why not a card share* holds for the in-hand round; the card share is certified after the hand),
 `D-036`, `D-065` and `D-087` for this band only.
+
+## D-091 -- Protocol major 3: a client of version 2 and one of version 3 never see each other
+
+**Decided 2026-10-01**, by the rule the owner gave with `D-089` -- *"jde mi jenom o to, aby se starý klient neviděl
+s novými a naopak"* -- applied to the first change of the wire since: `S1-KR` (`D-090`) adds `CHEAT_VOTE 0x0605`,
+`CHEAT_CERT 0x0606` and a `deck_tag` to every reveal body, which a client of protocol 2 cannot decode. A client of
+each version at one table would part from the other at the first reveal.
+
+1. **What.** `PROTOCOL_MAJOR` and `PROTOCOL_VERSION` are 3. Every protocol string (`/p2p-poker/3`, the lobby,
+   lobby-chat and search-queue topics, the snapshot and join RPCs, the table stream), every table topic, the private
+   Kademlia protocol (`/p2p-poker/kad/3`) and the lobby's DHT keys (`p2p-poker/main-lobby/v3`, its slices and hours)
+   carry the major, exactly as `D-089` laid them out; every envelope says `protocol_version = 3` and a receiver
+   refuses 1 and 2. The session record is version 6. 0.3.0 in `Cargo.toml`.
+2. **What does not change.** Everything `D-089` point 3 lists; and nothing is released or deployed by this decision:
+   the release waits for the owner and the Store (`D-080`), as every release does.
+3. **The price** is `D-089`'s: the lobby of 0.3.0 starts empty and fills as players update; relays that are players'
+   clients relay only for their own version.
+
+**Guard.** `the_lobby_rendezvous_key_is_the_published_one` and `an_hours_lobby_key_is_the_published_one` pin the keys
+of major 3; `the_corpus_and_the_code_agree_on_every_published_constant` holds §13's `PROTOCOL_VERSION` and
+`PROTOCOL_MAJOR` to the code's; `a_version_this_build_does_not_speak_is_rejected` refuses versions 1 and 2.

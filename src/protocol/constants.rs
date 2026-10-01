@@ -31,23 +31,28 @@ use crate::poker::state::Chips;
 /// the major (`PROTOCOL.md` §1.1), so the two never meet; and every signed
 /// envelope carries `protocol_version`, which a receiver holds to its own
 /// (`EventBody::check_envelope`), should any road cross all the same.
-pub const PROTOCOL_VERSION: u16 = 2;
-pub const PROTOCOL_MAJOR: u16 = 2;
+///
+/// `D-091`: 3 since 0.3.0 -- the wire changed (`S1-KR`: the cheat pair
+/// `0x0605`/`0x0606` and the deck tag in every reveal body), and a client of
+/// version 2 cannot read it; the owner's rule of `D-089` is that an old
+/// client and a new one never see each other.
+pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_MAJOR: u16 = 3;
 
 /// The libp2p identify protocol name.
 ///
 /// Held here and used from `net::swarm`, which defined its own copy of this
 /// string under the name `PROTOCOL_VERSION` — a third meaning for a name that
 /// already had two.
-pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/2";
-pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/2";
-pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/2";
+pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/3";
+pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/3";
+pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/3";
 /// `D-064`: the queue of clients searching for a game, beside the lobby and
 /// sliced like it (`PROTOCOL.md` §7.13).
-pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/2";
-pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/2";
-pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/2";
-pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/2";
+pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/3";
+pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/3";
+pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/3";
+pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/3";
 
 // **The two Mainline infohashes and their derivation strings are gone.**
 // `56b0b50` took BitTorrent out of the binary and the lobby became a libp2p

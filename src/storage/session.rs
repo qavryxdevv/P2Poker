@@ -40,7 +40,8 @@ use crate::protocol::constants::{RESUME_GIVE_UP_MS, RESUME_RECORD_MAX_AGE_MS};
 /// The record's own version, so a later shape can refuse an older one rather
 /// than misread it. `D-089`: 5 with protocol major 2 -- a record of a table
 /// of version 1 is no record, since this client cannot meet that table.
-pub const RECORD_VERSION: u8 = 5;
+/// `D-091`: 6 with protocol major 3, for the same reason.
+pub const RECORD_VERSION: u8 = 6;
 
 /// An unfinished session, as the node last knew it.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

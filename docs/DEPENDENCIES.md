@@ -816,7 +816,7 @@ fuzzed; none of them has been fuzzed by us.
 > **accepted security advisory** alive for a crate that is not there.
 >
 > Discovery today is a libp2p Kademlia provider record. `net::run::lobby_namespace`
-> keys it on `sha2-256("p2p-poker/main-lobby/v2")` and `relay_namespace` on
+> keys it on `sha2-256("p2p-poker/main-lobby/v3")` and `relay_namespace` on
 > `sha2-256("/libp2p/relay")`; the crates are in §5.5. The register's own infohash
 > constants outlived the crate in `src/protocol/constants.rs` too, guarded by two
 > compile-time assertions and a test that all passed while reaching nothing — they

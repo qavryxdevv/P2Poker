@@ -647,6 +647,9 @@ mod tests {
         assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(PROTOCOL_VERSION + 1)));
         body.protocol_version = 1;
         assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(1)), "version 1, 0.1.x's");
+        // `D-091`: and version 2, 0.2.x's.
+        body.protocol_version = 2;
+        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(2)), "version 2, 0.2.x's");
     }
 
     #[test]
