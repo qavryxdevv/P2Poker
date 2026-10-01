@@ -156,14 +156,27 @@ pub enum LobbyAction {
 /// without a commit. `tests/donation_page.rs` holds this link to that file.
 pub const DONATION_URL: &str = "https://github.com/qavryxdevv/P2Poker/blob/master/DONATE.md";
 
-/// `D-080`, 2026-09-28: whether this copy asks for gifts. A copy from the
-/// Microsoft Store does not: the donation page takes Bitcoin and USDT, and the
-/// Store's certification sent the first package back for it -- a product that
-/// leads to payments in a cryptocurrency is published only from a company
-/// account (Store policy 10.2.6). A copy from GitHub asks as before, and so
+/// `D-080`, amended 2026-10-01: the page a copy from the Microsoft Store's
+/// *Support the project* opens -- the project's GitHub Sponsors page, where
+/// GitHub takes the payment in ordinary money. A constant of the build, as
+/// `DONATION_URL` is.
+pub const SPONSORS_URL: &str = "https://github.com/sponsors/qavryxdevv";
+
+/// `D-080`: which page this copy's *Support the project* opens. A copy from the
+/// Microsoft Store **never the donation page**: it takes Bitcoin and USDT, and
+/// the Store's certification sent the first package back for it -- a product
+/// that leads to payments in a cryptocurrency is published only from a company
+/// account (Store policy 10.2.6). Since 2026-10-01 such a copy has the button
+/// again, for GitHub Sponsors (the owner: *"obnovit tlačítko pro finanční
+/// příspěvky pro MS Store verzi s odkazem na schválený systém GitHub
+/// Sponsors"*). A copy from GitHub opens the donation page as before, and so
 /// does a preview, which has no copy to speak of.
-pub fn asks_for_gifts(home: Option<&HomeView>) -> bool {
-    !home.is_some_and(|h| h.store)
+pub fn gift_page(home: Option<&HomeView>) -> &'static str {
+    if home.is_some_and(|h| h.store) {
+        SPONSORS_URL
+    } else {
+        DONATION_URL
+    }
 }
 
 /// `D-072`: where a player reports a bug -- the repository's issue tracker, with
@@ -3549,11 +3562,10 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> bo
     let widths = DONATE_FORMS.map(|words| donate_width(ui, words));
     let mut donate = false;
     let mut word_ends = details.left() - STRIP_GAP;
-    // `D-080`: a copy from the Store has no button here at all.
-    let place = asks_for_gifts(state.home.as_ref()).then(|| {
-        donate_place(row.left() + light + word_width + STRIP_GAP, details.left() - STRIP_GAP, row.center().x, &widths)
-    });
-    if let Some((form, x)) = place.flatten() {
+    // `D-080`: a copy from the Store has the button too since 2026-10-01; what it
+    // opens is `gift_page`'s to say.
+    let place = donate_place(row.left() + light + word_width + STRIP_GAP, details.left() - STRIP_GAP, row.center().x, &widths);
+    if let Some((form, x)) = place {
         let rect = egui::Rect::from_center_size(
             egui::pos2(x, row.center().y),
             egui::vec2(widths[form], DONATE_HEIGHT - 2.0),
@@ -4017,13 +4029,14 @@ mod tests {
         assert!(DONATION_URL.starts_with("https://github.com/") && DONATION_URL.ends_with("/DONATE.md"));
     }
 
-    /// `D-080`, 2026-09-28: a copy from the Store draws no *Support the
-    /// project* button -- the Store's certification sent back a package whose
-    /// button led to gifts in cryptocurrency -- and a copy from GitHub, or a
-    /// preview, draws it as before. Read off a whole pass of the strip, as
-    /// painted.
+    /// `D-080`, amended 2026-10-01: every copy draws the *Support the project*
+    /// button, and a copy from the Store opens GitHub Sponsors with it -- never
+    /// the donation page, whose gifts in cryptocurrency the Store's
+    /// certification sent a package back for -- while a copy from GitHub, or a
+    /// preview, opens the donation page as before. Read off a whole pass of the
+    /// strip, as painted.
     #[test]
-    fn a_copy_from_the_store_asks_for_no_gifts() {
+    fn a_copy_from_the_store_asks_through_github_sponsors() {
         fn words(shape: &egui::Shape, out: &mut Vec<String>) {
             match shape {
                 egui::Shape::Text(t) => out.push(t.galley.job.text.clone()),
@@ -4067,9 +4080,12 @@ mod tests {
         assert!(asks(&from_github), "a copy from GitHub asks: {from_github:?}");
         assert!(asks(&painted(None)), "and so does a preview");
         let from_store = painted(Some(home(true)));
-        assert!(!asks(&from_store), "a copy from the Store does not: {from_store:?}");
-        assert!(from_store.iter().any(|t| t == "Network details"), "and its strip is drawn all the same: {from_store:?}");
-        assert!(asks_for_gifts(None) && asks_for_gifts(Some(&home(false))) && !asks_for_gifts(Some(&home(true))));
+        assert!(asks(&from_store), "and a copy from the Store too: {from_store:?}");
+        assert!(from_store.iter().any(|t| t == "Network details"), "its strip drawn as any: {from_store:?}");
+        assert_eq!(gift_page(Some(&home(true))), SPONSORS_URL, "the Store's copy: GitHub Sponsors");
+        assert_eq!(gift_page(Some(&home(false))), DONATION_URL, "GitHub's: the donation page");
+        assert_eq!(gift_page(None), DONATION_URL, "a preview's: the donation page");
+        assert_eq!(SPONSORS_URL, "https://github.com/sponsors/qavryxdevv");
     }
 
     /// `S1-JG`: a table that was not opened is said in the lobby -- the reason,

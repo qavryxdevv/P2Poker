@@ -3294,17 +3294,17 @@ impl eframe::App for Client {
                     // `D-071`: the donation page, in the player's own browser. The
                     // address is said in the log either way: a player whose
                     // system opened nothing can still read where it is.
-                    // `D-080`: never from a copy from the Store, which draws no
-                    // such button to press.
-                    render::LobbyAction::OpenDonationPage if render::asks_for_gifts(self.ui.home.as_ref()) => {
-                        let opened = open_in_browser(render::DONATION_URL);
+                    // `D-080`: a copy from the Store opens GitHub Sponsors instead,
+                    // never the donation page (`render::gift_page`).
+                    render::LobbyAction::OpenDonationPage => {
+                        let page = render::gift_page(self.ui.home.as_ref());
+                        let opened = open_in_browser(page);
                         self.state.log.push_back(format!(
-                            "the donation page {}: {}",
+                            "the page to support the project {}: {}",
                             if opened { "was opened in the browser" } else { "could not be opened; it is at" },
-                            render::DONATION_URL
+                            page
                         ));
                     }
-                    render::LobbyAction::OpenDonationPage => {}
                     // `D-072`: the issue tracker, in the player's own browser.
                     // Nothing of this client goes with it -- the address carries
                     // no query, and what the report says is what the player
@@ -3429,20 +3429,23 @@ mod tests {
         assert_eq!(code.matches("check_for_update(&cc.egui_ctx, true)").count(), 1, "one opening question");
     }
 
-    /// **`D-080`, 2026-09-28: a copy from the Store opens no donation page**,
-    /// whatever asks it to: the one place the client opens it is behind
-    /// `render::asks_for_gifts`, which a copy from the Store answers no.
+    /// **`D-080`: a copy from the Store opens no donation page**, whatever asks
+    /// it to: the one place the client opens a page to support the project
+    /// opens `render::gift_page`'s, which for a copy from the Store is GitHub
+    /// Sponsors (amended 2026-10-01), and nothing opens the donation page by
+    /// name.
     #[test]
     fn a_copy_from_the_store_opens_no_donation_page() {
         let whole = include_str!("main.rs").replace("\r\n", "\n");
         let code = &whole[..whole.find("\n#[cfg(test)]\nmod tests").expect("the tests")];
-        assert_eq!(code.matches("open_in_browser(render::DONATION_URL)").count(), 1, "one place opens it");
-        let guard = code
-            .find("render::LobbyAction::OpenDonationPage if render::asks_for_gifts(self.ui.home.as_ref()) => {")
-            .expect("behind the question");
-        let opened = code.find("open_in_browser(render::DONATION_URL)").expect("opened");
-        assert!(guard < opened, "the question first");
-        assert!(!code[guard + 1..opened].contains("render::LobbyAction::"), "and the page opened inside its arm");
+        assert_eq!(code.matches("render::DONATION_URL").count(), 0, "never opened by name");
+        assert_eq!(code.matches("render::gift_page(").count(), 1, "one place opens a page to support the project");
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let arm = flat.find("render::LobbyAction::OpenDonationPage => {").expect("the arm");
+        let page = flat
+            .find("let page = render::gift_page(self.ui.home.as_ref()); let opened = open_in_browser(page);")
+            .expect("the page this copy's question names");
+        assert!(page > arm && page - arm < 400, "inside its arm");
     }
 
     #[test]
@@ -3569,7 +3572,8 @@ mod tests {
     /// and nothing else -- above all nothing the system would *run*.
     #[test]
     fn only_a_plain_web_address_is_handed_to_the_system() {
-        assert!(is_a_web_address(render::DONATION_URL), "the one address the client opens");
+        assert!(is_a_web_address(render::DONATION_URL), "the addresses the client opens");
+        assert!(is_a_web_address(render::SPONSORS_URL), "GitHub Sponsors too (D-080)");
         assert!(is_a_web_address("https://example.org/a-b_c.d~e?f=g&h=%20#i"));
         for refused in [
             "",

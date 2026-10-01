@@ -6514,9 +6514,20 @@ the first package back under its policy 10.2.6: a product that leads to payments
 only from a company account, with the authorisation of the exchange it uses -- and the only gifts this page takes are
 Bitcoin and USDT. A copy from the Store draws no *Support the project* button and opens no donation page
 (`render::asks_for_gifts`); a copy from GitHub, and a preview, ask exactly as above. **Guard.**
-`gui::render::tests::a_copy_from_the_store_asks_for_no_gifts` paints the strip in a pass of its own, as a copy from
+`gui::render::tests::a_copy_from_the_store_asks_through_github_sponsors` (so named since the amendment below) paints the strip in a pass of its own, as a copy from
 GitHub, as a preview and as a copy from the Store, and reads the button's words off what was painted;
 `a_copy_from_the_store_opens_no_donation_page` holds the one place the client opens the page behind the same question.
+
+**Amended 2026-10-01 (`D-080`): the Store's copy has the button again, for GitHub Sponsors.** The owner: *"můžeme
+obnovit tlačítko pro finanční příspěvky pro MS Store verzi s odkazem na schválený systém GitHub Sponsors"* -- the
+project's Sponsors page, <https://github.com/sponsors/qavryxdevv>, approved, where GitHub takes the payment in
+ordinary money and nothing is bought: the button opens it in the player's browser like any page the client opens.
+A copy from the Store draws *Support the project* as every copy does and opens GitHub Sponsors with it, **never the
+donation page** (`render::gift_page`); a copy from GitHub, and a preview, open the donation page as above. It reaches
+the Store with the next package -- the owner: none before the next protocol. **Guard.**
+`a_copy_from_the_store_asks_through_github_sponsors` (the strip painted for each copy, and the page each opens);
+`a_copy_from_the_store_opens_no_donation_page` (nothing opens the donation page by name, the one place opens
+`gift_page`'s).
 
 ## D-072 — the cash game is deactivated, and the client says what it is and where a bug goes
 
@@ -7239,7 +7250,8 @@ product that performs financial transactions involving a cryptocurrency must be 
 with the authorisation of the exchange or service it uses. The *Support* button opens `DONATE.md`, whose gifts are
 Bitcoin and USDT. Neither condition is one this project can meet or needs: the client performs no transaction of any
 kind, and its author is one person. So, as the paragraph above foresaw, **a copy from the Store asks for no gifts**:
-no button on its strip, and no page opened if anything asks (`render::asks_for_gifts`, `D-071` amended). Nothing else
+no button on its strip, and no page opened if anything asks (`D-071` amended). Since 2026-10-01 it has the button
+again for GitHub Sponsors, never for the donation page (`render::gift_page`, `D-071` amended again). Nothing else
 in the report objected -- not `runFullTrust`, not the rating, not the privacy policy -- and the package is sent again
 as **0.1.5**, which carries the connection limits of `S1-IY` and `S1-IZ`, the Linux listing of `S1-JA` and the clock
 of `S1-JB` besides. **0.1.5 is published on GitHub at once, on the owner's word, as the one exception to *a release
