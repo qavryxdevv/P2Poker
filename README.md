@@ -6,7 +6,7 @@ rather than promised.
 
 Written in Rust. One portable executable.
 
-> ## [Download P2Poker](https://github.com/qavryxdevv/P2Poker/releases/latest)
+> ## Download P2Poker
 >
 > **Windows, from the Microsoft Store** — the safest way:
 >
