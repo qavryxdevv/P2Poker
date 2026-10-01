@@ -3032,6 +3032,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
         }};
     }
+    // `S1-KQ`: a seat that accused itself of a card share that does not hold is
+    // named whether or not the hand ended -- its abort is not taken, and the
+    // hand goes on. Only that: a finding of this client's own (`D-084`) is kept
+    // once the hand is over, as before, so that a certificate about to put the
+    // seat out is not told to the players as a table that is not safe.
+    macro_rules! note_a_self_accusation {
+        ($t:ident, $h:expr) => {{
+            if let Some(seat) = $h.self_accused() {
+                if let Some(k) = $h.key_of(seat) {
+                    $t.cheats.insert(k, (seat, 3, true));
+                }
+            }
+        }};
+    }
     // `S1-CW`: what every road that can end a hand does once its frames are
     // out -- the abort said once, the boundary armed, this client's clock
     // read. `hand_event!` below does it for an incoming event; the stall
@@ -3049,6 +3063,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // seconds after `HandEnded`, and the window read the hand as
             // already over when it heard of it.
             remove_by_the_word!($t, $h);
+            note_a_self_accusation!($t, $h);
             if let Some(why) = $h.aborted().filter(|_| !$t.abort_reported) {
                 $t.abort_reported = true;
                 $t.act_by = None;
@@ -3360,6 +3375,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 remove_by_the_word!($t, $h);
+                                note_a_self_accusation!($t, $h);
                                 if let Some(why) =
                                     $h.aborted().filter(|_| !$t.abort_reported)
                                 {

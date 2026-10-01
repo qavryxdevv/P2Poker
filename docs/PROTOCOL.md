@@ -4623,6 +4623,18 @@ another subject (§4.8). A `cause = 3` abort goes at once as before: a
 reveal stage closes at a seat the rogue sent a good share to, and a client that stood on it could
 be certified out by that seat and the rogue. Heads-up both go at once: two seats certify nobody.
 
+**A seat that accuses itself (`S1-KQ`, 2026-10-02).** A `cause = 3` abort whose `attributed[0]` is its
+own emitter is not taken, at any table size: an honest client never accuses itself, and taken at once
+such an abort voided the hand at any moment of it -- after the showdown too -- on the rogue's own word.
+Where its one frame is a reveal of its own whose share fails at the receiver, the receiver names the seat
+as its own finding; it holds the frame and judges it at its own stage, as any finder judges a share: a
+share it still needs fails there and the receiver sends its own `cause = 3` abort with the evidence; a
+share it has already taken a copy of is a second version (`S1-KJ`) and the hand goes on. Evidence that is
+not a reveal of its own, or a share that verifies, is refused. A reveal stage that has heard a seat answers
+any other body from it as a second version before any share in it is judged. A `cause = 2` abort a shuffler
+sends about itself and that is taken at once (heads-up, or where no certificate can form) names it as the
+receiver's own finding would.
+
 **The tier-2 precondition is stated in the checkpoint number, not in a `sequence` — `G7-S8`.**
 The clause that stood in that row named *"a checkpoint of the same chain at or before the offending
 event's `sequence`"*, and no path evaluates it: `STATE_MACHINE.md`'s T64 guard compares

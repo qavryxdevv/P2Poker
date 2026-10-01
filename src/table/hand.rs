@@ -710,7 +710,10 @@ fn diverge_if_asked(state_hash: Hash, _hand_id: u64) -> Hash {
 /// `S1-JR`: whether this harness client plays the rogue behaviour `kind` at
 /// hand `hand_id` -- `P2P_POKER_ROGUE` names the behaviours, comma-separated
 /// (`bad-shuffle`: its shuffle proof is broken on the wire; `withhold-step`: it
-/// never takes its shuffle step), from hand `P2P_POKER_ROGUE_FROM_HAND` (1 when
+/// never takes its shuffle step; `bad-share`: its deal shares are broken on the
+/// wire; `bad-share-late`: its showdown shares are; `self-accuse`: a hand it
+/// lost, it accuses itself of a broken copy of its own last reveal in place of
+/// its settlement, `S1-KQ`), from hand `P2P_POKER_ROGUE_FROM_HAND` (1 when
 /// unset). For measuring what the honest seats do about a rogue; a build
 /// without `--features fault-harness` reads neither and plays none.
 #[cfg(feature = "fault-harness")]
@@ -729,6 +732,37 @@ pub(crate) fn rogue(kind: &str, hand_id: u64) -> bool {
 #[cfg(not(feature = "fault-harness"))]
 pub(crate) fn rogue(_kind: &str, _hand_id: u64) -> bool {
     false
+}
+
+/// `S1-KQ` harness: whether this client runs as the CONTROL of the measurement
+/// `name` -- `P2P_POKER_CONTROL` names them, comma-separated -- playing the
+/// behaviour that fix replaced, so a bed measures a fix against its control
+/// from one binary. `s1kq`: a seat's own `cause = 3` abort accusing itself is
+/// taken at once, as before `S1-KQ`.
+#[cfg(feature = "fault-harness")]
+pub(crate) fn control(name: &str) -> bool {
+    std::env::var("P2P_POKER_CONTROL").is_ok_and(|v| v.split(',').any(|k| k.trim() == name))
+}
+
+/// Never, in every build that did not ask for the harness.
+#[cfg(not(feature = "fault-harness"))]
+pub(crate) fn control(_name: &str) -> bool {
+    false
+}
+
+/// `S1-KQ` harness: a rogue's reveal entries broken on the wire -- the first
+/// two tokens swapped, so each still decodes (each is the other's point) and
+/// the frame dies at the DLEQ, the one failure that is evidence. `None` where
+/// the frame carries fewer than two entries.
+fn broken_entries(entries: &[RevealEntry]) -> Option<Vec<RevealEntry>> {
+    if entries.len() < 2 {
+        return None;
+    }
+    let mut out = entries.to_vec();
+    let first = out[0].token.clone();
+    out[0].token = out[1].token.clone();
+    out[1].token = first;
+    Some(out)
 }
 
 /// How much of an event body this client will decode.
@@ -1982,6 +2016,14 @@ pub struct Hand {
     /// and nothing else (`D-010`): it moves no chip and unseats nobody; the
     /// node reads it to tell the player the table is not safe.
     proven_cheat: Option<(SeatIdx, u16, bool)>,
+    /// `S1-KQ`: a seat that sent a `cause = 3` abort accusing itself over a
+    /// share of its own that this client found failing. The abort is not taken
+    /// and the hand goes on, so the node reads this rather than waiting for an
+    /// abort to name it.
+    self_accused: Option<SeatIdx>,
+    /// `S1-KQ` harness: the last reveal frame this client sent, kept only when
+    /// it plays the `self-accuse` rogue -- the frame a broken copy is made of.
+    rogue_last_reveal: Option<Vec<u8>>,
     /// `S1-JR`: this hand was ended by a certificate -- this client's own abort
     /// naming the seats a certificate named, or a peer's carrying one. The
     /// table settled it, and no count of hands called off takes it.
@@ -2573,6 +2615,8 @@ impl Hand {
                 half_refused_by: BTreeSet::new(),
                 unkept: false,
                 proven_cheat: None,
+                self_accused: None,
+                rogue_last_reveal: None,
                 cert_ended: false,
                 questions: BTreeSet::new(),
                 settled_pots: Vec::new(),
@@ -3978,6 +4022,18 @@ impl Hand {
         let body = DealPrivate { entries };
         let bytes = self.say(EventType::DealPrivate, &body, DEAL_PRIVATE_CAP, key, now_ms)?;
         let hash = self.opened(&bytes, EventType::DealPrivate)?.event_hash;
+        // `S1-KQ` harness: a rogue's share broken on the wire only -- its own
+        // chain takes the real one, as a modified client's would.
+        if rogue("self-accuse", self.open.hand_id) {
+            self.rogue_last_reveal = Some(bytes.clone());
+        }
+        let bytes = match rogue("bad-share", self.open.hand_id)
+            .then(|| broken_entries(&body.entries))
+            .flatten()
+        {
+            Some(entries) => self.say(EventType::DealPrivate, &DealPrivate { entries }, DEAL_PRIVATE_CAP, key, now_ms)?,
+            None => bytes,
+        };
         let complete = {
             let Phase::Dealing { stage, .. } = &mut self.phase else {
                 return Err(Failed::NothingFurther);
@@ -4038,6 +4094,15 @@ impl Hand {
         // verified, which is the other half of the same rule.
         if stage.heard(seat) == Some(opened.event_hash) {
             return Ok(Vec::new());
+        }
+        // `S1-KQ`: another body from a seat this stage has already heard is a
+        // second version of its step (`S1-KJ`), never a share to judge: its
+        // good share was taken, and this client needs nothing more from it
+        // here. Judged as shares first, a broken second copy -- a seat's own
+        // self-accusation held and replayed, or sent bare -- voided the hand
+        // wherever a third seat still kept the stage open.
+        if stage.heard(seat).is_some() {
+            return Err(Failed::Equivocation { seat });
         }
 
         // Exactly the required set: fewer is a refusal to cooperate, more means
@@ -4731,6 +4796,11 @@ impl Hand {
             if stage.heard(seat) == Some(opened.event_hash) {
                 return Ok(Vec::new());
             }
+            // `S1-KQ`: as at the deal -- a second version from a seat this
+            // stage has already heard, and never a share to judge.
+            if stage.heard(seat).is_some() {
+                return Err(Failed::Equivocation { seat });
+            }
             if street_from_code(body.street) != Some(street) {
                 return Err(Failed::Elsewhere {
                     seat,
@@ -5087,6 +5157,24 @@ impl Hand {
         )?;
         let hash = self.opened(&bytes, EventType::ShowdownReveal)?.event_hash;
         self.record_showdown(me, hash, true)?;
+        // `S1-KQ` harness: as at the deal -- a rogue's showdown share broken on
+        // the wire only, and the frame a self-accusing rogue breaks later.
+        if rogue("self-accuse", self.open.hand_id) {
+            self.rogue_last_reveal = Some(bytes.clone());
+        }
+        let bytes = match rogue("bad-share-late", self.open.hand_id)
+            .then(|| broken_entries(&body.entries))
+            .flatten()
+        {
+            Some(entries) => self.say(
+                EventType::ShowdownReveal,
+                &ShowdownReveal { entries },
+                SHOWDOWN_REVEAL_CAP,
+                key,
+                now_ms,
+            )?,
+            None => bytes,
+        };
         let mut out = vec![Send::Broadcast(bytes)];
         out.append(&mut self.close_showdown_if_done(key, now_ms)?);
         Ok(out)
@@ -5166,6 +5254,12 @@ impl Hand {
             };
             if stage.heard(seat) == Some(opened.event_hash) {
                 return Ok(Vec::new());
+            }
+            // `S1-KQ`: as at the deal -- a second version from a seat this
+            // stage has already heard (a show after its show, a show after its
+            // muck), and never a share to judge.
+            if stage.heard(seat).is_some() {
+                return Err(Failed::Equivocation { seat });
             }
             if !order.contains(&seat) {
                 return Err(Failed::NotInThisStage);
@@ -5358,6 +5452,11 @@ impl Hand {
             return Ok(Vec::new());
         }
         let mine = Box::new(self.settlement()?);
+        // `S1-KQ` harness: a rogue that lost the hand accuses itself of a
+        // broken copy of its own last reveal instead of settling.
+        if let Some(sends) = self.rogue_self_accusation(&mine, key, now_ms) {
+            return Ok(sends);
+        }
         let bytes = self.say(
             EventType::HandComplete,
             mine.as_ref(),
@@ -6206,6 +6305,44 @@ impl Hand {
         Ok(vec![Send::Broadcast(bytes)])
     }
 
+    /// `S1-KQ` harness: the `self-accuse` rogue -- a client that lost the hand
+    /// signs a broken copy of its own last reveal and its own `cause = 3` abort
+    /// accusing itself, in place of its settlement. `None` everywhere else,
+    /// and in every build without the harness (`rogue` is `false` there).
+    fn rogue_self_accusation(&mut self, mine: &HandComplete, key: &SigningKey, now_ms: u64) -> Option<Vec<Send>> {
+        if !rogue("self-accuse", self.open.hand_id) {
+            return None;
+        }
+        let me = self.open.my_seat;
+        if mine.deltas.get(usize::from(me)).copied().unwrap_or(0) >= 0 {
+            return None;
+        }
+        let frame = self.rogue_last_reveal.clone()?;
+        let (kind, _, _) = chained::peek(&frame, PEEK_CAP).ok()?;
+        let opened = chained::open_in_hand(&frame, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id).ok()?;
+        let at = chained::Slot {
+            table_id: self.open.table_id,
+            hand_id: self.open.hand_id,
+            sequence: opened.envelope.sequence,
+            previous_event_hash: opened.envelope.previous_event_hash,
+        };
+        let deadline = self.open.crypto_step_timeout_ms;
+        let broken = match kind {
+            EventType::DealPrivate => {
+                let b: DealPrivate = chained::payload(&opened, DEAL_PRIVATE_CAP).ok()?;
+                let body = DealPrivate { entries: broken_entries(&b.entries)? };
+                chained::seal(kind, &at, &body, key, now_ms, deadline, DEAL_PRIVATE_CAP).ok()?
+            }
+            EventType::ShowdownReveal => {
+                let b: ShowdownReveal = chained::payload(&opened, SHOWDOWN_REVEAL_CAP).ok()?;
+                let body = ShowdownReveal { entries: broken_entries(&b.entries)? };
+                chained::seal(kind, &at, &body, key, now_ms, deadline, SHOWDOWN_REVEAL_CAP).ok()?
+            }
+            _ => return None,
+        };
+        self.abort_bad_reveal(me, broken, key, now_ms).ok()
+    }
+
     /// A peer's abort.
     ///
     /// **Buffered, not refused**, until this receiver's own trigger is present.
@@ -6409,6 +6546,63 @@ impl Hand {
             // proof really does fail. Anything else and a seat could void any
             // hand by shouting `cause = 2` over a proof that is perfectly good.
             2 => self.bad_shuffle_holds(&body, seat)?,
+            // `S1-KQ`: the reveal half of `D-084`'s rule about a seat that
+            // accuses itself, and at every table size. An honest client never
+            // accuses itself, so a `cause = 3` abort naming its own emitter is a
+            // rogue's -- and taken at once it voided any hand at any moment of
+            // it: during the betting, at the showdown, at the settlement after
+            // the result was known (only a completed settlement stage stopped
+            // it), with the seat never named and, heads-up, the player never
+            // told (the rogue-cheat audit of 2026-10-02, its G3). The frame it
+            // carries is the accused's own signed share, so the seat is named
+            // here -- it signed both frames, nobody can be framed by them --
+            // and the frame is held and judged at this client's own stage, as
+            // any finder judges a share: one this client still needs fails
+            // there and ends the hand from this client's own check, with the
+            // evidence (`abort_bad_reveal`); one this client has taken a good
+            // copy of is another version of a step already taken (`S1-KJ`), and
+            // the hand goes on. An abort from another seat stays the rule
+            // below: a seat the rogue sent its bad share alone stands on it,
+            // and only taking its evidence at once keeps it with the others.
+            3 if body.attributed.first() == Some(&opened.sender) && !control("s1kq") => {
+                let [frame] = body.evidence.as_slice() else {
+                    return Err(Failed::Elsewhere {
+                        seat,
+                        what: "a cause-3 abort carried exactly the one frame it disputes",
+                    });
+                };
+                let a_reveal_of_its_own = chained::sender_of(frame, FRAME_CAP) == Some(opened.sender)
+                    && chained::peek(frame, PEEK_CAP).is_ok_and(|(k, _, _)| {
+                        matches!(k, EventType::DealPrivate | EventType::BoardReveal | EventType::ShowdownReveal)
+                    });
+                if !a_reveal_of_its_own {
+                    return Err(Failed::Elsewhere {
+                        seat,
+                        what: "a seat accusing itself carried a reveal of its own",
+                    });
+                }
+                // Judged once: a seat named already is named, and its further
+                // accusations of itself are nothing -- nor checked again.
+                if self.self_accused == Some(seat) {
+                    return Ok(Vec::new());
+                }
+                match self.bad_reveal_holds(&body, seat) {
+                    Ok(()) => {
+                        self.self_accused = Some(seat);
+                        if self.proven_cheat.is_none() {
+                            self.proven_cheat = Some((seat, 3, true));
+                        }
+                    }
+                    // Nothing to check against here yet: the frame is held and
+                    // judged at this client's own stage.
+                    Err(Failed::NotYet) => {}
+                    // A share that verifies here, or evidence of another shape,
+                    // is refused as before, and goes nowhere.
+                    Err(e) => return Err(e),
+                }
+                let _ = self.hold(frame.clone());
+                return Ok(Vec::new());
+            }
             // The reveal half of the same rule, and the same gate: accepted
             // at once, and only after this client's own check over the frame
             // the accused signed says the share really is wrong.
@@ -6467,13 +6661,21 @@ impl Hand {
             self.cert_ended = true;
         }
         // `S1-JR`: another seat's evidence, which this client's own check just
-        // confirmed (causes 2 and 3 are accepted on nothing less).
+        // confirmed (causes 2 and 3 are accepted on nothing less). `S1-KQ`: a
+        // seat that accused itself is named as this client's own finding would
+        // name it -- it signed both frames, so nobody is framed by naming it --
+        // where the abort is still taken at once (a shuffle proof where no
+        // certificate can form, heads-up above all, which named nobody and
+        // told nobody before).
         if matches!(body.cause, 2 | 3) && self.proven_cheat.is_none() {
             let accused = body
                 .attributed
                 .first()
                 .and_then(|k| self.open.seats.iter().find(|(_, key, _)| key == k).map(|(s, _, _)| *s));
-            self.proven_cheat = accused.map(|s| (s, body.cause, false));
+            // The harness's control of `S1-KQ` names nobody on a self-accusing
+            // share, as before it.
+            let itself = body.attributed.first() == Some(&opened.sender) && !(body.cause == 3 && control("s1kq"));
+            self.proven_cheat = accused.map(|s| (s, body.cause, itself));
         }
         Ok(Vec::new())
     }
@@ -6502,6 +6704,13 @@ impl Hand {
     /// checked another seat's evidence -- `None` for any other hand.
     pub fn proven_cheat(&self) -> Option<(SeatIdx, u16, bool)> {
         self.proven_cheat
+    }
+
+    /// `S1-KQ`: the seat that accused itself of a card share that does not
+    /// hold, in a `cause = 3` abort this client did not take -- see
+    /// `on_hand_abort`. Named by the node at once: the hand goes on.
+    pub fn self_accused(&self) -> Option<SeatIdx> {
+        self.self_accused
     }
 
     /// Does the `cause = 2` evidence really disprove the proof it names?
@@ -16439,6 +16648,163 @@ mod tests {
                      if what.contains("verifies at this client")),
             "and it says why: {err}"
         );
+    }
+
+    /// `S1-KQ`: **a seat that accuses itself of a share that does not hold ends
+    /// no hand where its good share was already taken**, and is named. Taken
+    /// at once, its own `cause = 3` abort over a freshly broken copy voided any
+    /// hand at any moment of it -- in the betting, at the settlement after the
+    /// showdown -- and named nobody; heads-up nobody was even told.
+    #[test]
+    fn a_seat_that_accuses_itself_ends_no_hand_where_its_good_share_was_taken() {
+        let (mut a, mut b, deal, _other) = ready_to_deal();
+        let at = b.slot();
+        b.on_event(&deal, &key(11), NOW).expect("seat 1 takes seat 0's good share");
+        let broken = tamper::<DealPrivate>(&deal, EventType::DealPrivate, &at, DEAL_PRIVATE_CAP, |d| {
+            let first = d.entries[0].token.clone();
+            d.entries[0].token = d.entries[1].token.clone();
+            d.entries[1].token = first;
+        });
+        // Seat 0 sends its own `cause = 3` abort, accusing itself, over the
+        // broken copy.
+        let sends = a.abort_bad_reveal(0, broken, &key(10), NOW).expect("seat 0 signs its own accusation");
+        let Send::Broadcast(abort) = &sends[0];
+        let body: HandAbort = chained::payload(
+            &chained::open_in_hand(abort, HAND_ABORT_CAP, EventType::HandAbort, &b.open.table_id, b.open.hand_id)
+                .unwrap(),
+            HAND_ABORT_CAP,
+        )
+        .unwrap();
+        assert_eq!(body.attributed, vec![b.open.seats[0].1], "seat 0 names itself");
+
+        b.on_event(abort, &key(11), NOW).expect("taken in, and not as an end of the hand");
+        assert!(b.aborted().is_none(), "the hand goes on: seat 1 holds the share it needs");
+        assert_eq!(b.self_accused(), Some(0), "and the seat that accused itself is named");
+        assert_eq!(b.proven_cheat(), Some((0, 3, true)), "as this client's own finding (S1-JR)");
+        let (more, _failures) = b.replay_early(&key(11), NOW);
+        assert!(more.is_empty(), "its broken copy, judged where seat 1 stands, ends nothing");
+        assert!(b.aborted().is_none());
+    }
+
+    /// `S1-KQ`: **a seat that accuses itself over a share this client still
+    /// needs is judged at this client's own stage**: the broken frame is the
+    /// seat's share there, it fails this client's own check, and the hand ends
+    /// from that check, with the evidence -- never on the accused's own word.
+    #[test]
+    fn a_self_accusation_over_a_share_still_needed_is_judged_at_this_clients_stage() {
+        let (mut a, mut b, deal, _other) = ready_to_deal();
+        let broken = tamper::<DealPrivate>(&deal, EventType::DealPrivate, &b.slot(), DEAL_PRIVATE_CAP, |d| {
+            let first = d.entries[0].token.clone();
+            d.entries[0].token = d.entries[1].token.clone();
+            d.entries[1].token = first;
+        });
+        let sends = a.abort_bad_reveal(0, broken, &key(10), NOW).expect("seat 0 signs its own accusation");
+        let Send::Broadcast(abort) = &sends[0];
+        b.on_event(abort, &key(11), NOW).expect("taken in, and held");
+        assert!(b.aborted().is_none(), "not on the accused's own word");
+        assert_eq!(b.self_accused(), Some(0));
+        let (more, _failures) = b.replay_early(&key(11), NOW);
+        assert_eq!(more.len(), 1, "this client's own abort, with the evidence");
+        assert_eq!(b.aborted(), Some(Abort::BadReveal { seat: 0 }), "from its own check of the share it needed");
+        assert_eq!(b.proven_cheat(), Some((0, 3, true)));
+    }
+
+    /// `S1-KQ`: a seat's accusation of itself over a share that verifies is
+    /// refused as any false accusation is, and names nobody.
+    #[test]
+    fn a_self_accusation_over_a_share_that_holds_is_refused() {
+        let (mut a, b, deal, _other) = ready_to_deal();
+        let mut b = b;
+        let sends = a.abort_bad_reveal(0, deal, &key(10), NOW).expect("seat 0 signs it");
+        let Send::Broadcast(abort) = &sends[0];
+        let err = b.on_event(abort, &key(11), NOW).expect_err("refused");
+        assert!(
+            matches!(&err, Failed::Elsewhere { what, .. } if what.contains("verifies at this client")),
+            "and it says why: {err}"
+        );
+        assert_eq!(b.self_accused(), None);
+        assert!(b.aborted().is_none());
+    }
+
+    /// `S1-KQ` (the refuter's R1): **at three seats, another copy of a share a
+    /// seat already took is a second version while a third seat still keeps
+    /// the stage open** -- seat 1 has taken seat 0's good share and waits for
+    /// seat 2's. Judged as shares first, the broken copy voided the hand there.
+    #[test]
+    fn a_second_share_copy_is_a_second_version_while_a_third_seat_keeps_the_stage_open() {
+        let keys = [key(10), key(11), key(12)];
+        let (a, from_a) = Hand::open(opening3(0), &keys[0], NOW, 30_000).unwrap();
+        let (b, from_b) = Hand::open(opening3(1), &keys[1], NOW, 30_000).unwrap();
+        let (c, from_c) = Hand::open(opening3(2), &keys[2], NOW, 30_000).unwrap();
+        let mut hands = [a, b, c];
+        let mut deal0: Option<Vec<u8>> = None;
+        let mut pending: Vec<(usize, Vec<Send>)> = vec![(0, from_a), (1, from_b), (2, from_c)];
+        for _ in 0..64 {
+            if pending.is_empty() {
+                break;
+            }
+            let mut next: Vec<(usize, Vec<Send>)> = Vec::new();
+            for (from, sends) in std::mem::take(&mut pending) {
+                for Send::Broadcast(bytes) in &sends {
+                    if from == 0 && chained::peek(bytes, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::DealPrivate) {
+                        deal0 = Some(bytes.clone());
+                    }
+                }
+                for to in 0..3usize {
+                    if to == from {
+                        continue;
+                    }
+                    let for_it: Vec<Send> = sends
+                        .iter()
+                        .filter(|Send::Broadcast(b)| {
+                            !(from == 2
+                                && to == 1
+                                && chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::DealPrivate))
+                        })
+                        .cloned()
+                        .collect();
+                    let out = deliver(&mut hands[to], &for_it, &keys[to]);
+                    if !out.is_empty() {
+                        next.push((to, out));
+                    }
+                }
+            }
+            pending = next;
+        }
+        let deal0 = deal0.expect("seat 0 dealt its shares");
+        assert!(matches!(hands[1].phase, Phase::Dealing { .. }), "seat 1 still waits at the deal, for seat 2");
+        let at = hands[1].slot();
+        let broken = tamper::<DealPrivate>(&deal0, EventType::DealPrivate, &at, DEAL_PRIVATE_CAP, |d| {
+            let first = d.entries[0].token.clone();
+            d.entries[0].token = d.entries[1].token.clone();
+            d.entries[1].token = first;
+        });
+        let err = hands[1].on_event(&broken, &keys[1], NOW).expect_err("a second version, refused");
+        assert!(matches!(err, Failed::Equivocation { seat: 0 }), "{err}");
+        assert!(hands[1].aborted().is_none(), "the hand goes on: the share seat 1 needs is taken");
+    }
+
+    /// `S1-KQ`: **heads-up, a shuffler that accuses itself is named** as this
+    /// client's own finding would name it. No certificate forms at two seats,
+    /// so its `cause = 2` abort is still taken at once -- but it named nobody,
+    /// and the player was never told.
+    #[test]
+    fn a_shuffler_that_accuses_itself_heads_up_is_named() {
+        let (mut a, mut b, shuffle) = ready_to_shuffle();
+        let Send::Broadcast(step) = &shuffle[0];
+        let Send::Broadcast(proof) = &shuffle[1];
+        b.on_event(step, &key(11), NOW).unwrap();
+        let broken = tamper::<ShuffleProof>(proof, EventType::ShuffleProof, &b.slot(), SHUFFLE_PROOF_CAP, |p| {
+            let n = p.proof.len();
+            p.proof[n / 2] ^= 0xff;
+        });
+        let sends = a
+            .abort_bad_shuffle(0, [step.clone(), broken], &key(10), NOW)
+            .expect("seat 0 signs its own accusation");
+        let Send::Broadcast(abort) = &sends[0];
+        b.on_event(abort, &key(11), NOW).expect("taken at once heads-up");
+        assert!(b.aborted().is_some(), "heads-up the abort still ends the hand");
+        assert_eq!(b.proven_cheat(), Some((0, 2, true)), "and the seat that accused itself is named");
     }
 
     /// Evidence that is not a reveal at all is refused before any share is

@@ -170,7 +170,10 @@ param(
     [ValidateRange(0, 32)][int]$DivergeNode = 1,
     # `S1-JR`: `-Rogue <kinds>` makes one node play a rogue's client from hand
     # `-RogueFromHand`: `bad-shuffle` (its shuffle proof is broken on the wire),
-    # `withhold-step` (it never takes its shuffle step); comma-separated. For
+    # `withhold-step` (it never takes its shuffle step), `bad-share` (its deal
+    # shares are broken on the wire), `bad-share-late` (its showdown shares
+    # are), `self-accuse` (a hand it lost, it accuses itself of a broken copy of
+    # its own last reveal in place of its settlement, `S1-KQ`); comma-separated. For
     # measuring what the honest seats do about it -- the table not safe, a hand
     # never held for ever. Needs a `--features fault-harness` binary.
     [string]$Rogue = '',
