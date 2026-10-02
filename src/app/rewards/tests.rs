@@ -623,9 +623,9 @@ fn a_month(games_a_day: u64) -> Month {
             r.take_notices();
             for _ in 0..hands {
                 let cards = rng.seven();
-                let showdown = rng.next() % 4 == 0;
+                let showdown = rng.next().is_multiple_of(4);
                 let won = rng.next() % u64::from(players) == 0;
-                game.hand(&mut r, now, cards, won, showdown || !won && false);
+                game.hand(&mut r, now, cards, won, showdown);
             }
             game.finish(&mut r, now, place);
             news.push(r.take_notices().iter().any(|x| matches!(x, Notice::Card(_) | Notice::Level(_) | Notice::Quest { .. })));
