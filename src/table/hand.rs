@@ -772,6 +772,14 @@ pub(crate) fn control(_name: &str) -> bool {
     false
 }
 
+/// `S1-LL`: whether `frame` is a `TIMEOUT_VOTE` that asks a question
+/// (`CAUSE_QUESTION`, `D-065`'s early question) rather than votes.
+pub fn is_question(frame: &[u8]) -> bool {
+    chained::peek(frame, PEEK_CAP).is_ok_and(|(kind, _, _)| kind == EventType::TimeoutVote)
+        && chained::payload_unverified::<TimeoutVote>(frame, frame_ceiling(EventType::TimeoutVote), TIMEOUT_VOTE_CAP)
+            .is_some_and(|v| v.cause == Some(CAUSE_QUESTION))
+}
+
 /// `S1-KS`: the name one judgement of `cause` over `frames` about `accused` is
 /// kept under -- the frames' own bytes, so a second version is a second name.
 fn evidence_memo(cause: u16, frames: &[&[u8]], accused: SeatIdx) -> Hash {
@@ -9156,7 +9164,7 @@ impl Hand {
                 // thinking, voted too, and the seat was folded and certified out.
                 // The vote goes at the deadline, like any other.
                 if age >= crate::protocol::constants::QUESTION_AFTER_MS
-                    && self.moved_past_by_another(seat)
+                    && (self.moved_past_by_another(seat) || self.asks_unprompted(owed))
                     && self.questions.insert((self.slot.sequence, seat))
                 {
                     if let Some(mut question) = self.subject_now(seat) {
@@ -9455,6 +9463,33 @@ impl Hand {
             out.append(&mut self.certify_if_unanimous(key, now_ms)?);
         }
         Ok(out)
+    }
+
+    /// `S1-LL`: whether this client asks for a missing frame of the stage now
+    /// open five seconds in without a later frame of a third seat in hand -- at a
+    /// cryptographic stage (the deck's keys, the shuffle's steps and proofs, the
+    /// commitment, the deal, the board), where no seat thinks and a frame five
+    /// seconds late is one this seat was not sent; never at a turn, where a seat
+    /// may think its whole clock, nor at the showdown or the settlement; at three
+    /// seats dealt in or more, where a third seat can hold the frame. A rogue that
+    /// kept its frame from the next seat to act or to shuffle -- which holds no
+    /// later frame of anybody's, the table waiting on it -- had it asked for only
+    /// by its vote at the stage's clock, and the table's clock on its own next
+    /// obligation ran out first: folded and struck. Answered as any question is
+    /// (`D-065`, `S1-LB`'s rotation once the table stands on the asker). Not in
+    /// the control build (`P2P_POKER_CONTROL=s1ll`).
+    fn asks_unprompted(&self, owed: EventType) -> bool {
+        !control("s1ll")
+            && self.mine.dealt_in.len() >= 3
+            && matches!(
+                owed,
+                EventType::DeckInit
+                    | EventType::ShuffleStep
+                    | EventType::ShuffleProof
+                    | EventType::DeckCommit
+                    | EventType::DealPrivate
+                    | EventType::BoardReveal
+            )
     }
 
     /// `D-065`'s early question: whether this hand holds, from a seat other than
@@ -16247,26 +16282,26 @@ mod tests {
         assert_eq!(patience_ms(4_000, 3), 4_000, "never longer than the step's own budget");
 
         let (mut a, _, _, keys) = three_at_the_deck_stage();
-        assert!(a.vote_on_timeouts(&keys[0], NOW + 29_999, 0).unwrap().is_empty());
-        assert!(!a.vote_on_timeouts(&keys[0], NOW + 30_000, 0).unwrap().is_empty(), "no wait before: the whole budget");
+        assert!(votes_in(a.vote_on_timeouts(&keys[0], NOW + 29_999, 0).unwrap()).is_empty());
+        assert!(!votes_in(a.vote_on_timeouts(&keys[0], NOW + 30_000, 0).unwrap()).is_empty(), "no wait before: the whole budget");
 
         let (mut a, _, _, keys) = three_at_the_deck_stage();
         a.set_patience(&[0, 0, 1]);
-        assert!(a.vote_on_timeouts(&keys[0], NOW + 19_999, 0).unwrap().is_empty());
-        assert!(!a.vote_on_timeouts(&keys[0], NOW + 20_000, 0).unwrap().is_empty(), "one wait before: twenty seconds");
+        assert!(votes_in(a.vote_on_timeouts(&keys[0], NOW + 19_999, 0).unwrap()).is_empty());
+        assert!(!votes_in(a.vote_on_timeouts(&keys[0], NOW + 20_000, 0).unwrap()).is_empty(), "one wait before: twenty seconds");
 
         for waits in [3u8, 7] {
             let (mut a, _, _, keys) = three_at_the_deck_stage();
             a.set_patience(&[0, 0, waits]);
-            assert!(a.vote_on_timeouts(&keys[0], NOW + WAIT_FROM_MS - 1, 0).unwrap().is_empty());
-            assert!(!a.vote_on_timeouts(&keys[0], NOW + WAIT_FROM_MS, 0).unwrap().is_empty(), "{waits} waits: ten seconds");
+            assert!(votes_in(a.vote_on_timeouts(&keys[0], NOW + WAIT_FROM_MS - 1, 0).unwrap()).is_empty());
+            assert!(!votes_in(a.vote_on_timeouts(&keys[0], NOW + WAIT_FROM_MS, 0).unwrap()).is_empty(), "{waits} waits: ten seconds");
         }
 
         let (mut a, _, _, keys) = three_at_the_deck_stage();
         a.set_patience(&[0, 0, 1]);
         let held = 1u32 << 2;
-        assert!(a.vote_on_timeouts(&keys[0], NOW + 39_999, held).unwrap().is_empty(), "still delivered: twice its time");
-        assert!(!a.vote_on_timeouts(&keys[0], NOW + 40_000, held).unwrap().is_empty());
+        assert!(votes_in(a.vote_on_timeouts(&keys[0], NOW + 39_999, held).unwrap()).is_empty(), "still delivered: twice its time");
+        assert!(!votes_in(a.vote_on_timeouts(&keys[0], NOW + 40_000, held).unwrap()).is_empty());
     }
 
     /// `D-059`: a stall is watched while it stands and counted once when it is
@@ -19063,6 +19098,40 @@ mod tests {
             assert_eq!(verdict == Judged::Proven, judged, "commitment owed by seat {withheld_from_1}: {verdict:?}");
             assert_eq!(verdict == Judged::Unjudgeable, !judged);
         }
+    }
+
+    /// `S1-LL`: the votes among `sends` -- a question (`CAUSE_QUESTION`) asked
+    /// at a cryptographic stage five seconds in is none.
+    fn votes_in(sends: Vec<Send>) -> Vec<Vec<u8>> {
+        bytes_of_sends(sends).into_iter().filter(|b| !is_question(b)).collect()
+    }
+
+    /// `S1-LL`: **a frame kept from the next seat to act is asked for five
+    /// seconds in at a cryptographic stage**, with no later frame of a third seat
+    /// in hand -- the table waits on this seat, so none exists -- once, as a
+    /// question that counts towards nothing; never at a turn.
+    #[test]
+    fn a_frame_kept_from_the_next_seat_is_asked_for_five_seconds_in() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 0 && to == 2 && is_kind(b, EventType::DealPrivate) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert_eq!(hands[2].waiting_for(), vec![0], "seat 2 waits on seat 0's deal share");
+        assert!(!hands[2].moved_past_by_another(0), "and holds no later frame of anybody's");
+        let t0 = hands[2].stage_at_ms;
+        assert!(hands[2].vote_on_timeouts(&keys[2], t0 + 4_000, 0).unwrap().is_empty(), "not before five seconds");
+        let asks = bytes_of_sends(hands[2].vote_on_timeouts(&keys[2], t0 + 5_000, 0).unwrap());
+        assert_eq!(asks.len(), 1, "one question");
+        let opened = chained::open_in_hand(&asks[0], FRAME_CAP, EventType::TimeoutVote, &hands[2].open.table_id, hands[2].open.hand_id).unwrap();
+        let body: TimeoutVote = chained::payload(&opened, TIMEOUT_VOTE_CAP).unwrap();
+        assert_eq!((body.subject_seat, body.cause), (0, Some(CAUSE_QUESTION)), "a question about seat 0");
+        assert!(hands[2].vote_on_timeouts(&keys[2], t0 + 9_000, 0).unwrap().is_empty(), "once");
+        assert!(!hands[2].asks_unprompted(EventType::ActionCall), "never at a turn");
     }
 
     /// `S1-LK`: **a share frame with an entry that is no share of this deck is

@@ -13492,12 +13492,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     None => format!("{s} never heard this hand"),
                                 })
                                 .collect();
+                            // `S1-LL`: a tick that only asked says so -- `D-065`'s
+                            // early question goes at every cryptographic stage five
+                            // seconds in, long before any clock runs out.
+                            let asked_only = sends
+                                .iter()
+                                .all(|crate::table::hand::Send::Broadcast(b)| crate::table::hand::is_question(b));
                             let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "my clock has run out on seat {} — {mine}; I am at stage {at}, {}",
-                                    who.join(", "),
-                                    seen.join(", ")
-                                )))
+                                .send(NodeEvent::Warning(if asked_only {
+                                    format!(
+                                        "asked for a frame this client lacks from seat(s) {} (D-065); I am at stage {at}, {}",
+                                        who.join(", "),
+                                        seen.join(", ")
+                                    )
+                                } else {
+                                    format!(
+                                        "my clock has run out on seat {} — {mine}; I am at stage {at}, {}",
+                                        who.join(", "),
+                                        seen.join(", ")
+                                    )
+                                }))
                                 .await;
                             // The same reading as at the macro's site, because a
                             // vote cast on this tick must not go unsampled just
