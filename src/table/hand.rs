@@ -4524,6 +4524,7 @@ impl Hand {
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
         let button = self.mine.button_position;
+        let sb_position = self.mine.sb_position;
         let bb_seat = self.mine.bb_seat;
         let seat_count = self.open.max_players;
         let up = {
@@ -4538,7 +4539,7 @@ impl Hand {
             if betting_is_closed(&play.round, &play.dealt) {
                 None
             } else {
-                first_to_act(street, &play.round, &play.dealt, button, bb_seat, seat_count)
+                first_to_act(street, &play.round, &play.dealt, button, sb_position, bb_seat, seat_count)
             }
         };
         match up {
@@ -5137,6 +5138,7 @@ impl Hand {
     fn begin_showdown(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         self.showdown_opened_ms.get_or_insert(now_ms);
         let button = self.mine.button_position;
+        let sb_position = self.mine.sb_position;
         let bb_seat = self.mine.bb_seat;
         let seat_count = self.open.max_players;
 
@@ -5167,6 +5169,7 @@ impl Hand {
                         &play.round,
                         &play.dealt,
                         button,
+                        sb_position,
                         bb_seat,
                         seat_count,
                     )
@@ -22720,6 +22723,34 @@ mod tests {
         }
         flood_among(&mut hands, &keys, &mut said, pending);
         (hands, keys, said)
+    }
+
+    /// `S1-KU`: **a river checked through shows from the first live seat left
+    /// of the button** (TDA 17-A) -- in a hand dealt to three whose button
+    /// folded, the small blind; the heads-up key had the big blind show first.
+    #[test]
+    fn a_hand_folded_down_to_two_shows_from_the_first_seat_left_of_the_button() {
+        let (mut hands, keys, mut said) = n_seats_to_the_bet(3);
+        let (button, sb) = (hands[0].mine.button_position, hands[0].mine.sb_position);
+        for _ in 0..64 {
+            let turn = hands[usize::from(sb)].turn().expect("a betting stage open");
+            let s = usize::from(turn.seat);
+            let action = if turn.seat == button {
+                Action::Fold
+            } else if turn.legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let sends = hands[s].act(action, &keys[s], NOW).expect("a legal action");
+            let order = hands[s].showdown_order();
+            if !order.is_empty() {
+                assert_eq!(order.first().copied(), Some(sb), "the small blind shows first: {order:?}");
+                return;
+            }
+            flood_among(&mut hands, &keys, &mut said, vec![(s, sends)]);
+        }
+        panic!("the hand never reached its showdown");
     }
 
     /// `S1-KK`: `frames` into a restored hand in order, the early held and the

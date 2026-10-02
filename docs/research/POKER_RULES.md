@@ -110,7 +110,12 @@ nothing; PokerTH's engine has no ante concept at all.
 
 ### A1.2 Heads-up button and blind rule
 
-With exactly two live players:
+With exactly two seats holding chips -- heads-up play, whose positions put the small blind on the button. Not two
+players left in a hand, and not two dealt in: a hand dealt to three or more that folds down to two, and a hand dealt
+to two beside an absent seat with chips (D-005: it takes no cards, and posts its blind dead when the blind is its),
+keep the 3+-handed order of A2. The engine keys its two-player branch on `sb_seat == button_seat`, which only
+heads-up positions produce; it once keyed it on two live players and played those hands in heads-up order -- after
+the flop, and before it where two seats were absent (`S1-KU`, D-093).
 
 > **TDA 34-B, verbatim:** "Heads-up, the small blind is the button, is dealt the
 > last card, and acts first pre-flop and last on all other betting rounds.
@@ -209,7 +214,7 @@ Streets in order: `PreFlop → Flop → Turn → River → Showdown`. The board 
 
 **First to act:**
 
-| Street | 2 live players | 3+ live players |
+| Street | Heads-up positions (A1.2) | Otherwise |
 |---|---|---|
 | Pre-flop | `button_seat` (= SB) | `succ_live(bb_seat)` (UTG) |
 | Flop / Turn / River | `bb_seat` (non-button) | `succ_live(button_pos)` |
@@ -219,6 +224,10 @@ For 3+ players post-flop, `succ_live(button_pos)` is computed from the button
 must be retained even when nobody occupies it.
 
 Action then proceeds clockwise, skipping folded and all-in players.
+
+The left-hand column is for heads-up positions, never for a count of the players still in the hand (A1.2): a hand
+that folds down to two keeps the right-hand column, the first live seat left of the button opening the flop
+(`S1-KU`).
 
 **A betting round ends** when both of the following hold:
 

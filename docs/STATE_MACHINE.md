@@ -3277,7 +3277,9 @@ behind (blinds already committed, `current_bet == BB`, nobody has acted), and
 `POKER_RULES.md` A1.2 is emphatic that the heads-up post-flop order is the *inverse* of the
 3+-handed order and must be an explicit two-player branch with unit tests on both, even though
 the general formula happens to give the right answer. This document adopts that instruction as
-normative.
+normative. Heads-up here is §7.1's -- the hand's positions, `sb_pos == button_pos` -- never a count of the seats
+still in the hand or dealt into it: a hand dealt to three or more that folds down to two, or one dealt to two
+beside an absent seat with chips (D-005), keeps the 3+-handed order (`S1-KU`, D-093).
 
 ---
 
@@ -3411,7 +3413,7 @@ here so the engine specification is self-contained.
   the sole mechanism giving the big blind its option, so it must not be "optimised" away.
 * Heads-up (exactly two seats with chips): `sb_pos == button_pos`, `bb_seat` is the other seat;
   pre-flop the button acts first, post-flop the big blind acts first and the button acts last.
-  Implement as an explicit two-player branch (A1.2).
+  Implement as an explicit two-player branch (A1.2), keyed on `sb_pos == button_pos` (`S1-KU`).
 
 ### 7.2 Button rotation, dead button, busts
 

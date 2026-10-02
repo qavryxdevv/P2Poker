@@ -298,6 +298,7 @@ fn three_peers_deal_and_play_one_hand() {
         &round,
         &dealt_in,
         BUTTON,
+        1,
         2,
         SEATS as u8,
     );

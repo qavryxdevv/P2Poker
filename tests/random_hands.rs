@@ -22,6 +22,20 @@ use p2p_poker::poker::pots::{award, build_pots, total};
 use p2p_poker::poker::state::{Card, Chips, SeatIdx, Street};
 use p2p_poker::poker::tournament::{HEADS_UP_CUSTOM_2P, RATED_SNG_POKERTH_V1};
 
+thread_local! {
+    /// `S1-KU`: what the engine decided, decision by decision, while a test
+    /// asks for it -- the digest the engine is pinned by.
+    static DECISIONS: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn record(bytes: &[u8]) {
+    DECISIONS.with(|d| {
+        if let Some(log) = d.borrow_mut().as_mut() {
+            log.extend_from_slice(bytes);
+        }
+    });
+}
+
 /// Deterministic, reproducible, and not used for anything that must be secret.
 struct Xorshift(u64);
 
@@ -121,7 +135,7 @@ fn play_hand(
 
     loop {
         // --- betting on this street -------------------------------------
-        let mut to_act = first_to_act(street, &round, dealt_in, button, bb_seat, seat_count);
+        let mut to_act = first_to_act(street, &round, dealt_in, button, sb_seat, bb_seat, seat_count);
         let mut guard = 0;
         while let Some(seat) = to_act {
             // Everyone folding to one seat ends the hand at once. The survivor
@@ -156,6 +170,27 @@ fn play_hand(
             }
 
             let action = choices[rng.below(choices.len())];
+            // Who was offered the turn, what the engine offered, what was taken.
+            let (tag, amount) = match action {
+                Action::Fold => (0u8, 0),
+                Action::Check => (1, 0),
+                Action::Call => (2, 0),
+                Action::Bet(x) => (3, x),
+                Action::Raise(x) => (4, x),
+            };
+            record(&[
+                street as u8,
+                seat,
+                u8::from(legal.can_fold),
+                u8::from(legal.can_check),
+                u8::from(legal.can_call),
+                u8::from(legal.can_bet),
+                u8::from(legal.can_raise),
+                tag,
+            ]);
+            record(&legal.min_raise_to.to_le_bytes());
+            record(&legal.max_raise_to.to_le_bytes());
+            record(&amount.to_le_bytes());
             round.apply(seat, action).unwrap_or_else(|e| {
                 panic!("engine offered {action:?} to seat {seat} and then rejected it: {e:?}")
             });
@@ -242,6 +277,9 @@ fn play_hand(
         }
     }
 
+    for s in stacks.iter() {
+        record(&s.to_le_bytes());
+    }
     HandOutcome {
         chips_before,
         chips_after: stacks.iter().sum(),
@@ -345,4 +383,49 @@ fn tiny_stacks_exercise_the_all_in_paths() {
     }
     println!("hands played: {played}");
     assert!(played > 10_000, "only {played} hands played; the driver stalled");
+}
+
+/// `S1-KU`: **the engine is the protocol major's.** Two clients of one major
+/// must decide every turn, every legal set and every pot alike: the cheat band
+/// is to judge a betting action against the engine (`S1-KT`), and two engines
+/// that differ would prove an honest seat a cheat. So every decision over a
+/// seeded corpus -- heads-up, three-, six- and ten-handed, deep and tiny stacks
+/// -- is pinned by its digest for this major, and a change to what the engine
+/// decides there fails here until the major moves (`D-089`'s procedure) and the
+/// digest is pinned again. What the corpus does not reach it does not pin: this
+/// driver lays out its own positions and deals in every seat with chips, so the
+/// positions (`initial_positions`, `advance_positions`), a dead button and an
+/// absent seat (D-005) stand on their own unit tests. Written out, not
+/// recomputed: a test that recomputes what it checks passes whatever the code
+/// does.
+#[test]
+fn the_engine_is_the_protocol_majors() {
+    DECISIONS.with(|d| *d.borrow_mut() = Some(Vec::new()));
+    // 250 tables of each shape, each played to its end or 300 hands. Three-handed
+    // is where a hand folds down to two most often (`S1-KU`).
+    let mut played = 0;
+    for (first, seats, stack) in [
+        (0x5eed_0000u64, 2usize, 10_000),
+        (0x5eed_1000, 3, 10_000),
+        (0x5eed_2000, 6, 10_000),
+        (0x5eed_3000, 10, 10_000),
+        (0x5eed_4000, 6, 300),
+    ] {
+        for seed in first..first + 250 {
+            played += run_table(seed, 300, seats, stack);
+        }
+    }
+    let log = DECISIONS.with(|d| d.borrow_mut().take()).expect("recorded");
+    assert!(played > 2_000, "only {played} hands: the corpus pins too little");
+    let digest = blake3::hash(&log).to_hex().to_string();
+    assert_eq!(
+        p2p_poker::protocol::constants::PROTOCOL_MAJOR,
+        3,
+        "a new major: pin this digest again (the engine may change with it)"
+    );
+    assert_eq!(
+        digest, "f91019a3befc48af2e1292c8b7fd68083b90ebbcce902fd9162f680f64ce54ef",
+        "the engine decided something else over the pinned corpus ({} bytes of decisions): that is a rule change, and a rule change is a protocol major (D-089)",
+        log.len()
+    );
 }

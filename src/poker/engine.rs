@@ -75,15 +75,28 @@ pub fn post_blinds(round: &mut BettingRound, sb_seat: SeatIdx, bb_seat: SeatIdx,
 /// how the bug survives review, so it is spelled out here instead.
 /// PokerTH branches explicitly for the same reason
 /// (`src/engine/local_engine/localhand.cpp:435-476`).
+///
+/// **Heads-up is the hand's positions, not a count** (`S1-KU`): two seats with
+/// chips, the small blind on the button (TDA 34-B), which [`initial_positions`]
+/// and [`advance_positions`] lay out for two alone. Not two seats left in the
+/// hand: one dealt to three or more that folds down to two keeps the ring's
+/// order, the first live seat left of the button opening every street after the
+/// flop. And not two seats dealt in: beside an absent seat with chips (D-005),
+/// which takes no cards and posts its blind dead when the blind is its, the
+/// positions are the whole ring's. Keyed on two live seats, the big blind opened
+/// the flop when the button had folded, the button when the big blind had or was
+/// absent -- and with two seats absent at four or more, the big blind or the
+/// button acted first before the flop.
 pub fn first_to_act(
     street: Street,
     round: &BettingRound,
     dealt_in: &DealtIn,
     button: SeatIdx,
+    sb_position: SeatIdx,
     bb_seat: SeatIdx,
     seat_count: u8,
 ) -> Option<SeatIdx> {
-    let heads_up = live_count(round, dealt_in) == 2;
+    let heads_up = sb_position == button;
 
     let start = match (street, heads_up) {
         // The button is the small blind and acts first.
@@ -328,7 +341,7 @@ mod tests {
         post_blinds(&mut r, 1, 2, 50, 100);
 
         // Seat 0 is UTG (first after the BB at seat 2, wrapping).
-        assert_eq!(first_to_act(Street::PreFlop, &r, &dealt, 0, 2, 3), Some(0));
+        assert_eq!(first_to_act(Street::PreFlop, &r, &dealt, 0, 1, 2, 3), Some(0));
 
         r.apply(0, Action::Call).unwrap(); // UTG calls 100
         r.apply(1, Action::Call).unwrap(); // SB completes to 100
@@ -352,16 +365,91 @@ mod tests {
         post_blinds(&mut r, 0, 1, 50, 100);
 
         assert_eq!(
-            first_to_act(Street::PreFlop, &r, &dealt, 0, 1, 2),
+            first_to_act(Street::PreFlop, &r, &dealt, 0, 0, 1, 2),
             Some(0),
             "the button is the small blind and acts first pre-flop"
         );
         for street in [Street::Flop, Street::Turn, Street::River] {
             assert_eq!(
-                first_to_act(street, &r, &dealt, 0, 1, 2),
+                first_to_act(street, &r, &dealt, 0, 0, 1, 2),
                 Some(1),
                 "post-flop the big blind opens and the button closes"
             );
+        }
+    }
+
+    /// `S1-KU`: **heads-up order is for heads-up positions alone.** A hand
+    /// dealt to three that folds down to two keeps the ring's order -- the small
+    /// blind opens the flop whether the button or the big blind folded before
+    /// it -- and so does a hand dealt to two beside a seat that posts its blind
+    /// dead and takes no cards (D-005). Each was once played in heads-up order.
+    #[test]
+    fn heads_up_order_is_for_heads_up_positions_alone() {
+        // Three dealt in. The button folds, the small blind completes, the big
+        // blind checks.
+        let dealt = [true, true, true];
+        let mut r = round(100, &[5000, 5000, 5000]);
+        post_blinds(&mut r, 1, 2, 50, 100);
+        r.apply(0, Action::Fold).unwrap();
+        r.apply(1, Action::Call).unwrap();
+        r.apply(2, Action::Check).unwrap();
+        assert_eq!(live_count(&r, &dealt), 2);
+        for street in [Street::Flop, Street::Turn, Street::River] {
+            assert_eq!(
+                first_to_act(street, &r, &dealt, 0, 1, 2, 3),
+                Some(1),
+                "the small blind opens, the big blind closes"
+            );
+        }
+        // The big blind folds to a raise the small blind calls.
+        let mut r = round(100, &[5000, 5000, 5000]);
+        post_blinds(&mut r, 1, 2, 50, 100);
+        r.apply(0, Action::Raise(300)).unwrap();
+        r.apply(1, Action::Call).unwrap();
+        r.apply(2, Action::Fold).unwrap();
+        assert_eq!(
+            first_to_act(Street::Flop, &r, &dealt, 0, 1, 2, 3),
+            Some(1),
+            "the small blind opens, the button closes"
+        );
+
+        // D-005: the big blind is absent, its blind posted dead; two dealt in.
+        let dealt = [true, true, false];
+        let mut r = round(100, &[5000, 5000, 5000]);
+        post_blinds(&mut r, 1, 2, 50, 100);
+        assert_eq!(
+            first_to_act(Street::PreFlop, &r, &dealt, 0, 1, 2, 3),
+            Some(0),
+            "pre-flop the first seat after the big blind: the button"
+        );
+        assert_eq!(
+            first_to_act(Street::Flop, &r, &dealt, 0, 1, 2, 3),
+            Some(1),
+            "after the flop the small blind, and the button closes"
+        );
+        // D-005: the button is absent; the blinds play it out.
+        let dealt = [false, true, true];
+        let mut r = round(100, &[5000, 5000, 5000]);
+        post_blinds(&mut r, 1, 2, 50, 100);
+        assert_eq!(
+            first_to_act(Street::PreFlop, &r, &dealt, 0, 1, 2, 3),
+            Some(1),
+            "pre-flop the small blind"
+        );
+        assert_eq!(
+            first_to_act(Street::Flop, &r, &dealt, 0, 1, 2, 3),
+            Some(1),
+            "and after the flop: the big blind keeps its position on it"
+        );
+
+        // D-005 at four seats, two absent: before the flop the first live seat
+        // after the big blind -- the heads-up key had the big blind, or the
+        // button, act first.
+        for dealt in [[false, false, true, true], [true, false, false, true]] {
+            let mut r = round(100, &[5000, 5000, 5000, 5000]);
+            post_blinds(&mut r, 1, 2, 50, 100);
+            assert_eq!(first_to_act(Street::PreFlop, &r, &dealt, 0, 1, 2, 4), Some(3), "{dealt:?}");
+            assert_eq!(first_to_act(Street::Flop, &r, &dealt, 0, 1, 2, 4), Some(if dealt[2] { 2 } else { 3 }), "{dealt:?}");
         }
     }
 
@@ -374,7 +462,7 @@ mod tests {
         let r = round(100, &[5000, 0, 5000, 5000]);
 
         assert_eq!(
-            first_to_act(Street::Flop, &r, &dealt, 1, 3, 4),
+            first_to_act(Street::Flop, &r, &dealt, 1, 2, 3, 4),
             Some(2),
             "the dead button position still orders the ring"
         );
@@ -628,7 +716,7 @@ mod tests {
         let mut r = round(100, &[0, 0]);
         r.stack = vec![0, 0];
         r.acted = vec![true, true];
-        assert_eq!(first_to_act(Street::Flop, &r, &dealt, 0, 1, 2), None);
+        assert_eq!(first_to_act(Street::Flop, &r, &dealt, 0, 0, 1, 2), None);
         assert_eq!(next_to_act(&r, &dealt, 0, 2), None);
     }
 
