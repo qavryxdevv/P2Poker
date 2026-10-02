@@ -2870,7 +2870,9 @@ the disposition of J2, and the clause it replaces is deleted (D-013):**
 > chain-`k` stage-0 event of this table signed by a roster key, grouped by
 > `(previous_event_hash, body)` and byte-identical within the group; the parent
 > is taken as `GENESIS(k)`, the body's `n(9) stacks`, `n(1) button_position`,
-> `n(4) level` and blinds as the opening's, and **the body's `n(8) dealt_in` joined
+> `n(2) sb_position` and `n(3) bb_seat` (`S1-KV`: taken where they have the
+> rotation's own shape, else laid out from the button), `n(4) level` and blinds as
+> the opening's, and **the body's `n(8) dealt_in` joined
 > with the seats that signed as `R(k)`** (D-039; it was the signers alone). A receiver
 > that `dealt_in` names is a member of the adopted hand: it opens it at that genesis
 > and emits its own `HAND_INIT(k)` with the same body, which is the copy the table's
@@ -9014,11 +9016,11 @@ ENGINE_DIGEST                   = 83021f6e91984aaa…  (S1-KT, D-093/D-094: the
   carried in HAND_INIT n(12) beside ENGINE_SOURCE; a change to what the
   engine decides there is a new digest and a new protocol major, one digest
   pinned per major.)
-ENGINE_SOURCE                   = 134d275171513dd8…  (S1-KT, D-094: the digest of the
+ENGINE_SOURCE                   = 2be3475d093e4f00…  (S1-KT, D-094: the digest of the
   code the engine and the hand's judge decide by -- src/poker/engine.rs and
   actions.rs before their tests, and the functions of src/table/hand.rs a
   betting stage's round and its judgement stand on, comments and whitespace
-  dropped -- 134d275171513dd817c17544e5c238be1d90e25ff74319e4fa3932e5bbcb8c84.
+  dropped -- 2be3475d093e4f00bd569de7f1c77c3e750085a7aaa88ddf5e48e3d99916b480.
   HAND_INIT n(12) is blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖
   ENGINE_SOURCE): two clients that differ in either never share a hand.)
 CHEAT_HOLD_MS                   = 8 000         (client liveness, D-090: how

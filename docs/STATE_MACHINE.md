@@ -3429,7 +3429,9 @@ next_button_pos = old sb_pos                // a POSITION; may now be empty -> d
 A dead small blind is simply not posted and the pot is one small blind lighter. A dead button is
 still a well-defined index and is used by the post-flop action order (A2) and the odd-chip rule
 (A8). At two players, apply TDA 34-B: adjust the button if the rotation would give one player the
-big blind twice in a row.
+big blind twice in a row. The next hand's `HAND_INIT` carries all three as the rotation left them --
+never laid out again from the button, which skipped a seat's big blind when the big blind busted
+(`S1-KV`, D-095).
 
 A seat whose stack reaches 0 is eliminated at the **end** of the hand and is not dealt into the
 next one. Simultaneous bust-outs are ranked by `start_stack_this_hand`, larger finishing higher;

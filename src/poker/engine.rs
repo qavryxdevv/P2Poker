@@ -378,7 +378,17 @@ pub fn advance_positions(prev: Positions, alive: &[bool], seat_count: u8) -> Opt
         // and small blind. Stated directly rather than derived, because the
         // TDA 34-B adjustment exists precisely so the general rotation cannot
         // hand one player the big blind twice.
-        let big_blind = if prev.big_blind == a { b } else { a };
+        // `S1-KV`: the big blind alternates while both seats played it in
+        // turn; where the last big blind busted it moves on as the rotation
+        // moves it, to the next seat with chips -- which took the lower seat
+        // before, and passed the big blind over the seat it was due to.
+        let big_blind = if prev.big_blind == a {
+            b
+        } else if prev.big_blind == b {
+            a
+        } else {
+            succ_alive(prev.big_blind, alive, seat_count)?
+        };
         let other = if big_blind == a { b } else { a };
         return Some(Positions { button: other, small_blind: other, big_blind });
     }
@@ -389,6 +399,43 @@ pub fn advance_positions(prev: Positions, alive: &[bool], seat_count: u8) -> Opt
         small_blind: prev.big_blind,
         big_blind,
     })
+}
+
+/// `S1-KV`: positions a previous hand laid out -- [`advance_positions`]'
+/// answer, a dead button or a dead small blind among them, or the ones an
+/// adopted hand's `HAND_INIT` carries -- where they still fit the seats with
+/// chips and have the rotation's own shape: two seats with chips at least,
+/// every position a seat of the table, the big blind the first seat with chips
+/// after the small blind, and the small blind on the button exactly when two
+/// seats have chips (TDA 34-B) -- three or more, with no seat with chips between
+/// them. Every layout the rotation makes has it, so an honest one is never sent
+/// back; a copy laid out any other way is (the refuter's: a seat skipped, the
+/// adopter both button and big blind). `None` sends the caller to
+/// [`initial_positions`], which lays them out from the button alone and never
+/// leaves a small blind dead.
+pub fn carried_positions(
+    button: SeatIdx,
+    small_blind: SeatIdx,
+    big_blind: SeatIdx,
+    alive: &[bool],
+    seat_count: u8,
+) -> Option<Positions> {
+    let with_chips = alive.iter().filter(|a| **a).count();
+    if with_chips < 2 || button >= seat_count || small_blind >= seat_count || big_blind >= seat_count {
+        return None;
+    }
+    let has_chips = |s: SeatIdx| alive.get(usize::from(s)).copied().unwrap_or(false);
+    if !has_chips(big_blind) || succ_alive(small_blind, alive, seat_count) != Some(big_blind) {
+        return None;
+    }
+    let two = with_chips == 2;
+    if two != (button == small_blind) || (two && !has_chips(button)) {
+        return None;
+    }
+    if !two && ring_after(button, seat_count).take_while(|s| *s != small_blind).any(has_chips) {
+        return None;
+    }
+    Some(Positions { button, small_blind, big_blind })
 }
 
 #[cfg(test)]
@@ -569,6 +616,53 @@ mod tests {
         let mut r = round(100, &[0, 5000, 5000]);
         r.apply(1, Action::Bet(300)).unwrap();
         assert_eq!(turn_after(&r, &dealt, 1, 3), Some(2));
+    }
+
+    /// `S1-KV`: **TDA 32's dead small blind.** Five seats, button 1, small
+    /// blind 2, big blind 3, and seat 3 busts: the rotation plays button 2, the
+    /// small blind dead on seat 3, seat 4 the big blind -- and carried, those
+    /// are the next hand's positions. Laid out from the button alone they were
+    /// button 2, small blind 4, big blind 0: seat 4 skipped the big blind.
+    #[test]
+    fn the_rotation_carried_leaves_the_small_blind_dead_on_a_busted_seat() {
+        let alive = [true, true, true, false, true];
+        let prev = Positions { button: 1, small_blind: 2, big_blind: 3 };
+        let next = advance_positions(prev, &alive, 5).unwrap();
+        assert_eq!(next, Positions { button: 2, small_blind: 3, big_blind: 4 });
+        assert_eq!(carried_positions(2, 3, 4, &alive, 5), Some(next), "carried as laid out");
+        assert_eq!(
+            initial_positions(2, &alive, 5),
+            Some(Positions { button: 2, small_blind: 4, big_blind: 0 }),
+            "from the button alone seat 4 would skip the big blind"
+        );
+        // Positions that no longer fit are not carried.
+        assert_eq!(carried_positions(2, 3, 3, &alive, 5), None, "a big blind on a seat without chips");
+        assert_eq!(carried_positions(2, 3, 4, &alive, 4), None, "a seat off the table");
+        assert_eq!(carried_positions(2, 2, 4, &alive, 5), None, "the button on the small blind at three seats");
+        let two = [false, true, false, false, true];
+        assert_eq!(carried_positions(1, 1, 4, &two, 5), Some(Positions { button: 1, small_blind: 1, big_blind: 4 }));
+        assert_eq!(carried_positions(2, 1, 4, &two, 5), None, "heads-up the button is the small blind");
+        // The refuter's: the rotation's own shape, or nothing.
+        let one = [false, true, false, false, false];
+        assert_eq!(carried_positions(0, 2, 1, &one, 5), None, "one seat with chips is the end, not a hand");
+        let six = [true; 6];
+        assert_eq!(carried_positions(2, 0, 2, &six, 6), None, "the adopter both button and big blind");
+        assert_eq!(carried_positions(5, 3, 2, &six, 6), None, "a big blind not after the small blind");
+        assert_eq!(carried_positions(0, 2, 3, &six, 6), None, "seat 1 skipped between button and small blind");
+        assert_eq!(carried_positions(1, 2, 3, &six, 6), Some(Positions { button: 1, small_blind: 2, big_blind: 3 }));
+    }
+
+    /// `S1-KV` (its refuter, a finding of its own): **three to two, the last big
+    /// blind busted** -- the big blind moves on as the rotation moves it. Five
+    /// seats, chips on 1, 3 and 4, button 4, small blind 1, big blind 3, and
+    /// seat 3 busts: seat 4 is next and takes the big blind, seat 1 the button
+    /// and the small blind. The lower seat took it before, and seat 4 was passed
+    /// over.
+    #[test]
+    fn three_to_two_with_the_big_blind_busted_moves_the_big_blind_on() {
+        let alive = [false, true, false, false, true];
+        let prev = Positions { button: 4, small_blind: 1, big_blind: 3 };
+        assert_eq!(advance_positions(prev, &alive, 5), Some(Positions { button: 1, small_blind: 1, big_blind: 4 }));
     }
 
     /// Three-handed post-flop the first live seat after the button opens — and

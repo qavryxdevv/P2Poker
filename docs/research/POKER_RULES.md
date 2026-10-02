@@ -173,6 +173,10 @@ When the field reaches two players, apply the TDA 34-B adjustment: if applying
 the rotation above would give one player the big blind twice in a row, the button
 is adjusted so it does not.
 
+**The next hand is laid out by this rotation, not again from the button** (`S1-KV`,
+D-095): the client once carried the button alone and laid the blinds out from it, so
+a big blind that busted moved them past a seat, which skipped the big blind.
+
 **PokerTH does NOT implement the dead button.** Verification: (source)
 `src/engine/game.cpp:191-210` shifts `dealerPosition` to the next entry found in
 `activePlayerList` — i.e. the next *surviving player*, skipping busted seats

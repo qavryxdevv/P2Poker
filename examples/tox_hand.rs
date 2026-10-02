@@ -169,6 +169,7 @@ async fn main() {
         returns: vec![0, 0],
         out: Vec::new(),
         button: None,
+        blinds: None,
         ratified_at: Vec::new(),
     };
 

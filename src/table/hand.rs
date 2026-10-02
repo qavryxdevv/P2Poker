@@ -47,8 +47,8 @@ use crate::mental_poker::shuffle::{ChainParams, ShuffleChain, StepError};
 use crate::mental_poker::protocol::{DeckCrypto, VerifyOutcome};
 use crate::poker::actions::{Action, BettingRound, Illegal, LegalActions};
 use crate::poker::engine::{
-    advance_positions, first_to_act, initial_positions, next_street, only_one_live, opening_round, opening_turn,
-    table_action, turn_after, Positions,
+    advance_positions, carried_positions, first_to_act, initial_positions, next_street, only_one_live, opening_round,
+    opening_turn, table_action, turn_after, Positions,
 };
 use crate::poker::evaluator::{evaluate_holdem, HandRank};
 use crate::poker::pots::{award, build_pots};
@@ -361,6 +361,11 @@ pub struct Opening {
     /// exists. From hand two onwards it is the dead-button rotation's answer,
     /// and re-rolling it from `session_id` would move the button backwards.
     pub button: Option<SeatIdx>,
+    /// `S1-KV`: the small blind's position and the big blind's seat laid out
+    /// with `button` -- the previous hand's dead-button rotation, TDA 32's dead
+    /// small blind among it, or what the adopted hand's `HAND_INIT` carries.
+    /// `None` for the first hand, laid out from the button alone.
+    pub blinds: Option<(SeatIdx, SeatIdx)>,
 }
 
 impl Opening {
@@ -419,6 +424,7 @@ impl Opening {
             out: Vec::new(),
             // The first hand of a table: nothing has decided the button yet.
             button: None,
+            blinds: None,
             ratified_at,
         })
     }
@@ -655,6 +661,7 @@ impl Opening {
             big_blind: body.big_blind,
             level: body.level,
             button: Some(body.button_position),
+            blinds: Some((body.sb_position, body.bb_seat)),
             roster_hash: body.roster_hash,
             grace: vec![GRACE_HANDS; usize::from(base.max_players)],
             present_run: vec![0; usize::from(base.max_players)],
@@ -2583,9 +2590,7 @@ impl Hand {
         // Keyed on **chips**, not on occupancy. A busted seat is still an
         // occupied seat, so "two seats at the table" and "two players with
         // chips" part company the moment somebody busts — and heads-up is a
-        // rule about the second of those. `initial_positions` is the engine's
-        // own TDA 32 implementation and gets it right; deriving it a second
-        // time here is how the two would come to disagree.
+        // rule about the second of those.
         let mut alive = vec![false; usize::from(o.max_players)];
         for (seat, _, stack) in &o.seats {
             let Some(slot) = alive.get_mut(usize::from(*seat)) else {
@@ -2593,11 +2598,20 @@ impl Hand {
             };
             *slot = *stack > 0;
         }
+        // `S1-KV`: the positions the previous hand's rotation laid out -- TDA
+        // 32's dead button and dead small blind with them -- where they still
+        // fit; laid out from the button alone only for the first hand. Laid out
+        // again every hand, a big blind that busted moved the blinds past a
+        // seat, which skipped the big blind.
         let Positions {
             button,
             small_blind: sb_position,
             big_blind: bb_seat,
-        } = initial_positions(button, &alive, o.max_players).ok_or(Failed::NotInThisStage)?;
+        } = o
+            .blinds
+            .and_then(|(sb, bb)| carried_positions(button, sb, bb, &alive, o.max_players))
+            .or_else(|| initial_positions(button, &alive, o.max_players))
+            .ok_or(Failed::NotInThisStage)?;
 
         let mine = HandInit {
             // `S1-KT`: the engine this client decides the hand by (`D-093`).
@@ -11845,6 +11859,7 @@ impl Hand {
             returns,
             out,
             button: Some(positions.button),
+            blinds: Some((positions.small_blind, positions.big_blind)),
             ratified_at: self.open.ratified_at.clone(),
         })
     }
@@ -14306,6 +14321,7 @@ mod tests {
             returns: vec![0; 3],
             out: Vec::new(),
             button: None,
+            blinds: None,
             ratified_at: Vec::new(),
         }
     }
@@ -14350,6 +14366,7 @@ mod tests {
             returns: vec![0; 5],
             out: Vec::new(),
             button: None,
+            blinds: None,
             ratified_at: Vec::new(),
         }
     }
@@ -14447,6 +14464,7 @@ mod tests {
             returns: vec![0; 3],
             out: Vec::new(),
             button: None,
+            blinds: None,
             ratified_at: Vec::new(),
         }
     }
@@ -23348,6 +23366,35 @@ mod tests {
         }
         flood_among(&mut hands, &keys, &mut said, pending);
         (hands, keys, said)
+    }
+
+    /// `S1-KV`: **a big blind that busts leaves the next small blind dead on
+    /// its seat** -- the next hand's positions are the rotation's, carried in the
+    /// opening, and its `HAND_INIT` says so -- where every hand laid out again
+    /// from the button alone moved the blinds past a seat, which skipped the big
+    /// blind.
+    #[test]
+    fn a_busted_big_blind_leaves_the_next_small_blind_dead() {
+        let keys: Vec<SigningKey> = (0..5).map(|s| key(10 + s)).collect();
+        let (h0, _) = Hand::open(hashed_opening(opening_n(5, 0)), &keys[0], NOW, 30_000).unwrap();
+        let me = if h0.mine.bb_seat == 0 { 1u8 } else { 0 };
+        let (h, _) = Hand::open(hashed_opening(opening_n(5, me)), &keys[usize::from(me)], NOW, 30_000).unwrap();
+        let (sb, bb) = (h.mine.sb_position, h.mine.bb_seat);
+        let mut stacks = vec![0 as Chips; usize::from(h.open.max_players)];
+        for (seat, _, stack) in &h.open.seats {
+            stacks[usize::from(*seat)] = *stack;
+        }
+        stacks[usize::from(bb)] = 0;
+        let after = (bb + 1) % 5;
+        let next = h.next_hand_with([3; 32], stacks).expect("a next hand");
+        assert_eq!(next.button, Some(sb), "the button on the old small blind");
+        assert_eq!(next.blinds, Some((bb, after)), "the small blind dead on the busted seat");
+        let (n, _) = Hand::open(next, &keys[usize::from(me)], NOW, 30_000).unwrap();
+        assert_eq!(
+            (n.mine.button_position, n.mine.sb_position, n.mine.bb_seat),
+            (sb, bb, after),
+            "and the next HAND_INIT carries them"
+        );
     }
 
     /// `S1-KU`: **a river checked through shows from the first live seat left

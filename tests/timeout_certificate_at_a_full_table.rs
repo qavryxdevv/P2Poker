@@ -357,6 +357,7 @@ fn opening_at_max_seats(my_seat: u8) -> Opening {
         returns: vec![0; n],
         out: Vec::new(),
         button: None,
+        blinds: None,
         ratified_at: Vec::new(),
     }
 }
