@@ -1604,10 +1604,11 @@ struct TableRun {
     /// `D-065`: the questions this client has answered, once each.
     vote_asks_answered: std::collections::BTreeSet<(u64, u64, u8, bool)>,
     /// `S1-LC`: the members whose frame of a running hand this client said in
-    /// answer to another seat's question, by that hand -- it relays their later
-    /// stage frames of that hand and of the next, `RELAY_HANDS` hands in all
-    /// ([`crate::table::hand::Hand::note_relays`]).
-    relays: std::collections::BTreeSet<(u64, u8)>,
+    /// answer to another seat's question, as (hand, asker, member) -- it relays
+    /// their later stage frames of that hand and of the next, `RELAY_HANDS`
+    /// hands in all ([`crate::table::hand::Hand::note_relays`]); `S1-LE`: at
+    /// most `RELAY_MEMBERS` members for one asker ([`add_relay`]).
+    relays: std::collections::BTreeSet<(u64, u8, u8)>,
     /// `D-066`: since when each seat has been gone from the table's group, as
     /// this client reads it with its own line sound (`note_unheard`).
     unheard_since: std::collections::BTreeMap<u8, tokio::time::Instant>,
@@ -3202,10 +3203,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     && !crate::table::hand::control("s1lc")
                                 {
                                     let hid = $h.hand_id();
-                                    $t.relays.retain(|(x, _)| x.saturating_add(RELAY_HANDS) > hid);
-                                    $t.relays.insert((hid, ask.seat));
-                                    let seats: Vec<u8> = $t.relays.iter().map(|(_, s)| *s).collect();
-                                    $h.note_relays(&seats);
+                                    add_relay(&mut $t.relays, hid, ask.voter, ask.seat);
+                                    $h.note_relays(&relay_members(&$t.relays, hid));
                                 }
                                 if !answer.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() {
                                     let mut said_again = 0usize;
@@ -3249,9 +3248,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // hears out-of-order messages as a matter
                                 // of course rather than as an exception.
                                 let (mut more, held_failures) = $h.replay_early(&app_key, now);
-                                // `S1-KB`: and the betting actions of other seats
-                                // the hand took, the held ones too, said again.
-                                say_again!($t, $h);
                                 let mut sends = sends;
                                 sends.append(&mut more);
                                 for e in held_failures {
@@ -3273,6 +3269,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .await;
                                 }
                                 publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
+                                // `S1-KB`: and the betting actions of other seats
+                                // the hand took, the held ones too, said again --
+                                // `S1-LE`: after this client's own frames, which a
+                                // relay's said again had queued behind.
+                                say_again!($t, $h);
                                 // `D-033`: the hand's card material goes into the
                                 // record the moment the deck stage begins -- not on
                                 // the next tick, which a stop at the deal beat by a
@@ -13239,8 +13240,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         for (ask, _, hand) in &answers {
                             if let Some((hid, me)) = running {
                                 if *hand == hid && !ask.silent && ask.seat != me && !crate::table::hand::control("s1lc") {
-                                    t.relays.retain(|(x, _)| x.saturating_add(RELAY_HANDS) > hid);
-                                    t.relays.insert((hid, ask.seat));
+                                    add_relay(&mut t.relays, hid, ask.voter, ask.seat);
                                 }
                             }
                         }
@@ -13297,9 +13297,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     h.note_asking_behind(&behind);
                     // `S1-LC`: and the members this client relays for in this hand --
                     // asked about within the last `RELAY_HANDS` hands.
-                    t.relays.retain(|(x, _)| x.saturating_add(RELAY_HANDS) > running_id);
-                    let relay_seats: Vec<u8> = t.relays.iter().map(|(_, s)| *s).collect();
-                    h.note_relays(&relay_seats);
+                    h.note_relays(&relay_members(&t.relays, running_id));
 
                     // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
                     // and the carrier's blind repair ladder puts its attempts in
@@ -14913,12 +14911,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // other genesis and none at this one (`S1-BS`).
                         let voice = quiet_if_contested(&opening, &t.next_inits);
                         // `S1-LC`: the relays asked for in the hand before carry over.
-                        let relay_seats: Vec<u8> = t
-                            .relays
-                            .iter()
-                            .filter(|(x, _)| x.saturating_add(RELAY_HANDS) > opening.hand_id)
-                            .map(|(_, s)| *s)
-                            .collect();
+                        let relay_seats = relay_members(&t.relays, opening.hand_id);
                         begin_hand_with(
                             opening,
                             voice,
@@ -16137,6 +16130,36 @@ fn note_unheard(
 /// and 9 s hands in turn); a relay outliving it costs one copy more of each of
 /// that member's frames.
 const RELAY_HANDS: u64 = 4;
+
+/// `S1-LE`: how many members one asker may have this client relay at once. A
+/// seat kept from one member, or two, needs no more; a rogue that asked about
+/// every member made every honest seat say the whole table again (`S1-LC`'s
+/// review).
+const RELAY_MEMBERS: usize = 2;
+
+/// `S1-LC`, `S1-LE`: a relay asked by `asker` for `member` at hand `hand` --
+/// relays older than `RELAY_HANDS` hands forgotten, and none past
+/// `RELAY_MEMBERS` members for one asker. Whether it was taken.
+fn add_relay(relays: &mut std::collections::BTreeSet<(u64, u8, u8)>, hand: u64, asker: u8, member: u8) -> bool {
+    relays.retain(|(x, _, _)| x.saturating_add(RELAY_HANDS) > hand);
+    let members: std::collections::BTreeSet<u8> =
+        relays.iter().filter(|(_, a, _)| *a == asker).map(|(_, _, m)| *m).collect();
+    if !members.contains(&member) && members.len() >= RELAY_MEMBERS {
+        return false;
+    }
+    relays.insert((hand, asker, member));
+    true
+}
+
+/// `S1-LC`: the members relayed for at hand `hand`, each once.
+fn relay_members(relays: &std::collections::BTreeSet<(u64, u8, u8)>, hand: u64) -> Vec<u8> {
+    let members: std::collections::BTreeSet<u8> = relays
+        .iter()
+        .filter(|(x, _, _)| x.saturating_add(RELAY_HANDS) > hand)
+        .map(|(_, _, m)| *m)
+        .collect();
+    members.into_iter().collect()
+}
 
 /// `S1-LB`: who answers a question about another seat's frame -- the lowest
 /// candidate alone, or, with `every`, each of them. The lowest alone answered
@@ -18884,6 +18907,14 @@ async fn begin_hand_with(
             }
             publish_hand(sends, swarm, said, tox);
             publish_hand(more, swarm, said, tox);
+            // `S1-LE`: and what the early copies' replay took of a member this
+            // client relays -- said now, not at the next tick.
+            let again = h.take_said_again();
+            if !again.is_empty() && tox.is_on_tox() && !nothing_leaves() && !no_saying_again() {
+                for b in &again {
+                    tox.try_broadcast(b);
+                }
+            }
             // What this hand hangs off, said out loud. Two peers that opened
             // hand one from different views of the formation produce different
             // genesis values, and every message each sends is then "a different
@@ -23651,8 +23682,11 @@ mod late_roster_tests {
         let judged = code
             .find("let (mut more, held_failures) = $h.replay_early(&app_key, now);")
             .expect("the held replayed");
-        let said = code[judged..].find("say_again!($t, $h);").expect("said again after the replay");
-        assert!(said < 200, "right after it");
+        let own = code[judged..]
+            .find("publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);")
+            .expect("this client's own frames published");
+        let said = code[judged + own..].find("say_again!($t, $h);").expect("said again after the replay");
+        assert!(said < 400, "right after this client's own frames (S1-LE)");
         assert!(
             code.contains("let again = $h.take_said_again(); if !again.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() && !no_saying_again() {"),
             "what the hand took, and nothing else"
@@ -25930,7 +25964,25 @@ mod answer_rotation_tests {
         let noted = code.find("h.note_relays(relays);").expect("noted at the opening");
         let replayed = code.find("for b in buffered { let _ = h.hold(b); }").expect("the early copies");
         assert!(noted < replayed, "noted before they replay");
-        assert_eq!(code.matches("x.saturating_add(RELAY_HANDS) >").count(), 4, "one lifetime everywhere");
+        assert_eq!(code.matches("x.saturating_add(RELAY_HANDS) >").count(), 2, "one lifetime, in the two helpers");
         assert!(RELAY_HANDS >= 2, "a relay outlives the hand it was asked in");
+        assert_eq!(code.matches("add_relay(&mut").count(), 2, "the answer and the tick add through the bound");
+        assert_eq!(code.matches("relay_members(&").count(), 3, "and read through one function");
+    }
+
+    /// `S1-LE`: **one asker has at most `RELAY_MEMBERS` members relayed** --
+    /// a rogue asking about every member no longer has the whole table said
+    /// again -- and a relay older than `RELAY_HANDS` hands is forgotten.
+    #[test]
+    fn one_asker_has_at_most_two_members_relayed() {
+        let mut r = std::collections::BTreeSet::new();
+        assert!(add_relay(&mut r, 5, 1, 3));
+        assert!(add_relay(&mut r, 5, 1, 4));
+        assert!(!add_relay(&mut r, 5, 1, 2), "a third member for one asker");
+        assert!(add_relay(&mut r, 6, 1, 3), "a member it has, asked again");
+        assert!(add_relay(&mut r, 6, 0, 2), "another asker, its own bound");
+        assert_eq!(relay_members(&r, 6), vec![2, 3, 4]);
+        assert!(add_relay(&mut r, 9, 1, 2), "the hand-5 relays forgotten four hands on");
+        assert_eq!(relay_members(&r, 9), vec![2, 3]);
     }
 }
