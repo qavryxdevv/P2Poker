@@ -53,6 +53,9 @@ pub enum Domain {
     Genesis,
     /// `ABORT_TERMINAL(k)`, the terminal value of an aborted chain (§3.1).
     AbortTerminal,
+    /// `S1-KY`: `SETTLED_TERMINAL(k)`, the terminal value of a settled chain
+    /// (§3.1) -- the money the settlement moved, at its own position.
+    SettledTerminal,
     /// `STATE_HASH` (§6).
     State,
     /// `roster_hash` (§3.1).
@@ -97,6 +100,7 @@ impl Domain {
             Domain::Stage => "p2p-poker v1 stage",
             Domain::Genesis => "p2p-poker v1 genesis",
             Domain::AbortTerminal => "p2p-poker v1 abort-terminal",
+            Domain::SettledTerminal => "p2p-poker v1 settled-terminal",
             Domain::State => "p2p-poker v1 state",
             Domain::Roster => "p2p-poker v1 roster",
             Domain::RngCommit => "p2p-poker v1 rng-commit",
@@ -116,11 +120,12 @@ impl Domain {
     }
 
     /// Every variant, so tests and audits can enumerate the register.
-    pub const ALL: [Domain; 19] = [
+    pub const ALL: [Domain; 20] = [
         Domain::Transcript,
         Domain::Stage,
         Domain::Genesis,
         Domain::AbortTerminal,
+        Domain::SettledTerminal,
         Domain::State,
         Domain::Roster,
         Domain::RngCommit,

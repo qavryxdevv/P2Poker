@@ -814,6 +814,7 @@ change; changing or removing one is a major change.
 | `p2p-poker v1 stage` | `stage_hash` (§3.2) |
 | `p2p-poker v1 genesis` | the genesis hash of each chain (§3.1) |
 | `p2p-poker v1 abort-terminal` | `ABORT_TERMINAL(k)`, the terminal value of an aborted chain (§3.1) |
+| `p2p-poker v1 settled-terminal` | `SETTLED_TERMINAL(k)`, the terminal value of a settled chain (§3.1, `S1-KY`) |
 | `p2p-poker v1 state` | `STATE_HASH` (§6) |
 | `p2p-poker v1 roster` | `roster_hash` (§3.1) |
 | `p2p-poker v1 rng-commit` | `RNG_COMMIT` commitment (§4.4) |
@@ -1260,13 +1261,28 @@ completes.
 ends in exactly one of two ways and each has its own terminal value:
 
 ```
-TERMINAL(k) = stage_hash of the HAND_COMPLETE stage          the hand was decided
+TERMINAL(k) = SETTLED_TERMINAL(k)                            the hand was decided
             = ABORT_TERMINAL(k)                              the hand was aborted
 
-ABORT_TERMINAL(k) = h("p2p-poker v1 abort-terminal",
-                      [ u16_be(protocol_version), table_id, u64_be(k),
-                        GENESIS(k) ])
+SETTLED_TERMINAL(k) = h("p2p-poker v1 settled-terminal",
+                        [ u16_be(protocol_version), table_id, u64_be(k),
+                          GENESIS(k), u64_be(s), P_s, money ])
+ABORT_TERMINAL(k)   = h("p2p-poker v1 abort-terminal",
+                        [ u16_be(protocol_version), table_id, u64_be(k),
+                          GENESIS(k) ])
 ```
+
+`s` is the `HAND_COMPLETE` stage's sequence and `P_s` its `previous_event_hash`, the
+hash every event of the hand before the settlement chains into; `money` is the
+canonical encoding of the settlement's body with `n(5) state_hash` zeroed -- the pots,
+refunds, deltas, final stacks and busted seats it moves. **`S1-KY`: it was the
+`stage_hash` of the `HAND_COMPLETE` stage**, which hashes every copy's `event_hash`,
+and an event hash covers its envelope: one settlement signed twice -- a rogue's two
+signatures sent to two halves of the table, or an honest restart signing again
+(`S1-KK`) -- gave two halves two terminals and two `GENESIS(k+1)`. Every seat at
+`(s, P_s)` with one engine (`HAND_INIT`'s `n(12) engine`) derives the same money and
+the same terminal however the stage closed, and a difference in the state hash alone
+never moves it.
 
 `TERMINAL(0)` for the setup chain is the `stage_hash` of the `TABLE_READY` stage.
 
@@ -1297,8 +1313,10 @@ aborted hand's transcript is complete. That is the price of not deriving a
 terminal hash from a disputed quantity, and it costs nothing that depends on it:
 an aborted hand moves no chips, awards no pot and changes no stack, so no later
 value is computed from its content. `HAND_COMPLETE` — the only path on which a
-hand's content changes anything — keeps the ordinary `stage_hash` and keeps the
-full binding.
+hand's content changes anything — binds that content: `P_s` chains every event of
+the hand up to the settlement and `money` is what the settlement moves. What it no
+longer binds is which signatures of the settlement arrived (`S1-KY`): they say the
+same thing, and a terminal that depended on them was a terminal a signer could fork.
 
 `session_id` is defined in §4.3. Because it is inside `GENESIS(k)` and every event
 of hand `k` chains transitively to `GENESIS(k)`, every event is bound to the

@@ -1266,6 +1266,10 @@ struct Late {
     /// borrowed body — published the same thing. The second clause was in
     /// this sentence before it was in the code (`S1-CL`).
     closed: Option<(Hash, Vec<Chips>)>,
+    /// `S1-KY`: the settlement stage's parent, `P_s` -- this client's own where
+    /// it gave the hand up at the settlement, the first copy's where it borrows
+    /// a body; a copy at another parent is another settlement.
+    parent: Hash,
 }
 
 /// A `TIMEOUT_CERT` checked from its own bytes, with nothing taken on trust.
@@ -6157,13 +6161,23 @@ impl Hand {
             let Phase::Playing { play, .. } = &self.phase else {
                 return Ok(Vec::new());
             };
-            let Step::Settling { stage, .. } = &play.step else {
+            let Step::Settling { stage, mine } = &play.step else {
                 return Ok(Vec::new());
             };
             if !stage.complete() {
                 return Ok(Vec::new());
             }
-            stage.hash().ok_or(Failed::NotInThisStage)?
+            // `S1-KY`: `SETTLED_TERMINAL(k)` -- the money at the stage's own
+            // position, not the stage hash over the copies that arrived, which
+            // a seat signing its settlement twice made two of.
+            crate::protocol::transcript::settled_terminal(
+                &self.open.table_id,
+                self.open.hand_id,
+                &self.open.genesis,
+                self.slot.sequence,
+                &self.slot.previous_event_hash,
+                &mine.money_bytes(),
+            )
         };
         self.slot = self.slot.then(parent);
 
@@ -9382,6 +9396,7 @@ impl Hand {
                         own: true,
                         disagreed: false,
                         closed: None,
+                        parent: self.slot.previous_event_hash,
                     });
                 }
             }
@@ -9445,12 +9460,14 @@ impl Hand {
                 own: false,
                 disagreed: false,
                 closed: None,
+                parent: opened.envelope.previous_event_hash,
             });
         }
         let Some(late) = self.late.as_mut() else {
             unreachable!("just set")
         };
-        if late.stage.sequence() != sequence {
+        // `S1-KY`: and at one parent -- the terminal is taken at it.
+        if late.stage.sequence() != sequence || late.parent != opened.envelope.previous_event_hash {
             // Two settlements at two positions is not a settlement.
             return Err(Failed::Elsewhere {
                 seat,
@@ -9538,7 +9555,16 @@ impl Hand {
         }
         if late.stage.complete() {
             if late.own || !late.disagreed {
-                let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
+                // `S1-KY`: the settled terminal, not the stage hash over the
+                // copies that arrived -- the one every seat that settled holds.
+                let hash = crate::protocol::transcript::settled_terminal(
+                    &self.open.table_id,
+                    self.open.hand_id,
+                    &self.open.genesis,
+                    late.stage.sequence(),
+                    &late.parent,
+                    &late.body.money_bytes(),
+                );
                 let stacks = late.body.final_stacks.clone();
                 // `D-052`: the settlement this client ends on is the one the
                 // window says the pots from, the late road included.
@@ -18863,6 +18889,42 @@ mod tests {
         // a bet without its amount -- is proven wherever it sits.
         let broken = chained::seal(EventType::ActionBet, &at, &head, &keys[rogue], NOW, 30_000, ACTION_CAP).unwrap();
         assert_eq!(hands[judge].judge_action(&broken, rogue as u8), Judged::Proven, "bytes alone");
+    }
+
+    /// `S1-KY`: **one settlement signed twice gives one terminal** -- the seat
+    /// that heard the third seat's settlement in another signature closes the
+    /// hand on the same `SETTLED_TERMINAL(k)` as the others, and the next hand
+    /// opens at one genesis. The stage hash over the copies that arrived gave
+    /// them two terminals, and the table two halves.
+    #[test]
+    fn a_settled_terminal_is_one_whatever_copies_were_heard() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let k2 = keys[2].clone();
+        let route = move |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 2 && to == 1 && is_kind(b, EventType::HandComplete) {
+                let at = slot_of(b, EventType::HandComplete);
+                let opened =
+                    chained::open_in_hand(b, FRAME_CAP, EventType::HandComplete, &at.table_id, at.hand_id).unwrap();
+                let body: HandComplete = chained::payload(&opened, HAND_COMPLETE_CAP).unwrap();
+                let again =
+                    chained::seal(EventType::HandComplete, &at, &body, &k2, NOW + 5, 30_000, HAND_COMPLETE_CAP).unwrap();
+                assert_ne!(chained::event_hash_of(&again, FRAME_CAP), chained::event_hash_of(b, FRAME_CAP));
+                return Some(again);
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..2 {
+            let s = seat_to_act(&hands);
+            let sends = hands[s].act(Action::Fold, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &route, &mut refused);
+        }
+        let terminals: Vec<Option<Hash>> = hands.iter().map(|h| h.terminal()).collect();
+        assert!(terminals[0].is_some(), "the hand settled: {refused:?}");
+        assert_eq!(terminals[0], terminals[1], "the seat that heard another signature holds the same terminal");
+        assert_eq!(terminals[1], terminals[2]);
+        let geneses: Vec<Hash> = hands.iter().map(|h| h.next_hand().expect("a next hand").genesis).collect();
+        assert!(geneses.windows(2).all(|w| w[0] == w[1]), "and the next hand opens at one genesis");
     }
 
     /// `S1-KT`: a vote whose frame is evidence of nothing here -- another

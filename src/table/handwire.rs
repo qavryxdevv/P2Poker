@@ -521,6 +521,14 @@ pub struct HandComplete {
 }
 
 impl HandComplete {
+    /// `S1-KY`: the money this settlement moves -- every field but the state
+    /// hash, canonically encoded -- what `SETTLED_TERMINAL(k)` is taken over. A
+    /// difference in the state hash alone never moves a terminal (`S1-BD`).
+    pub fn money_bytes(&self) -> Vec<u8> {
+        let money = HandComplete { state_hash: [0; 32], ..self.clone() };
+        crate::protocol::serialization::to_canonical(&money).unwrap_or_default()
+    }
+
     /// Whether the deltas conserve chips.
     ///
     /// Checked as an `i128` sum rather than an `i64` one: ten seats of `i64`

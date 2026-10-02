@@ -194,6 +194,36 @@ pub fn abort_terminal(table_id: &Hash, hand_id: u64, genesis: &Hash) -> Hash {
     )
 }
 
+/// `S1-KY`: `SETTLED_TERMINAL(k)`, the terminal of a hand that settled (§3.1):
+/// the hand's genesis, the settlement stage's own position -- its sequence and
+/// its parent, which chains every event of the hand before it -- and the money
+/// the settlement moves (`HandComplete::money_bytes`). Not the stage hash over
+/// the copies that arrived: a copy's event hash covers its envelope, and one
+/// settlement signed twice gave two halves of a table two terminals. Every seat
+/// at the stage with one engine (`HAND_INIT`'s `engine`) derives it, however the
+/// stage closed.
+pub fn settled_terminal(
+    table_id: &Hash,
+    hand_id: u64,
+    genesis: &Hash,
+    sequence: u64,
+    parent: &Hash,
+    money: &[u8],
+) -> Hash {
+    hash(
+        Domain::SettledTerminal,
+        &[
+            &PROTOCOL_VERSION.to_be_bytes(),
+            table_id,
+            &hand_id.to_be_bytes(),
+            genesis,
+            &sequence.to_be_bytes(),
+            parent,
+            money,
+        ],
+    )
+}
+
 /// The session identifier, derived from the roster's ratification.
 ///
 /// Every later `GENESIS(k)` carries it, so every hand event is bound to this
