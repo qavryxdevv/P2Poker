@@ -2516,6 +2516,11 @@ pub struct Hand {
     /// `S1-KB`: another seat's betting actions this hand took, each the first
     /// time it took it, for the node to say again once (`take_said_again`).
     said_again: Vec<Vec<u8>>,
+    /// `S1-LC`: the members this client relays for in this hand -- a seat asked
+    /// it for one of their frames (`D-065`) within the last few hands, and the
+    /// node noted them ([`Hand::note_relays`]): each of their stage frames the
+    /// hand takes for the first time goes into `said_again` too.
+    relay_for: BTreeSet<SeatIdx>,
     /// `S1-KB`: the seat whose frame `on_action` just applied as a betting
     /// action -- whatever type its writer signed it under -- read where the
     /// frame enters the transcript.
@@ -2864,6 +2869,7 @@ impl Hand {
                 taken_from: BTreeMap::new(),
                 versions_said: BTreeSet::new(),
                 said_again: Vec::new(),
+                relay_for: BTreeSet::new(),
                 took_action: None,
                 voice,
                 own_init,
@@ -3053,6 +3059,10 @@ impl Hand {
                 // first time -- verified, in its slot, applied, the hand moved
                 // by it.
                 if took.is_some_and(|writer| self.says_again(writer, bytes)) {
+                    self.said_again.push(bytes.to_vec());
+                } else if self.relays(bytes, kind) {
+                    // `S1-LC`: or a stage frame of a member this client relays
+                    // for, taken now for the first time.
                     self.said_again.push(bytes.to_vec());
                 }
             }
@@ -11182,6 +11192,49 @@ impl Hand {
             && writer != self.open.my_seat
             && bytes.len() <= SAID_AGAIN_MAX
             && self.said_again.len() < SAID_AGAIN_CAP
+    }
+
+    /// `S1-LC`: whether `bytes`, a frame of `kind` this hand has just taken for
+    /// the first time, is a stage frame of a member this client relays for --
+    /// never its own, never heads-up (nobody else to say it to), never over its
+    /// type's ceiling, and not in the control build (`P2P_POKER_CONTROL=s1lc`).
+    fn relays(&self, bytes: &[u8], kind: EventType) -> bool {
+        if self.relay_for.is_empty()
+            || self.mine.dealt_in.len() < 3
+            || self.said_again.len() >= SAID_AGAIN_CAP
+            || control("s1lc")
+        {
+            return false;
+        }
+        let stage_frame = matches!(
+            kind,
+            EventType::HandInit
+                | EventType::DeckInit
+                | EventType::ShuffleStep
+                | EventType::ShuffleProof
+                | EventType::DeckCommit
+                | EventType::DealPrivate
+                | EventType::BoardReveal
+                | EventType::ActionCheck
+                | EventType::ActionCall
+                | EventType::ActionBet
+                | EventType::ActionRaise
+                | EventType::ActionFold
+                | EventType::ShowdownReveal
+                | EventType::ShowdownMuck
+                | EventType::HandComplete
+        );
+        stage_frame
+            && bytes.len() <= frame_ceiling(kind)
+            && chained::sender_of(bytes, FRAME_CAP)
+                .and_then(|k| self.seat_of_key(&k))
+                .is_some_and(|w| w != self.open.my_seat && self.relay_for.contains(&w))
+    }
+
+    /// `S1-LC`: the members this client relays for in this hand, as the node
+    /// reads them now -- the whole set each time.
+    pub fn note_relays(&mut self, seats: &[SeatIdx]) {
+        self.relay_for = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
     }
 
     /// `S1-KB`: the betting actions of other seats this hand has taken since
@@ -21761,6 +21814,31 @@ mod tests {
         );
         let late = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], NOW + 46_000, 0).unwrap());
         assert_eq!(late.len(), 1, "half a budget past its time: the vote");
+    }
+
+    /// `S1-LC`: **a member this client relays for has each stage frame said
+    /// again once** -- the first time the hand takes it, never its own, never a
+    /// member it does not relay for.
+    #[test]
+    fn a_member_relayed_for_has_its_frames_said_again_once() {
+        let keys: Vec<SigningKey> = (0..5u8).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..5u8 {
+            let (h, from) = Hand::open(opening_n(5, seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        hands[0].note_relays(&[3]);
+        let _ = hands[0].take_said_again();
+        let _ = deliver(&mut hands[0], &inits[1], &keys[0]);
+        assert!(hands[0].take_said_again().is_empty(), "a member it does not relay for");
+        let _ = deliver(&mut hands[0], &inits[3], &keys[0]);
+        let again = hands[0].take_said_again();
+        assert_eq!(again.len(), 1, "seat 3's opening, said again");
+        assert_eq!(chained::sender_of(&again[0], FRAME_CAP), Some(keys[3].verifying_key().to_bytes()));
+        let _ = deliver(&mut hands[0], &inits[3], &keys[0]);
+        assert!(hands[0].take_said_again().is_empty(), "once");
     }
 
     /// `S1-JS`: the early question is a question and nothing more. A frame of a

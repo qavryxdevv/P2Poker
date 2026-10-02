@@ -1603,6 +1603,11 @@ struct TableRun {
     vote_asks_heard: std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
     /// `D-065`: the questions this client has answered, once each.
     vote_asks_answered: std::collections::BTreeSet<(u64, u64, u8, bool)>,
+    /// `S1-LC`: the members whose frame of a running hand this client said in
+    /// answer to another seat's question, by that hand -- it relays their later
+    /// stage frames of that hand and of the next, `RELAY_HANDS` hands in all
+    /// ([`crate::table::hand::Hand::note_relays`]).
+    relays: std::collections::BTreeSet<(u64, u8)>,
     /// `D-066`: since when each seat has been gone from the table's group, as
     /// this client reads it with its own line sound (`note_unheard`).
     unheard_since: std::collections::BTreeMap<u8, tokio::time::Instant>,
@@ -2067,6 +2072,7 @@ impl TableRun {
             stage_waiting: (u64::MAX, 0),
             vote_asks_heard: std::collections::BTreeMap::new(),
             vote_asks_answered: std::collections::BTreeSet::new(),
+            relays: std::collections::BTreeSet::new(),
             unheard_since: std::collections::BTreeMap::new(),
             long_gone_said: std::collections::BTreeSet::new(),
             line_down_at: None,
@@ -3120,7 +3126,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if n == 1 || n % 50 == 0 {
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
-                                    "fault-harness: {n} betting action(s) of other seats said again (S1-KB)"
+                                    "fault-harness: {n} frame(s) of other seats said again (S1-KB, S1-LC)"
                                 )))
                                 .await;
                         }
@@ -3187,6 +3193,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     false,
                                     false,
                                 );
+                                // `S1-LC`: another member's frame of the running hand
+                                // said in answer: its later frames are relayed.
+                                if !answer.is_empty()
+                                    && !ask.silent
+                                    && ask.seat != $h.my_seat()
+                                    && !$h.over()
+                                    && !crate::table::hand::control("s1lc")
+                                {
+                                    let hid = $h.hand_id();
+                                    $t.relays.retain(|(x, _)| x.saturating_add(RELAY_HANDS) > hid);
+                                    $t.relays.insert((hid, ask.seat));
+                                    let seats: Vec<u8> = $t.relays.iter().map(|(_, s)| *s).collect();
+                                    $h.note_relays(&seats);
+                                }
                                 if !answer.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() {
                                     let mut said_again = 0usize;
                                     for b in &answer {
@@ -4617,6 +4637,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.hand = None;
             $t.vote_asks_heard.clear();
             $t.vote_asks_answered.clear();
+            $t.relays.clear();
             $t.unheard_since.clear();
             $t.long_gone_said.clear();
             $t.line_down_at = None;
@@ -13212,7 +13233,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             ),
                             None => Vec::new(),
                         };
-                        for (ask, frames) in answers {
+                        // `S1-LC`: another member's frame of the running hand said
+                        // in answer: its later frames are relayed.
+                        let running = t.hand.as_ref().map(|h| (h.hand_id(), h.my_seat()));
+                        for (ask, _, hand) in &answers {
+                            if let Some((hid, me)) = running {
+                                if *hand == hid && !ask.silent && ask.seat != me && !crate::table::hand::control("s1lc") {
+                                    t.relays.retain(|(x, _)| x.saturating_add(RELAY_HANDS) > hid);
+                                    t.relays.insert((hid, ask.seat));
+                                }
+                            }
+                        }
+                        for (ask, frames, _) in answers {
                             let mut said_again = 0usize;
                             for b in &frames {
                                 // fault-harness, `-NoVote`: nobody's votes either.
@@ -13263,6 +13295,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // waits for its answer.
                     let behind = behind_seats(h, t.previous.as_ref(), &t.vote_asks_heard);
                     h.note_asking_behind(&behind);
+                    // `S1-LC`: and the members this client relays for in this hand --
+                    // asked about within the last `RELAY_HANDS` hands.
+                    t.relays.retain(|(x, _)| x.saturating_add(RELAY_HANDS) > running_id);
+                    let relay_seats: Vec<u8> = t.relays.iter().map(|(_, s)| *s).collect();
+                    h.note_relays(&relay_seats);
 
                     // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
                     // and the carrier's blind repair ladder puts its attempts in
@@ -14875,10 +14912,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // Quiet if two seats already signed this hand at one
                         // other genesis and none at this one (`S1-BS`).
                         let voice = quiet_if_contested(&opening, &t.next_inits);
+                        // `S1-LC`: the relays asked for in the hand before carry over.
+                        let relay_seats: Vec<u8> = t
+                            .relays
+                            .iter()
+                            .filter(|(x, _)| x.saturating_add(RELAY_HANDS) > opening.hand_id)
+                            .map(|(_, s)| *s)
+                            .collect();
                         begin_hand_with(
                             opening,
                             voice,
                             line_down_within(t.line_down_at),
+                            &relay_seats,
                             &mut t.next_inits,
                             &mut t.next_early,
                             &mut t.next_early_lost,
@@ -16086,6 +16131,13 @@ fn note_unheard(
         .collect()
 }
 
+/// `S1-LC`: how many hands a relay lasts, the hand it was asked in among them.
+/// A partial delivery that lasts asks again only once in so many hands: with
+/// one hand of carry every other hand of it paid a question (`run145204-5`, 21 s
+/// and 9 s hands in turn); a relay outliving it costs one copy more of each of
+/// that member's frames.
+const RELAY_HANDS: u64 = 4;
+
 /// `S1-LB`: who answers a question about another seat's frame -- the lowest
 /// candidate alone, or, with `every`, each of them. The lowest alone answered
 /// every question, and a silent accomplice in the lowest seat left the asking
@@ -16213,7 +16265,7 @@ fn answer_open_questions(
     heard: &mut std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
     answered: &mut std::collections::BTreeSet<(u64, u64, u8, bool)>,
     now_ms: u64,
-) -> Vec<(crate::table::hand::VoteAsk, Vec<Vec<u8>>)> {
+) -> Vec<(crate::table::hand::VoteAsk, Vec<Vec<u8>>, u64)> {
     if running.over() || running.stage_open_ms(now_ms) < crate::protocol::constants::QUESTION_AFTER_MS {
         return Vec::new();
     }
@@ -16235,7 +16287,7 @@ fn answer_open_questions(
         let ask = crate::table::hand::VoteAsk { voter, seat, sequence, silent };
         let frames = answer_a_vote(h, ask, said, gone, heard, answered, moved_on, true);
         if !frames.is_empty() {
-            out.push((ask, frames));
+            out.push((ask, frames, hand));
         }
     }
     out
@@ -17826,6 +17878,8 @@ async fn begin_hand(
         crate::table::hand::Voice::Speak,
         // Hand one: no certificate before it to take.
         false,
+        // Nor a relay.
+        &[],
         &mut none,
         &mut none_either,
         // This path opens hand one, where nothing can have arrived early.
@@ -18378,7 +18432,7 @@ fn is_betting_action(kind: crate::protocol::messages::EventType) -> bool {
     matches!(kind, E::ActionCheck | E::ActionCall | E::ActionBet | E::ActionRaise | E::ActionFold)
 }
 
-/// fault-harness: the betting actions of other seats said again, for the log.
+/// fault-harness: the frames of other seats said again (`S1-KB`, `S1-LC`), for the log.
 static SAID_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// fault-harness: `P2P_POKER_NO_SAY_AGAIN` -- `S1-KB`'s control: no betting
@@ -18747,6 +18801,7 @@ async fn begin_hand_with(
     opening: crate::table::hand::Opening,
     voice: crate::table::hand::Voice,
     line_down: bool,
+    relays: &[u8],
     next_inits: &mut Vec<(u8, Vec<u8>)>,
     next_early: &mut Vec<(u8, Vec<u8>)>,
     lost: &mut (u32, u32),
@@ -18771,6 +18826,10 @@ async fn begin_hand_with(
             // `D-066`: before the early copies replay -- a certificate among
             // them may name this seat.
             h.note_line_down_recently(line_down);
+            // `S1-LC`: and the members it relays for, before the early copies
+            // replay: a member's opening and deck key arrive first, and were
+            // taken before the tick noted the relay.
+            h.note_relays(relays);
             if voice == Voice::Quiet {
                 let _ = events
                     .send(NodeEvent::Warning(format!(
@@ -25855,5 +25914,20 @@ mod answer_rotation_tests {
             code.contains("let table_dealt = t.hand.as_ref().is_some_and(|h| h.aborted().is_none() && most_have_dealt(h, &t.next_inits));"),
             "the pause"
         );
+    }
+
+    /// `S1-LC`: **the next hand opens with its relays noted** -- before the
+    /// copies that arrived early replay, which the member's opening and deck key
+    /// are -- and a relay lasts `RELAY_HANDS` hands at every place that keeps it.
+    #[test]
+    fn a_relay_is_noted_before_the_early_copies_replay() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let noted = code.find("h.note_relays(relays);").expect("noted at the opening");
+        let replayed = code.find("for b in buffered { let _ = h.hold(b); }").expect("the early copies");
+        assert!(noted < replayed, "noted before they replay");
+        assert_eq!(code.matches("x.saturating_add(RELAY_HANDS) >").count(), 4, "one lifetime everywhere");
+        assert!(RELAY_HANDS >= 2, "a relay outlives the hand it was asked in");
     }
 }

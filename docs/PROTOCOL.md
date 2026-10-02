@@ -3694,7 +3694,10 @@ own stage has stood `QUESTION_AFTER_MS` on the asker: one silent seat no longer
 stands between the asker and the event. Nothing about another seat's event is said
 to a voter the receiver has accepted an event from past the stage asked about, or
 in a later hand, and no question is kept about a stage the receiver has not
-reached. A vote about the receiver itself is answered with
+reached. A receiver that answered a question about another seat's event of the
+running hand says that seat's later events again, once each as it takes them,
+for that hand and the next three (`S1-LC`): a seat kept from one member's events
+gets them without a question each. A vote about the receiver itself is answered with
 the receiver's own events of that stage, and one with `cause = 2` about it with
 its own votes and copies there and every event of that stage it holds -- what it
 did not vote about may be what it has. Once per hand, stage, seat and cause at
