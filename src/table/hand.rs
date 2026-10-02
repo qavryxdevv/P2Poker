@@ -4741,7 +4741,17 @@ impl Hand {
         self.last_stamp_ms = now_ms;
         let mut out: Vec<Send> = refused.into_iter().map(Send::Broadcast).collect();
         out.push(Send::Broadcast(bytes));
-        out.append(&mut self.apply_action(me, action, kind, hash, key, now_ms)?);
+        match self.apply_action(me, action, kind, hash, key, now_ms) {
+            Ok(mut more) => out.append(&mut more),
+            // Refused by the engine: nothing moved, and the bytes are dropped --
+            // `say` kept them nowhere.
+            Err(e @ Failed::Illegal { .. }) => return Err(e),
+            // `S1-KX`: the hand took the action -- the round and the slot moved
+            // -- and failed after it, at the street's close or the board's
+            // opening. The action is said all the same: dropped, the other seats
+            // never heard it and this client went on alone from it.
+            Err(e) => self.cert_note.push(format!("this seat's own action was taken, and then: {e} (S1-KX)")),
+        }
         // What this turn cost the reserve, charged once and only on the action
         // that ends the turn. `stage_at_ms` is when this client accepted the
         // event that gave it the turn, which is §8.2's own starting point, so
