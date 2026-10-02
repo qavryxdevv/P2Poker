@@ -7576,16 +7576,21 @@ impl Hand {
             return Judged::Unjudgeable;
         };
         let ctx = self.deck_ctx_at(&accused_key, opened.envelope.sequence);
-        let mut unjudgeable = false;
+        // `S1-LK`: the frame's own defects -- an entry naming no index of this
+        // deck, bytes that are not a point or not a proof -- are the accused's,
+        // the same at every seat holding this deck and for ever: a tier-1 finding
+        // under another cause, never this one, and no evidence -- not "not
+        // judged yet". Held as unjudgeable, a hundred aborts over one such frame
+        // were judged again, share by share, at every replay of the held queue.
+        let mut defective = false;
+        let mut unverified = false;
         for entry in &entries {
             let Some(index) = table.map.index_from_wire(entry.deck_index) else {
-                unjudgeable = true;
+                defective = true;
                 continue;
             };
-            // Bytes that are not a point or not a proof are a tier-1 finding
-            // under another cause, never this one: held, not promoted.
             let (Ok(token), Ok(proof)) = (WireToken::decode(&entry.token), WireTokenProof::decode(&entry.proof)) else {
-                unjudgeable = true;
+                defective = true;
                 continue;
             };
             match deal.deck.verify_token(key, &table.deck, index, token, &proof, &ctx) {
@@ -7593,11 +7598,13 @@ impl Hand {
                 Ok(_) => {}
                 // `CouldNotVerify` is this client saying it could not run the
                 // check -- never evidence against anybody.
-                Err(_) => unjudgeable = true,
+                Err(_) => unverified = true,
             }
         }
-        if unjudgeable {
+        if unverified {
             Judged::Unjudgeable
+        } else if defective {
+            Judged::NotEvidence("every entry of the frame were a share of this deck")
         } else {
             Judged::Holds
         }
@@ -19056,6 +19063,44 @@ mod tests {
             assert_eq!(verdict == Judged::Proven, judged, "commitment owed by seat {withheld_from_1}: {verdict:?}");
             assert_eq!(verdict == Judged::Unjudgeable, !judged);
         }
+    }
+
+    /// `S1-LK`: **a share frame with an entry that is no share of this deck is
+    /// no evidence, and stays none** -- held as unjudgeable, a hundred aborts
+    /// over one such frame were judged again, share by share, at every replay
+    /// of the held queue. A share that fails beside it still proves; the abort
+    /// over the defective frame alone is refused, not held.
+    #[test]
+    fn a_share_frame_with_a_defective_entry_is_no_evidence() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let deal0: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 0 && is_kind(b, EventType::DealPrivate) {
+                *deal0.borrow_mut() = Some(b.to_vec());
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let deal0 = deal0.borrow().clone().expect("seat 0 dealt");
+        let junk = |frame: &[u8]| {
+            let at = slot_of(frame, EventType::DealPrivate);
+            tamper::<DealPrivate>(frame, EventType::DealPrivate, &at, DEAL_PRIVATE_CAP, |d| {
+                let mut extra = d.entries[0].clone();
+                extra.deck_index = 255;
+                d.entries.push(extra);
+            })
+        };
+        assert!(
+            matches!(hands[1].judge_reveal(&junk(&deal0), 0), Judged::NotEvidence(_)),
+            "no evidence, and never 'not yet'"
+        );
+        assert_eq!(hands[1].judge_reveal(&junk(&broken_deal(&deal0, 0)), 0), Judged::Proven, "a failing share beside it proves");
+        let abort = HandAbort::on_bad_reveal(hands[1].open.seats[0].1, junk(&deal0), hands[1].mine.stacks.clone());
+        assert!(
+            matches!(hands[1].bad_reveal_holds(&abort, 2), Err(Failed::Elsewhere { .. })),
+            "refused, not held"
+        );
     }
 
     /// `S1-KR` (the refuter's H1): **a voter heard from only after the seal is
