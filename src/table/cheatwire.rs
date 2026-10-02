@@ -47,12 +47,12 @@ pub struct CheatVote {
     #[cbor(n(1), with = "minicbor::bytes")]
     pub anchor: Hash,
     /// What the frames prove: [`CAUSE_REVEAL`], [`CAUSE_SHUFFLE`],
-    /// [`CAUSE_KEY`] or [`CAUSE_ACTION`].
+    /// [`CAUSE_KEY`], [`CAUSE_ACTION`] or [`CAUSE_MONEY`].
     #[n(2)]
     pub cause: u16,
     /// Frames of the subject's own signing that this voter holds it proven by:
     /// one reveal; one deck key; one shuffle step, or a step and the proof
-    /// bound to it; one betting action. Not in the digest: two judges may hold two broken frames.
+    /// bound to it; one betting action; one settlement. Not in the digest: two judges may hold two broken frames.
     #[n(3)]
     pub evidence: Vec<minicbor::bytes::ByteVec>,
 }
@@ -70,10 +70,15 @@ pub const CAUSE_KEY: u16 = 7;
 /// of turn there, a body that does not decode, or an action the engine refuses
 /// at that stage's round (`S1-KT`). Not a cause of §4.10's.
 pub const CAUSE_ACTION: u16 = 8;
+/// A settlement (`HAND_COMPLETE`) that pays other money than the one every
+/// client of the engine derives at its own position -- pots, refunds, final
+/// stacks, deltas, busted seats (`HandComplete::money_bytes`), judged against the
+/// judge's own derivation and nothing borrowed (`G9`). Not a cause of §4.10's.
+pub const CAUSE_MONEY: u16 = 9;
 
 /// The causes the band knows.
 pub fn cause_known(cause: u16) -> bool {
-    matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY | CAUSE_ACTION)
+    matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY | CAUSE_ACTION | CAUSE_MONEY)
 }
 
 impl CheatVote {
@@ -206,11 +211,11 @@ mod tests {
     }
 
     #[test]
-    fn the_band_knows_four_causes() {
-        for c in [CAUSE_REVEAL, CAUSE_SHUFFLE, CAUSE_KEY, CAUSE_ACTION] {
+    fn the_band_knows_five_causes() {
+        for c in [CAUSE_REVEAL, CAUSE_SHUFFLE, CAUSE_KEY, CAUSE_ACTION, CAUSE_MONEY] {
             assert!(cause_known(c));
         }
-        for c in [0u16, 1, 4, 5, 6, 9] {
+        for c in [0u16, 1, 4, 5, 6, 10] {
             assert!(!cause_known(c), "{c}");
         }
     }

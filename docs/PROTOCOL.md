@@ -2960,7 +2960,7 @@ requires the next hand to start automatically and deterministically, not to be
 | `n(9) stacks` | `Vec<u64>` | one per occupied seat, ascending by seat |
 | `n(10) roster_hash` | `bytes[32]` | `roster_hash(k)` |
 | `n(11) ledger_delta` | `Vec<(u8, i64)>` | ≤ `MAX_SEATS`, ascending by seat, unique; the per-seat ledger change applied at this hand boundary — positive for a buy-in, negative for a departing stack |
-| `n(12) engine` | `bytes[32]` | `blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖ ENGINE_SOURCE)` (§13): what the sender's betting engine decides over the pinned corpus (D-093), and the code it and the hand's judge decide by. Two clients that differ in either never complete stage 0 together, so neither ever judges the other's betting action against a round of its own (`S1-KT`, D-094): a split, never a framing |
+| `n(12) engine` | `bytes[32]` | `blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖ ENGINE_SOURCE)` (§13): what the sender's betting engine decides over the pinned corpus (D-093), and the code it, the hand's judge and the settlement decide by (D-097). Two clients that differ in either never complete stage 0 together, so neither ever judges the other's betting action against a round of its own (`S1-KT`, D-094): a split, never a framing |
 
 **`HAND_INIT` announces nothing and decides nothing.** Every field is a pure
 function of `TERMINAL(k-1)` and the table parameters, so every receiver
@@ -3905,7 +3905,11 @@ not decode (bytes alone, at any stage, as `cause = 2`'s). Judged at the stage it
 signed at, never at the voter's cursor: a certificate that acted for the seat leaves
 the seat's own late action legal at its parent. The head fields are not evidence. One
 parent is one round at every client whose `HAND_INIT` carried the same engine (§4.4,
-`n(12)`). Evidence is the voter's own
+`n(12)`). `cause = 9` (`S1-LD`, D-097): a `HAND_COMPLETE` at the settlement stage's
+position -- the voter's own sequence and parent there -- whose money (pots, refunds,
+final stacks, deltas, busted seats; not the state hash) is not the money the voter's
+own engine derived at that position; never judged against a body the voter took from
+another seat. Evidence is the voter's own
 stage's finding
 stage's finding, another seat's `cause = 3` evidence, a seat's accusation of
 itself (§4.10), or a frame another seat's `CHEAT_VOTE` carries. Nothing else is
@@ -3929,10 +3933,10 @@ band (§13).
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) subject_seat` | `u8` | `< MAX_SEATS`, dealt in to hand `k`, not the voter |
+| `n(0) subject_seat` | `u8` | `< MAX_SEATS`, dealt in to hand `k` -- or, for `cause = 9`, a seat of its stages not dealt in (dead money, D-097) -- not the voter |
 | `n(1) anchor` | `bytes[32]` | `ANCHOR(k)`, equal to the envelope's parent |
-| `n(2) cause` | `u16` | `3` a card share, `2` a shuffle frame, `7` a deck key, `8` a betting action (above) |
-| `n(3) evidence` | `Vec<bytes>` | the frames of the subject's own signing that the voter holds it proven by: one reveal, one key, one step, a step and its proof, or one action -- each within its type's frame ceiling; not in the digest |
+| `n(2) cause` | `u16` | `3` a card share, `2` a shuffle frame, `7` a deck key, `8` a betting action, `9` a settlement (above) |
+| `n(3) evidence` | `Vec<bytes>` | the frames of the subject's own signing that the voter holds it proven by: one reveal, one key, one step, a step and its proof, one action, or one settlement -- each within its type's frame ceiling; not in the digest |
 
 *Receiver must validate:* the envelope binding above; `subject_seat` is not the
 sender's seat; `anchor` is this receiver's own `ANCHOR(k)` (another genesis of the

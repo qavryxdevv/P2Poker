@@ -17135,6 +17135,8 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             // `S1-KT`: the hand is not called off for it -- the frame is
             // refused, and a turn it lets run out is played for it.
             8 => "a betting action the rules refuse",
+            // `G9`: the hand is settled on the honest money all the same.
+            9 => "a settlement that pays what the cards do not",
             _ => "a shuffle step or proof that does not hold",
         };
         // Heads-up nobody plays its turns for it: a turn it lets run out holds
@@ -17143,6 +17145,7 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
         let spoils = match (*cause, two) {
             (8, true) => "A turn it lets run out holds the hand until the hand's own time runs out",
             (8, false) => "Its turns are played for it when its clock runs out",
+            (9, _) => "Every hand is settled on the money the cards give, whatever it signs",
             _ => "Every hand it spoils is called off",
         };
         return Some(format!(

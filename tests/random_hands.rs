@@ -442,6 +442,48 @@ const HAND_FUNCTIONS: &[&str] = &[
     "fn is_betting_action(",
     "fn claimed_action(",
     "fn action_of(",
+    // `G9`: the money path -- what a settlement is derived from, and its judge.
+    "    fn settlement(",
+    "    fn record_showdown(",
+    "    fn close_showdown_if_done(",
+    "    fn on_showdown(",
+    "    fn show(&mut self",
+    "    fn muck(&mut self",
+    "    fn muck_allowed(",
+    "    fn shows_rather_than_mucks(",
+    "    fn hold_until(",
+    "    fn speak_at_showdown(",
+    "    pub fn show_held(",
+    "    fn start_stacks_by_seat(",
+    "fn five_card_board(",
+    "    fn on_hand_complete(",
+    "    fn note_settled_money(",
+    "    fn judge_money(",
+    "    fn judge_left_settlement(",
+    // and what feeds the judge: where the reference is derived or carried, the
+    // late road's borrowed body, the routing of a frame at a stage left, the
+    // evidence's dispatch and the proof's gate (the refuter of G9 v2).
+    "    fn begin_settlement(",
+    "    fn settle_mine(",
+    "    fn give_up(",
+    "    fn on_late_settlement(",
+    "    fn judge_left(",
+    "    fn judge_evidence(",
+    "    fn note_proven(",
+    // the live writers of the round a settlement reads (the diff's review).
+    "    pub fn act(",
+    "    fn apply_action(",
+];
+
+/// `G9`: the money path outside `hand.rs`, by file and header -- a function's
+/// end found as for `HAND_FUNCTIONS`.
+const MONEY_FUNCTIONS: &[(&str, &str, &str)] = &[
+    ("dealing.rs", include_str!("../src/table/dealing.rs"), "    pub fn board(&self) -> Vec<Card> {"),
+    ("deck.rs", include_str!("../src/mental_poker/deck.rs"), "    pub fn hole_cards(&self, seat: SeatIdx) -> Option<[CardIndex; 2]> {"),
+    ("handwire.rs", include_str!("../src/table/handwire.rs"), "pub struct HandComplete {"),
+    ("handwire.rs", include_str!("../src/table/handwire.rs"), "pub struct PotAward {"),
+    ("handwire.rs", include_str!("../src/table/handwire.rs"), "pub struct Refund {"),
+    ("handwire.rs", include_str!("../src/table/handwire.rs"), "    pub fn money_bytes(&self) -> Vec<u8> {"),
 ];
 
 /// The code `ENGINE_SOURCE` is the digest of: comments and whitespace dropped,
@@ -457,6 +499,9 @@ fn engine_source() -> Vec<u8> {
     for (name, text, must) in [
         ("engine.rs", include_str!("../src/poker/engine.rs"), "pub fn first_to_act("),
         ("actions.rs", include_str!("../src/poker/actions.rs"), "pub fn apply("),
+        // `G9`: the pots and the ranking every settlement is derived by.
+        ("pots.rs", include_str!("../src/poker/pots.rs"), "pub fn build_pots("),
+        ("evaluator.rs", include_str!("../src/poker/evaluator.rs"), "pub fn evaluate_holdem("),
     ] {
         let code = &text[..text.find("\n#[cfg(test)]\nmod tests").unwrap_or_else(|| panic!("{name}: its tests"))];
         assert!(code.contains(must), "{name}: the tripwire reads the code it claims to");
@@ -469,6 +514,16 @@ fn engine_source() -> Vec<u8> {
         let body = &hand[at..at + hand[at..].find(end).unwrap_or_else(|| panic!("hand.rs: the end of {header}"))];
         strip(body, &mut out);
     }
+    for (name, text, header) in MONEY_FUNCTIONS {
+        let at = text.find(header).unwrap_or_else(|| panic!("{name}: {header}"));
+        let end = if header.starts_with(' ') { "\n    }\n" } else { "\n}\n" };
+        let body = &text[at..at + text[at..].find(end).unwrap_or_else(|| panic!("{name}: the end of {header}"))];
+        strip(body, &mut out);
+    }
+    // `G9`: and the ranking crate's version, which the facade above leans on.
+    let cargo = include_str!("../Cargo.toml");
+    let line = cargo.lines().find(|l| l.starts_with("rs_poker = ")).expect("Cargo.toml: rs_poker");
+    strip(line, &mut out);
     out
 }
 
@@ -530,7 +585,7 @@ fn the_engine_is_the_protocol_majors() {
     assert_eq!(
         *source.as_bytes(),
         p2p_poker::protocol::constants::ENGINE_SOURCE,
-        "the code the betting engine and the hand's judge decide by changed ({}; src/poker/engine.rs or actions.rs before their tests, or HAND_FUNCTIONS of hand.rs): if anything it decides changed, that is a new protocol major (D-089) -- the corpus may not reach it; if nothing did, pin ENGINE_SOURCE again. Either way HAND_INIT's engine moves, and builds of the two never share a hand",
+        "the code the betting engine and the hand's judge decide by changed ({}; src/poker/engine.rs, actions.rs, pots.rs or evaluator.rs before their tests, HAND_FUNCTIONS of hand.rs, MONEY_FUNCTIONS, or the rs_poker line of Cargo.toml): if anything it decides changed, that is a new protocol major (D-089) -- the corpus may not reach it; if nothing did, pin ENGINE_SOURCE again. Either way HAND_INIT's engine moves, and builds of the two never share a hand",
         source.to_hex()
     );
 }

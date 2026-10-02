@@ -68,7 +68,7 @@ use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 use crate::table::cheatwire::{
     cause_known, cheat_sequence, subject_digest as cheat_digest, CheatCert, CheatVote, CAUSE_ACTION, CAUSE_KEY,
-    CAUSE_REVEAL, CAUSE_SHUFFLE, CHEAT_CERT_CAP, CHEAT_VOTE_CAP,
+    CAUSE_MONEY, CAUSE_REVEAL, CAUSE_SHUFFLE, CHEAT_CERT_CAP, CHEAT_VOTE_CAP,
 };
 
 /// What a step wants sent.
@@ -770,6 +770,23 @@ pub(crate) fn control(name: &str) -> bool {
 #[cfg(not(feature = "fault-harness"))]
 pub(crate) fn control(_name: &str) -> bool {
     false
+}
+
+/// `G9` harness: the `bad-money` rogue's settlement -- one chip from the first
+/// other seat holding two or more to the rogue, the deltas moved with it so the
+/// body still conserves chips. `None` where no seat has two to give.
+fn rogue_money(mine: &HandComplete, me: SeatIdx) -> Option<HandComplete> {
+    let from = (0..mine.final_stacks.len()).find(|s| *s != usize::from(me) && mine.final_stacks[*s] >= 2)?;
+    let to = usize::from(me);
+    if to >= mine.final_stacks.len() || to >= mine.deltas.len() || from >= mine.deltas.len() {
+        return None;
+    }
+    let mut out = mine.clone();
+    out.final_stacks[from] -= 1;
+    out.final_stacks[to] += 1;
+    out.deltas[from] -= 1;
+    out.deltas[to] += 1;
+    Some(out)
 }
 
 /// `S1-KQ` harness: a rogue's reveal entries broken on the wire -- the first
@@ -2521,6 +2538,13 @@ pub struct Hand {
     /// node noted them ([`Hand::note_relays`]): each of their stage frames the
     /// hand takes for the first time goes into `said_again` too.
     relay_for: BTreeSet<SeatIdx>,
+    /// `G9`: this client's OWN settlement -- `(sequence, parent, money)`, the
+    /// money its own `settlement()` derived at the settlement stage's position
+    /// -- the one reference a copy of another seat's is judged against
+    /// ([`Hand::judge_money`]). Never a body borrowed from another seat (the late
+    /// road's `Late { own: false }`): a rogue's copy taken as the reference
+    /// framed the honest seats (the refuter's finding 1).
+    settled_money: Option<(u64, Hash, Vec<u8>)>,
     /// `S1-KB`: the seat whose frame `on_action` just applied as a betting
     /// action -- whatever type its writer signed it under -- read where the
     /// frame enters the transcript.
@@ -2870,6 +2894,7 @@ impl Hand {
                 versions_said: BTreeSet::new(),
                 said_again: Vec::new(),
                 relay_for: BTreeSet::new(),
+                settled_money: None,
                 took_action: None,
                 voice,
                 own_init,
@@ -3004,8 +3029,9 @@ impl Hand {
         if sequence < self.slot.sequence {
             // A stage this hand has left. Not a fault and not worth a word: the
             // mesh delivers a message more than once as a matter of course.
-            // `S1-KT`: a betting action there is judged there all the same.
-            self.judge_left_action(bytes, kind, sequence);
+            // `S1-KT`: a betting action there is judged there all the same,
+            // and (`G9`) a settlement.
+            self.judge_left(bytes, kind, sequence);
             // `S1-KJ`: unless it is another version of what this hand took
             // there from the same writer -- said once, and nothing else done.
             return match self.another_version(bytes, kind, sequence) {
@@ -3027,7 +3053,7 @@ impl Hand {
         // `S1-KT`: given up at a betting stage, an action at it is judged there
         // all the same -- the phase answers nothing more.
         if matches!(self.phase, Phase::Aborted(_)) {
-            self.judge_left_action(bytes, kind, sequence);
+            self.judge_left(bytes, kind, sequence);
         }
         let out = self.dispatch(bytes, kind, key, now_ms);
         self.mark_stage(now_ms);
@@ -5524,20 +5550,24 @@ impl Hand {
                     proof: proof.encode(),
                 });
             }
-            // Its own hand goes on the table here, because nothing else will
-            // put it there: every other seat learns it from the message below,
-            // and this client is not a receiver of its own messages.
+            // Its own hand goes on the table below, once the stage took it,
+            // because nothing else will put it there: every other seat learns it
+            // from the message, and this client is not a receiver of its own
+            // messages. `G9`: not before -- a show the stage refused (this seat
+            // heard there already, a restored seat's previous life's muck) left
+            // this client ranking a hand nobody else ranked.
             let Some(cards) = play.cards else {
                 // Only a seat that was dealt cards reaches a showdown, and this
                 // is the one place that would otherwise have to invent two.
                 return Err(Failed::NotInThisStage);
             };
-            if let Some(slot) = play.shown.get_mut(usize::from(me)) {
-                *slot = Some(cards);
+            if let Step::Showdown { stage, .. } = &play.step {
+                if stage.heard(me).is_some() {
+                    return Err(Failed::NotInThisStage);
+                }
             }
             (entries, cards)
         };
-        let _ = cards;
 
         let body = ShowdownReveal { entries, deck_tag: self.deck_tag().ok_or(Failed::NothingFurther)? };
         let bytes = self.say(
@@ -5549,6 +5579,11 @@ impl Hand {
         )?;
         let hash = self.opened(&bytes, EventType::ShowdownReveal)?.event_hash;
         self.record_showdown(me, hash, true)?;
+        if let Phase::Playing { play, .. } = &mut self.phase {
+            if let Some(slot) = play.shown.get_mut(usize::from(me)) {
+                *slot = Some(cards);
+            }
+        }
         // `S1-KQ` harness: as at the deal -- a rogue's showdown share broken on
         // the wire only, and the frame a self-accusing rogue breaks later.
         if rogue("self-accuse", self.open.hand_id) {
@@ -5631,19 +5666,21 @@ impl Hand {
         let Phase::Playing { play, .. } = &mut self.phase else {
             return Err(Failed::NothingFurther);
         };
+        let Step::Showdown { stage, .. } = &mut play.step else {
+            return Err(Failed::NothingFurther);
+        };
+        match stage.hear(seat, hash) {
+            Heard::Counted | Heard::Bystander | Heard::Again => {}
+            Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => return Err(Failed::NotInThisStage),
+        }
+        // `G9`: the muck written once the stage took it, and not before.
         if !showed {
             if let Some(slot) = play.mucked.get_mut(usize::from(seat)) {
                 *slot = true;
             }
         }
-        let Step::Showdown { stage, .. } = &mut play.step else {
-            return Err(Failed::NothingFurther);
-        };
-        match stage.hear(seat, hash) {
-            Heard::Counted | Heard::Bystander | Heard::Again => Ok(()),
-            Heard::Equivocation { .. } => Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => Err(Failed::NotInThisStage),
-        }
+        Ok(())
     }
 
     /// One seat's showdown message.
@@ -5853,6 +5890,7 @@ impl Hand {
             // is the whole of how a follower knows it is still in step. What it
             // does not do is seal one or count itself into the stage.
             let mine = Box::new(self.settlement()?);
+            self.note_settled_money(&mine);
             let stage = Collective::closed(
                 self.slot.sequence,
                 EventType::HandComplete.code(),
@@ -5866,14 +5904,22 @@ impl Hand {
             return Ok(Vec::new());
         }
         let mine = Box::new(self.settlement()?);
+        self.note_settled_money(&mine);
         // `S1-KQ` harness: a rogue that lost the hand accuses itself of a
         // broken copy of its own last reveal instead of settling.
         if let Some(sends) = self.rogue_self_accusation(&mine, key, now_ms) {
             return Ok(sends);
         }
+        // `G9` harness: a rogue's settlement moves a chip on the wire only --
+        // its own close stays on its own money.
+        let wire = if rogue("bad-money", self.open.hand_id) {
+            rogue_money(mine.as_ref(), self.open.my_seat)
+        } else {
+            None
+        };
         let bytes = self.say(
             EventType::HandComplete,
-            mine.as_ref(),
+            wire.as_ref().unwrap_or(mine.as_ref()),
             HAND_COMPLETE_CAP,
             key,
             now_ms,
@@ -6118,6 +6164,10 @@ impl Hand {
         if stage.heard(seat) == Some(opened.event_hash) {
             return Ok(Vec::new());
         }
+        // `G9`: other money than this client's own settlement at this very
+        // position -- not a disagreement about the hand but a settlement no
+        // client of this engine derives: proven, once the stage has heard it.
+        let money_differs = theirs.money_bytes() != mine.money_bytes();
         // Every field recomputed, and compared as a whole. There is no writer
         // here: a body that differs anywhere means two engines disagree about
         // the hand, which is a divergence and not a preference.
@@ -6182,7 +6232,17 @@ impl Hand {
             // The report above is kept and is now the only thing that refusal
             // was really achieving.
         }
-        match stage.hear(seat, opened.event_hash) {
+        let heard = stage.hear(seat, opened.event_hash);
+        // `G9`: judged by `judge_money`, whose own position check is the pinned
+        // one, for every copy the stage heard -- a second version among them: a
+        // rogue that sent its honest copy first escaped every seat.
+        if money_differs
+            && !matches!(heard, Heard::Uninvited)
+            && self.judge_money(bytes, seat) == Judged::Proven
+        {
+            self.note_proven(seat, CAUSE_MONEY, vec![bytes.to_vec()]);
+        }
+        match heard {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
             // **Held, not refused.** By the time a contribution reaches a
@@ -7507,7 +7567,14 @@ impl Hand {
     /// which signs nothing of the deck. `S1-KS`: never on a frame over its own
     /// type's ceiling -- no vote could carry it, and no other seat would judge it.
     fn note_proven(&mut self, seat: SeatIdx, cause: u16, frames: Vec<Vec<u8>>) {
-        if seat == self.open.my_seat || !self.mine.dealt_in.contains(&seat) || self.proven.contains_key(&seat) {
+        // `G9`: a seat not dealt in signs nothing of the deck -- but a seat of the
+        // hand's stages signs its settlement.
+        let signs_it = self.mine.dealt_in.contains(&seat) || (cause == CAUSE_MONEY && self.open.required.contains(&seat));
+        if seat == self.open.my_seat || !signs_it || self.proven.contains_key(&seat) {
+            return;
+        }
+        // `G9`'s control build (`P2P_POKER_CONTROL=g9`) proves no settlement.
+        if cause == CAUSE_MONEY && control("g9") {
             return;
         }
         let fits = frames.iter().all(|f| {
@@ -7520,6 +7587,7 @@ impl Hand {
             CAUSE_KEY => "a deck key that does not hold",
             CAUSE_SHUFFLE => "a shuffle step or proof that is not well formed",
             CAUSE_ACTION => "a betting action the rules refuse",
+            CAUSE_MONEY => "a settlement that pays what the cards do not",
             _ => "a card share that does not hold",
         };
         self.cert_note.push(format!(
@@ -7552,6 +7620,7 @@ impl Hand {
             (CAUSE_KEY, [frame]) => self.judge_key(frame, accused),
             (CAUSE_SHUFFLE, [_] | [_, _]) => self.judge_shuffle_bytes(frames, accused),
             (CAUSE_ACTION, [frame]) => self.judge_action(frame, accused),
+            (CAUSE_MONEY, [frame]) => self.judge_money(frame, accused),
             _ => Judged::NotEvidence("the evidence were the frames its cause names"),
         };
         // Kept only where the frames are the accused's own and were judged:
@@ -7718,6 +7787,98 @@ impl Hand {
         };
         if would_prove && self.judge_action(bytes, seat) == Judged::Proven {
             self.note_proven(seat, CAUSE_ACTION, vec![bytes.to_vec()]);
+        }
+    }
+
+    /// `S1-KT`, `G9`: a frame at a stage this hand has left, or at the one it
+    /// gave up at, judged there all the same -- a betting action, a settlement.
+    /// One function, so the pin (`tests/random_hands.rs`) reads the routing.
+    fn judge_left(&mut self, bytes: &[u8], kind: EventType, sequence: u64) {
+        self.judge_left_action(bytes, kind, sequence);
+        self.judge_left_settlement(bytes, kind, sequence);
+    }
+
+    /// `G9`: this client's own settlement, kept as the reference another seat's
+    /// is judged against -- the stage's position and the money, from the body
+    /// its own `settlement()` derived and nothing else.
+    fn note_settled_money(&mut self, mine: &HandComplete) {
+        self.settled_money = Some((self.slot.sequence, self.slot.previous_event_hash, mine.money_bytes()));
+    }
+
+    /// `G9`: whether `frame`, a settlement the evidence says `accused` signed,
+    /// pays other money than this client's own at the frame's own position.
+    /// At this client's sequence but another parent, or in a hand it gave up
+    /// before settling, it is no evidence here (`S1-KT` R8: refused without a
+    /// refusal); before this client settles, it cannot be judged yet.
+    fn judge_money(&self, frame: &[u8], accused: SeatIdx) -> Judged {
+        if control("g9") {
+            return Judged::NotEvidence("the control build judges no settlement");
+        }
+        let Ok(opened) = chained::open_in_hand(
+            frame,
+            frame_ceiling(EventType::HandComplete),
+            EventType::HandComplete,
+            &self.open.table_id,
+            self.open.hand_id,
+        ) else {
+            return Judged::NotEvidence("the frame were a settlement of this hand");
+        };
+        if self.seat_of_key(&opened.sender) != Some(accused) {
+            return Judged::NotEvidence("the settlement were the accused's own");
+        }
+        let Ok(theirs) = chained::payload::<HandComplete>(&opened, HAND_COMPLETE_CAP) else {
+            return Judged::NotEvidence("the settlement decoded");
+        };
+        match &self.settled_money {
+            Some((sequence, parent, money))
+                if *sequence == opened.envelope.sequence && *parent == opened.envelope.previous_event_hash =>
+            {
+                if theirs.money_bytes() == *money {
+                    Judged::Holds
+                } else {
+                    Judged::Proven
+                }
+            }
+            Some(_) => Judged::NotEvidence("the settlement were at this client's own position"),
+            None if self.over() => Judged::NotEvidence("this client settled this hand"),
+            None => Judged::Unjudgeable,
+        }
+    }
+
+    /// `G9`: a settlement at a stage this hand has left, or on the late road --
+    /// judged there as at the stage (the refuter's finding 4: a bad copy after
+    /// the close, or into the late stage, was never compared). Cheap first: a
+    /// copy at another position or with this client's own money is passed over
+    /// by its claim, and only one that would prove is verified.
+    fn judge_left_settlement(&mut self, bytes: &[u8], kind: EventType, sequence: u64) {
+        if kind != EventType::HandComplete {
+            return;
+        }
+        let Some((at, parent, money)) = self.settled_money.as_ref() else {
+            return;
+        };
+        if *at != sequence || chained::parent_of(bytes, FRAME_CAP) != Some(*parent) {
+            return;
+        }
+        let Some(sender) = chained::sender_of(bytes, FRAME_CAP) else {
+            return;
+        };
+        let Ok(seat) = self.seat_of(&sender) else {
+            return;
+        };
+        // Only a seat `note_proven` would take -- nothing else stops a stranger's
+        // copies being checked again and again.
+        let signs_it = self.mine.dealt_in.contains(&seat) || self.open.required.contains(&seat);
+        if seat == self.open.my_seat || !signs_it || self.proven.contains_key(&seat) {
+            return;
+        }
+        let claimed: Option<HandComplete> =
+            chained::payload_unverified(bytes, frame_ceiling(EventType::HandComplete), HAND_COMPLETE_CAP);
+        if claimed.is_some_and(|c| c.money_bytes() == *money) {
+            return;
+        }
+        if self.judge_money(bytes, seat) == Judged::Proven {
+            self.note_proven(seat, CAUSE_MONEY, vec![bytes.to_vec()]);
         }
     }
 
@@ -9508,6 +9669,9 @@ impl Hand {
         let seat = self.seat_of(&opened.sender)?;
         let theirs: HandComplete =
             chained::payload(&opened, HAND_COMPLETE_CAP).map_err(Failed::Wire)?;
+        // `G9`: judged on the late road too -- every settlement given up at
+        // arrives here, before `judge_left` could see it (the diff's review).
+        self.judge_left_settlement(bytes, EventType::HandComplete, opened.envelope.sequence);
 
         let sequence = opened.envelope.sequence;
         // `S1-ER`: read before `self.late` is borrowed, because what each seat
@@ -11458,10 +11622,12 @@ impl Hand {
     }
 
     /// Whether a showdown is open and this client has yet to speak in it.
+    /// `G9`: both halves -- it read the first alone, so a seat already heard
+    /// there was offered its show again.
     pub fn showing(&self) -> bool {
         matches!(
             &self.phase,
-            Phase::Playing { play, .. } if matches!(play.step, Step::Showdown { .. })
+            Phase::Playing { play, .. } if matches!(&play.step, Step::Showdown { stage, .. } if stage.heard(self.open.my_seat).is_none())
         )
     }
 
@@ -13773,7 +13939,9 @@ impl Hand {
     /// subject: the opening's, which every seat of the hand holds alike, and
     /// not this client's `certified`, which a late certificate can change.
     fn cheat_voters(&self, subject: SeatIdx) -> Vec<SeatIdx> {
-        if !self.mine.dealt_in.contains(&subject) {
+        // `G9`: a seat in the hand's stages that was not dealt in -- dead money
+        // (D-095) -- signs a settlement, and a false one is provable.
+        if !self.mine.dealt_in.contains(&subject) && !self.open.required.contains(&subject) {
             return Vec::new();
         }
         self.mine.dealt_in.iter().copied().filter(|s| *s != subject).collect()
@@ -19048,6 +19216,249 @@ mod tests {
         assert_eq!(hands[first].showdown_order().first(), Some(&(first as u8)), "at the showdown, first to show: {refused:?}");
         assert!(!hands[first].mucked(first as u8), "no muck of its own recorded");
         assert!(!mucks.borrow().contains(&first), "and none said");
+    }
+
+    /// `G9`: **a settlement with other money is proven by every honest seat**
+    /// -- four seats played to the settlement; seat 2 signs, at its own
+    /// position, a copy that moves one chip to itself. Seats 0 and 1 prove it as
+    /// it comes; seat 3, which closed on a copy differing in its state hash alone
+    /// -- no proof -- proves the bad one at the stage it has left. Every honest
+    /// seat closes on the same money, and no honest seat is proven by anybody.
+    #[test]
+    fn a_settlement_with_other_money_is_proven_by_every_honest_seat() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let captured: std::cell::RefCell<Vec<(usize, Vec<u8>)>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if is_kind(b, EventType::HandComplete) {
+                let mut c = captured.borrow_mut();
+                if !c.iter().any(|(f, _)| *f == from) {
+                    c.push((from, b.to_vec()));
+                }
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..64 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &route, &mut refused);
+        }
+        let rogue = 2usize;
+        let (altered, state_only) = {
+            let Phase::Playing { play, .. } = &hands[rogue].phase else {
+                panic!("playing")
+            };
+            let Step::Settling { mine, .. } = &play.step else {
+                panic!("at the settlement")
+            };
+            let altered = rogue_money(mine, rogue as u8).expect("a chip to move");
+            let mut state_only = (**mine).clone();
+            state_only.state_hash = [7; 32];
+            (altered, state_only)
+        };
+        let bad = hands[rogue].say(EventType::HandComplete, &altered, HAND_COMPLETE_CAP, &keys[rogue], NOW).unwrap();
+        let odd = hands[rogue].say(EventType::HandComplete, &state_only, HAND_COMPLETE_CAP, &keys[rogue], NOW).unwrap();
+        let copies = captured.borrow().clone();
+        assert_eq!(copies.len(), 4, "every seat said its settlement");
+        for to in [0usize, 1, 3] {
+            for (from, b) in &copies {
+                if *from != to && *from != rogue {
+                    let _ = hands[to].on_event(b, &keys[to], NOW);
+                }
+            }
+        }
+        for to in [0usize, 1] {
+            let _ = hands[to].on_event(&bad, &keys[to], NOW);
+            assert_eq!(hands[to].proven.get(&2).map(|p| p.cause), Some(CAUSE_MONEY), "seat {to} proves seat 2");
+            assert!(hands[to].over(), "and closes the hand all the same");
+        }
+        let _ = hands[3].on_event(&odd, &keys[3], NOW);
+        assert!(hands[3].proven.is_empty(), "the state hash alone proves nothing");
+        assert!(hands[3].over(), "seat 3 closed on it");
+        let _ = hands[3].on_event(&bad, &keys[3], NOW);
+        assert_eq!(hands[3].proven.get(&2).map(|p| p.cause), Some(CAUSE_MONEY), "proven at the stage left");
+        assert_eq!(hands[0].stacks(), hands[1].stacks(), "one money");
+        assert_eq!(hands[0].stacks(), hands[3].stacks(), "one money");
+        for to in [0usize, 1, 3] {
+            assert!(hands[to].proven.keys().all(|s| *s == 2), "no honest seat proven at seat {to}");
+        }
+    }
+
+    /// `G9`: **an honest hand to its showdown proves nobody** -- the last seat
+    /// to show included: its own hand is written once the stage took it, and
+    /// before the settlement is derived.
+    #[test]
+    fn an_honest_showdown_proves_nobody() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let route = |_from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> { Some(b.to_vec()) };
+        let mut refused = Vec::new();
+        for _ in 0..64 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &route, &mut refused);
+        }
+        for (i, h) in hands.iter().enumerate() {
+            assert!(h.over(), "seat {i} settled");
+            assert!(h.proven.is_empty(), "seat {i} proved nobody");
+        }
+        assert_eq!(hands[0].stacks(), hands[1].stacks());
+        assert_eq!(hands[0].stacks(), hands[2].stacks());
+        assert!((0..3u8).any(|s| hands[0].shown(s).is_some()), "a hand was shown");
+    }
+
+    /// `G9`: the settlement four seats reach, every copy held back -- for the
+    /// tests below. Returns the hands, the keys, the copies by writer, and the
+    /// rogue's (seat 2's) copy that moves a chip to itself.
+    fn four_at_the_settlement() -> (Vec<Hand>, Vec<SigningKey>, Vec<(usize, Vec<u8>)>, Vec<u8>) {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let captured: std::cell::RefCell<Vec<(usize, Vec<u8>)>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if is_kind(b, EventType::HandComplete) {
+                let mut c = captured.borrow_mut();
+                if !c.iter().any(|(f, _)| *f == from) {
+                    c.push((from, b.to_vec()));
+                }
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..64 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &route, &mut refused);
+        }
+        let altered = {
+            let Phase::Playing { play, .. } = &hands[2].phase else {
+                panic!("playing")
+            };
+            let Step::Settling { mine, .. } = &play.step else {
+                panic!("at the settlement")
+            };
+            rogue_money(mine, 2).expect("a chip to move")
+        };
+        let bad = hands[2].say(EventType::HandComplete, &altered, HAND_COMPLETE_CAP, &keys[2], NOW).unwrap();
+        let copies = captured.borrow().clone();
+        assert_eq!(copies.len(), 4, "every seat said its settlement");
+        (hands, keys, copies, bad)
+    }
+
+    /// `G9`: **a bad second copy is proven as it comes** -- a rogue that sent
+    /// its honest copy first escaped every seat, the stage answering the second
+    /// version before anything judged it.
+    #[test]
+    fn a_bad_second_copy_is_proven_as_it_comes() {
+        let (mut hands, keys, copies, bad) = four_at_the_settlement();
+        let honest = copies.iter().find(|(f, _)| *f == 2).map(|(_, b)| b.clone()).expect("the rogue's own copy");
+        let _ = hands[0].on_event(&honest, &keys[0], NOW);
+        assert!(hands[0].proven.is_empty(), "its honest copy proves nothing");
+        let _ = hands[0].on_event(&bad, &keys[0], NOW);
+        assert_eq!(hands[0].proven.get(&2).map(|p| p.cause), Some(CAUSE_MONEY), "the second version is proven");
+    }
+
+    /// `G9`: **the late road is judged, against this client's own body only**
+    /// -- a seat that gave the hand up while settling proves a bad copy that
+    /// reaches it after; one that gave up before it settled has no reference,
+    /// and the copy it borrows its body from proves nothing.
+    #[test]
+    fn the_late_road_is_judged_against_the_own_body_only() {
+        let (mut hands, keys, copies, bad) = four_at_the_settlement();
+        hands[0].give_up(Abort::Deadline);
+        let _ = hands[0].on_event(&bad, &keys[0], NOW);
+        assert_eq!(hands[0].proven.get(&2).map(|p| p.cause), Some(CAUSE_MONEY), "proven on the late road");
+        // Seat 1 never settled: no reference of its own.
+        hands[1].settled_money = None;
+        hands[1].give_up(Abort::Deadline);
+        let _ = hands[1].on_event(&bad, &keys[1], NOW);
+        assert!(hands[1].proven.is_empty(), "a borrowed body is no reference");
+        let _ = copies;
+    }
+
+    /// `G9`: **`judge_money`'s other answers** -- at this client's sequence
+    /// but another parent, no evidence; before this client settles, not yet;
+    /// in a hand over without a settlement of its own, no evidence.
+    #[test]
+    fn judge_money_answers_by_its_own_position() {
+        let (mut hands, _keys, _copies, bad) = four_at_the_settlement();
+        assert_eq!(hands[0].judge_money(&bad, 2), Judged::Proven);
+        let (s, _, money) = hands[0].settled_money.clone().expect("settled");
+        hands[0].settled_money = Some((s, [9; 32], money));
+        assert!(matches!(hands[0].judge_money(&bad, 2), Judged::NotEvidence(_)), "another parent");
+        hands[0].settled_money = None;
+        assert_eq!(hands[0].judge_money(&bad, 2), Judged::Unjudgeable, "not settled yet");
+        hands[0].give_up(Abort::Deadline);
+        hands[0].settled_money = None;
+        assert!(matches!(hands[0].judge_money(&bad, 2), Judged::NotEvidence(_)), "given up before settling");
+        assert!(matches!(hands[0].judge_money(&bad, 1), Judged::NotEvidence(_)), "not the accused's own");
+    }
+
+    /// `G9`: **a seat of the hand's stages that was not dealt in is provable
+    /// for its settlement, and for nothing else** -- it signs a settlement and
+    /// nothing of the deck.
+    #[test]
+    fn a_dead_money_seat_is_provable_for_its_settlement_alone() {
+        let keys: Vec<SigningKey> = (0..4u8).map(|s| key(10 + s)).collect();
+        let (mut h, _) = Hand::open(opening_n(4, 0), &keys[0], NOW, 30_000).unwrap();
+        let (_, frame) = Hand::open(opening_n(4, 3), &keys[3], NOW, 30_000).unwrap();
+        let bytes = bytes_of_sends(frame).remove(0);
+        assert!(h.open.required.contains(&3));
+        h.mine.dealt_in.retain(|s| *s != 3);
+        assert!(!h.cheat_voters(3).is_empty(), "the band has voters about it");
+        h.note_proven(3, CAUSE_ACTION, vec![bytes.clone()]);
+        assert!(h.proven.is_empty(), "not for an action");
+        h.note_proven(3, CAUSE_MONEY, vec![bytes]);
+        assert_eq!(h.proven.get(&3).map(|p| p.cause), Some(CAUSE_MONEY), "for its settlement");
+    }
+
+    /// `G9`: **`show()` refuses once this seat is heard at the showdown**, and
+    /// writes nothing of its own -- the stage held open by one seat's silence.
+    #[test]
+    fn show_refuses_once_this_seat_is_heard() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let quiet = std::cell::Cell::new(None::<usize>);
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            let showdown = is_kind(b, EventType::ShowdownReveal) || is_kind(b, EventType::ShowdownMuck);
+            if showdown && quiet.get().is_some_and(|q| q == from) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..64 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            // The last to show is kept from the others: the showdown stays open.
+            if quiet.get().is_none() {
+                if let Some(o) = hands[s].showdown_order().last() {
+                    quiet.set(Some(usize::from(*o)));
+                }
+            }
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &route, &mut refused);
+        }
+        let Some(q) = quiet.get() else {
+            panic!("a showdown")
+        };
+        let spoke = (0..3usize).find(|s| *s != q && !hands[*s].over() && !hands[*s].showing()).expect("a seat heard there");
+        let before = hands[spoke].shown(spoke as u8);
+        assert!(matches!(hands[spoke].show(&keys[spoke], NOW), Err(Failed::NotInThisStage)), "refused once heard");
+        assert_eq!(hands[spoke].shown(spoke as u8), before, "and nothing written");
     }
 
     /// `S1-KY`: **one settlement signed twice gives one terminal** -- the seat

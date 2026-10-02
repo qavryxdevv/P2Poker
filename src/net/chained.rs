@@ -206,7 +206,12 @@ pub fn open(
 ///   changed by it: a second version that verifies is a finding the node
 ///   counts, and one that does not is nothing.
 ///
-/// No sixth caller may be added without a clause of its own.
+/// * The cheat band's judges (`S1-KR` .. `S1-KT`, `D-097`): a frame of the
+///   accused's own signing, judged where it was signed -- the judge compares
+///   the frame's own sequence and parent with the stage it held there (a
+///   betting stage, its own settlement), never the receiver's cursor.
+///
+/// No caller may be added without a clause of its own.
 pub fn open_in_hand(
     bytes: &[u8],
     cap: usize,

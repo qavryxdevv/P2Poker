@@ -55,15 +55,19 @@ pub const ENGINE_DIGEST: [u8; 32] = [
 /// `S1-KT`: the digest of the code the betting engine and the hand's judge
 /// decide by -- `src/poker/engine.rs` and `src/poker/actions.rs` before their
 /// tests, and the functions of `src/table/hand.rs` a betting stage's round and
-/// its judgement stand on -- comments and whitespace dropped (the test
+/// its judgement stand on; `G9` (`D-097`): and the money path -- `pots.rs` and
+/// `evaluator.rs` before their tests, the `rs_poker` line of `Cargo.toml`, the
+/// settlement's functions and its judge's, `dealing.rs` `board`, `deck.rs`
+/// `hole_cards`, `handwire.rs`'s settlement types -- comments and whitespace
+/// dropped (the test
 /// `the_engine_is_the_protocol_majors` reads it again and fails until this
 /// equals its own). Pinned again after a change that decides nothing new; a
 /// change that does is a new major.
 pub const ENGINE_SOURCE: [u8; 32] = [
-    0x2b, 0xe3, 0x47, 0x5d, 0x09, 0x3e, 0x4f, 0x00,
-    0xbd, 0x56, 0x9d, 0xe7, 0xf1, 0xc7, 0x7c, 0x3e,
-    0x75, 0x00, 0x85, 0xa7, 0xaa, 0xa8, 0x8d, 0xdf,
-    0x5e, 0x48, 0xe3, 0xd9, 0x99, 0x16, 0xb4, 0x80,
+    0xeb, 0x66, 0xc1, 0xef, 0xe1, 0xcd, 0x99, 0x82,
+    0x0d, 0xae, 0xbc, 0x94, 0x60, 0x75, 0x4f, 0x2f,
+    0x05, 0xf8, 0x1b, 0x61, 0x9f, 0x75, 0xc2, 0x6e,
+    0x18, 0x61, 0x7d, 0x8e, 0x3c, 0x47, 0x08, 0x1d,
 ];
 
 /// `S1-KT`: what every `HAND_INIT` carries as its `engine` -- the digest of
