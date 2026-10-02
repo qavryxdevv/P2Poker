@@ -176,7 +176,9 @@ param(
     # its own last reveal in place of its settlement, `S1-KQ`), `bad-key` (its
     # deck key's ownership proof is broken on the wire, `S1-KS`), `bad-step` (its
     # shuffle step is a card short on the wire, `S1-KS`), `bad-proof-round` (its
-    # shuffle proof names another round on the wire, `S1-KS`); comma-separated. For
+    # shuffle proof names another round on the wire, `S1-KS`), `bad-action` (at
+    # each turn it first says an action the rules refuse -- a check facing a bet,
+    # a call with nothing owed -- then its own, `S1-KT`); comma-separated. For
     # measuring what the honest seats do about it -- the table not safe, a hand
     # never held for ever. Needs a `--features fault-harness` binary.
     [string]$Rogue = '',

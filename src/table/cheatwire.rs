@@ -46,13 +46,13 @@ pub struct CheatVote {
     /// `ANCHOR(k)`: the abort terminal of the hand the cheat was in.
     #[cbor(n(1), with = "minicbor::bytes")]
     pub anchor: Hash,
-    /// What the frames prove: [`CAUSE_REVEAL`], [`CAUSE_SHUFFLE`] or
-    /// [`CAUSE_KEY`].
+    /// What the frames prove: [`CAUSE_REVEAL`], [`CAUSE_SHUFFLE`],
+    /// [`CAUSE_KEY`] or [`CAUSE_ACTION`].
     #[n(2)]
     pub cause: u16,
     /// Frames of the subject's own signing that this voter holds it proven by:
     /// one reveal; one deck key; one shuffle step, or a step and the proof
-    /// bound to it. Not in the digest: two judges may hold two broken frames.
+    /// bound to it; one betting action. Not in the digest: two judges may hold two broken frames.
     #[n(3)]
     pub evidence: Vec<minicbor::bytes::ByteVec>,
 }
@@ -66,10 +66,14 @@ pub const CAUSE_SHUFFLE: u16 = 2;
 /// A deck key that does not hold: it does not decode, it is the identity, or its
 /// ownership proof fails at its own context (`S1-KS`). Not a cause of §4.10's.
 pub const CAUSE_KEY: u16 = 7;
+/// A betting action the rules refuse at the betting stage it was signed at: out
+/// of turn there, a body that does not decode, or an action the engine refuses
+/// at that stage's round (`S1-KT`). Not a cause of §4.10's.
+pub const CAUSE_ACTION: u16 = 8;
 
 /// The causes the band knows.
 pub fn cause_known(cause: u16) -> bool {
-    matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY)
+    matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY | CAUSE_ACTION)
 }
 
 impl CheatVote {
@@ -202,11 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn the_band_knows_three_causes() {
-        for c in [CAUSE_REVEAL, CAUSE_SHUFFLE, CAUSE_KEY] {
+    fn the_band_knows_four_causes() {
+        for c in [CAUSE_REVEAL, CAUSE_SHUFFLE, CAUSE_KEY, CAUSE_ACTION] {
             assert!(cause_known(c));
         }
-        for c in [0u16, 1, 4, 5, 6, 8] {
+        for c in [0u16, 1, 4, 5, 6, 9] {
             assert!(!cause_known(c), "{c}");
         }
     }

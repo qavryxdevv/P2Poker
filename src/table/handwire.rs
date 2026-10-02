@@ -1,6 +1,6 @@
 //! `HAND_INIT` on the wire, and how to check one.
 //!
-//! `PROTOCOL.md` §4.3's twelve fields, in its own numbering, and the sentence
+//! `PROTOCOL.md` §4.3's thirteen fields, in its own numbering, and the sentence
 //! that governs all of them:
 //!
 //! > **`HAND_INIT` announces nothing and decides nothing.** Every field is a
@@ -70,6 +70,13 @@ pub struct HandInit {
     /// negative for a departing stack. Ascending by seat, unique.
     #[n(11)]
     pub ledger_delta: Vec<(SeatIdx, i64)>,
+    /// `S1-KT`: the digest of the engine this client decides the hand by --
+    /// `ENGINE_DIGEST`, the one `tests/random_hands.rs` pins (`D-093`). Two
+    /// clients whose engines differ never complete stage 0 together, so they
+    /// never share a parent at which one could judge the other's action: a
+    /// split, never a framing (`D-094`).
+    #[cbor(n(12), with = "minicbor::bytes")]
+    pub engine: Hash,
 }
 
 /// Which field two copies disagree about.
@@ -92,6 +99,7 @@ pub enum Field {
     Stacks,
     RosterHash,
     LedgerDelta,
+    Engine,
 }
 
 impl std::fmt::Display for Field {
@@ -109,6 +117,7 @@ impl std::fmt::Display for Field {
             Self::Stacks => "stacks",
             Self::RosterHash => "roster_hash",
             Self::LedgerDelta => "ledger_delta",
+            Self::Engine => "engine",
         };
         f.write_str(name)
     }
@@ -181,6 +190,9 @@ impl HandInit {
                 }
             };
         }
+        // `S1-KT`: the engine first -- two engines disagree about everything
+        // downstream of it, and the note names the engine, not a field it moved.
+        same!(engine, Engine);
         same!(hand_id, HandId);
         same!(button_position, ButtonPosition);
         same!(sb_position, SbPosition);
@@ -1410,6 +1422,7 @@ mod tests {
             stacks: vec![10_000, 10_000],
             roster_hash: [3; 32],
             ledger_delta: vec![(0, 10_000), (1, 10_000)],
+            engine: [5; 32],
         }
     }
 
@@ -1466,6 +1479,7 @@ mod tests {
                 HandInit { ledger_delta: vec![(0, 1)], ..body() },
                 Field::LedgerDelta,
             ),
+            (HandInit { engine: [6; 32], ..body() }, Field::Engine),
         ];
         for (theirs, expected) in cases {
             assert_eq!(

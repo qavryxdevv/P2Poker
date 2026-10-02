@@ -39,6 +39,46 @@ use crate::poker::state::Chips;
 pub const PROTOCOL_VERSION: u16 = 3;
 pub const PROTOCOL_MAJOR: u16 = 3;
 
+/// `S1-KT`, `D-093`: the digest of what the betting engine decides over the
+/// seeded corpus of `tests/random_hands.rs` (`the_engine_is_the_protocol_majors`,
+/// which fails until this equals its own) -- one per protocol major: a change
+/// to what the engine decides is a new major. Carried in every `HAND_INIT`
+/// through [`engine_id`].
+/// `83021f6e91984aaa1b796cf43427bd5c83bf49b10616b829ac0539f381bc71e8` (2026-10-02, `S1-KT`).
+pub const ENGINE_DIGEST: [u8; 32] = [
+    0x83, 0x02, 0x1f, 0x6e, 0x91, 0x98, 0x4a, 0xaa,
+    0x1b, 0x79, 0x6c, 0xf4, 0x34, 0x27, 0xbd, 0x5c,
+    0x83, 0xbf, 0x49, 0xb1, 0x06, 0x16, 0xb8, 0x29,
+    0xac, 0x05, 0x39, 0xf3, 0x81, 0xbc, 0x71, 0xe8,
+];
+
+/// `S1-KT`: the digest of the code the betting engine and the hand's judge
+/// decide by -- `src/poker/engine.rs` and `src/poker/actions.rs` before their
+/// tests, and the functions of `src/table/hand.rs` a betting stage's round and
+/// its judgement stand on -- comments and whitespace dropped (the test
+/// `the_engine_is_the_protocol_majors` reads it again and fails until this
+/// equals its own). Pinned again after a change that decides nothing new; a
+/// change that does is a new major.
+pub const ENGINE_SOURCE: [u8; 32] = [
+    0x13, 0x4d, 0x27, 0x51, 0x71, 0x51, 0x3d, 0xd8,
+    0x17, 0xc1, 0x75, 0x44, 0xe5, 0xc2, 0x38, 0xbe,
+    0x1d, 0x90, 0xe2, 0x5f, 0xf7, 0x43, 0x19, 0xe4,
+    0xfa, 0x39, 0x32, 0xe5, 0xbb, 0xcb, 0x8c, 0x84,
+];
+
+/// `S1-KT`: what every `HAND_INIT` carries as its `engine` -- the digest of
+/// what the engine decides ([`ENGINE_DIGEST`]) and of the code it decides by
+/// ([`ENGINE_SOURCE`]). Two builds that differ in either never complete a
+/// hand's stage 0 together, so neither ever judges the other's action against a
+/// round of its own making: a split, never a framing (`D-094`).
+pub fn engine_id() -> [u8; 32] {
+    let mut parts = Vec::with_capacity(16 + 64);
+    parts.extend_from_slice(b"p2p-poker engine");
+    parts.extend_from_slice(&ENGINE_DIGEST);
+    parts.extend_from_slice(&ENGINE_SOURCE);
+    *blake3::hash(&parts).as_bytes()
+}
+
 /// The libp2p identify protocol name.
 ///
 /// Held here and used from `net::swarm`, which defined its own copy of this

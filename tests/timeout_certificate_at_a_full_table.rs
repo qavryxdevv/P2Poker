@@ -238,6 +238,8 @@ fn a_hand_init_at_max_seats_fits_its_cap() {
         stacks: vec![u64::MAX; usize::from(MAX_SEATS)],
         roster_hash: [0x33; 32],
         ledger_delta: (0..MAX_SEATS).map(|s| (s, i64::MIN)).collect(),
+        // `S1-KT`: the engine's digest, 32 bytes on every copy.
+        engine: [0xff; 32],
     };
     let encoded = canonical(&body).len();
     assert!(

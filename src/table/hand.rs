@@ -47,8 +47,8 @@ use crate::mental_poker::shuffle::{ChainParams, ShuffleChain, StepError};
 use crate::mental_poker::protocol::{DeckCrypto, VerifyOutcome};
 use crate::poker::actions::{Action, BettingRound, Illegal, LegalActions};
 use crate::poker::engine::{
-    advance_positions, betting_is_closed, first_to_act, initial_positions, next_to_act,
-    only_one_live, post_blinds, round_complete, Positions,
+    advance_positions, first_to_act, initial_positions, next_street, only_one_live, opening_round, opening_turn,
+    table_action, turn_after, Positions,
 };
 use crate::poker::evaluator::{evaluate_holdem, HandRank};
 use crate::poker::pots::{award, build_pots};
@@ -67,8 +67,8 @@ use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, B
 use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 use crate::table::cheatwire::{
-    cause_known, cheat_sequence, subject_digest as cheat_digest, CheatCert, CheatVote, CAUSE_KEY, CAUSE_REVEAL,
-    CAUSE_SHUFFLE, CHEAT_CERT_CAP, CHEAT_VOTE_CAP,
+    cause_known, cheat_sequence, subject_digest as cheat_digest, CheatCert, CheatVote, CAUSE_ACTION, CAUSE_KEY,
+    CAUSE_REVEAL, CAUSE_SHUFFLE, CHEAT_CERT_CAP, CHEAT_VOTE_CAP,
 };
 
 /// What a step wants sent.
@@ -98,6 +98,11 @@ pub struct VoteAsk {
 pub enum Failed {
     /// The bytes are not a well-formed chained event for the slot expected.
     Wire(WireError),
+    /// `S1-KT`: a vote or a certificate that is evidence of nothing here --
+    /// another branch's frame, or junk -- answered with nothing: no refusal and
+    /// no line in the log. (A hand's frames ride the table's group alone today,
+    /// whose deliveries take no verdict; were one read, this is `Ignore`.)
+    Ignored,
     /// The sender is not on this table's roster.
     NotAtThisTable,
     /// The sender is on the roster but may not speak in this stage.
@@ -183,6 +188,7 @@ impl std::fmt::Display for Failed {
             Self::NotYet => f.write_str("that belongs to a stage this client has not reached"),
             Self::BadKey { seat, why } => write!(f, "seat {seat}'s deck key: {why}"),
             Self::NothingFurther => f.write_str("this hand has gone as far as it can"),
+            Self::Ignored => f.write_str("evidence of nothing here"),
             Self::OutOfTurn { seat, expected } => match expected {
                 Some(e) => write!(f, "seat {seat} shuffled out of turn; seat {e} is up"),
                 None => write!(f, "seat {seat} shuffled after the chain closed"),
@@ -544,6 +550,11 @@ impl Opening {
             if body.hand_id != base.hand_id || body.self_consistent(base.max_players).is_err() {
                 continue;
             }
+            // `S1-KT`: never a copy of another engine -- this client would
+            // refuse every copy of that hand and adopt it again, for ever.
+            if body.engine != crate::protocol::constants::engine_id() {
+                continue;
+            }
             let entry = groups
                 .entry((opened.envelope.previous_event_hash, opened.envelope.payload.clone()))
                 .or_insert_with(|| (BTreeSet::new(), body));
@@ -795,6 +806,57 @@ pub const FRAME_CAP: usize = 16_384;
 /// this whole row exists to end — and `src/net/relay.rs` already budgets 220
 /// for the same quantity, so 214 is not comfortably above every encoder.
 pub const ENVELOPE_MAX: usize = 384;
+
+/// `S1-KT`: the five types a betting stage takes, and nothing else.
+fn is_betting_action(kind: EventType) -> bool {
+    matches!(
+        kind,
+        EventType::ActionCheck
+            | EventType::ActionCall
+            | EventType::ActionBet
+            | EventType::ActionRaise
+            | EventType::ActionFold
+    )
+}
+
+/// `S1-KT`: the action a betting frame names, read and not checked -- what
+/// decides whether the frame is worth a signature check at a stage left.
+fn claimed_action(bytes: &[u8], kind: EventType) -> Option<Action> {
+    match kind {
+        EventType::ActionBet => chained::payload_unverified::<ActionAmount>(bytes, FRAME_CAP, ACTION_CAP).map(|a| Action::Bet(a.total)),
+        EventType::ActionRaise => {
+            chained::payload_unverified::<ActionAmount>(bytes, FRAME_CAP, ACTION_CAP).map(|a| Action::Raise(a.total))
+        }
+        EventType::ActionFold => chained::payload_unverified::<ActionHead>(bytes, FRAME_CAP, ACTION_CAP).map(|_| Action::Fold),
+        EventType::ActionCheck => chained::payload_unverified::<ActionHead>(bytes, FRAME_CAP, ACTION_CAP).map(|_| Action::Check),
+        _ => chained::payload_unverified::<ActionHead>(bytes, FRAME_CAP, ACTION_CAP).map(|_| Action::Call),
+    }
+}
+
+/// `S1-KT`: a betting action's head and the action it names, by its type --
+/// one decoding for the live path and the band's judge.
+fn action_of(opened: &chained::Opened, kind: EventType) -> Result<(ActionHead, Action), WireError> {
+    match kind {
+        EventType::ActionBet | EventType::ActionRaise => {
+            let a: ActionAmount = chained::payload(opened, ACTION_CAP)?;
+            let act = if kind == EventType::ActionBet {
+                Action::Bet(a.total)
+            } else {
+                Action::Raise(a.total)
+            };
+            Ok((a.head(), act))
+        }
+        _ => {
+            let h: ActionHead = chained::payload(opened, ACTION_CAP)?;
+            let act = match kind {
+                EventType::ActionFold => Action::Fold,
+                EventType::ActionCheck => Action::Check,
+                _ => Action::Call,
+            };
+            Ok((h, act))
+        }
+    }
+}
 
 /// The largest a frame of this type may legitimately be, payload cap plus
 /// envelope — **the ceiling a buffer should charge it, rather than
@@ -1851,6 +1913,16 @@ struct Judge {
     commit_waiting: Vec<SeatIdx>,
 }
 
+/// `S1-KT`: a betting stage this client held -- its slot's parent, the seat it
+/// waited for, the round as it stood -- so an action signed at it is judged
+/// there by the engine from any later stage, and after a give-up.
+#[derive(Debug, Clone)]
+struct BetStage {
+    parent: Hash,
+    to_act: SeatIdx,
+    round: BettingRound,
+}
+
 /// What the deck stages leave behind and every later stage needs.
 ///
 /// One struct rather than three fields repeated in each variant, because the
@@ -2089,6 +2161,16 @@ pub struct Hand {
     /// a rogue re-signing votes around an honest seat's genuine frames costs
     /// this client one verification per frame, not one per vote.
     verdicts: BTreeMap<Hash, Judged>,
+    /// `S1-KT`: the voters whose evidence about a subject was evidence of
+    /// nothing here -- a certificate carrying their votes again is ignored,
+    /// never refused.
+    junk_from: BTreeSet<(SeatIdx, SeatIdx)>,
+    /// `S1-KT`: a seat of another engine has been said this hand.
+    engine_said: bool,
+    /// `S1-KT`: every betting stage this client held in this hand, by its
+    /// sequence -- what another seat's betting action is judged at. Outside
+    /// the phase, so a give-up keeps it.
+    bet_stages: BTreeMap<u64, BetStage>,
     /// `S1-KR`: the cheat votes held, by subject and then by voter.
     cheat_votes: BTreeMap<SeatIdx, BTreeMap<SeatIdx, Vec<u8>>>,
     /// `S1-KR`: the subjects this client has sealed a certificate about.
@@ -2518,6 +2600,8 @@ impl Hand {
         } = initial_positions(button, &alive, o.max_players).ok_or(Failed::NotInThisStage)?;
 
         let mine = HandInit {
+            // `S1-KT`: the engine this client decides the hand by (`D-093`).
+            engine: crate::protocol::constants::engine_id(),
             hand_id: o.hand_id,
             button_position: button,
             sb_position,
@@ -2700,6 +2784,9 @@ impl Hand {
                 cheat_voted: BTreeSet::new(),
                 judged_from: BTreeSet::new(),
                 verdicts: BTreeMap::new(),
+                junk_from: BTreeSet::new(),
+                engine_said: false,
+                bet_stages: BTreeMap::new(),
                 cheat_votes: BTreeMap::new(),
                 cheat_sealed: BTreeSet::new(),
                 cheat_certs: BTreeMap::new(),
@@ -2881,6 +2968,8 @@ impl Hand {
         if sequence < self.slot.sequence {
             // A stage this hand has left. Not a fault and not worth a word: the
             // mesh delivers a message more than once as a matter of course.
+            // `S1-KT`: a betting action there is judged there all the same.
+            self.judge_left_action(bytes, kind, sequence);
             // `S1-KJ`: unless it is another version of what this hand took
             // there from the same writer -- said once, and nothing else done.
             return match self.another_version(bytes, kind, sequence) {
@@ -2899,6 +2988,11 @@ impl Hand {
             return self.on_timeout_vote(bytes, key, now_ms);
         }
 
+        // `S1-KT`: given up at a betting stage, an action at it is judged there
+        // all the same -- the phase answers nothing more.
+        if matches!(self.phase, Phase::Aborted(_)) {
+            self.judge_left_action(bytes, kind, sequence);
+        }
         let out = self.dispatch(bytes, kind, key, now_ms);
         self.mark_stage(now_ms);
         // `D-033`: kept once, for a seat back from a restart -- keyed by the
@@ -3191,6 +3285,16 @@ impl Hand {
                     short(&self.open.genesis),
                     theirs.dealt_in,
                     self.mine.dealt_in
+                ));
+            }
+            // `S1-KT`: a seat whose client decides the betting by another
+            // engine -- said once a hand, as `S1-CF`'s note is.
+            if what == NotOurs::Differs(Field::Engine) && !self.engine_said {
+                self.engine_said = true;
+                self.dealt_note = Some(format!(
+                    "seat {seat}'s client decides the betting by another engine than this client's: the two cannot \
+                     play hand #{} together, and stage 0 will not complete (S1-KT)",
+                    self.open.hand_id
                 ));
             }
             return Err(Failed::Disagrees { seat, what });
@@ -4468,20 +4572,22 @@ impl Hand {
             *slot = true;
         }
 
-        let mut play = Play {
+        // Pre-flop, and only pre-flop, the blinds go in before anybody acts.
+        // They are not actions: `post_blinds` leaves `acted` false for both,
+        // which is what gives the big blind its option without a rule for it.
+        // A seat that is not dealt in is `folded` from the start. `S1-KT`: the
+        // engine's own rule, which the digest pins.
+        let round = opening_round(
+            stack,
+            &dealt,
+            self.mine.sb_position,
+            self.mine.bb_seat,
+            self.mine.small_blind,
+            self.mine.big_blind,
+        );
+        let play = Play {
             dealing,
-            round: BettingRound {
-                big_blind: self.mine.big_blind,
-                current_bet: 0,
-                last_full_raise: self.mine.big_blind,
-                committed: vec![0; n],
-                stack,
-                acted: vec![false; n],
-                // A seat that is not dealt in is `folded` from the start. The
-                // engine has one predicate for "cannot act", and this is how a
-                // seat that was never in the hand enters it.
-                folded: dealt.iter().map(|d| !d).collect(),
-            },
+            round,
             dealt,
             paid: vec![0; n],
             street: Street::PreFlop,
@@ -4492,17 +4598,6 @@ impl Hand {
             mucked: vec![false; n],
             step: Step::Ended,
         };
-
-        // Pre-flop, and only pre-flop, the blinds go in before anybody acts.
-        // They are not actions: `post_blinds` leaves `acted` false for both,
-        // which is what gives the big blind its option without a rule for it.
-        post_blinds(
-            &mut play.round,
-            self.mine.sb_position,
-            self.mine.bb_seat,
-            self.mine.small_blind,
-            self.mine.big_blind,
-        );
         self.phase = Phase::Playing {
             deal,
             table,
@@ -4536,11 +4631,9 @@ impl Hand {
             // leaves the previous street's aggressor standing, which is the
             // seat that must show first at the showdown (D-021).
             play.aggressor = None;
-            if betting_is_closed(&play.round, &play.dealt) {
-                None
-            } else {
-                first_to_act(street, &play.round, &play.dealt, button, sb_position, bb_seat, seat_count)
-            }
+            // `S1-KT`: the engine's own rule, which the digest of
+            // `tests/random_hands.rs` pins -- not a copy of it.
+            opening_turn(street, &play.round, &play.dealt, button, sb_position, bb_seat, seat_count)
         };
         match up {
             Some(to_act) => {
@@ -4551,6 +4644,7 @@ impl Hand {
                 play.step = Step::Acting { to_act };
                 self.turn_began_unix_ms = began;
                 self.turn_heard_ms = now_ms;
+                self.note_betting_stage();
                 Ok(Vec::new())
             }
             // Nobody can act. Either every remaining seat is all in — the
@@ -4616,6 +4710,14 @@ impl Hand {
             (kind, body)
         };
 
+        // `S1-KT` harness: a rogue first signs, at the same slot, an action the
+        // rules refuse -- a check facing a bet, a call with nothing owed -- and
+        // says it before its own.
+        let refused = if rogue("bad-action", self.open.hand_id) {
+            self.rogue_bad_action(key, now_ms)
+        } else {
+            None
+        };
         let bytes = match &body {
             Body::Head(h) => self.say(kind, h, ACTION_CAP, key, now_ms)?,
             Body::Amount(a) => self.say(kind, a, ACTION_CAP, key, now_ms)?,
@@ -4623,7 +4725,8 @@ impl Hand {
         let hash = self.opened(&bytes, kind)?.event_hash;
         // `D-034`: this client's own action gives the next seat its turn now.
         self.last_stamp_ms = now_ms;
-        let mut out = vec![Send::Broadcast(bytes)];
+        let mut out: Vec<Send> = refused.into_iter().map(Send::Broadcast).collect();
+        out.push(Send::Broadcast(bytes));
         out.append(&mut self.apply_action(me, action, kind, hash, key, now_ms)?);
         // What this turn cost the reserve, charged once and only on the action
         // that ends the turn. `stage_at_ms` is when this client accepted the
@@ -4651,32 +4754,28 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, kind)?;
         let seat = self.seat_of(&opened.sender)?;
+        // `S1-KT`: a betting stage takes a betting action and nothing else --
+        // every other type was taken as a call. No honest client signs another
+        // at a betting stage's slot: its own engine is at that stage too.
+        if !is_betting_action(kind) {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "a betting stage took a frame of another type",
+            });
+        }
         // `D-034`: the turn this action gives begins when the action was made.
         self.last_stamp_ms = opened.envelope.emitted_at_unix_ms;
         self.note_signed(seat);
+        // `S1-KT`: judged first, by the band's own judge, at the stage it was
+        // signed at -- this one, the frame opened at it already. Proven, the
+        // seat is voted about at the node's next tick (two seconds); the frame
+        // is refused below as it always was (out of turn, a body that does not
+        // decode, the engine's refusal), and refused it is never taken.
+        if self.judge_opened_action(&opened, kind, seat) == Judged::Proven {
+            self.note_proven(seat, CAUSE_ACTION, vec![bytes.to_vec()]);
+        }
 
-        let (head, action) = match kind {
-            EventType::ActionBet | EventType::ActionRaise => {
-                let a: ActionAmount =
-                    chained::payload(&opened, ACTION_CAP).map_err(Failed::Wire)?;
-                let act = if kind == EventType::ActionBet {
-                    Action::Bet(a.total)
-                } else {
-                    Action::Raise(a.total)
-                };
-                (a.head(), act)
-            }
-            _ => {
-                let h: ActionHead =
-                    chained::payload(&opened, ACTION_CAP).map_err(Failed::Wire)?;
-                let act = match kind {
-                    EventType::ActionFold => Action::Fold,
-                    EventType::ActionCheck => Action::Check,
-                    _ => Action::Call,
-                };
-                (h, act)
-            }
-        };
+        let (head, action) = action_of(&opened, kind).map_err(Failed::Wire)?;
 
         {
             let Phase::Playing { play, .. } = &self.phase else {
@@ -4718,10 +4817,10 @@ impl Hand {
             }
         }
         let out = self.apply_action(seat, action, kind, opened.event_hash, key, now_ms)?;
-        // `S1-KB`: applied as a betting action, whatever type it was signed
-        // under -- every type this path is reached by but a bet, a raise, a
-        // fold and a check is taken as a call, and a writer that signed its
-        // call under another kept it from being said again.
+        // `S1-KB`: applied as a betting action -- one of the five types, the
+        // only ones a betting stage takes since `S1-KT` (every other type was
+        // taken as a call, and a writer that signed its call under another
+        // kept it from being said again).
         self.took_action = Some(seat);
         Ok(out)
     }
@@ -4781,11 +4880,8 @@ impl Hand {
             let Phase::Playing { play, .. } = &self.phase else {
                 return Err(Failed::NothingFurther);
             };
-            if only_one_live(&play.round, &play.dealt) || round_complete(&play.round, &play.dealt) {
-                None
-            } else {
-                next_to_act(&play.round, &play.dealt, seat, seat_count)
-            }
+            // `S1-KT`: the engine's own rule, pinned with `opening_turn`.
+            turn_after(&play.round, &play.dealt, seat, seat_count)
         };
         match next {
             Some(to_act) => {
@@ -4796,6 +4892,7 @@ impl Hand {
                 play.step = Step::Acting { to_act };
                 self.turn_began_unix_ms = began;
                 self.turn_heard_ms = now_ms;
+                self.note_betting_stage();
                 Ok(Vec::new())
             }
             None => self.close_round_and_open(key, now_ms),
@@ -4816,13 +4913,10 @@ impl Hand {
             // round resets for the next one. This is the only place `paid` is
             // written, and `paid[s] + round.committed[s]` is what `build_pots`
             // will want — the engine holds only the per-round half.
-            for seat in 0..play.paid.len() {
-                play.paid[seat] += play.round.committed[seat];
-                play.round.committed[seat] = 0;
-                play.round.acted[seat] = false;
+            // `S1-KT`: the engine's own rule, which the digest pins.
+            for (paid, moved) in play.paid.iter_mut().zip(next_street(&mut play.round)) {
+                *paid += moved;
             }
-            play.round.current_bet = 0;
-            play.round.last_full_raise = play.round.big_blind;
 
             // Everybody but one has folded. No card needs opening, whatever
             // street it is, and there is no showdown: nobody has to show a hand
@@ -7344,6 +7438,7 @@ impl Hand {
         let what = match cause {
             CAUSE_KEY => "a deck key that does not hold",
             CAUSE_SHUFFLE => "a shuffle step or proof that is not well formed",
+            CAUSE_ACTION => "a betting action the rules refuse",
             _ => "a card share that does not hold",
         };
         self.cert_note.push(format!(
@@ -7375,6 +7470,7 @@ impl Hand {
             (CAUSE_REVEAL, [frame]) => self.judge_reveal(frame, accused),
             (CAUSE_KEY, [frame]) => self.judge_key(frame, accused),
             (CAUSE_SHUFFLE, [_] | [_, _]) => self.judge_shuffle_bytes(frames, accused),
+            (CAUSE_ACTION, [frame]) => self.judge_action(frame, accused),
             _ => Judged::NotEvidence("the evidence were the frames its cause names"),
         };
         // Kept only where the frames are the accused's own and were judged:
@@ -7384,6 +7480,184 @@ impl Hand {
             self.verdicts.insert(memo, verdict);
         }
         verdict
+    }
+
+    /// `S1-KT`: the betting stage now open, kept for the hand's life. Called
+    /// where `Step::Acting` is set, and every road there has moved the slot to
+    /// that stage first: an action applied, a certificate acting for a seat, a
+    /// street opened.
+    fn note_betting_stage(&mut self) {
+        let Phase::Playing { play, .. } = &self.phase else {
+            return;
+        };
+        let Step::Acting { to_act } = play.step else {
+            return;
+        };
+        let stage = BetStage {
+            parent: self.slot.previous_event_hash,
+            to_act,
+            round: play.round.clone(),
+        };
+        self.bet_stages.insert(self.slot.sequence, stage);
+    }
+
+    /// `S1-KT`: what a betting action of `accused`'s own signing says about it,
+    /// judged at the betting stage it was signed at -- one this client held, by
+    /// its sequence and its parent -- by the engine, which the protocol major
+    /// pins (`S1-KU`). Out of turn there, a body that does not decode, an action
+    /// the engine refuses there: proven. One it takes holds, whatever the stage
+    /// became after: a certificate that acted for the seat leaves the seat's own
+    /// late action legal at its parent. An honest client signs an action at its
+    /// own turn alone, through the same engine, and says none the engine
+    /// refused (`act`: the refused bytes are dropped). The head fields are not
+    /// read -- an illegal action proves whatever its head says, and a legal one
+    /// with another head is two engines diverging, which is not this.
+    fn judge_action(&self, frame: &[u8], accused: SeatIdx) -> Judged {
+        let Some(accused_key) = self.key_of(accused) else {
+            return Judged::NotEvidence("the seat it accuses were at this table");
+        };
+        let Ok((kind, _, _)) = chained::peek(frame, PEEK_CAP) else {
+            return Judged::NotEvidence("the evidence were a frame");
+        };
+        if !is_betting_action(kind) {
+            return Judged::NotEvidence("the frame it carries were a betting action");
+        }
+        if frame.len() > frame_ceiling(kind) {
+            return Judged::NotEvidence("the frame were within its cap");
+        }
+        // Cheap first (the refuters' CPU bound): a frame whose body decodes,
+        // at a stage this client holds no record of, proves nothing here
+        // whatever its signature -- answered without one, so a vote held for a
+        // stage ahead costs nothing at each replay. One whose body does not
+        // decode is proven anywhere, and needs the signature that names it.
+        let sequence = chained::peek(frame, PEEK_CAP).map(|(_, _, s)| s).unwrap_or(0);
+        if claimed_action(frame, kind).is_some() && !self.bet_stages.contains_key(&sequence) {
+            return if self.may_reach(sequence) {
+                Judged::Unjudgeable
+            } else {
+                Judged::NotEvidence("the frame sat at a betting stage of this client's chain")
+            };
+        }
+        let Ok(opened) = chained::open_in_hand(frame, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id) else {
+            return Judged::NotEvidence("the frame opened in this hand");
+        };
+        if opened.sender != accused_key {
+            return Judged::NotEvidence("the frame were signed by the seat it accuses");
+        }
+        self.judge_opened_action(&opened, kind, accused)
+    }
+
+    /// `S1-KT`: [`Hand::judge_action`] past the signature -- the live path has
+    /// opened the frame at its own slot already. The bytes before the chain
+    /// (`D-092`): a body that does not decode is proven wherever it is judged,
+    /// an honest client's never failing to; then the stage it was signed at.
+    fn judge_opened_action(&self, opened: &chained::Opened, kind: EventType, accused: SeatIdx) -> Judged {
+        let Ok((_, action)) = action_of(opened, kind) else {
+            return Judged::Proven;
+        };
+        let Some(stage) = self.bet_stages.get(&opened.envelope.sequence) else {
+            // A stage this client may yet reach cannot be judged yet. One it
+            // will never reach -- the hand given up, or past its betting -- or
+            // one it stands at or has left that was no betting stage here, is
+            // evidence of nothing (the refuter's A2: held, it was refused at
+            // the hand's end, a voter on the table's branch marked down).
+            return if self.may_reach(opened.envelope.sequence) {
+                Judged::Unjudgeable
+            } else {
+                Judged::NotEvidence("the frame sat at a betting stage of this client's chain")
+            };
+        };
+        // Another branch of the hand: its stage is not this client's.
+        if stage.parent != opened.envelope.previous_event_hash {
+            return Judged::NotEvidence("the frame sat on this client's chain");
+        }
+        if accused != stage.to_act {
+            return Judged::Proven;
+        }
+        let mut round = stage.round.clone();
+        if round.apply(accused, action).is_err() {
+            Judged::Proven
+        } else {
+            Judged::Holds
+        }
+    }
+
+    /// `S1-KT`: whether this client may still reach the stage at `sequence` --
+    /// ahead of it, the hand neither given up nor past its betting.
+    fn may_reach(&self, sequence: u64) -> bool {
+        sequence > self.slot.sequence
+            && !self.over()
+            && !matches!(
+                &self.phase,
+                Phase::Playing { play, .. }
+                    if matches!(play.step, Step::Showdown { .. } | Step::Settling { .. } | Step::Ended)
+            )
+    }
+
+    /// `S1-KT`: a betting action of another seat's signing at a betting stage
+    /// this hand has left -- or the stage it gave the hand up at -- judged
+    /// there. Not only a second version: an action refused live was never
+    /// taken, and a stage a certificate closed took nothing of its seat's, so
+    /// `another_version` finds neither. Cheap first and the signature last (the
+    /// refuters' CPU bound): the copy this hand took is passed over by its event
+    /// hash, a frame on another parent by its claim, and a frame whose claim the
+    /// engine takes by the claim alone -- so a legal version spends nothing and
+    /// hides nothing that follows it (the refuter's A3). Only a frame that would
+    /// prove is verified. Nothing is memoized.
+    fn judge_left_action(&mut self, bytes: &[u8], kind: EventType, sequence: u64) {
+        if !is_betting_action(kind) {
+            return;
+        }
+        let Some(parent) = self.bet_stages.get(&sequence).map(|s| s.parent) else {
+            return;
+        };
+        if chained::parent_of(bytes, FRAME_CAP) != Some(parent) {
+            return;
+        }
+        let Some(sender) = chained::sender_of(bytes, FRAME_CAP) else {
+            return;
+        };
+        let Ok(seat) = self.seat_of(&sender) else {
+            return;
+        };
+        // Never this client's own seat, one proven already, or one not dealt in
+        // -- whom `note_proven` would never take, so nothing would stop its
+        // frames being checked again.
+        if seat == self.open.my_seat || self.proven.contains_key(&seat) || !self.mine.dealt_in.contains(&seat) {
+            return;
+        }
+        let digest = chained::event_hash_of(bytes, FRAME_CAP);
+        if digest.is_some() && self.taken_from.get(&(sequence, sender)).copied() == digest {
+            return;
+        }
+        let would_prove = match (claimed_action(bytes, kind), self.bet_stages.get(&sequence)) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(action), Some(stage)) => seat != stage.to_act || stage.round.clone().apply(seat, action).is_err(),
+        };
+        if would_prove && self.judge_action(bytes, seat) == Judged::Proven {
+            self.note_proven(seat, CAUSE_ACTION, vec![bytes.to_vec()]);
+        }
+    }
+
+    /// `S1-KT` harness: the action the `bad-action` rogue says first at its
+    /// turn -- of this client's own signing, at its own slot, refused there.
+    fn rogue_bad_action(&self, key: &SigningKey, now_ms: u64) -> Option<Vec<u8>> {
+        let Phase::Playing { play, .. } = &self.phase else {
+            return None;
+        };
+        let me = self.open.my_seat;
+        let head = ActionHead {
+            street: street_code(play.street),
+            seat: me,
+            action_index: play.actions,
+        };
+        let kind = if play.round.to_call(me) > 0 {
+            EventType::ActionCheck
+        } else {
+            EventType::ActionCall
+        };
+        self.say(kind, &head, ACTION_CAP, key, now_ms).ok()
     }
 
     /// `S1-KS`: what a `DECK_INIT` of `accused`'s own signing says about it,
@@ -10104,11 +10378,8 @@ impl Hand {
                             what: Illegal::NotToAct,
                         });
                     }
-                    if play.round.to_call(seat) == 0 {
-                        Action::Check
-                    } else {
-                        Action::Fold
-                    }
+                    // `S1-KT`: the engine's own rule, which the digest pins.
+                    table_action(&play.round, seat)
                 };
                 {
                     let Phase::Playing { play, .. } = &mut self.phase else {
@@ -10785,9 +11056,10 @@ impl Hand {
     /// a stage the hand has left, which `on_event` answers `Ok` and nothing, is
     /// never said again: said again, every copy made more (`run053626-4`, 13 300
     /// in six seconds at four seats); and a frame taken on the replay of held
-    /// ones is said like any other. **What `on_action` applied, not the type the
-    /// writer signed:** that path takes every type but a bet, a raise, a fold and
-    /// a check as a call, and a call signed as another type was never said again.
+    /// ones is said like any other. **What `on_action` applied:** one of the five
+    /// action types, the only ones a betting stage takes since `S1-KT` -- it took
+    /// every other type as a call, and a call signed as another was never said
+    /// again.
     ///
     /// **Every seat that takes it, not some.** Three seats named by the seating
     /// -- the three dealt in after the writer, to spare ten seats nine copies of
@@ -13379,6 +13651,14 @@ impl Hand {
             .keys()
             .copied()
             .filter(|s| !self.cheat_out.contains(s) && self.band_possible(*s) && self.cheat_voters_present(*s) >= 2)
+            // `S1-KT`: and only where this client has a part in it -- it votes
+            // about the seat, or holds a vote about it to bank on. A seat not
+            // dealt in proves and votes nothing: its hold kept nobody's deal
+            // for a certificate it could not help.
+            .filter(|s| {
+                self.cheat_voters(*s).contains(&self.open.my_seat)
+                    || self.cheat_votes.get(s).is_some_and(|m| !m.is_empty())
+            })
             .filter(|s| !self.out_for_good().contains(s))
             .collect()
     }
@@ -13501,9 +13781,10 @@ impl Hand {
                 what: "a cheat vote named a cause the band knows",
             });
         }
-        if !self.cheat_voters(body.subject_seat).contains(&voter) {
-            return Err(Failed::NotInThisStage);
-        }
+        // `S1-KT`: a vote from a seat that is no voter -- not dealt in -- is
+        // judged all the same, once, and may prove the subject here, which this
+        // client then votes about itself; the vote itself is never counted.
+        let counted = self.cheat_voters(body.subject_seat).contains(&voter);
         let subject = body.subject_seat;
         if self.cheat_votes.get(&subject).is_some_and(|m| m.contains_key(&voter)) {
             return Ok(Vec::new());
@@ -13539,12 +13820,23 @@ impl Hand {
                         what: "the evidence its cheat vote carries could be judged here before the hand ended",
                     })
                 }
-                Judged::NotEvidence(what) => return Err(Failed::Elsewhere { seat: voter, what }),
+                // `S1-KT`: junk, or another branch's frame -- ignored, never
+                // refused, and remembered: a certificate carrying this vote
+                // again is ignored too.
+                Judged::NotEvidence(_) => {
+                    self.junk_from.insert((voter, subject));
+                    return Err(Failed::Ignored);
+                }
             }
         }
         // `note_proven` takes no vote about this client's own seat.
         if !self.proven.contains_key(&subject) {
             return Ok(Vec::new());
+        }
+        if !counted {
+            let mut out = Vec::new();
+            self.vote_on_cheats_into(&mut out, key, now_ms);
+            return Ok(out);
         }
         let votes = self.cheat_votes.entry(subject).or_default();
         votes.insert(voter, bytes.to_vec());
@@ -13768,10 +14060,16 @@ impl Hand {
             let mut unjudgeable = false;
             let mut refused: Option<&'static str> = None;
             let mut judged_before = false;
+            let mut junk = false;
             for (voter, _, cause, frames) in &carried {
                 // Once per voter and subject, as a vote of its own is.
                 if !self.judged_from.insert((*voter, subject)) {
-                    judged_before = true;
+                    // `S1-KT`: judged before as evidence of nothing here.
+                    if self.junk_from.contains(&(*voter, subject)) {
+                        junk = true;
+                    } else {
+                        judged_before = true;
+                    }
                     continue;
                 }
                 match self.judge_evidence(*cause, frames, subject) {
@@ -13788,7 +14086,10 @@ impl Hand {
                         self.judged_from.remove(&(*voter, subject));
                         unjudgeable = true;
                     }
-                    Judged::NotEvidence(what) => refused = refused.or(Some(what)),
+                    Judged::NotEvidence(_) => {
+                        self.junk_from.insert((*voter, subject));
+                        junk = true;
+                    }
                 }
             }
             if !self.proven.contains_key(&subject) {
@@ -13803,6 +14104,12 @@ impl Hand {
                         seat: emitter,
                         what: "the evidence its certificate carries could be judged here before the hand ended",
                     });
+                }
+                // `S1-KT`: evidence of nothing here -- ignored, never refused,
+                // and before the refusal of votes judged already: one that was
+                // junk here was no failure.
+                if junk && !judged_before {
+                    return Err(Failed::Ignored);
                 }
                 if judged_before {
                     return Err(Failed::Elsewhere {
@@ -16771,8 +17078,9 @@ mod tests {
         let _ = deliver(&mut hu[other], &sends, &hu_keys[other]);
         assert!(hu[other].take_said_again().is_empty(), "heads-up there is nobody else to say it to");
 
-        // What the hand applied, not the type the writer signed: a call signed
-        // as a private deal share is taken as a call, and said again.
+        // `S1-KT`: a betting stage takes a betting action and nothing else. A
+        // call signed as a private deal share was taken as a call and said
+        // again; it is refused now, and nothing is said again.
         let (mut hands, keys) = three_to_the_bet();
         let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
         let genuine = bytes_of(&hands[up].act(Action::Call, &keys[up], NOW).expect("the big blind is faced: a call"));
@@ -16789,8 +17097,9 @@ mod tests {
         let disguised = chained::seal(EventType::DealPrivate, &slot, &head, &keys[up], NOW, 30_000, ACTION_CAP).unwrap();
         for i in (0..3).filter(|i| *i != up) {
             let _ = hands[i].take_said_again();
-            hands[i].on_event(&disguised, &keys[i], NOW).expect("taken as a call");
-            assert_eq!(hands[i].take_said_again(), vec![disguised.clone()], "seat {i}: said again as what it was taken for");
+            let err = hands[i].on_event(&disguised, &keys[i], NOW).expect_err("not a betting action");
+            assert!(matches!(&err, Failed::Elsewhere { what, .. } if what.contains("another type")), "{err}");
+            assert!(hands[i].take_said_again().is_empty(), "seat {i}: nothing said again");
         }
     }
 
@@ -18369,6 +18678,322 @@ mod tests {
         assert!(again.is_empty());
         assert_eq!(hands[1].verdicts.len(), verdicts, "nothing judged again");
         assert!(hands[1].cheat_out().is_empty());
+    }
+
+    // `S1-KT`: an illegal betting action through the cheat band -- the
+    // rogue-cheat audit's G10.
+
+    /// `S1-KT`: the head of the action `h`'s own seat would sign now.
+    fn head_of(h: &Hand) -> ActionHead {
+        let Phase::Playing { play, .. } = &h.phase else {
+            panic!("a hand being played");
+        };
+        ActionHead {
+            street: street_code(play.street),
+            seat: h.open.my_seat,
+            action_index: play.actions,
+        }
+    }
+
+    /// `S1-KT`: an action frame of `h`'s own seat at its own slot -- whatever
+    /// the rules say of it.
+    fn action_frame(h: &Hand, key: &SigningKey, kind: EventType) -> Vec<u8> {
+        h.say(kind, &head_of(h), ACTION_CAP, key, NOW).unwrap()
+    }
+
+    /// `S1-KT`: the seat whose turn it is at `hands[0]`.
+    fn seat_to_act(hands: &[Hand]) -> usize {
+        usize::from(hands[0].turn().expect("a turn").seat)
+    }
+
+    /// `S1-KT`: **a check facing a bet, signed at the seat's own turn, is
+    /// proven at every seat that receives it -- by the engine, at the stage it
+    /// was signed at -- and the seat is put out of the table for good**, where
+    /// before it was a frame refused and a turn left to its clock.
+    #[test]
+    fn a_check_facing_a_bet_is_proven_and_put_out() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        assert!(hands[rogue].turn().unwrap().to_call > 0, "facing the big blind");
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        let judges: Vec<usize> = (0..3).filter(|s| *s != rogue).collect();
+        for &s in &judges {
+            let err = hands[s].on_event(&check, &keys[s], NOW).expect_err("refused, as it always was");
+            assert!(matches!(err, Failed::Illegal { .. }), "{err}");
+            assert_eq!(hands[s].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_ACTION), "seat {s}");
+            assert_eq!(seat_to_act(std::slice::from_ref(&hands[s])), rogue, "seat {s}: still the rogue's turn");
+        }
+        let mut refused = Vec::new();
+        tick_votes(&mut hands, &keys, &mut refused);
+        for &s in &judges {
+            assert_eq!(hands[s].cheat_out(), vec![rogue as u8], "seat {s}: out of the table for good");
+            assert!(hands[s].out_for_good().contains(&(rogue as u8)), "seat {s}");
+            assert!(hands[s].awaiting_cheat_certificate().is_empty(), "seat {s}: nothing left to hold for");
+        }
+        assert!(hands[rogue].cheat_out().is_empty(), "the rogue banks nothing about itself");
+    }
+
+    /// `S1-KT`: **a fold signed by a seat whose turn it is not**, at the
+    /// stage's own slot, is proven and put out the same way.
+    #[test]
+    fn an_action_out_of_turn_is_proven_and_put_out() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = (seat_to_act(&hands) + 1) % 3;
+        let fold = action_frame(&hands[rogue], &keys[rogue], EventType::ActionFold);
+        let judges: Vec<usize> = (0..3).filter(|s| *s != rogue).collect();
+        for &s in &judges {
+            let err = hands[s].on_event(&fold, &keys[s], NOW).expect_err("out of turn");
+            assert!(matches!(err, Failed::OutOfTurn { .. }), "{err}");
+            assert_eq!(hands[s].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_ACTION), "seat {s}");
+        }
+        let mut refused = Vec::new();
+        tick_votes(&mut hands, &keys, &mut refused);
+        for &s in &judges {
+            assert_eq!(hands[s].cheat_out(), vec![rogue as u8], "seat {s}");
+        }
+    }
+
+    /// `S1-KT`: **a seat the illegal action never reached judges it from the
+    /// vote** -- at its own record of a stage it has left, the rogue's legal
+    /// action having moved the hand on -- and banks.
+    #[test]
+    fn a_seat_the_illegal_action_never_reached_judges_it_from_the_vote() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let (a, b) = ((rogue + 1) % 3, (rogue + 2) % 3);
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
+        let _ = hands[a].on_event(&check, &keys[a], NOW);
+        assert!(hands[a].proven.contains_key(&(rogue as u8)), "seat {a} proves it");
+        for s in [a, b] {
+            hands[s].on_event(&call, &keys[s], NOW).expect("the rogue's legal call");
+            assert_ne!(seat_to_act(std::slice::from_ref(&hands[s])), rogue, "seat {s}: the hand moved on");
+        }
+        assert!(hands[b].proven.is_empty(), "seat {b} never saw the check");
+        let mut refused = Vec::new();
+        tick_votes(&mut hands, &keys, &mut refused);
+        assert_eq!(
+            hands[b].proven.get(&(rogue as u8)).map(|p| p.cause),
+            Some(CAUSE_ACTION),
+            "seat {b} proves it from the vote, at a stage it has left"
+        );
+        for s in [a, b] {
+            assert_eq!(hands[s].cheat_out(), vec![rogue as u8], "seat {s}");
+        }
+    }
+
+    /// `S1-KT`: **an action the rules allow is never proven** -- live, at a
+    /// stage left (the copy taken, another legal version of it), or from a
+    /// vote, which is refused.
+    #[test]
+    fn a_legal_action_is_never_proven() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let actor = seat_to_act(&hands);
+        let (judge, third) = ((actor + 1) % 3, (actor + 2) % 3);
+        let call = action_frame(&hands[actor], &keys[actor], EventType::ActionCall);
+        let fold = action_frame(&hands[actor], &keys[actor], EventType::ActionFold);
+        hands[judge].on_event(&call, &keys[judge], NOW).expect("a legal call");
+        let _ = hands[judge].on_event(&call, &keys[judge], NOW);
+        let _ = hands[judge].on_event(&fold, &keys[judge], NOW);
+        assert_eq!(hands[judge].judge_action(&fold, actor as u8), Judged::Holds, "a fold is legal at the seat's turn");
+        assert_eq!(hands[judge].judge_action(&call, actor as u8), Judged::Holds);
+        assert!(hands[judge].proven.is_empty(), "nothing proven");
+        let anchor = hands[judge].anchor();
+        let slot = hands[judge].slot().at(cheat_sequence(actor as u8).unwrap(), anchor);
+        let v = CheatVote {
+            subject_seat: actor as u8,
+            anchor,
+            cause: CAUSE_ACTION,
+            evidence: vec![fold.clone().into()],
+        };
+        let vote = chained::seal(EventType::CheatVote, &slot, &v, &keys[third], NOW, 30_000, CHEAT_VOTE_CAP).unwrap();
+        let err = hands[judge].on_event(&vote, &keys[judge], NOW).expect_err("its frame holds here");
+        assert!(matches!(&err, Failed::Elsewhere { what, .. } if what.contains("failed at this client")), "{err}");
+        assert!(hands[judge].cheat_out().is_empty());
+    }
+
+    /// `S1-KT`: an action signed at another parent -- another branch of the
+    /// hand -- proves nothing, whatever the rules would say of it here; and
+    /// one at a stage this client has not reached cannot be judged yet.
+    #[test]
+    fn an_action_on_another_branch_proves_nothing() {
+        let (hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let judge = (rogue + 1) % 3;
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        assert_eq!(hands[judge].judge_action(&check, rogue as u8), Judged::Proven, "at its own parent");
+        let mut at = slot_of(&check, EventType::ActionCheck);
+        at.previous_event_hash[0] ^= 1;
+        let head = head_of(&hands[rogue]);
+        let elsewhere = chained::seal(EventType::ActionCheck, &at, &head, &keys[rogue], NOW, 30_000, ACTION_CAP).unwrap();
+        assert!(matches!(hands[judge].judge_action(&elsewhere, rogue as u8), Judged::NotEvidence(_)));
+        let ahead = hands[rogue].slot().at(hands[rogue].slot().sequence + 3, [7; 32]);
+        let later = chained::seal(EventType::ActionCheck, &ahead, &head, &keys[rogue], NOW, 30_000, ACTION_CAP).unwrap();
+        assert_eq!(hands[judge].judge_action(&later, rogue as u8), Judged::Unjudgeable);
+        assert!(matches!(hands[judge].judge_action(&check, judge as u8), Judged::NotEvidence(_)), "not the signer");
+        // The bytes before the chain (`D-092`): a body that does not decode --
+        // a bet without its amount -- is proven wherever it sits.
+        let broken = chained::seal(EventType::ActionBet, &at, &head, &keys[rogue], NOW, 30_000, ACTION_CAP).unwrap();
+        assert_eq!(hands[judge].judge_action(&broken, rogue as u8), Judged::Proven, "bytes alone");
+    }
+
+    /// `S1-KT`: a vote whose frame is evidence of nothing here -- another
+    /// branch's -- is ignored, never refused: whoever passed it on is not
+    /// marked down for it.
+    #[test]
+    fn a_vote_of_another_branch_is_ignored() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let (judge, voter) = ((rogue + 1) % 3, (rogue + 2) % 3);
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        let mut at = slot_of(&check, EventType::ActionCheck);
+        at.previous_event_hash[0] ^= 1;
+        let elsewhere =
+            chained::seal(EventType::ActionCheck, &at, &head_of(&hands[rogue]), &keys[rogue], NOW, 30_000, ACTION_CAP)
+                .unwrap();
+        let anchor = hands[judge].anchor();
+        let slot = hands[judge].slot().at(cheat_sequence(rogue as u8).unwrap(), anchor);
+        let v = CheatVote { subject_seat: rogue as u8, anchor, cause: CAUSE_ACTION, evidence: vec![elsewhere.into()] };
+        let vote = chained::seal(EventType::CheatVote, &slot, &v, &keys[voter], NOW, 30_000, CHEAT_VOTE_CAP).unwrap();
+        assert_eq!(hands[judge].on_event(&vote, &keys[judge], NOW), Err(Failed::Ignored));
+        assert!(hands[judge].proven.is_empty());
+    }
+
+    /// `S1-KT`: **two engines that decide differently never complete a hand's
+    /// stage 0 together** -- the digest every `HAND_INIT` carries -- so neither
+    /// ever judges the other's action against a round of its own: a split,
+    /// never a framing.
+    #[test]
+    fn a_hand_init_of_another_engine_is_refused() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let copy = bytes_of(&pending[0].1)
+            .into_iter()
+            .find(|b| is_kind(b, EventType::HandInit))
+            .expect("seat 0's copy");
+        let opened =
+            chained::open_in_hand(&copy, FRAME_CAP, EventType::HandInit, &hands[0].open.table_id, hands[0].open.hand_id)
+                .unwrap();
+        let body: HandInit = chained::payload(&opened, HAND_INIT_CAP).unwrap();
+        assert_eq!(body.engine, crate::protocol::constants::engine_id(), "the wire copy carries the engine");
+        hands[2].mine.engine = [9; 32];
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &|_, _, b: &[u8]| Some(b.to_vec()), &mut refused);
+        assert!(
+            refused.iter().any(|(to, e)| *to == 2 && e.contains("engine")),
+            "seat 2 refuses the others' copies over the engine: {refused:?}"
+        );
+        assert!(hands[2].turn().is_none(), "and plays nothing with them");
+        assert!(hands[2].take_dealt_note().is_some_and(|n| n.contains("another engine")), "and says so, once");
+    }
+
+    /// `S1-KT`: a hand given up -- or past its betting -- reaches no later
+    /// stage, so an action there is evidence of nothing here, never held (the
+    /// refuter's A2).
+    #[test]
+    fn after_a_give_up_an_action_ahead_proves_nothing() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let judge = (rogue + 1) % 3;
+        let head = head_of(&hands[rogue]);
+        let ahead = hands[rogue].slot().at(hands[rogue].slot().sequence + 3, [7; 32]);
+        let later = chained::seal(EventType::ActionCheck, &ahead, &head, &keys[rogue], NOW, 30_000, ACTION_CAP).unwrap();
+        assert_eq!(hands[judge].judge_action(&later, rogue as u8), Judged::Unjudgeable, "live: it may yet come");
+        let _ = hands[judge].abort_now(Abort::Deadline, &keys[judge], NOW).unwrap();
+        assert!(
+            matches!(hands[judge].judge_action(&later, rogue as u8), Judged::NotEvidence(_)),
+            "given up: never"
+        );
+    }
+
+    /// `S1-KT`: at a stage left, a legal version spends nothing -- the rogue's
+    /// own second legal version does not hide the illegal one after it (the
+    /// refuter's A3).
+    #[test]
+    fn a_legal_version_does_not_hide_an_illegal_one_at_a_stage_left() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let judge = (rogue + 1) % 3;
+        let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
+        let fold = action_frame(&hands[rogue], &keys[rogue], EventType::ActionFold);
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        hands[judge].on_event(&call, &keys[judge], NOW).expect("the call");
+        let _ = hands[judge].on_event(&fold, &keys[judge], NOW);
+        assert!(hands[judge].proven.is_empty(), "a legal version proves nothing");
+        let _ = hands[judge].on_event(&check, &keys[judge], NOW);
+        assert_eq!(
+            hands[judge].proven.get(&(rogue as u8)).map(|p| p.cause),
+            Some(CAUSE_ACTION),
+            "and the check after it is proven all the same"
+        );
+    }
+
+    /// `S1-KT`: **a betting stage takes a betting action and nothing else** --
+    /// a frame of another type carrying an action's body was taken as a call.
+    #[test]
+    fn a_betting_stage_takes_no_other_type() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let actor = seat_to_act(&hands);
+        let judge = (actor + 1) % 3;
+        let other = hands[actor].say(EventType::ShowdownMuck, &head_of(&hands[actor]), ACTION_CAP, &keys[actor], NOW).unwrap();
+        let err = hands[judge].on_event(&other, &keys[judge], NOW).expect_err("not a betting action");
+        assert!(matches!(&err, Failed::Elsewhere { what, .. } if what.contains("another type")), "{err}");
+        assert_eq!(seat_to_act(std::slice::from_ref(&hands[judge])), actor, "nothing applied");
+        assert!(hands[judge].proven.is_empty(), "and nothing proven: it is no betting action");
+    }
+
+    /// `S1-KT`: heads-up an illegal action is proven at the other seat, and
+    /// nobody votes -- no certificate can form -- and the player is told.
+    #[test]
+    fn heads_up_an_illegal_action_is_proven_and_voted_about_by_nobody() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(2);
+        let rogue = seat_to_act(&hands);
+        let other = 1 - rogue;
+        assert!(hands[rogue].turn().unwrap().to_call > 0, "the small blind faces the big blind");
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        let _ = hands[other].on_event(&check, &keys[other], NOW);
+        assert_eq!(hands[other].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_ACTION));
+        assert!(!hands[other].band_possible(rogue as u8));
+        assert!(hands[other].vote_on_cheats(&keys[other], NOW).unwrap().is_empty(), "nobody to vote with");
+        assert_eq!(hands[other].proven_unbanked(), vec![(rogue as u8, CAUSE_ACTION)], "the player is told");
+        assert!(hands[other].awaiting_cheat_certificate().is_empty(), "no deal held");
+    }
+
+    /// `S1-KT`: the deal is held only where this client has a part in the
+    /// certificate -- it votes about the seat, or holds a vote to bank on.
+    #[test]
+    fn only_a_seat_with_a_part_holds_the_deal_for_a_certificate() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let rogue = seat_to_act(&hands);
+        let judge = (rogue + 1) % 4;
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        let _ = hands[judge].on_event(&check, &keys[judge], NOW);
+        assert_eq!(hands[judge].awaiting_cheat_certificate(), vec![rogue as u8], "a voter holds");
+        let me = hands[judge].open.my_seat;
+        hands[judge].mine.dealt_in.retain(|s| *s != me);
+        assert!(hands[judge].awaiting_cheat_certificate().is_empty(), "one that votes nothing does not");
+    }
+
+    /// `S1-KT`: a vote from a seat that is no voter here is judged -- and
+    /// proves the subject here, which this client then votes about itself --
+    /// but is never counted.
+    #[test]
+    fn a_vote_from_a_seat_that_is_no_voter_is_judged_and_never_counted() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let rogue = seat_to_act(&hands);
+        let (a, c) = ((rogue + 1) % 4, (rogue + 3) % 4);
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        let _ = hands[a].on_event(&check, &keys[a], NOW);
+        let votes = hands[a].vote_on_cheats(&keys[a], NOW).unwrap();
+        let vote = bytes_of(&votes).into_iter().find(|b| is_kind(b, EventType::CheatVote)).expect("seat a votes");
+        hands[c].mine.dealt_in.retain(|s| *s != a as u8);
+        let said = hands[c].on_event(&vote, &keys[c], NOW).expect("judged");
+        assert_eq!(hands[c].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_ACTION), "proven here");
+        assert!(
+            bytes_of(&said).iter().any(|b| is_kind(b, EventType::CheatVote)),
+            "and this client votes itself"
+        );
+        let held: Vec<SeatIdx> = hands[c].cheat_votes.get(&(rogue as u8)).map(|m| m.keys().copied().collect()).unwrap_or_default();
+        assert_eq!(held, vec![c as u8], "only its own vote is held: seat {a}'s is not counted");
     }
 
     /// Evidence that is not a reveal at all is refused before any share is

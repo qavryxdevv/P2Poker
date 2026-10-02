@@ -5,7 +5,7 @@
 //! is it* and *is the round over*. Both are pure functions of the round state,
 //! with no clock and no randomness, as the determinism contract requires.
 
-use crate::poker::actions::BettingRound;
+use crate::poker::actions::{Action, BettingRound};
 use crate::poker::state::{Chips, SeatIdx, Street};
 
 /// Which seats were dealt into this hand.
@@ -121,6 +121,105 @@ pub fn next_to_act(
     seat_count: u8,
 ) -> Option<SeatIdx> {
     seek(round, dealt_in, from, seat_count, false)
+}
+
+/// The seat that opens a street's betting, or `None` where nobody bets: every
+/// seat but one all in with nothing owed, the run-out (`betting_is_closed`).
+///
+/// `S1-KT`: the hand's own rule (`Hand::open_betting`), one function so the
+/// digest of `tests/random_hands.rs` pins what the hand does and not a copy of
+/// it -- the cheat band judges a betting action by it.
+pub fn opening_turn(
+    street: Street,
+    round: &BettingRound,
+    dealt_in: &DealtIn,
+    button: SeatIdx,
+    sb_position: SeatIdx,
+    bb_seat: SeatIdx,
+    seat_count: u8,
+) -> Option<SeatIdx> {
+    if betting_is_closed(round, dealt_in) {
+        None
+    } else {
+        first_to_act(street, round, dealt_in, button, sb_position, bb_seat, seat_count)
+    }
+}
+
+/// A hand's first betting round: every seat's stack, a seat not dealt in
+/// folded from the start -- the engine has one predicate for "cannot act", and
+/// this is how a seat never in the hand enters it -- and the blinds posted
+/// (A1.1), which are not actions.
+///
+/// `S1-KT`: the hand's own rule (`Hand`'s deal), one function so the digest of
+/// `tests/random_hands.rs` pins what the hand does.
+pub fn opening_round(
+    stack: Vec<Chips>,
+    dealt_in: &DealtIn,
+    sb_position: SeatIdx,
+    bb_seat: SeatIdx,
+    small: Chips,
+    big: Chips,
+) -> BettingRound {
+    let n = stack.len();
+    let mut round = BettingRound {
+        big_blind: big,
+        current_bet: 0,
+        last_full_raise: big,
+        committed: vec![0; n],
+        stack,
+        acted: vec![false; n],
+        folded: (0..n).map(|s| !dealt_in.get(s).copied().unwrap_or(false)).collect(),
+    };
+    post_blinds(&mut round, sb_position, bb_seat, small, big);
+    round
+}
+
+/// The street is over: what each seat committed on it leaves the round --
+/// returned, by seat, for the hand's own total -- and the round opens afresh,
+/// the minimum bet the big blind again (A4).
+///
+/// `S1-KT`: the hand's own rule (`Hand::close_round_and_open`), pinned.
+pub fn next_street(round: &mut BettingRound) -> Vec<Chips> {
+    let moved = round.committed.clone();
+    round.committed.iter_mut().for_each(|c| *c = 0);
+    round.acted.iter_mut().for_each(|a| *a = false);
+    round.current_bet = 0;
+    round.last_full_raise = round.big_blind;
+    moved
+}
+
+/// What the table does for a seat whose clock ran out -- a timeout
+/// certificate's action: **check** when nothing is owed and **fold** when
+/// facing a bet, never fold a hand that could check for free.
+///
+/// `S1-KT`: the hand's own rule (`Hand::apply_certificate`), pinned: a seat's
+/// late action is judged at the stage the certificate closed, and every stage
+/// after it hangs on what the certificate did.
+pub fn table_action(round: &BettingRound, seat: SeatIdx) -> Action {
+    if round.to_call(seat) == 0 {
+        Action::Check
+    } else {
+        Action::Fold
+    }
+}
+
+/// Whose turn it is after `seat` acted, or `None` where the street is over:
+/// all but one folded, every seat able to act has acted and matched, or no
+/// betting is left -- one seat with chips, owing nothing, beside seats all in.
+///
+/// `S1-KT`: the hand's own rule (`Hand::after_action`), pinned with
+/// [`opening_turn`]. **`S1-KW`: the last clause is new to the hand.** It asked
+/// only the first two, so a fold that left one seat with chips beside an all-in
+/// seat offered that seat the action with nothing to call -- and its fold left
+/// the side pot above the all-in with nobody eligible for it (the 19 326 chips
+/// of [`betting_is_closed`]'s doc, which the random-hand driver had answered in
+/// its own loop and the hand had not).
+pub fn turn_after(round: &BettingRound, dealt_in: &DealtIn, seat: SeatIdx, seat_count: u8) -> Option<SeatIdx> {
+    if only_one_live(round, dealt_in) || round_complete(round, dealt_in) || betting_is_closed(round, dealt_in) {
+        None
+    } else {
+        next_to_act(round, dealt_in, seat, seat_count)
+    }
 }
 
 /// First seat able to act at or after `start`, wrapping once.
@@ -451,6 +550,25 @@ mod tests {
             assert_eq!(first_to_act(Street::PreFlop, &r, &dealt, 0, 1, 2, 4), Some(3), "{dealt:?}");
             assert_eq!(first_to_act(Street::Flop, &r, &dealt, 0, 1, 2, 4), Some(if dealt[2] { 2 } else { 3 }), "{dealt:?}");
         }
+    }
+
+    /// `S1-KW`: **a fold that leaves one seat with chips, owing nothing, beside a
+    /// seat all in ends the street** -- the seat is not offered the action, where
+    /// a fold of its own left the side pot above the all-in with nobody
+    /// eligible for it.
+    #[test]
+    fn a_fold_that_leaves_one_seat_owing_nothing_ends_the_street() {
+        let dealt = [true, true, true];
+        // Seat 0 is all in from an earlier street; seats 1 and 2 have chips. A
+        // new street, nothing bet: seat 1 folds instead of checking.
+        let mut r = round(100, &[0, 5000, 5000]);
+        r.apply(1, Action::Fold).unwrap();
+        assert!(!only_one_live(&r, &dealt) && !round_complete(&r, &dealt), "neither old clause ends it");
+        assert_eq!(turn_after(&r, &dealt, 1, 3), None, "nobody is left to bet into");
+        // Owing something, the seat still acts.
+        let mut r = round(100, &[0, 5000, 5000]);
+        r.apply(1, Action::Bet(300)).unwrap();
+        assert_eq!(turn_after(&r, &dealt, 1, 3), Some(2));
     }
 
     /// Three-handed post-flop the first live seat after the button opens — and

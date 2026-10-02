@@ -2940,6 +2940,7 @@ requires the next hand to start automatically and deterministically, not to be
 | `n(9) stacks` | `Vec<u64>` | one per occupied seat, ascending by seat |
 | `n(10) roster_hash` | `bytes[32]` | `roster_hash(k)` |
 | `n(11) ledger_delta` | `Vec<(u8, i64)>` | ≤ `MAX_SEATS`, ascending by seat, unique; the per-seat ledger change applied at this hand boundary — positive for a buy-in, negative for a departing stack |
+| `n(12) engine` | `bytes[32]` | `blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖ ENGINE_SOURCE)` (§13): what the sender's betting engine decides over the pinned corpus (D-093), and the code it and the hand's judge decide by. Two clients that differ in either never complete stage 0 together, so neither ever judges the other's betting action against a round of its own (`S1-KT`, D-094): a split, never a framing |
 
 **`HAND_INIT` announces nothing and decides nothing.** Every field is a pure
 function of `TERMINAL(k-1)` and the table parameters, so every receiver
@@ -3484,9 +3485,17 @@ published Illustration Addendum examples for rule 47. [RULES A5]
 An illegal action is a protocol violation attributable to its signer — **it is not
 a state transition, and it never becomes one.** The receiver does not "correct" it.
 
+**And it is proof (`S1-KT`, D-094).** An `ACTION_*` frame of the seat's own signing at a
+betting stage the receiver held -- the same `sequence` and the same
+`previous_event_hash` -- that the engine refuses at that stage's round, that is out of
+turn there, or whose body does not decode, is §4.8's `cause = 8`: no honest client signs
+one. Judged at the stage it was signed at, from any later stage and after a give-up; the
+head fields are not evidence. A betting stage takes the five `ACTION_*` types and no
+other.
+
 **Said again by every seat that takes it (`S1-KB`, 2026-09-30).** At a hand dealt to three seats or more, a client
-that takes another seat's betting action -- applies it as that seat's action, whatever type it was signed under, since
-every type but a bet, a raise, a fold and a check is taken as a call, and enters it in its transcript for the first
+that takes another seat's betting action -- applies it as that seat's action, one of the five `ACTION_*` types (until
+`S1-KT` every other type was taken as a call), and enters it in its transcript for the first
 time -- broadcasts the same bytes once more to the table's carrier group. A Tox group message goes from its sender to
 each member and nothing passes it on, so the writer before a seat could keep its action from that seat alone: the
 others took it and started the seat's clock, the seat never saw its turn, and at its deadline every other seat -- the
@@ -3838,7 +3847,7 @@ subject digest; a redelivery is inert.
 
 *Direction:* one voter, about one subject, once per hand.
 *Legal:* only about a seat dealt in to hand `k` that the voter holds **proven**,
-by frames of the subject's own signing, for one of three causes. `cause = 3`: a
+by frames of the subject's own signing, for one of four causes. `cause = 3`: a
 reveal frame (`DEAL_PRIVATE`, `BOARD_REVEAL`, `SHOWDOWN_REVEAL`) whose `deck_tag`
 is the voter's own and one of whose shares is `Invalid` against the voter's own
 final deck, the subject's verified deck key and the context at the frame's own
@@ -3853,7 +3862,15 @@ step's stage hash) where the proof does not decode or names another round or an
 output that is not the step's deck -- bytes alone, no chain read. The shuffle
 argument itself is D-084's and not this band's: judged by a seat that may hold
 another deck stage, a rogue with two keys could frame an honest shuffler or split
-the table -- the voter's own
+the table. `cause = 8` (`S1-KT`, D-094): an `ACTION_*` frame at a betting stage the
+voter held -- the same `sequence` and the same `previous_event_hash` -- that the
+engine refuses at that stage's round, that is out of turn there, or whose body does
+not decode (bytes alone, at any stage, as `cause = 2`'s). Judged at the stage it was
+signed at, never at the voter's cursor: a certificate that acted for the seat leaves
+the seat's own late action legal at its parent. The head fields are not evidence. One
+parent is one round at every client whose `HAND_INIT` carried the same engine (§4.4,
+`n(12)`). Evidence is the voter's own
+stage's finding
 stage's finding, another seat's `cause = 3` evidence, a seat's accusation of
 itself (§4.10), or a frame another seat's `CHEAT_VOTE` carries. Nothing else is
 evidence: a share that was not due yet, one that does not decode, a verifier
@@ -3878,13 +3895,16 @@ band (§13).
 |---|---|---|
 | `n(0) subject_seat` | `u8` | `< MAX_SEATS`, dealt in to hand `k`, not the voter |
 | `n(1) anchor` | `bytes[32]` | `ANCHOR(k)`, equal to the envelope's parent |
-| `n(2) cause` | `u16` | `3` a card share, `2` a shuffle frame, `7` a deck key (above) |
-| `n(3) evidence` | `Vec<bytes>` | the frames of the subject's own signing that the voter holds it proven by: one reveal, one key, one step, or a step and its proof -- each within its type's frame ceiling; not in the digest |
+| `n(2) cause` | `u16` | `3` a card share, `2` a shuffle frame, `7` a deck key, `8` a betting action (above) |
+| `n(3) evidence` | `Vec<bytes>` | the frames of the subject's own signing that the voter holds it proven by: one reveal, one key, one step, a step and its proof, or one action -- each within its type's frame ceiling; not in the digest |
 
 *Receiver must validate:* the envelope binding above; `subject_seat` is not the
 sender's seat; `anchor` is this receiver's own `ANCHOR(k)` (another genesis of the
-hand is another game: refused); `cause` is one of the three; the sender is dealt in
-to hand `k`; one judgement per voter and subject in a hand -- a second, different
+hand is another game: refused); `cause` is one of the four; the sender is dealt in
+to hand `k` -- a vote from a seat that is not is judged all the same and may prove the
+subject here, but is never counted (`S1-KT`); evidence of nothing here -- another
+branch's frame, junk -- is ignored, never refused, so a seat that passed it on is not
+marked down for it; one judgement per voter and subject in a hand -- a second, different
 vote from a voter whose evidence about that subject was judged here is passed over,
 and every verdict is kept by the frames' hash, so a rogue re-signing votes around an
 honest seat's genuine frames costs a verification per frame, not per vote;
@@ -8988,6 +9008,19 @@ CHEAT_SEQUENCE_BASE             = 8 234         (§4.8's cheat band, S1-KR,
   CHEAT_SEQUENCE_BASE + s, parented on ANCHOR(k), hand k's abort terminal, so
   the band is the ten values 8 234 .. 8 243, right above the return band.
   `cheatwire::tests` holds that no two boundary bands meet.)
+ENGINE_DIGEST                   = 83021f6e91984aaa…  (S1-KT, D-093/D-094: the
+  digest of what the betting engine decides over tests/random_hands.rs's pinned
+  corpus -- 83021f6e91984aaa1b796cf43427bd5c83bf49b10616b829ac0539f381bc71e8 --
+  carried in HAND_INIT n(12) beside ENGINE_SOURCE; a change to what the
+  engine decides there is a new digest and a new protocol major, one digest
+  pinned per major.)
+ENGINE_SOURCE                   = 134d275171513dd8…  (S1-KT, D-094: the digest of the
+  code the engine and the hand's judge decide by -- src/poker/engine.rs and
+  actions.rs before their tests, and the functions of src/table/hand.rs a
+  betting stage's round and its judgement stand on, comments and whitespace
+  dropped -- 134d275171513dd817c17544e5c238be1d90e25ff74319e4fa3932e5bbcb8c84.
+  HAND_INIT n(12) is blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖
+  ENGINE_SOURCE): two clients that differ in either never share a hand.)
 CHEAT_HOLD_MS                   = 8 000         (client liveness, D-090: how
   long the next deal is held at a boundary while a seat this client proved
   cheating is not yet certified out here; under WAIT_FROM_MS, so the holder

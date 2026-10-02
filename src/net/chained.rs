@@ -340,6 +340,18 @@ pub fn parent_of(bytes: &[u8], cap: usize) -> Option<Hash> {
     Some(envelope.previous_event_hash)
 }
 
+/// `S1-KT`: an event's payload, decoded -- read, not checked, like [`peek`]:
+/// use it to choose what is worth a signature check, never to decide.
+pub fn payload_unverified<T: for<'b> Decode<'b, ()> + Encode<()>>(
+    bytes: &[u8],
+    frame_cap: usize,
+    cap: usize,
+) -> Option<T> {
+    let signed: SignedEvent = from_canonical(bytes, frame_cap).ok()?;
+    let envelope: EventBody = from_canonical(&signed.body, frame_cap).ok()?;
+    from_canonical(&envelope.payload, cap).ok()
+}
+
 /// The payload of an opened event, decoded under its own cap.
 pub fn payload<'a, T: Decode<'a, ()> + Encode<()>>(
     o: &'a Opened,

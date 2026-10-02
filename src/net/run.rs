@@ -3058,6 +3058,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $t.cheats.insert(k, (seat, 3, true));
                 }
             }
+            // `S1-KT`: a seat proven here that no certificate can put out --
+            // heads-up -- is named as it is proven, not at the hand's end: the
+            // band never answers it. The window waits for the hand by its own
+            // rule (`unsafe_may_show`).
+            for (seat, cause) in $h.proven_seats() {
+                if !$h.band_possible(seat) {
+                    if let Some(k) = $h.key_of(seat) {
+                        $t.cheats.entry(k).or_insert((seat, cause, true));
+                    }
+                }
+            }
         }};
     }
     // `S1-CW`: what every road that can end a hand does once its frames are
@@ -3227,6 +3238,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         if let Some(k) = $h.key_of(*seat) {
                                             count_equivocation(&mut $t.equivocators, &$t.back_from_restart, k, *seat, $h.hand_id());
                                         }
+                                    }
+                                    // `S1-KT`: evidence of nothing here is no refusal.
+                                    if matches!(e, Failed::Ignored) {
+                                        continue;
                                     }
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
@@ -3700,6 +3715,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // because the formation handler below reports
                             // for it.
                             Err(Failed::Wire(joinwire::WireError::WrongType)) => None,
+                            // `S1-KT`: a vote or a certificate that is evidence of
+                            // nothing here -- no refusal and no line. (A hand's
+                            // frames ride the table's group alone today, whose
+                            // deliveries take no verdict.)
+                            Err(Failed::Ignored) => Some(gossipsub::MessageAcceptance::Ignore),
                             Err(e) => {
                                 if let Some(n) = $h.take_shuffle_note() {
                                     let _ = events
@@ -12729,6 +12749,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         let (more, failures) = h.replay_early(&app_key, now);
                                                         publish_hand(more, &mut swarm, &mut t.said, &t.tox_sink);
                                                         for e in failures {
+                                                            // `S1-KT`: evidence of nothing here is no refusal.
+                                                            if matches!(e, crate::table::hand::Failed::Ignored) {
+                                                                continue;
+                                                            }
                                                             let _ = events
                                                                 .send(NodeEvent::Warning(format!("a held frame was refused by the adopted hand #{hid}: {e}")))
                                                                 .await;
@@ -13009,6 +13033,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(k) = h.key_of(*seat) {
                                 count_equivocation(&mut t.equivocators, &t.back_from_restart, k, *seat, h.hand_id());
                             }
+                        }
+                        // `S1-KT`: evidence of nothing here is no refusal.
+                        if matches!(e, crate::table::hand::Failed::Ignored) {
+                            continue;
                         }
                         let _ = events
                             .send(NodeEvent::Warning(format!("a held event: {e}")))
@@ -16775,12 +16803,23 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
     if let Some((_, (seat, cause, _))) = t.cheats.iter().find(|(k, _)| playing(k)) {
         // `S1-KS`: and a deck key.
         let what = match *cause {
-            3 => "a card share",
-            7 => "a deck key",
-            _ => "a shuffle step or proof",
+            3 => "a card share that does not hold",
+            7 => "a deck key that does not hold",
+            // `S1-KT`: the hand is not called off for it -- the frame is
+            // refused, and a turn it lets run out is played for it.
+            8 => "a betting action the rules refuse",
+            _ => "a shuffle step or proof that does not hold",
+        };
+        // Heads-up nobody plays its turns for it: a turn it lets run out holds
+        // the hand to the hand's own budget (the refuter's B1).
+        let two = t.hand.as_ref().is_some_and(|h| h.dealt_in().len() <= 2);
+        let spoils = match (*cause, two) {
+            (8, true) => "A turn it lets run out holds the hand until the hand's own time runs out",
+            (8, false) => "Its turns are played for it when its clock runs out",
+            _ => "Every hand it spoils is called off",
         };
         return Some(format!(
-            "{} sent {what} that does not hold: its client does not play by the rules. Every hand it spoils is called off, and nothing here puts it out of the game.",
+            "{} sent {what}: its client does not play by the rules. {spoils}, and nothing here puts it out of the game.",
             seat_called(t, *seat)
         ));
     }
@@ -18378,6 +18417,10 @@ async fn reopen_hand(
             }
             let (more, failures) = h.replay_early(app_key, now);
             for e in failures {
+                // `S1-KT`: evidence of nothing here is no refusal.
+                if matches!(e, crate::table::hand::Failed::Ignored) {
+                    continue;
+                }
                 let _ = events
                     .send(NodeEvent::Warning(format!("a held event was refused: {e}")))
                     .await;
@@ -18494,6 +18537,10 @@ async fn begin_hand_with(
             }
             let (more, failures) = h.replay_early(app_key, now);
             for e in failures {
+                // `S1-KT`: evidence of nothing here is no refusal.
+                if matches!(e, crate::table::hand::Failed::Ignored) {
+                    continue;
+                }
                 let _ = events
                     .send(NodeEvent::Warning(format!("a held event was refused: {e}")))
                     .await;

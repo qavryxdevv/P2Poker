@@ -13,9 +13,9 @@
 //! cryptographic randomness rule is enforced separately over `src/` by
 //! `p2p_poker::security::rng`.
 
-use p2p_poker::poker::actions::{Action, BettingRound};
+use p2p_poker::poker::actions::{Action, BettingRound, Illegal, LegalActions};
 use p2p_poker::poker::engine::{
-    betting_is_closed, first_to_act, next_to_act, only_one_live, post_blinds, round_complete,
+    betting_is_closed, next_street, opening_round, opening_turn, table_action, turn_after,
 };
 use p2p_poker::poker::evaluator::{evaluate_holdem, HandRank};
 use p2p_poker::poker::pots::{award, build_pots, total};
@@ -34,6 +34,45 @@ fn record(bytes: &[u8]) {
             log.extend_from_slice(bytes);
         }
     });
+}
+
+/// `S1-KT`: the engine's verdict on a fixed set of probe actions at a decision,
+/// each on a copy of the round -- the hand goes on as the corpus plays it. What
+/// the engine refuses, and with which minimum or maximum, is what the cheat band
+/// proves a seat by, so it is pinned beside what the engine offers.
+fn record_refusals(round: &BettingRound, seat: SeatIdx, legal: &LegalActions) {
+    let (lo, hi, bet) = (legal.min_raise_to, legal.max_raise_to, round.current_bet);
+    let probes = [
+        Action::Fold,
+        Action::Check,
+        Action::Call,
+        Action::Bet(0),
+        Action::Bet(lo.saturating_sub(1)),
+        Action::Bet(lo),
+        Action::Bet(hi),
+        Action::Bet(hi + 1),
+        Action::Raise(bet),
+        Action::Raise(lo.saturating_sub(1)),
+        Action::Raise(lo),
+        Action::Raise(hi),
+        Action::Raise(hi + 1),
+    ];
+    for probe in probes {
+        let mut copy = round.clone();
+        let (code, value): (u8, Chips) = match copy.apply(seat, probe) {
+            Ok(()) => (0, 0),
+            Err(Illegal::NotToAct) => (1, 0),
+            Err(Illegal::CheckFacingBet) => (2, 0),
+            Err(Illegal::CallNothingOwed) => (3, 0),
+            Err(Illegal::BetWhenBetStands) => (4, 0),
+            Err(Illegal::RaiseWithNoBet) => (5, 0),
+            Err(Illegal::RaiseNotReopened) => (6, 0),
+            Err(Illegal::BelowMinimum { minimum }) => (7, minimum),
+            Err(Illegal::AboveStack { maximum }) => (8, maximum),
+        };
+        record(&[code]);
+        record(&value.to_le_bytes());
+    }
 }
 
 /// Deterministic, reproducible, and not used for anything that must be secret.
@@ -113,16 +152,8 @@ fn play_hand(
         next_card += 2;
     }
 
-    let mut round = BettingRound {
-        big_blind,
-        current_bet: 0,
-        last_full_raise: big_blind,
-        committed: vec![0; seat_count as usize],
-        stack: stacks.to_vec(),
-        acted: vec![false; seat_count as usize],
-        folded: (0..seat_count).map(|s| !dealt_in[s as usize]).collect(),
-    };
-    post_blinds(&mut round, sb_seat, bb_seat, small_blind, big_blind);
+    // `S1-KT`: the hand's own opening round, which the digest pins.
+    let mut round = opening_round(stacks.to_vec(), dealt_in, sb_seat, bb_seat, small_blind, big_blind);
 
     // Total commitment across every street, which is what pots are built from.
     // Filled in at the end of each street, including pre-flop, so the blinds
@@ -135,18 +166,14 @@ fn play_hand(
 
     loop {
         // --- betting on this street -------------------------------------
-        let mut to_act = first_to_act(street, &round, dealt_in, button, sb_seat, bb_seat, seat_count);
+        // `S1-KT`: the hand's own two rules (`Hand::open_betting`,
+        // `Hand::after_action`), so the digest pins what the hand does. A street
+        // nobody can bet on is never opened, and everyone folding to one seat
+        // ends the street at once: the survivor is never offered the action -
+        // otherwise it could fold too, and the pot would have nobody eligible.
+        let mut to_act = opening_turn(street, &round, dealt_in, button, sb_seat, bb_seat, seat_count);
         let mut guard = 0;
         while let Some(seat) = to_act {
-            // Everyone folding to one seat ends the hand at once. The survivor
-            // is never offered the action - otherwise it could fold too, and
-            // the pot would have nobody eligible for it.
-            if only_one_live(&round, dealt_in)
-                || betting_is_closed(&round, dealt_in)
-                || round_complete(&round, dealt_in)
-            {
-                break;
-            }
             guard += 1;
             assert!(guard < 400, "betting on {street:?} did not terminate");
 
@@ -169,7 +196,16 @@ fn play_hand(
                 }
             }
 
-            let action = choices[rng.below(choices.len())];
+            // Now and then the seat's clock runs out and the table acts for it --
+            // `S1-KT`: the hand's own `table_action`, pinned with the rest.
+            let action = if rng.below(10) == 0 {
+                table_action(&round, seat)
+            } else {
+                choices[rng.below(choices.len())]
+            };
+            // What the engine refuses here, pinned as well: the cheat band
+            // proves a seat by a refusal (`S1-KT`).
+            record_refusals(&round, seat, &legal);
             // Who was offered the turn, what the engine offered, what was taken.
             let (tag, amount) = match action {
                 Action::Fold => (0u8, 0),
@@ -204,7 +240,7 @@ fn play_hand(
                 + carried;
             assert_eq!(live, chips_before, "chips moved on {action:?} by seat {seat}");
 
-            to_act = next_to_act(&round, dealt_in, seat, seat_count);
+            to_act = turn_after(&round, dealt_in, seat, seat_count);
         }
 
         // --- fold-out ----------------------------------------------------
@@ -212,10 +248,11 @@ fn play_hand(
             .filter(|&s| dealt_in[s as usize] && !round.folded[s as usize])
             .collect();
         // --- carry this street's commitments into the hand total ---------
-        for (total, this_street) in committed_hand.iter_mut().zip(&round.committed) {
+        // `S1-KT`: by the hand's own rule, which opens the next street too.
+        for (total, this_street) in committed_hand.iter_mut().zip(next_street(&mut round)) {
             *total += this_street;
+            carried += this_street;
         }
-        carried += round.committed.iter().sum::<Chips>();
 
         if still_live.len() == 1 {
             break;
@@ -228,10 +265,6 @@ fn play_hand(
         }
 
         street = street.next().expect("river was handled above");
-        round.current_bet = 0;
-        round.last_full_raise = big_blind;
-        round.committed.iter_mut().for_each(|c| *c = 0);
-        round.acted.iter_mut().for_each(|a| *a = false);
     }
 
     // --- showdown ------------------------------------------------------
@@ -385,19 +418,75 @@ fn tiny_stacks_exercise_the_all_in_paths() {
     assert!(played > 10_000, "only {played} hands played; the driver stalled");
 }
 
+/// `S1-KT`: every engine digest pinned, by the protocol major it was pinned
+/// for -- one per major. A change to what the engine decides is a rule change,
+/// and a rule change is a new major (`D-089`): two builds of one major never
+/// decide differently, so no seat is judged by a round another build would not
+/// make. Edited in place only while its major is unreleased (3: 0.3.0 is not).
+const PINNED: &[(u16, &str)] = &[(3, "83021f6e91984aaa1b796cf43427bd5c83bf49b10616b829ac0539f381bc71e8")];
+
+/// `S1-KT`: the functions of `src/table/hand.rs` a betting stage's round and
+/// its judgement stand on -- the round built at the deal, the turns, the
+/// street's close, a certificate's action, the record of a stage and the judge
+/// -- read into `ENGINE_SOURCE` beside the engine's own code. Methods end at
+/// their closing brace at four spaces, free functions at the margin.
+const HAND_FUNCTIONS: &[&str] = &[
+    "    fn read_my_cards(",
+    "    fn open_betting(",
+    "    fn after_action(",
+    "    fn close_round_and_open(",
+    "    fn apply_certificate(",
+    "    fn note_betting_stage(",
+    "    fn judge_action(",
+    "    fn judge_opened_action(",
+    "fn is_betting_action(",
+    "fn claimed_action(",
+    "fn action_of(",
+];
+
+/// The code `ENGINE_SOURCE` is the digest of: comments and whitespace dropped,
+/// carriage returns with them, so a checkout's line endings do not move it.
+fn engine_source() -> Vec<u8> {
+    fn strip(code: &str, out: &mut Vec<u8>) {
+        for line in code.lines() {
+            let line = line.split("//").next().unwrap_or("");
+            out.extend(line.bytes().filter(|b| !b.is_ascii_whitespace()));
+        }
+    }
+    let mut out = Vec::new();
+    for (name, text, must) in [
+        ("engine.rs", include_str!("../src/poker/engine.rs"), "pub fn first_to_act("),
+        ("actions.rs", include_str!("../src/poker/actions.rs"), "pub fn apply("),
+    ] {
+        let code = &text[..text.find("\n#[cfg(test)]\nmod tests").unwrap_or_else(|| panic!("{name}: its tests"))];
+        assert!(code.contains(must), "{name}: the tripwire reads the code it claims to");
+        strip(code, &mut out);
+    }
+    let hand = include_str!("../src/table/hand.rs");
+    for header in HAND_FUNCTIONS {
+        let at = hand.find(header).unwrap_or_else(|| panic!("hand.rs: {header}"));
+        let end = if header.starts_with(' ') { "\n    }\n" } else { "\n}\n" };
+        let body = &hand[at..at + hand[at..].find(end).unwrap_or_else(|| panic!("hand.rs: the end of {header}"))];
+        strip(body, &mut out);
+    }
+    out
+}
+
 /// `S1-KU`: **the engine is the protocol major's.** Two clients of one major
 /// must decide every turn, every legal set and every pot alike: the cheat band
-/// is to judge a betting action against the engine (`S1-KT`), and two engines
-/// that differ would prove an honest seat a cheat. So every decision over a
-/// seeded corpus -- heads-up, three-, six- and ten-handed, deep and tiny stacks
-/// -- is pinned by its digest for this major, and a change to what the engine
-/// decides there fails here until the major moves (`D-089`'s procedure) and the
-/// digest is pinned again. What the corpus does not reach it does not pin: this
-/// driver lays out its own positions and deals in every seat with chips, so the
-/// positions (`initial_positions`, `advance_positions`), a dead button and an
-/// absent seat (D-005) stand on their own unit tests. Written out, not
-/// recomputed: a test that recomputes what it checks passes whatever the code
-/// does.
+/// judges a betting action against the engine (`S1-KT`), and two engines that
+/// differ would prove an honest seat a cheat. So every decision over a seeded
+/// corpus -- heads-up, three-, six- and ten-handed, deep and tiny stacks; whose
+/// turn by the hand's own two rules, what the engine offered and what it refuses
+/// -- is pinned by its digest, `ENGINE_DIGEST`, and a change to what the engine
+/// decides there fails here until the constant is set to the new digest.
+/// `S1-KT`: every `HAND_INIT` carries `ENGINE_DIGEST`, so two clients whose
+/// engines decide differently never complete a hand's stage 0 together -- a
+/// split, never a framing. What the corpus does not reach it does not pin: this
+/// driver lays out its own positions and deals in every seat with chips, and the
+/// positions, the dealt-in set and the stacks are `HAND_INIT`'s own fields,
+/// compared one by one. Written out, not recomputed: a test that recomputes what
+/// it checks passes whatever the code does.
 #[test]
 fn the_engine_is_the_protocol_majors() {
     DECISIONS.with(|d| *d.borrow_mut() = Some(Vec::new()));
@@ -417,15 +506,31 @@ fn the_engine_is_the_protocol_majors() {
     }
     let log = DECISIONS.with(|d| d.borrow_mut().take()).expect("recorded");
     assert!(played > 2_000, "only {played} hands: the corpus pins too little");
-    let digest = blake3::hash(&log).to_hex().to_string();
+    let digest = blake3::hash(&log);
+    let major = p2p_poker::protocol::constants::PROTOCOL_MAJOR;
+    let majors: std::collections::BTreeSet<u16> = PINNED.iter().map(|(m, _)| *m).collect();
+    assert_eq!(majors.len(), PINNED.len(), "one digest per major: a new digest is a new major (D-089)");
+    let pinned = PINNED
+        .iter()
+        .find(|(m, _)| *m == major)
+        .map(|(_, d)| *d)
+        .unwrap_or_else(|| panic!("no digest pinned for protocol major {major}: pin {}", digest.to_hex()));
     assert_eq!(
-        p2p_poker::protocol::constants::PROTOCOL_MAJOR,
-        3,
-        "a new major: pin this digest again (the engine may change with it)"
+        digest.to_hex().as_str(),
+        pinned,
+        "the engine decided something else over the pinned corpus ({} bytes of decisions): a rule change, and a rule change is a new protocol major (D-089), its digest pinned beside the old one",
+        log.len()
     );
     assert_eq!(
-        digest, "f91019a3befc48af2e1292c8b7fd68083b90ebbcce902fd9162f680f64ce54ef",
-        "the engine decided something else over the pinned corpus ({} bytes of decisions): that is a rule change, and a rule change is a protocol major (D-089)",
-        log.len()
+        *digest.as_bytes(),
+        p2p_poker::protocol::constants::ENGINE_DIGEST,
+        "ENGINE_DIGEST, which every HAND_INIT carries, is this major's pinned digest"
+    );
+    let source = blake3::hash(&engine_source());
+    assert_eq!(
+        *source.as_bytes(),
+        p2p_poker::protocol::constants::ENGINE_SOURCE,
+        "the code the betting engine and the hand's judge decide by changed ({}; src/poker/engine.rs or actions.rs before their tests, or HAND_FUNCTIONS of hand.rs): if anything it decides changed, that is a new protocol major (D-089) -- the corpus may not reach it; if nothing did, pin ENGINE_SOURCE again. Either way HAND_INIT's engine moves, and builds of the two never share a hand",
+        source.to_hex()
     );
 }

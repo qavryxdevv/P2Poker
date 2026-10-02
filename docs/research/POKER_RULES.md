@@ -242,7 +242,11 @@ returns to the big blind, who may check or raise. Same for the small blind
 heads-up, where the SB/button acts first and the BB closes the action.
 
 If at most one live player is not all-in, no further betting is possible: skip
-directly to dealing the remaining board cards and then to showdown. The hand is
+directly to dealing the remaining board cards and then to showdown. This is asked
+after every action, not only as a street opens: a fold that leaves one player with
+chips, owing nothing, beside players all in ends the street there -- offered the
+action, that player could fold too and leave the side pot above the all-in with
+nobody eligible for it (`S1-KW`). The hand is
 **not** abandoned — remaining streets are still dealt because they decide the
 pots. (SPEC_CS.md §10: each board card is still cryptographically revealed at
 its own street; the reveals happen back to back with no action between them.)
