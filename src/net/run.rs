@@ -3309,6 +3309,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(n) = $h.take_shuffle_note() {
                                     let _ = events.send(NodeEvent::Warning(n)).await;
                                 }
+                                // `S1-LG`: and a settlement that differs from this
+                                // client's own. Since `S1-BD` it counts towards the
+                                // close, which is an `Ok`, and the note was said on
+                                // a refusal alone: `G9`'s control bed held a rogue's
+                                // false settlement of every hand and its log said
+                                // nothing of one.
+                                if let Some(n) = $h.take_settle_note() {
+                                    let _ = events.send(NodeEvent::Warning(n)).await;
+                                }
                                 // The one condition this client cannot
                                 // repair and must not hide.
                                 if let Some(f) = $h.take_fork() {
@@ -25968,6 +25977,20 @@ mod answer_rotation_tests {
         assert!(RELAY_HANDS >= 2, "a relay outlives the hand it was asked in");
         assert_eq!(code.matches("add_relay(&mut").count(), 2, "the answer and the tick add through the bound");
         assert_eq!(code.matches("relay_members(&").count(), 3, "and read through one function");
+    }
+
+    /// `S1-LG`: **a settlement that differs is said where it is counted** --
+    /// in the arm that takes a frame, not only in the one that refuses it.
+    #[test]
+    fn a_settlement_that_differs_is_said_where_it_is_counted() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(code.matches("if let Some(n) = $h.take_settle_note() {").count(), 2, "the Ok arm and the refusal");
+        let ok = code.find("if let Some(n) = $h.take_shuffle_note() { let _ = events.send(NodeEvent::Warning(n)).await; }").expect("the Ok arm's notes");
+        assert!(code[ok..].starts_with("if let Some(n) = $h.take_shuffle_note()"));
+        let settle = code[ok..].find("if let Some(n) = $h.take_settle_note() {").expect("said there");
+        assert!(settle < 600, "beside the shuffle's note");
     }
 
     /// `S1-LE`: **one asker has at most `RELAY_MEMBERS` members relayed** --
