@@ -5550,8 +5550,34 @@ impl Hand {
     /// two shares that would open this hand are never published, so no peer —
     /// honest, modified, or all of them together — can open it. The forfeiture
     /// needs no enforcement for the same reason.
+    /// `S1-KZ`: whether `seat` may muck at the showdown now open -- not the
+    /// first to show, and nobody at the showdown all in (TDA 16, `PROTOCOL.md`
+    /// §4.6). One predicate for this seat's own muck and another seat's: a muck
+    /// the rules refuse is not a muck, and a seat that recorded its own where
+    /// every receiver refused it reached a settlement nobody else held.
+    fn muck_allowed(&self, seat: SeatIdx) -> Result<(), &'static str> {
+        let Phase::Playing { play, .. } = &self.phase else {
+            return Err("the showdown were open");
+        };
+        let Step::Showdown { order, .. } = &play.step else {
+            return Err("the showdown were open");
+        };
+        if order.first() == Some(&seat) {
+            return Err("it were not first to show");
+        }
+        if order.iter().any(|s| play.round.stack.get(usize::from(*s)).copied() == Some(0)) {
+            return Err("nobody at this showdown were all in");
+        }
+        Ok(())
+    }
+
     fn muck(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let me = self.open.my_seat;
+        // `S1-KZ`: never a muck the rules refuse -- said or recorded here.
+        if let Err(why) = self.muck_allowed(me) {
+            self.cert_note.push(format!("this seat may not muck here ({why}), and says nothing (S1-KZ)"));
+            return Ok(Vec::new());
+        }
         let body = ShowdownMuck { forfeit: true };
         let bytes = self.say(
             EventType::ShowdownMuck,
@@ -5628,25 +5654,14 @@ impl Hand {
             if !order.contains(&seat) {
                 return Err(Failed::NotInThisStage);
             }
-            // The first to show may not muck, and nobody may muck with a seat
-            // all in (TDA 16). Both are refusals of the message, not of the
-            // seat: a muck that is not allowed is not a muck.
-            if kind == EventType::ShowdownMuck {
-                if order.first() == Some(&seat) {
-                    return Err(Failed::Elsewhere {
-                        seat,
-                        what: "it were not first to show",
-                    });
-                }
-                if order
-                    .iter()
-                    .any(|s| play.round.stack.get(usize::from(*s)).copied() == Some(0))
-                {
-                    return Err(Failed::Elsewhere {
-                        seat,
-                        what: "nobody at this showdown were all in",
-                    });
-                }
+        }
+        // The first to show may not muck, and nobody may muck with a seat all in
+        // (TDA 16). Both are refusals of the message, not of the seat: a muck
+        // that is not allowed is not a muck. `S1-KZ`: the predicate this seat's
+        // own muck answers to as well.
+        if kind == EventType::ShowdownMuck {
+            if let Err(what) = self.muck_allowed(seat) {
+                return Err(Failed::Elsewhere { seat, what });
             }
         }
 
@@ -18889,6 +18904,41 @@ mod tests {
         // a bet without its amount -- is proven wherever it sits.
         let broken = chained::seal(EventType::ActionBet, &at, &head, &keys[rogue], NOW, 30_000, ACTION_CAP).unwrap();
         assert_eq!(hands[judge].judge_action(&broken, rogue as u8), Judged::Proven, "bytes alone");
+    }
+
+    /// `S1-KZ`: **a seat that may not muck says nothing rather than a muck
+    /// every receiver refuses** -- here a restored seat with no cards to show
+    /// (`fold_only`) that is first to show. It recorded its own muck before,
+    /// where the others refused it, and reached a settlement nobody else held.
+    #[test]
+    fn a_seat_that_may_not_muck_records_no_muck_of_its_own() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let first = usize::from(hands[0].mine.sb_position);
+        let mucks: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if is_kind(b, EventType::ShowdownMuck) {
+                mucks.borrow_mut().push(from);
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..32 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            // The board is out by the river: from here the seat has no cards to
+            // show, as a seat restored without its material.
+            if hands[first].street() == Some(Street::River) {
+                hands[first].fold_only = true;
+            }
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &route, &mut refused);
+        }
+        assert_eq!(hands[first].showdown_order().first(), Some(&(first as u8)), "at the showdown, first to show: {refused:?}");
+        assert!(!hands[first].mucked(first as u8), "no muck of its own recorded");
+        assert!(!mucks.borrow().contains(&first), "and none said");
     }
 
     /// `S1-KY`: **one settlement signed twice gives one terminal** -- the seat
