@@ -389,6 +389,41 @@ impl ShuffleChain {
         Some(self.ctx_for(k, sequence))
     }
 
+    /// `G8`: whether `proof` justifies `next` as step `k` of this chain -- its
+    /// input this chain's own deck after step `k - 1` (the open deck at `k = 0`),
+    /// its context step `k`'s own at `sequence` -- without taking it: nothing
+    /// is admitted and nothing is pushed, so a step this chain took already can
+    /// be judged again (another version of it), and so can one of a chain
+    /// finished. `None` where this chain holds no input for `k`.
+    pub fn judge_step<C: DeckCrypto>(
+        &self,
+        crypto: &C,
+        k: usize,
+        next: &[Ciphertext],
+        proof: &[u8],
+        sequence: u64,
+    ) -> Option<Result<(), VerifyOutcome>> {
+        if k >= self.order.len() || k > self.decks.len() {
+            return None;
+        }
+        let ctx = self.ctx_for(k, sequence);
+        let outcome = match k {
+            0 => crypto.verify_initial_shuffle(next, proof, &ctx).map(|_| ()),
+            _ => crypto.verify_shuffle(self.decks[k - 1].as_ref(), next, proof, &ctx).map(|_| ()),
+        };
+        Some(outcome)
+    }
+
+    /// `G8`: the seat at position `k` of the committed order.
+    pub fn shuffler_at(&self, k: usize) -> Option<SeatIdx> {
+        self.order.get(k).copied()
+    }
+
+    /// `G8`: the deck after step `k`, where this chain took it.
+    pub fn deck_at(&self, k: usize) -> Option<&Verified<Vec<Ciphertext>>> {
+        self.decks.get(k)
+    }
+
     /// The deck the next shuffler must shuffle from, or `None` before the first
     /// step - where the input is the open deck and only the library knows it.
     ///

@@ -61,7 +61,10 @@ pub struct CheatVote {
 pub const CAUSE_REVEAL: u16 = 3;
 /// A shuffle step or proof of the seat's own that is not well formed: a deck
 /// that is not fifty-two cards, bytes that do not decode, a proof whose round or
-/// output is not its step's (`S1-KS`). The argument itself is `D-084`'s.
+/// output is not its step's (`S1-KS`). The argument itself is `D-084`'s, and
+/// since `D-098` this cause's too where the judge holds the prover's own
+/// context: the shuffler of that round in its chain, the proof under its
+/// aggregate key and from its deck after the round before.
 pub const CAUSE_SHUFFLE: u16 = 2;
 /// A deck key that does not hold: it does not decode, it is the identity, or its
 /// ownership proof fails at its own context (`S1-KS`). Not a cause of §4.10's.

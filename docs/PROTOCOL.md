@@ -2960,7 +2960,7 @@ requires the next hand to start automatically and deterministically, not to be
 | `n(9) stacks` | `Vec<u64>` | one per occupied seat, ascending by seat |
 | `n(10) roster_hash` | `bytes[32]` | `roster_hash(k)` |
 | `n(11) ledger_delta` | `Vec<(u8, i64)>` | ≤ `MAX_SEATS`, ascending by seat, unique; the per-seat ledger change applied at this hand boundary — positive for a buy-in, negative for a departing stack |
-| `n(12) engine` | `bytes[32]` | `blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖ ENGINE_SOURCE)` (§13): what the sender's betting engine decides over the pinned corpus (D-093), and the code it, the hand's judge and the settlement decide by (D-097). Two clients that differ in either never complete stage 0 together, so neither ever judges the other's betting action against a round of its own (`S1-KT`, D-094): a split, never a framing |
+| `n(12) engine` | `bytes[32]` | `blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖ ENGINE_SOURCE)` (§13): what the sender's betting engine decides over the pinned corpus (D-093), and the code it, the hand's judge and the settlement decide by (D-097), and the deck's code, the vendored shuffle verifier and the lock's entries of its crates (D-098). Two clients that differ in either never complete stage 0 together, so neither ever judges the other's betting action against a round of its own (`S1-KT`, D-094): a split, never a framing |
 
 **`HAND_INIT` announces nothing and decides nothing.** Every field is a pure
 function of `TERMINAL(k-1)` and the table parameters, so every receiver
@@ -3088,6 +3088,7 @@ shuffler's `SHUFFLE_PROOF` has verified.
 | `n(1) input_deck_hash` | `bytes[32]` | `h("p2p-poker v1 deck-commit", [input deck bytes])`; for round 0 see below |
 | `n(2) output_deck_hash` | `bytes[32]` | over the preceding `SHUFFLE_STEP`'s deck |
 | `n(3) proof` | `bytes` | ≤ 8192 B; 5547 B for a 52-card Bayer–Groth proof |
+| `n(4) apk` | `bytes` | **D-098.** The aggregate key the step is masked under, in `DECK_COMMIT`'s encoding: with `n(0)` and `n(1)` it names the prover's whole context, so a receiver holding another key -- a seat that said two deck keys gave two halves two -- refuses the proof as another branch's and judges nothing from it |
 
 Round 0 is the exception: its input is the **open deck**, which is a library
 constant and never travels, so `input_deck_hash` is the fixed value
@@ -3896,9 +3897,11 @@ does not decode or whose deck is not fifty-two cards, or a step with the
 `SHUFFLE_PROOF` bound to it by parent (the proof's `previous_event_hash` is that
 step's stage hash) where the proof does not decode or names another round or an
 output that is not the step's deck -- bytes alone, no chain read. The shuffle
-argument itself is D-084's and not this band's: judged by a seat that may hold
-another deck stage, a rogue with two keys could frame an honest shuffler or split
-the table. `cause = 8` (`S1-KT`, D-094): an `ACTION_*` frame at a betting stage the
+argument itself is D-084's, and since D-098 this band's too where the voter holds the
+prover's own context -- the accused the shuffler of that round in the voter's chain, the
+proof's `apk` (`n(4)`) and input deck the voter's own; outside it, another branch where
+an honest proof can fail, it is no evidence: judged by a seat that held another deck
+stage, a rogue with two keys could frame an honest shuffler or split the table. `cause = 8` (`S1-KT`, D-094): an `ACTION_*` frame at a betting stage the
 voter held -- the same `sequence` and the same `previous_event_hash` -- that the
 engine refuses at that stage's round, that is out of turn there, or whose body does
 not decode (bytes alone, at any stage, as `cause = 2`'s). Judged at the stage it was
@@ -4760,7 +4763,7 @@ receiver's own state**:
 |---|---|---|
 | `1`, certified-subject path (`cert_hash = Some`) — **reachable from D-023**, which restored the decision clock and with it the certificate this row was always written for. D-015's *unreachable, therefore reject* disposition is superseded and does not survive anywhere: a `kind = 2` certificate is produced whenever `\|V\| >= 2` and a cryptographic deadline passes, and the emitter of the abort **must** populate `cert_hash` with that `TIMEOUT_CERT`'s `event_hash` whenever it names a subject. `attributed` and `cert_hash` travel together or not at all — a named subject without the certificate that named it is one peer's accusation on its own word, and §4.10's shape rules refuse it in both directions | it holds, or `n(3) evidence` carries, the named `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2`. *Holds* means it verified that certificate itself — opened every carried vote, checked each against the voter set, and found unanimity — and never that it took the hash on trust | **buffer, do not reject**: the mesh does not order two messages, so an abort whose certificate has not arrived yet is ordinary weather and not a fault |
 | `1`, uncertified path (`attributed = []`, `cert_hash = None`) — the hand-deadline path and §6.3 case (b) are **one row**, see below | its **own** `hand_deadline_ms` has expired (§8.2), **or** it has itself reached §6.3 case (b) | **buffer, do not reject** |
-| `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once -- but not a `cause = 2` whose emitter is the seat it accuses, at a hand of three seats or more (D-084, below) |
+| `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once -- but not a `cause = 2` whose emitter is the seat it accuses, at a hand of three seats or more (D-084, below); and a `cause = 2` at the accused's own turn alone, where the cheat band's judge proves the pair (D-098, below) |
 | `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
 | `6`, tier 1 (D-014) | `n(3) evidence` carries exactly one `SignedEvent` signed by the seat named in `n(1) attributed`, and **this receiver's own** run of §4.0 over that event returns a tier-1 illegality — a signature that does not verify, a non-canonical encoding, a malformed message, an out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that is not a permutation, a signer who is not a party to this table. **The list is closed and every member is decidable from the offending event's own bytes**; *a parent that does not exist* stood here and is deleted, because it is decidable only against this receiver's own store (§4.0's box, `THREAT_MODEL.md` §5.1) | accept at once |
 | `6`, tier 2 (D-014) | as above, **and** this receiver holds a completed `STATE_ACK` stage for a checkpoint of the same chain **whose §6.2 checkpoint number is at or after the number of the checkpoint the illegality was fixed at** (`G7-S8`; the clause read *at or before the offending event's `sequence`*, and the box below says why the number replaces it), whose emitter set contained both the accused and this receiver, **and** the event is illegal against the `PublicTableState` that checkpoint fixed | reject |
@@ -4790,6 +4793,21 @@ at the stage's deadline whose proof then fails is voted about again with `cause 
 another subject (§4.8). A `cause = 3` abort goes at once as before: a
 reveal stage closes at a seat the rogue sent a good share to, and a client that stood on it could
 be certified out by that seat and the rogue. Heads-up both go at once: two seats certify nobody.
+
+**`cause = 2` at and past the shuffler's turn (D-098).** A receiver takes a peer's `cause = 2`
+abort at the accused's own turn alone, where its own chain holds the input the step was made from,
+and there only where the cheat band's judge proves the pair: the accused's own step and its proof
+bound to it by parent, of that round, under the receiver's `apk` (`n(4)`) and from its deck. Any
+other pair is held -- another key is another branch, where an honest proof fails -- and the stage
+clock answers the accused's silence. Past the turn -- a receiver that took the accused's good
+version and went on -- the evidence is judged against the chain that receiver keeps (from the
+commitment on, and through a give-up): a pair that fails there proves the accused for the cheat
+band and is no reason to end a hand going on; a pair that holds there is a false accusation,
+refused; anything else is held. Each sender's abort about a seat is judged once a hand, and past
+the turn none once the seat is proven. Taking the abort past the turn, up to the
+receiver's own commitment, was built and withdrawn: the point is each receiver's own, and an
+accomplice that keeps its commitment from one seat and sends the abort to it alone has that seat
+void while the rest go on (`S1-LJ`).
 
 **A seat that accuses itself (`S1-KQ`, 2026-10-01).** A `cause = 3` abort whose `attributed[0]` is its
 own emitter is not taken, at any table size: an honest client never accuses itself, and taken at once

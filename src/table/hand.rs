@@ -772,6 +772,18 @@ pub(crate) fn control(_name: &str) -> bool {
     false
 }
 
+/// `S1-KS`: the name one judgement of `cause` over `frames` about `accused` is
+/// kept under -- the frames' own bytes, so a second version is a second name.
+fn evidence_memo(cause: u16, frames: &[&[u8]], accused: SeatIdx) -> Hash {
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(frames.len() + 2);
+    let cause_bytes = cause.to_be_bytes();
+    let seat_byte = [accused];
+    parts.push(&cause_bytes);
+    parts.push(&seat_byte);
+    parts.extend_from_slice(frames);
+    h(Domain::CheatCert.context(), &parts)
+}
+
 /// `G9` harness: the `bad-money` rogue's settlement -- one chip from the first
 /// other seat holding two or more to the rogue, the deltas moved with it so the
 /// body still conserves chips. `None` where no seat has two to give.
@@ -1902,6 +1914,11 @@ struct Table {
     /// deck of the hand. Every reveal body names it (`deck_tag`), so a share
     /// is judged against the deck it was made for, from any later stage.
     tag: Hash,
+    /// `G8`: the shuffle chain this deck came out of, every step's deck in
+    /// it -- a step and its proof are judged against it from any later stage
+    /// (`judge_shuffle_argument`), and after a give-up (`Judge`). Boxed: some
+    /// thirty kilobytes.
+    shuffled: Box<ShuffleChain>,
 }
 
 /// `S1-KR`: what one reveal frame says about the seat that signed it, judged
@@ -2195,6 +2212,11 @@ pub struct Hand {
     /// `S1-KS`: the voters whose evidence about a subject was judged here --
     /// once per hand each (the refuter's CPU bound).
     judged_from: BTreeSet<(SeatIdx, SeatIdx)>,
+    /// `G8`: the senders whose `cause = 2` abort about a seat was judged here
+    /// past that seat's turn -- once per hand each, and none once the seat is
+    /// proven: a rogue re-signing failing proofs of its own step cost every
+    /// seat one verification per abort (the diff's refuter).
+    aborts_judged: BTreeSet<(SeatIdx, SeatIdx)>,
     /// `S1-KS`: every verdict reached about a set of frames, by their hash --
     /// a rogue re-signing votes around an honest seat's genuine frames costs
     /// this client one verification per frame, not one per vote.
@@ -2538,6 +2560,9 @@ pub struct Hand {
     /// node noted them ([`Hand::note_relays`]): each of their stage frames the
     /// hand takes for the first time goes into `said_again` too.
     relay_for: BTreeSet<SeatIdx>,
+    /// `G8`: the deal and the shuffle chain of a hand given up during the
+    /// shuffle -- what a step's argument is judged against after.
+    shuffle_judge: Option<Box<(Deal, Box<ShuffleChain>)>>,
     /// `G9`: this client's OWN settlement -- `(sequence, parent, money)`, the
     /// money its own `settlement()` derived at the settlement stage's position
     /// -- the one reference a copy of another seat's is judged against
@@ -2842,6 +2867,7 @@ impl Hand {
                 judge: None,
                 cheat_voted: BTreeSet::new(),
                 judged_from: BTreeSet::new(),
+                aborts_judged: BTreeSet::new(),
                 verdicts: BTreeMap::new(),
                 junk_from: BTreeSet::new(),
                 engine_said: false,
@@ -2894,6 +2920,7 @@ impl Hand {
                 versions_said: BTreeSet::new(),
                 said_again: Vec::new(),
                 relay_for: BTreeSet::new(),
+                shuffle_judge: None,
                 settled_money: None,
                 took_action: None,
                 voice,
@@ -3769,6 +3796,16 @@ impl Hand {
                 why: "this client could not shuffle the deck it holds",
             })?;
         let output_hash = deck_hash(&next);
+        // `G8`: the aggregate key the step is masked under, named in the proof.
+        let apk = deal.deck.apk().encode();
+        // `G8` harness: a second shuffle of the same input, whose proof the
+        // `bad-proof-argument` rogue sends with the first one's deck -- every
+        // hash and the key honest, the argument failing.
+        let other_proof = if rogue("bad-proof-argument", self.open.hand_id) {
+            deal.deck.shuffle(chain.last_verified(), &ctx).ok().map(|(_, p)| p)
+        } else {
+            None
+        };
 
         let step = chained::seal(
             EventType::ShuffleStep,
@@ -3826,6 +3863,7 @@ impl Hand {
             input_deck_hash: input_hash,
             output_deck_hash: output_hash,
             proof,
+            apk,
         };
         // `S1-JR` harness: a rogue's proof, broken on the wire only -- its own
         // chain takes the real one, as a modified client's would.
@@ -3845,6 +3883,14 @@ impl Hand {
                 rogue("bad-proof-round", self.open.hand_id).then(|| {
                     let mut broken = body.clone();
                     broken.shuffle_round = broken.shuffle_round.wrapping_add(1);
+                    broken
+                })
+            })
+            // `G8` harness: another shuffle's proof with this one's deck.
+            .or_else(|| {
+                other_proof.clone().map(|p| {
+                    let mut broken = body.clone();
+                    broken.proof = p;
                     broken
                 })
             });
@@ -4047,6 +4093,18 @@ impl Hand {
                 why: "the proof names an input deck this client does not hold",
             });
         }
+        // `G8`: nor a key this client does not hold -- another branch, where an
+        // honest proof can fail, and no finding about anybody here.
+        if !control("g8") && body.apk != deal.deck.apk().encode() {
+            return Err(Failed::BadDeck {
+                seat,
+                why: "the proof names an aggregate key this client does not hold",
+            });
+        }
+        // `G8`: the pair's memo, seeded with `Holds` once the chain takes it --
+        // the version this chain took is never verified again; another proof
+        // bound to the same step is.
+        let seed = evidence_memo(CAUSE_SHUFFLE, &[held.bytes.as_slice(), bytes], seat);
 
         let deck = held.deck.clone();
         let taken = chain.steps_taken();
@@ -4079,6 +4137,11 @@ impl Hand {
                 self.slot.sequence, body.shuffle_round
             ));
             if let Some(evidence) = evidence {
+                // `G8`: and the band, beside it -- two votes and each receiver's
+                // own judgement, which no accomplice that never votes can block.
+                if !control("g8") {
+                    self.note_proven(seat, CAUSE_SHUFFLE, evidence.to_vec());
+                }
                 // `D-084`: at three seats or more the table certifies the seat
                 // out first -- every seat that found the proof failing votes at
                 // once, the stage waiting on it for ever -- and gives the hand
@@ -4113,6 +4176,7 @@ impl Hand {
             unreachable!("just matched")
         };
         *heard = None;
+        self.verdicts.insert(seed, Judged::Holds);
 
         let hash = stage_hash_single(
             self.slot.sequence,
@@ -4140,16 +4204,17 @@ impl Hand {
             return Ok(Vec::new());
         };
         let taken = std::mem::replace(&mut self.phase, Phase::Between);
-        let Phase::Shuffling { deal, .. } = taken else {
+        let Phase::Shuffling { deal, chain, .. } = taken else {
             unreachable!("just matched")
         };
-        self.begin_commit(deal, final_deck, key, now_ms)
+        self.begin_commit(deal, chain, final_deck, key, now_ms)
     }
 
     /// The chain has closed: commit to the deck everybody must now agree on.
     fn begin_commit(
         &mut self,
         deal: Deal,
+        chain: Box<ShuffleChain>,
         final_deck: Final<Verified<Vec<Ciphertext>>>,
         key: &SigningKey,
         now_ms: u64,
@@ -4187,6 +4252,7 @@ impl Hand {
                 // `S1-KR`: the slot is the commitment's, its parent the last
                 // proof's stage hash.
                 tag: self.slot.previous_event_hash,
+                shuffled: chain,
             },
             stage,
             mine,
@@ -7034,7 +7100,15 @@ impl Hand {
             // verification over the two signed frames and accepts only if the
             // proof really does fail. Anything else and a seat could void any
             // hand by shouting `cause = 2` over a proof that is perfectly good.
-            2 => self.bad_shuffle_holds(&body, seat)?,
+            2 => {
+                if !self.take_shuffle_abort(&body, seat)? {
+                    self.cert_note.push(
+                        "a shuffle proven bad past its shuffler's turn is proof of its signer and no reason to end a hand going on (G8)"
+                            .to_string(),
+                    );
+                    return Ok(Vec::new());
+                }
+            }
             // `S1-KQ`: the reveal half of `D-084`'s rule about a seat that
             // accuses itself, and at every table size. An honest client never
             // accuses itself, so a `cause = 3` abort naming its own emitter is a
@@ -7324,6 +7398,14 @@ impl Hand {
             // it, and the deadline remains the backstop.
             return Err(Failed::NotYet);
         }
+        // `G8`: nor under a key this client does not hold -- another branch (a
+        // seat that said two deck keys gave two halves two), where an honest
+        // proof fails: held, and proof of nobody. Verified under this client's
+        // own key, an honest shuffler's proof read as its fraud (the diff's
+        // refuter).
+        if !control("g8") && proof_body.apk != deal.deck.apk().encode() {
+            return Err(Failed::NotYet);
+        }
 
         // **The proof's own `sequence`, which the accused signed.** Not the
         // abort emitter's and not this client's cursor: the accused chose it
@@ -7585,7 +7667,8 @@ impl Hand {
         }
         let what = match cause {
             CAUSE_KEY => "a deck key that does not hold",
-            CAUSE_SHUFFLE => "a shuffle step or proof that is not well formed",
+            // `G8`: not well formed (`S1-KS`), or an argument that does not hold.
+            CAUSE_SHUFFLE => "a shuffle step or proof that does not hold",
             CAUSE_ACTION => "a betting action the rules refuse",
             CAUSE_MONEY => "a settlement that pays what the cards do not",
             _ => "a card share that does not hold",
@@ -7601,24 +7684,16 @@ impl Hand {
     /// frames' hash (the refuter's CPU bound). A check that could not be run is
     /// not kept: this client may yet catch up.
     fn judge_evidence(&mut self, cause: u16, frames: &[Vec<u8>], accused: SeatIdx) -> Judged {
-        let memo = {
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(frames.len() + 2);
-            let cause_bytes = cause.to_be_bytes();
-            let seat_byte = [accused];
-            parts.push(&cause_bytes);
-            parts.push(&seat_byte);
-            for f in frames {
-                parts.push(f.as_slice());
-            }
-            h(Domain::CheatCert.context(), &parts)
-        };
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let memo = evidence_memo(cause, &refs, accused);
         if let Some(v) = self.verdicts.get(&memo) {
             return *v;
         }
         let verdict = match (cause, frames) {
             (CAUSE_REVEAL, [frame]) => self.judge_reveal(frame, accused),
             (CAUSE_KEY, [frame]) => self.judge_key(frame, accused),
-            (CAUSE_SHUFFLE, [_] | [_, _]) => self.judge_shuffle_bytes(frames, accused),
+            // `G8`: the bytes first, and where they hold, the argument.
+            (CAUSE_SHUFFLE, [_] | [_, _]) => self.judge_shuffle_evidence(frames, accused),
             (CAUSE_ACTION, [frame]) => self.judge_action(frame, accused),
             (CAUSE_MONEY, [frame]) => self.judge_money(frame, accused),
             _ => Judged::NotEvidence("the evidence were the frames its cause names"),
@@ -7937,12 +8012,151 @@ impl Hand {
         }
     }
 
+    /// `G8`: the deck code and the shuffle chain a step of this hand is judged
+    /// against -- while shuffling, from the commitment on (the chain kept in
+    /// the `Table`), and after a give-up (`Judge`). `None` before the chain
+    /// opened, and after a give-up during the shuffle.
+    fn shuffle_context(&self) -> Option<(&HandDeck, &ShuffleChain)> {
+        match &self.phase {
+            Phase::Shuffling { deal, chain, .. } => Some((&deal.deck, chain.as_ref())),
+            Phase::Committing { deal, table, .. }
+            | Phase::Dealing { deal, table, .. }
+            | Phase::Playing { deal, table, .. } => Some((&deal.deck, table.shuffled.as_ref())),
+            Phase::Aborted(_) => match (&self.judge, &self.shuffle_judge) {
+                (Some(j), _) => Some((&j.deal.deck, j.table.shuffled.as_ref())),
+                (None, Some(s)) => Some((&s.0.deck, s.1.as_ref())),
+                (None, None) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `G8`: a shuffle's evidence judged -- its bytes (`judge_shuffle_bytes`),
+    /// and where they hold, a step's argument (`judge_shuffle_argument`). The
+    /// control build (`P2P_POKER_CONTROL=g8`) judges the bytes alone, as before.
+    fn judge_shuffle_evidence(&self, frames: &[Vec<u8>], accused: SeatIdx) -> Judged {
+        match self.judge_shuffle_bytes(frames, accused) {
+            Judged::Holds if frames.len() == 2 && !control("g8") => self.judge_shuffle_argument(frames, accused),
+            other => other,
+        }
+    }
+
+    /// `G8`: what a `cause = 2` abort from `from` does here: `bad_shuffle_holds`'
+    /// checks, then the band's own judge (`judge_evidence`) -- once per sender
+    /// and accused a hand, before any verification, and past the accused's turn
+    /// not once it is proven (a rogue re-signing failing proofs of its own step
+    /// cost every seat a verification per abort -- the diff's refuter). At the
+    /// accused's own turn a pair the judge proves ends the hand, as before, and
+    /// proves the accused; a pair it does not -- a proof not bound to its step,
+    /// another round, another key -- is held, and the stage clock answers the
+    /// accused's silence: the gate alone took such a pair, and a shuffler that
+    /// withheld its step and an accomplice carrying an unbound failing proof of
+    /// its signing voided every hand it shuffled in, nobody proven (the delta's
+    /// refuter). Past the turn -- a seat that took the accused's good version and
+    /// went on -- a proven pair is proof for the band and no reason to end a hand
+    /// going on; a pair that holds here is a false accusation, refused. Taking it
+    /// past the turn up to this client's commitment was designed and refuted:
+    /// the point is each client's own, and an accomplice that keeps its
+    /// commitment from one seat and sends the abort to it alone has that seat
+    /// void while the rest go on, and certify it absent. `Ok(true)`: take it.
+    fn take_shuffle_abort(&mut self, body: &HandAbort, from: SeatIdx) -> Result<bool, Failed> {
+        // The control build (`P2P_POKER_CONTROL=g8`): the gate alone, as before.
+        if control("g8") {
+            return self.bad_shuffle_holds(body, from).map(|()| true);
+        }
+        let Some(a) = body.attributed.first().and_then(|k| self.seat_of_key(k)) else {
+            return self.bad_shuffle_holds(body, from).map(|()| true);
+        };
+        let at_turn = matches!(&self.phase, Phase::Shuffling { chain, .. } if chain.whose_turn() == Some(a));
+        if (!at_turn && self.proven.contains_key(&a)) || !self.aborts_judged.insert((from, a)) {
+            return Err(Failed::NotYet);
+        }
+        // Refused as before -- malformed, or a proof that holds at the turn --
+        // and judged no further from that sender about that seat.
+        match self.bad_shuffle_holds(body, from) {
+            Ok(()) | Err(Failed::NotYet) => {}
+            Err(e) => return Err(e),
+        }
+        match self.judge_evidence(CAUSE_SHUFFLE, &body.evidence, a) {
+            Judged::Proven => {
+                self.note_proven(a, CAUSE_SHUFFLE, body.evidence.clone());
+                Ok(at_turn)
+            }
+            // A false accusation, proven so by this client's own chain.
+            Judged::Holds => Err(Failed::Elsewhere {
+                seat: from,
+                what: "the proof it calls invalid holds here",
+            }),
+            // Not judgeable yet: judged again when this client can.
+            Judged::Unjudgeable => {
+                self.aborts_judged.remove(&(from, a));
+                Err(Failed::NotYet)
+            }
+            // Another branch's, or not the accused's own bound pair: held, never
+            // refused -- this client's position is no fault of the sender's.
+            Judged::NotEvidence(_) => Err(Failed::NotYet),
+        }
+    }
+
+    /// `G8`: whether a step and its proof -- the accused's own, bound by parent,
+    /// their bytes holding (`judge_shuffle_bytes`) -- carry an argument that
+    /// fails in the accused's own context, which this client holds: the
+    /// accused dealt in here and the shuffler of that round in this client's
+    /// chain, the proof naming this client's aggregate key and its deck after
+    /// the round before. Another key or another input is another branch, where
+    /// an honest proof can fail: no evidence. A round whose input this client
+    /// does not hold yet, or a check that could not run: not judged yet.
+    /// Cheap first: the claim is read, unverified, before any deck is decoded.
+    fn judge_shuffle_argument(&self, frames: &[Vec<u8>], accused: SeatIdx) -> Judged {
+        let [step_frame, proof_frame] = frames else {
+            return Judged::NotEvidence("a step and its proof");
+        };
+        let ceiling = frame_ceiling(EventType::ShuffleProof);
+        let Some(claimed) = chained::payload_unverified::<ShuffleProof>(proof_frame, ceiling, SHUFFLE_PROOF_CAP) else {
+            return Judged::NotEvidence("the proof decoded");
+        };
+        let round = usize::from(claimed.shuffle_round);
+        let Some((crypto, chain)) = self.shuffle_context() else {
+            return Judged::Unjudgeable;
+        };
+        if round > chain.steps_taken() {
+            return Judged::Unjudgeable;
+        }
+        if !self.mine.dealt_in.contains(&accused) || chain.shuffler_at(round) != Some(accused) {
+            return Judged::NotEvidence("the accused were the shuffler of that round here");
+        }
+        if claimed.apk != crypto.apk().encode() {
+            return Judged::NotEvidence("the proof were under this client's aggregate key");
+        }
+        let input = input_deck_hash(if round == 0 { None } else { chain.deck_at(round - 1) });
+        if claimed.input_deck_hash != input {
+            return Judged::NotEvidence("the proof were from this client's deck at that round");
+        }
+        let Some(sequence) = chained::peek(proof_frame, PEEK_CAP).ok().map(|(_, _, s)| s) else {
+            return Judged::NotEvidence("the proof were a frame");
+        };
+        let Some(step) = chained::payload_unverified::<ShuffleStep>(step_frame, frame_ceiling(EventType::ShuffleStep), SHUFFLE_STEP_CAP)
+        else {
+            return Judged::NotEvidence("the step decoded");
+        };
+        let Some(next) = unflatten(&step.deck) else {
+            return Judged::NotEvidence("the step's deck decoded");
+        };
+        match chain.judge_step(crypto, round, &next, &claimed.proof, sequence) {
+            None => Judged::Unjudgeable,
+            Some(Ok(())) => Judged::Holds,
+            Some(Err(VerifyOutcome::Invalid(_))) => Judged::Proven,
+            Some(Err(_)) => Judged::Unjudgeable,
+        }
+    }
+
     /// `S1-KS`: what a shuffle step of `accused`'s own -- alone, or with the
     /// proof bound to it by parent -- says about it, by its bytes alone: a deck
     /// that is not fifty-two cards, a body that does not decode, a proof whose
     /// round or output is not its step's. None of that asks this client's chain,
     /// so a fork of the deck stage or the chain changes nothing here, and an
-    /// honest client never signs any of it. The argument is `D-084`'s, not this.
+    /// honest client never signs any of it. The argument is `D-084`'s, and
+    /// since `D-098` `judge_shuffle_argument`'s too, not this.
     fn judge_shuffle_bytes(&self, frames: &[Vec<u8>], accused: SeatIdx) -> Judged {
         let Some(accused_key) = self.key_of(accused) else {
             return Judged::NotEvidence("the seat it accuses were at this table");
@@ -9640,6 +9854,11 @@ impl Hand {
             }
             Phase::Dealing { deal, table, .. } | Phase::Playing { deal, table, .. } => {
                 self.judge = Some(Box::new(Judge { deal, table, commit_waiting: Vec::new() }));
+            }
+            // `G8`: and the shuffle's chain, given up during the shuffle -- a
+            // step's argument is judged against it after.
+            Phase::Shuffling { deal, chain, .. } => {
+                self.shuffle_judge = Some(Box::new((deal, chain)));
             }
             _ => {}
         }
@@ -18009,27 +18228,47 @@ mod tests {
         );
     }
 
-    /// An abort this client cannot judge is **held**, never refused.
-    ///
-    /// Refusing would punish a peer for this receiver's own position in the
+    /// An abort this client cannot judge is **held**, never refused --
+    /// refusing would punish a peer for this receiver's own position in the
     /// hand, and `run.rs` turns anything but `NotYet` into a GossipSub
-    /// `Reject` — so a receiver one stage behind would score down the peer
-    /// carrying the one message that ends the hand.
+    /// `Reject`. `G8`: a receiver past the position the evidence is about now
+    /// judges it against the chain it kept, so a proof that holds there is a
+    /// false accusation, refused; one it cannot judge yet is still held.
     #[test]
     fn a_cause_two_abort_is_held_when_this_client_cannot_judge_it() {
         let (mut a, mut b, step, proof) = shuffling_with_a_step_in_hand();
 
         // Move seat 0 past the position the evidence is about by giving it the
-        // proof. Now its chain is somewhere else and it can no longer derive
-        // the context the argument was made in.
+        // proof: its chain took the step, and kept it.
         let _ = a.on_event(&proof, &key(10), NOW).unwrap();
 
         let sends = b.abort_bad_shuffle(1, [step, proof], &key(11), NOW).unwrap();
         let Send::Broadcast(abort) = &sends[0];
         assert!(
-            matches!(a.on_event(abort, &key(10), NOW), Err(Failed::NotYet)),
-            "held, not refused"
+            matches!(a.on_event(abort, &key(10), NOW), Err(Failed::Elsewhere { .. })),
+            "the proof holds on the chain kept: a false accusation, refused"
         );
+        // A seat before the round the evidence is about holds it: seat 2 has not
+        // taken seat 0's step, and an abort carrying seat 1's genuine pair is
+        // neither taken nor refused, and proves nobody.
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let proofs: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 1, b, EventType::ShuffleStep);
+            capture(&proofs, from, 1, b, EventType::ShuffleProof);
+            if from == 0 && to == 2 && (is_kind(b, EventType::ShuffleStep) || is_kind(b, EventType::ShuffleProof)) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let step = steps.borrow().first().cloned().expect("seat 1's step");
+        let proof = proofs.borrow().first().cloned().expect("seat 1's proof");
+        let body = HandAbort::on_bad_shuffle(hands[2].open.seats[1].1, [step, proof], hands[2].mine.stacks.clone());
+        assert_eq!(hands[2].take_shuffle_abort(&body, 0), Err(Failed::NotYet), "held");
+        assert!(hands[2].proven.is_empty() && hands[2].aborted().is_none());
     }
 
     /// An action out of turn is refused and names who was up.
@@ -18916,6 +19155,269 @@ mod tests {
         let init0 = inits.borrow().first().cloned().expect("seat 0 said its key");
         assert_eq!(hands[1].judge_key(&init0, 0), Judged::Holds);
         assert!(hands[1].proven.is_empty());
+    }
+
+    /// `G8`: **a shuffle argument that does not hold goes to the cheat band**
+    /// -- seat 1 is sent seat 0's proof with a byte of its argument broken, the
+    /// bytes still a proof's: it proves seat 0 as its chain refuses the step;
+    /// seat 2, which took the good proof, proves it from seat 1's vote against
+    /// the chain it kept; both put seat 0 out. `D-084`'s round stands beside.
+    #[test]
+    fn a_failing_shuffle_argument_goes_to_the_band() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 0 && to == 1 && is_kind(b, EventType::ShuffleProof) {
+                let at = slot_of(b, EventType::ShuffleProof);
+                return Some(tamper::<ShuffleProof>(b, EventType::ShuffleProof, &at, SHUFFLE_PROOF_CAP, |p| {
+                    let n = p.proof.len();
+                    p.proof[n / 2] ^= 0x01;
+                }));
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert_eq!(hands[1].proven.get(&0).map(|p| p.cause), Some(CAUSE_SHUFFLE), "seat 1 proves seat 0");
+        assert!(hands[2].proven.is_empty(), "seat 2 took a good proof");
+        tick_votes(&mut hands, &keys, &mut refused);
+        assert_eq!(hands[2].proven.get(&0).map(|p| p.cause), Some(CAUSE_SHUFFLE), "seat 2 proves it from the vote");
+        for s in [1usize, 2] {
+            assert_eq!(hands[s].cheat_out(), vec![0], "seat {s}: out of the table for good");
+        }
+    }
+
+    /// `G8`: **a shuffle proof under another aggregate key proves nobody** --
+    /// another branch, where an honest proof can fail -- and the proof as it
+    /// was holds, from the chain kept past the shuffle.
+    #[test]
+    fn a_shuffle_proof_under_another_key_proves_nobody() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let proofs: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 0, b, EventType::ShuffleStep);
+            capture(&proofs, from, 0, b, EventType::ShuffleProof);
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let step = steps.borrow().first().cloned().expect("seat 0's step");
+        let proof = proofs.borrow().first().cloned().expect("seat 0's proof");
+        assert_eq!(hands[2].judge_shuffle_argument(&[step.clone(), proof.clone()], 0), Judged::Holds, "the proof as it was");
+        let at = slot_of(&proof, EventType::ShuffleProof);
+        let elsewhere = tamper::<ShuffleProof>(&proof, EventType::ShuffleProof, &at, SHUFFLE_PROOF_CAP, |p| {
+            if let Some(b) = p.apk.get_mut(1) {
+                *b ^= 0x01;
+            }
+            let n = p.proof.len();
+            p.proof[n / 2] ^= 0x01;
+        });
+        assert!(
+            matches!(hands[2].judge_shuffle_argument(&[step.clone(), elsewhere], 0), Judged::NotEvidence(_)),
+            "another key: no evidence, the argument never run"
+        );
+        assert!(
+            matches!(hands[2].judge_shuffle_argument(&[step, proof], 1), Judged::NotEvidence(_)),
+            "not the shuffler of that round"
+        );
+    }
+
+    /// `G8`: **a shuffle argument is judged after a give-up** -- during the
+    /// shuffle, against the chain `shuffle_judge` keeps, and past the
+    /// commitment, against the one `Judge` keeps: a failing second proof of
+    /// seat 0's step is proven, the proof as it was holds.
+    #[test]
+    fn a_shuffle_argument_is_judged_after_a_give_up() {
+        let bad_of = |proof: &[u8]| {
+            let at = slot_of(proof, EventType::ShuffleProof);
+            tamper::<ShuffleProof>(proof, EventType::ShuffleProof, &at, SHUFFLE_PROOF_CAP, |p| {
+                let n = p.proof.len();
+                p.proof[n / 2] ^= 0x01;
+            })
+        };
+        // During the shuffle: seat 1's proof never reaches seat 2.
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let proofs: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 0, b, EventType::ShuffleStep);
+            capture(&proofs, from, 0, b, EventType::ShuffleProof);
+            if from == 1 && to == 2 && is_kind(b, EventType::ShuffleProof) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert!(matches!(hands[2].phase, Phase::Shuffling { .. }), "seat 2 waits for seat 1's proof");
+        let step = steps.borrow().first().cloned().expect("seat 0's step");
+        let proof = proofs.borrow().first().cloned().expect("seat 0's proof");
+        hands[2].give_up(Abort::Deadline);
+        assert!(hands[2].aborted().is_some());
+        assert_eq!(hands[2].judge_shuffle_evidence(&[step.clone(), bad_of(&proof)], 0), Judged::Proven, "during the shuffle");
+        assert_eq!(hands[2].judge_shuffle_evidence(&[step, proof], 0), Judged::Holds);
+        // Past the commitment.
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let proofs: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 0, b, EventType::ShuffleStep);
+            capture(&proofs, from, 0, b, EventType::ShuffleProof);
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert!(!matches!(hands[2].phase, Phase::Shuffling { .. }), "seat 2 is past the shuffle");
+        let step = steps.borrow().first().cloned().expect("seat 0's step");
+        let proof = proofs.borrow().first().cloned().expect("seat 0's proof");
+        hands[2].give_up(Abort::Deadline);
+        assert_eq!(hands[2].judge_shuffle_evidence(&[step.clone(), bad_of(&proof)], 0), Judged::Proven, "past the commitment");
+        assert_eq!(hands[2].judge_shuffle_evidence(&[step, proof], 0), Judged::Holds);
+    }
+
+    /// `G8`: **an abort at the shuffler's turn carrying a proof under another
+    /// aggregate key is held and proves nobody** -- another branch, where an
+    /// honest proof fails: the gate verified such a proof under this client's
+    /// own key and proved the shuffler (the diff's refuter). Seat 2 holds seat
+    /// 0's step, its proof never came; the proof carried names another key, and
+    /// its argument fails here too.
+    #[test]
+    fn an_abort_under_another_key_at_the_turn_proves_nobody() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let proofs: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 0, b, EventType::ShuffleStep);
+            capture(&proofs, from, 0, b, EventType::ShuffleProof);
+            if from == 0 && to == 2 && is_kind(b, EventType::ShuffleProof) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert!(matches!(hands[2].phase, Phase::Shuffling { .. }), "seat 2 at seat 0's turn");
+        let step = steps.borrow().first().cloned().expect("seat 0's step");
+        let proof = proofs.borrow().first().cloned().expect("seat 0's proof");
+        let at = slot_of(&proof, EventType::ShuffleProof);
+        let elsewhere = tamper::<ShuffleProof>(&proof, EventType::ShuffleProof, &at, SHUFFLE_PROOF_CAP, |p| {
+            if let Some(b) = p.apk.get_mut(1) {
+                *b ^= 0x01;
+            }
+            let n = p.proof.len();
+            p.proof[n / 2] ^= 0x01;
+        });
+        let body = HandAbort::on_bad_shuffle(hands[2].open.seats[0].1, [step, elsewhere], hands[2].mine.stacks.clone());
+        assert_eq!(hands[2].take_shuffle_abort(&body, 1), Err(Failed::NotYet), "held: another branch");
+        assert!(hands[2].proven.is_empty(), "and nobody proven");
+        assert!(hands[2].aborted().is_none());
+    }
+
+    /// `G8`: **an abort at the shuffler's turn whose proof is not bound to its
+    /// step is held, and proves nobody** -- the turn gate checked no binding:
+    /// a shuffler that withheld its step and an accomplice carrying an unbound
+    /// failing proof of its signing voided every hand it shuffled in, nobody
+    /// proven (the delta's refuter). Seat 2 holds seat 0's step, its proof never
+    /// came; the proof carried is seat 0's, failing, under another parent.
+    #[test]
+    fn an_unbound_proof_at_the_turn_voids_nothing() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let proofs: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 0, b, EventType::ShuffleStep);
+            capture(&proofs, from, 0, b, EventType::ShuffleProof);
+            if from == 0 && to == 2 && is_kind(b, EventType::ShuffleProof) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert!(matches!(hands[2].phase, Phase::Shuffling { .. }), "seat 2 at seat 0's turn");
+        let step = steps.borrow().first().cloned().expect("seat 0's step");
+        let proof = proofs.borrow().first().cloned().expect("seat 0's proof");
+        let at = slot_of(&proof, EventType::ShuffleProof);
+        let opened = chained::open(&proof, FRAME_CAP, EventType::ShuffleProof, &at).unwrap();
+        let mut body: ShuffleProof = chained::payload(&opened, SHUFFLE_PROOF_CAP).unwrap();
+        let n = body.proof.len();
+        body.proof[n / 2] ^= 0x01;
+        let elsewhere = Slot { previous_event_hash: [7; 32], ..at };
+        let unbound =
+            chained::seal(EventType::ShuffleProof, &elsewhere, &body, &key(10), NOW, 30_000, SHUFFLE_PROOF_CAP).unwrap();
+        let abort = HandAbort::on_bad_shuffle(hands[2].open.seats[0].1, [step, unbound], hands[2].mine.stacks.clone());
+        assert_eq!(hands[2].take_shuffle_abort(&abort, 1), Err(Failed::NotYet), "held");
+        assert!(hands[2].proven.is_empty(), "nobody proven");
+        assert!(hands[2].aborted().is_none(), "the hand stands");
+    }
+
+    /// `G8`: **past the turn a sender's abort about a seat is judged once a
+    /// hand** -- a false accusation is refused, and the same sender's next abort
+    /// about that seat is held unjudged (the diff's refuter: a rogue re-signing
+    /// failing proofs cost every seat a verification per abort).
+    #[test]
+    fn a_sender_is_judged_once_per_seat_past_the_turn() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let proofs: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 0, b, EventType::ShuffleStep);
+            capture(&proofs, from, 0, b, EventType::ShuffleProof);
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let step = steps.borrow().first().cloned().expect("seat 0's step");
+        let proof = proofs.borrow().first().cloned().expect("seat 0's proof");
+        let at = slot_of(&proof, EventType::ShuffleProof);
+        let bad = tamper::<ShuffleProof>(&proof, EventType::ShuffleProof, &at, SHUFFLE_PROOF_CAP, |p| {
+            let n = p.proof.len();
+            p.proof[n / 2] ^= 0x01;
+        });
+        let accused = hands[2].open.seats[0].1;
+        let good = HandAbort::on_bad_shuffle(accused, [step.clone(), proof], hands[2].mine.stacks.clone());
+        assert!(
+            matches!(hands[2].take_shuffle_abort(&good, 1), Err(Failed::Elsewhere { .. })),
+            "a false accusation, refused"
+        );
+        let bad = HandAbort::on_bad_shuffle(accused, [step, bad], hands[2].mine.stacks.clone());
+        assert_eq!(hands[2].take_shuffle_abort(&bad, 1), Err(Failed::NotYet), "the same sender: judged no further");
+        assert!(hands[2].proven.is_empty());
+    }
+
+    /// `G8`: **a proven shuffle abort past the shuffler's turn is proof for the
+    /// band and nothing more** -- seat 2 took seat 0's good proof and waits for
+    /// seat 1's step; an abort carrying seat 0's step with a failing proof is
+    /// judged against the chain kept, seat 0 proven, the hand going on.
+    #[test]
+    fn a_proven_shuffle_abort_past_the_turn_is_proof_alone() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let steps: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let bad: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&steps, from, 0, b, EventType::ShuffleStep);
+            if from == 0 && to == 1 && is_kind(b, EventType::ShuffleProof) {
+                let at = slot_of(b, EventType::ShuffleProof);
+                let t = tamper::<ShuffleProof>(b, EventType::ShuffleProof, &at, SHUFFLE_PROOF_CAP, |p| {
+                    let n = p.proof.len();
+                    p.proof[n / 2] ^= 0x01;
+                });
+                bad.borrow_mut().push(t.clone());
+                return Some(t);
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let step = steps.borrow().first().cloned().expect("seat 0's step");
+        let proof = bad.borrow().first().cloned().expect("the bad proof");
+        let accused = hands[2].open.seats[0].1;
+        let body = HandAbort::on_bad_shuffle(accused, [step, proof], hands[2].mine.stacks.clone());
+        assert_eq!(hands[2].take_shuffle_abort(&body, 1), Ok(false), "past the turn: no reason to end the hand");
+        assert_eq!(hands[2].proven.get(&0).map(|p| p.cause), Some(CAUSE_SHUFFLE), "the signer proven all the same");
+        assert!(hands[2].aborted().is_none(), "the hand goes on");
+        // Proven: judged no further, whoever carries it.
+        assert_eq!(hands[2].take_shuffle_abort(&body, 1), Err(Failed::NotYet));
     }
 
     /// `S1-KS`: **a shuffle step whose deck is not fifty-two cards is proven by
@@ -22731,9 +23233,12 @@ mod tests {
             .expect("a vote");
         let body: TimeoutVote = chained::payload(&v, TIMEOUT_VOTE_CAP).expect("its body");
         assert_eq!(body.cause, Some(CAUSE_CHEAT), "the cheat cause, not the flood cause");
-        // Its own bare abort, long past every deadline: nothing.
+        // Its own bare abort, long past every deadline: nothing -- but the cheat
+        // band's vote about it, owed since this client found the proof failing
+        // (`G8`).
         let bare = bytes_of_sends(hands[0].abort_now(Abort::Deadline, &keys[0], NOW + 3_600_000).unwrap());
-        assert!(hands[1].on_event(&bare[0], &keys[1], NOW + 3_600_000).unwrap().is_empty());
+        let out = bytes_of_sends(hands[1].on_event(&bare[0], &keys[1], NOW + 3_600_000).unwrap());
+        assert!(out.iter().all(|b| is_kind(b, EventType::CheatVote)), "nothing but the band's vote");
         assert!(hands[1].aborted().is_none(), "the hand stands on the evidence");
     }
 

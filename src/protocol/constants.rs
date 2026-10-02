@@ -58,16 +58,20 @@ pub const ENGINE_DIGEST: [u8; 32] = [
 /// its judgement stand on; `G9` (`D-097`): and the money path -- `pots.rs` and
 /// `evaluator.rs` before their tests, the `rs_poker` line of `Cargo.toml`, the
 /// settlement's functions and its judge's, `dealing.rs` `board`, `deck.rs`
-/// `hole_cards`, `handwire.rs`'s settlement types -- comments and whitespace
-/// dropped (the test
+/// `hole_cards`, `handwire.rs`'s settlement types; `G8` (`D-098`): and the
+/// deck's -- `shuffle.rs`, `protocol.rs` and `backend.rs` of
+/// `src/mental_poker` before their tests, the band's judges and gates, the
+/// shuffle frames' types, the vendored verifier `vendor/ziffle` (its source and
+/// manifest whole) and the lock's entries of its dependency closure -- comments
+/// and whitespace dropped (the test
 /// `the_engine_is_the_protocol_majors` reads it again and fails until this
 /// equals its own). Pinned again after a change that decides nothing new; a
 /// change that does is a new major.
 pub const ENGINE_SOURCE: [u8; 32] = [
-    0xeb, 0x66, 0xc1, 0xef, 0xe1, 0xcd, 0x99, 0x82,
-    0x0d, 0xae, 0xbc, 0x94, 0x60, 0x75, 0x4f, 0x2f,
-    0x05, 0xf8, 0x1b, 0x61, 0x9f, 0x75, 0xc2, 0x6e,
-    0x18, 0x61, 0x7d, 0x8e, 0x3c, 0x47, 0x08, 0x1d,
+    0xf3, 0x89, 0xae, 0x49, 0x6f, 0x73, 0x33, 0x76,
+    0x1d, 0x93, 0x2d, 0x35, 0xc6, 0x71, 0x48, 0x02,
+    0xd2, 0x5c, 0x5c, 0xd7, 0xe0, 0xb8, 0xc4, 0xca,
+    0xf2, 0xe7, 0x00, 0xa0, 0x19, 0x1b, 0x56, 0x32,
 ];
 
 /// `S1-KT`: what every `HAND_INIT` carries as its `engine` -- the digest of

@@ -280,6 +280,14 @@ pub struct ShuffleProof {
     pub output_deck_hash: [u8; 32],
     #[cbor(n(3), with = "minicbor::bytes")]
     pub proof: Vec<u8>,
+    /// `G8`: the aggregate key the prover masked its step under, in
+    /// `DECK_COMMIT`'s encoding. With `shuffle_round` and `input_deck_hash` it
+    /// names the prover's whole context by content: a judge that holds another
+    /// key -- a seat that said two deck keys gave two halves two -- or another
+    /// input deck finds no evidence in the proof, so an honest shuffler is never
+    /// proven by a branch it was not on.
+    #[cbor(n(4), with = "minicbor::bytes")]
+    pub apk: Vec<u8>,
 }
 
 /// `DECK_COMMIT 0x0307`: the barrier before any card exists.
