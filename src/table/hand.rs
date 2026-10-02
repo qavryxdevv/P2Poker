@@ -2094,6 +2094,16 @@ pub struct Hand {
     /// floor fails with it named, no certificate is reachable in this hand and
     /// the local abort waits for none.
     gone_from_group: BTreeSet<SeatIdx>,
+    /// `S1-LB`: the seats that signed a frame of a later hand, as the node
+    /// reads them now ([`Hand::note_ahead`]) -- they finished this hand, so
+    /// they moved past every stage of it, and `D-065`'s early question reads
+    /// them as it reads a later frame of this hand.
+    ahead_seats: BTreeSet<SeatIdx>,
+    /// `S1-LB`: the seats the node heard asking about an earlier stage of this
+    /// hand, or about the hand before, and has accepted nothing from since --
+    /// behind, not silent ([`Hand::note_asking_behind`]): a vote about one waits
+    /// for its answer.
+    asking_behind: BTreeSet<SeatIdx>,
     /// `D-066`: the seats the node reads as out of the table's group, or
     /// silent there, for `LONG_GONE_S` or more -- set each tick
     /// ([`Hand::note_long_gone`]). Voted about at once and with
@@ -2783,6 +2793,8 @@ impl Hand {
                 leave_words: BTreeMap::new(),
                 resigned: BTreeSet::new(),
                 gone_from_group: BTreeSet::new(),
+                ahead_seats: BTreeSet::new(),
+                asking_behind: BTreeSet::new(),
                 long_gone: BTreeSet::new(),
                 line_down_recently: false,
                 voted_about: BTreeSet::new(),
@@ -3231,6 +3243,12 @@ impl Hand {
     /// The stage this client is at, which is what it accuses a seat against.
     pub fn stage_sequence(&self) -> u64 {
         self.slot.sequence
+    }
+
+    /// `S1-LB`: how long the stage now open has stood here, by the node's clock
+    /// `now_ms`.
+    pub fn stage_open_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.stage_at_ms)
     }
 
     /// Which seat a sender is, or nobody.
@@ -8602,10 +8620,11 @@ impl Hand {
                     owing = true;
                 }
                 format!(
-                    "seat {s}: subject {}, voters {:?}, I voted {voted}, votes held {held}, mid-delivery {}",
+                    "seat {s}: subject {}, voters {:?}, I voted {voted}, votes held {held}, mid-delivery {}, asking behind {}",
                     if subject.is_some() { "yes" } else { "NONE" },
                     self.voters(*s),
-                    (mid_delivery >> u32::from((*s).min(31))) & 1 == 1
+                    (mid_delivery >> u32::from((*s).min(31))) & 1 == 1,
+                    self.asking_behind.contains(s)
                 )
             })
             .collect();
@@ -8745,7 +8764,7 @@ impl Hand {
                 // thinking, voted too, and the seat was folded and certified out.
                 // The vote goes at the deadline, like any other.
                 if age >= crate::protocol::constants::QUESTION_AFTER_MS
-                    && self.later_frame_from_another(seat)
+                    && self.moved_past_by_another(seat)
                     && self.questions.insert((self.slot.sequence, seat))
                 {
                     if let Some(mut question) = self.subject_now(seat) {
@@ -8776,6 +8795,19 @@ impl Hand {
             // seat that has not made the table wait.
             if age < after.saturating_mul(2)
                 && mid_delivery & (1u32 << u32::from(seat.min(31))) != 0
+            {
+                continue;
+            }
+            // `S1-LB`: a seat heard asking about an earlier stage, or about the
+            // hand before, is behind and not silent -- the vote about it waits
+            // for its answer, half a stage budget past its time and never past
+            // twice its time (`S1-BK`'s bound). Not twice its time alone: a rogue
+            // that asked once and then went silent held the round so late that a
+            // silent accomplice ran it into the hand's ceiling (`S1-BT`), and a
+            // bare abort let it go unnamed.
+            if !control("s1lb")
+                && self.asking_behind.contains(&seat)
+                && age < after.saturating_add(u64::from(self.next_deadline_for(owed)) / 2).min(after.saturating_mul(2))
             {
                 continue;
             }
@@ -9069,6 +9101,17 @@ impl Hand {
                     )
             }) && chained::sender_of(b, FRAME_CAP).is_some_and(|k| k != theirs && Some(k) != mine)
         })
+    }
+
+    /// `S1-LB`: [`Hand::later_frame_from_another`], or a seat other than
+    /// `seat` and this client that signed a frame of a later hand: it finished
+    /// this one, so it moved past every stage of it -- the settlement too, the
+    /// hand's last stage, where no later frame of the hand exists and the
+    /// question came at the deadline, as the table voted the asker absent at
+    /// the next opening. Not in the control build (`P2P_POKER_CONTROL=s1lb`).
+    fn moved_past_by_another(&self, seat: SeatIdx) -> bool {
+        self.later_frame_from_another(seat)
+            || (!control("s1lb") && self.ahead_seats.iter().any(|s| *s != seat && *s != self.open.my_seat))
     }
 
     /// `D-065`: the subject this client votes about a voter silent about the
@@ -12890,6 +12933,19 @@ impl Hand {
     /// `QUIET_LIMIT_S`, as the node reads them now -- the whole set each time.
     pub fn note_gone_from_group(&mut self, seats: &[SeatIdx]) {
         self.gone_from_group = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
+    }
+
+    /// `S1-LB`: the seats that signed a frame of a later hand, as the node
+    /// reads them now -- the whole set each time.
+    pub fn note_ahead(&mut self, seats: &[SeatIdx]) {
+        self.ahead_seats = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
+    }
+
+    /// `S1-LB`: the seats heard asking about an earlier stage of this hand, or
+    /// about the hand before, and heard nothing from since, as the node reads
+    /// them now -- the whole set each time.
+    pub fn note_asking_behind(&mut self, seats: &[SeatIdx]) {
+        self.asking_behind = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
     }
 
     /// `D-066`: the seats out of the table's group, or silent there, for
@@ -21647,6 +21703,64 @@ mod tests {
         let _ = hands[0].replay_early(&keys[0], t + 100);
         assert_ne!(hands[0].waiting_for(), vec![4], "seat 0 has the opening and its hand moves on");
         assert!(hands[0].slot().sequence >= 1, "past stage 0");
+    }
+
+    /// `S1-LB`: **a seat in a later hand has moved past every stage of this
+    /// one** -- at the settlement, the hand's last stage, no later frame of the
+    /// hand exists, and the question came at the deadline, as the table voted
+    /// the asker absent at the next opening. Here seat 0 never received seat
+    /// 4's opening and holds no later frame of the hand: noted that seat 1
+    /// signed a frame of a later hand, it asks five seconds in; the subject
+    /// alone ahead proves nothing about another seat.
+    #[test]
+    fn a_seat_in_a_later_hand_makes_the_question_early() {
+        let keys: Vec<SigningKey> = (0..5u8).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..5u8 {
+            let (h, from) = Hand::open(opening_n(5, seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        for j in 1..4 {
+            let _ = deliver(&mut hands[0], &inits[j], &keys[0]);
+        }
+        assert_eq!(hands[0].waiting_for(), vec![4]);
+        let t = NOW + 6_000;
+        assert!(hands[0].vote_on_timeouts(&keys[0], t, 0).unwrap().is_empty(), "nothing ahead: the stage's deadline");
+        hands[0].note_ahead(&[4]);
+        assert!(hands[0].vote_on_timeouts(&keys[0], t, 0).unwrap().is_empty(), "the subject alone ahead: the deadline");
+        hands[0].note_ahead(&[1, 4]);
+        let asked = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], t, 0).unwrap());
+        assert_eq!(asked.len(), 1, "seat 1 in a later hand: seat 0 asks about seat 4 six seconds in");
+        let ask = hands[1].vote_asks(&asked[0]).expect("a vote asks");
+        assert_eq!((ask.voter, ask.seat, ask.silent), (0, 4, false));
+    }
+
+    /// `S1-LB`: **a seat heard asking behind is voted about half a budget late**
+    /// -- it lacks a frame, it is not silent -- and the vote still goes then:
+    /// never later than twice its time.
+    #[test]
+    fn a_seat_asking_behind_is_voted_about_half_a_budget_late() {
+        let keys: Vec<SigningKey> = (0..5u8).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..5u8 {
+            let (h, from) = Hand::open(opening_n(5, seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(from);
+        }
+        for j in 1..4 {
+            let _ = deliver(&mut hands[0], &inits[j], &keys[0]);
+        }
+        assert_eq!(hands[0].waiting_for(), vec![4]);
+        hands[0].note_asking_behind(&[4]);
+        assert!(
+            bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], NOW + 31_000, 0).unwrap()).is_empty(),
+            "past its time, asking behind: no vote yet"
+        );
+        let late = bytes_of_sends(hands[0].vote_on_timeouts(&keys[0], NOW + 46_000, 0).unwrap());
+        assert_eq!(late.len(), 1, "half a budget past its time: the vote");
     }
 
     /// `S1-JS`: the early question is a question and nothing more. A frame of a

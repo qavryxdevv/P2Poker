@@ -3684,19 +3684,32 @@ to carry the cause.
 that event can answer by sending it again under its author's signature -- an
 honest peer's events need no other authority, and a voter whose vote split from
 the table's because it lacked an event is answered with the event rather than
-certified. One receiver answers: the lowest dealt-in seat that is neither `s`, nor
-out of the table's group, nor heard voting the same; the next takes the question
-up when that one holds nothing. A vote about the receiver itself is answered with
+certified. One receiver answers at once: the lowest dealt-in seat that is neither
+`s`, nor out of the table's group, nor heard voting the same; the next takes the
+question up when that one holds nothing. **Every such receiver answers** (`S1-LB`) a
+question about a hand that is over at the receiver -- the table went on and the
+asker is a hand behind and alone; a receiver in hand `k+1` answers a vote about
+hand `k` from the hand it retains -- and a question still open once the receiver's
+own stage has stood `QUESTION_AFTER_MS` on the asker: one silent seat no longer
+stands between the asker and the event. Nothing about another seat's event is said
+to a voter the receiver has accepted an event from past the stage asked about, or
+in a later hand, and no question is kept about a stage the receiver has not
+reached. A vote about the receiver itself is answered with
 the receiver's own events of that stage, and one with `cause = 2` about it with
 its own votes and copies there and every event of that stage it holds -- what it
 did not vote about may be what it has. Once per hand, stage, seat and cause at
 each receiver. Answering is never a precondition of anything: a receiver that
-answers nothing breaks no rule, and the vote is judged as before.
+answers nothing breaks no rule, and the vote is judged as before. A receiver that
+heard a seat ask about an earlier stage, or about the hand before, and has accepted
+nothing from it since votes about it half a stage budget past its time at the
+latest, never past twice its time: it is behind, not silent (`S1-LB`).
 
 **The question may come early.** A voter may ask about seat `s` at stage `x` before
 `x`'s deadline -- `QUESTION_AFTER_MS`, five seconds, into the stage -- when it holds
 an event of a later stage of this hand signed by another seat of the hand than `s`
-and itself. That seat moved past `x`, which no honest seat does without `s`'s event
+and itself -- or (`S1-LB`) an event of the next hand so signed: that seat finished the
+hand, the settlement included, where no later event of the hand exists. That seat
+moved past `x`, which no honest seat does without `s`'s event
 of `x` (a collective stage needs every event, a single-writer one builds on the last),
 so the answer comes seconds after the loss rather than a deadline after it. **The
 early question is a `TIMEOUT_VOTE` with `cause = 4` and counts towards nothing**

@@ -1598,7 +1598,8 @@ struct TableRun {
     stage_waiting: (u64, u64),
     /// `D-065`: the voters heard asking about each (hand, stage, seat, silent)
     /// -- the seats known to lack what the question is about, so the seat that
-    /// answers is the lowest one not among them.
+    /// answers is the lowest one not among them (`S1-LB`: or each of them, once
+    /// the stage has stood on the asker).
     vote_asks_heard: std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
     /// `D-065`: the questions this client has answered, once each.
     vote_asks_answered: std::collections::BTreeSet<(u64, u64, u8, bool)>,
@@ -3183,6 +3184,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &gone,
                                     &mut $t.vote_asks_heard,
                                     &mut $t.vote_asks_answered,
+                                    false,
+                                    false,
                                 );
                                 if !answer.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() {
                                     let mut said_again = 0usize;
@@ -3628,6 +3631,68 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             )
                                                         };
                                                         let _ = events.send(NodeEvent::Warning(line)).await;
+                                                    }
+                                                }
+                                            }
+                                        } else if hand_id.saturating_add(1) == $h.hand_id()
+                                            && kind == Some(crate::protocol::messages::EventType::TimeoutVote)
+                                        {
+                                            // `S1-LB`: a question about the hand before, from a seat
+                                            // still in it -- the one that most needs an answer, and the
+                                            // running hand cannot read it (`vote_asks` opens a vote of
+                                            // its own hand alone), so it was dropped here and a seat kept
+                                            // from one copy of the settlement was kept from it for good.
+                                            // Answered from the retained hand, by every seat holding
+                                            // the frame (`answer_a_vote`).
+                                            if answers_votes() && !crate::table::hand::control("s1lb") {
+                                                if let Some(p) = $t.previous.as_ref().filter(|p| p.hand_id() == hand_id) {
+                                                    if let Some(ask) = p.vote_asks($bytes) {
+                                                        let gone: Vec<u8> = $t
+                                                            .table
+                                                            .as_ref()
+                                                            .map(|f| seats_unheard(f, &$t.tox_sink))
+                                                            .unwrap_or_default();
+                                                        let moved_on = $h.last_heard_at(ask.voter).is_some();
+                                                        let answer = answer_a_vote(
+                                                            p,
+                                                            ask,
+                                                            &$t.said,
+                                                            &gone,
+                                                            &mut $t.vote_asks_heard,
+                                                            &mut $t.vote_asks_answered,
+                                                            moved_on,
+                                                            false,
+                                                        );
+                                                        if !answer.is_empty() && $t.tox_sink.is_on_tox() && !nothing_leaves() {
+                                                            let mut said_again = 0usize;
+                                                            for b in &answer {
+                                                                // fault-harness, `-NoVote`: nobody's votes either.
+                                                                if withholds_votes()
+                                                                    && matches!(
+                                                                        crate::net::chained::peek(b, TABLE_FRAME_PEEK),
+                                                                        Ok((
+                                                                            crate::protocol::messages::EventType::TimeoutVote
+                                                                                | crate::protocol::messages::EventType::TimeoutCert,
+                                                                            _,
+                                                                            _
+                                                                        ))
+                                                                    )
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                $t.tox_sink.try_broadcast(b);
+                                                                said_again += 1;
+                                                            }
+                                                            let _ = events
+                                                                .send(NodeEvent::Warning(format!(
+                                                                    "seat {}'s vote about seat {}{} at stage {} of hand #{hand_id}, the hand before, asks for what it lacks: said {said_again} frame(s) again from the retained hand (D-065, S1-LB)",
+                                                                    ask.voter,
+                                                                    ask.seat,
+                                                                    if ask.silent { " as a silent voter" } else { "" },
+                                                                    ask.sequence
+                                                                )))
+                                                                .await;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -13131,10 +13196,73 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )))
                             .await;
                     }
+                    // `S1-LB`: the questions heard here and not answered, put again on
+                    // this client's own clock while the running hand waits on a seat
+                    // that asked -- their answerers rotate, and the asker says each once.
+                    if answers_votes() && !crate::table::hand::control("s1lb") && t.tox_sink.is_on_tox() && !nothing_leaves() {
+                        let answers = match t.hand.as_ref() {
+                            Some(running) => answer_open_questions(
+                                running,
+                                t.previous.as_ref(),
+                                &t.said,
+                                &gone_from_group,
+                                &mut t.vote_asks_heard,
+                                &mut t.vote_asks_answered,
+                                now,
+                            ),
+                            None => Vec::new(),
+                        };
+                        for (ask, frames) in answers {
+                            let mut said_again = 0usize;
+                            for b in &frames {
+                                // fault-harness, `-NoVote`: nobody's votes either.
+                                if withholds_votes()
+                                    && matches!(
+                                        crate::net::chained::peek(b, TABLE_FRAME_PEEK),
+                                        Ok((
+                                            crate::protocol::messages::EventType::TimeoutVote
+                                                | crate::protocol::messages::EventType::TimeoutCert,
+                                            _,
+                                            _
+                                        ))
+                                    )
+                                {
+                                    continue;
+                                }
+                                t.tox_sink.try_broadcast(b);
+                                said_again += 1;
+                            }
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "seat {}'s question about seat {}{} at stage {} stayed open while the table waits on it: said {said_again} frame(s) again (D-065, S1-LB)",
+                                    ask.voter,
+                                    ask.seat,
+                                    if ask.silent { " as a silent voter" } else { "" },
+                                    ask.sequence
+                                )))
+                                .await;
+                        }
+                    }
                     let Some(h) = t.hand.as_mut() else { continue };
                     h.note_gone_from_group(&gone_from_group);
                     h.note_long_gone(&long_gone);
                     h.note_line_down_recently(line_down_recently);
+                    // `S1-LB`: and the seats that signed a frame of the next hand --
+                    // they finished this one, so they moved past every stage of it.
+                    // The next alone: a frame of a hand far ahead keeps its seat's
+                    // entry for as many hands.
+                    let running_id = h.hand_id();
+                    let ahead_now: Vec<u8> = t
+                        .ahead
+                        .iter()
+                        .filter(|(_, k)| **k == running_id.saturating_add(1))
+                        .map(|(s, _)| *s)
+                        .collect();
+                    h.note_ahead(&ahead_now);
+                    // `S1-LB`: and the seats heard asking behind -- a vote about one
+                    // waits for its answer.
+                    let behind = behind_seats(h, t.previous.as_ref(), &t.vote_asks_heard);
+                    h.note_asking_behind(&behind);
 
                     // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
                     // and the carrier's blind repair ladder puts its attempts in
@@ -14206,7 +14334,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // that the window, the checkpoint and the sit-in request above
                 // went out at once; the deal itself waits for D-020's pause.
                 if let Some(at) = t.deal_at {
-                    if tokio::time::Instant::now() < at {
+                    // `S1-LB`: not once most of the table has dealt the next hand --
+                    // this client closed this one late (its last copy came by
+                    // `D-065`'s answer), the table waits on its opening, and the
+                    // pause would make it the seat that stalled the table. Not after
+                    // an abort: the pause is the window in which a late settlement
+                    // still wins over it (`S1-CN`).
+                    let table_dealt = t.hand.as_ref().is_some_and(|h| h.aborted().is_none() && most_have_dealt(h, &t.next_inits));
+                    if tokio::time::Instant::now() < at && (!table_dealt || crate::table::hand::control("s1lb")) {
                         t.next_hand_at = Some(at);
                         continue;
                     }
@@ -15951,6 +16086,15 @@ fn note_unheard(
         .collect()
 }
 
+/// `S1-LB`: who answers a question about another seat's frame -- the lowest
+/// candidate alone, or, with `every`, each of them. The lowest alone answered
+/// every question, and a silent accomplice in the lowest seat left the asking
+/// seat without the frame for good: stuck at the stage, voted absent at the
+/// next one, and the fourth time out for good (`D-047`).
+fn answerers(candidates: &[u8], every: bool) -> &[u8] {
+    &candidates[..candidates.len().min(if every { usize::MAX } else { 1 })]
+}
+
 /// `D-065`: what this client says in answer to a vote read as a question
 /// ([`crate::table::hand::Hand::vote_asks`]). A vote naming this client: its
 /// own frames of that stage -- and, named silent about the round, its own votes
@@ -15961,6 +16105,15 @@ fn note_unheard(
 /// the same -- one answer and not ten (`S1-HD`'s rule) -- and the next seat
 /// takes the question up if this one holds nothing. Once per hand, stage, seat
 /// and kind; the questions of hands before the last are forgotten.
+///
+/// `S1-LB`: every such seat answers with `every` -- a question still open once
+/// the stage has stood on its asker, put again by [`answer_open_questions`] --
+/// and about a hand that is over here: the table went on, and the asker is a
+/// hand behind and alone. No question about another seat's frame is answered
+/// for a seat heard past the stage it asks about, or in a later hand
+/// (`moved_on`) -- it holds what it asks for, or asks for nothing it needs --
+/// and no question about a stage this client has not reached is kept.
+#[allow(clippy::too_many_arguments)]
 fn answer_a_vote(
     h: &crate::table::hand::Hand,
     ask: crate::table::hand::VoteAsk,
@@ -15968,11 +16121,19 @@ fn answer_a_vote(
     gone: &[u8],
     heard: &mut std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
     answered: &mut std::collections::BTreeSet<(u64, u64, u8, bool)>,
+    moved_on: bool,
+    every: bool,
 ) -> Vec<Vec<u8>> {
     use crate::protocol::messages::EventType as E;
     let hid = h.hand_id();
     heard.retain(|k, _| k.0.saturating_add(1) >= hid);
     answered.retain(|k| k.0.saturating_add(1) >= hid);
+    // `S1-LB`: nothing is held about a stage this client has not reached, and
+    // a question about one is not kept -- which bounds what a seat asking
+    // about every stage it can name leaves here.
+    if ask.sequence > h.slot().sequence {
+        return Vec::new();
+    }
     let key = (hid, ask.sequence, ask.seat, ask.silent);
     heard.entry(key).or_default().insert(ask.voter);
     if answered.contains(&key) {
@@ -15999,14 +16160,23 @@ fn answer_a_vote(
             own_at(false)
         }
     } else {
+        let control = crate::table::hand::control("s1lb");
+        // `S1-LB`: the asker is behind at what it asks about -- not heard past
+        // that stage, nor in a later hand -- or the question is spent.
+        if !control && (moved_on || h.last_heard_at(ask.voter).is_some_and(|l| l > ask.sequence)) {
+            return Vec::new();
+        }
         let lacking = heard.get(&key).cloned().unwrap_or_default();
-        let answerer = h
+        let mut candidates: Vec<u8> = h
             .dealt_in()
             .iter()
             .copied()
             .filter(|s| *s != ask.seat && !gone.contains(s) && !lacking.contains(s))
-            .min();
-        if answerer != Some(me) {
+            .collect();
+        candidates.sort_unstable();
+        // `S1-LB`: the lowest, or every seat -- the lowest alone in the control
+        // build.
+        if !answerers(&candidates, !control && (every || h.over())).contains(&me) {
             return Vec::new();
         }
         if ask.silent {
@@ -16023,6 +16193,111 @@ fn answer_a_vote(
         answered.insert(key);
     }
     out
+}
+
+/// `S1-LB`: the questions heard here and not answered, put to [`answer_a_vote`]
+/// again on this client's own clock and answered by every seat holding the
+/// frame -- a seat votes once about a seat at a stage, so a silent lowest seat
+/// held the frame back for good, and a rotation through the seats lost the race
+/// with the vote about the asker. Only while the running hand waits on a seat
+/// that asked, once the stage now open has stood `QUESTION_AFTER_MS` here, and
+/// under [`answer_a_vote`]'s gate on an asker heard past what it asks about:
+/// the asker is behind and the table stands on it, which bounds the answers said
+/// twice (`S1-HD`) to one per seat and question. A question about a hand
+/// neither running nor retained here is left alone.
+fn answer_open_questions(
+    running: &crate::table::hand::Hand,
+    retained: Option<&crate::table::hand::Hand>,
+    said: &[Vec<u8>],
+    gone: &[u8],
+    heard: &mut std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
+    answered: &mut std::collections::BTreeSet<(u64, u64, u8, bool)>,
+    now_ms: u64,
+) -> Vec<(crate::table::hand::VoteAsk, Vec<Vec<u8>>)> {
+    if running.over() || running.stage_open_ms(now_ms) < crate::protocol::constants::QUESTION_AFTER_MS {
+        return Vec::new();
+    }
+    let waiting = running.waiting_for();
+    let open: Vec<((u64, u64, u8, bool), u8)> = heard
+        .iter()
+        .filter(|(k, _)| !answered.contains(*k))
+        .filter_map(|(k, voters)| voters.iter().copied().find(|v| waiting.contains(v)).map(|v| (*k, v)))
+        .collect();
+    let mut out = Vec::new();
+    for ((hand, sequence, seat, silent), voter) in open {
+        let (h, moved_on) = if hand == running.hand_id() {
+            (running, false)
+        } else if let Some(r) = retained.filter(|r| r.hand_id() == hand) {
+            (r, running.last_heard_at(voter).is_some())
+        } else {
+            continue;
+        };
+        let ask = crate::table::hand::VoteAsk { voter, seat, sequence, silent };
+        let frames = answer_a_vote(h, ask, said, gone, heard, answered, moved_on, true);
+        if !frames.is_empty() {
+            out.push((ask, frames));
+        }
+    }
+    out
+}
+
+/// `S1-LB`: the seats this client heard asking about an earlier stage of the
+/// running hand `hand` (now at stage `at`), or about the hand before, and has
+/// accepted nothing from since -- behind, not silent
+/// ([`crate::table::hand::Hand::note_asking_behind`]). `last_heard` is the
+/// running hand's [`crate::table::hand::Hand::last_heard_at`], `before` the
+/// retained hand's, `None` where none is held.
+fn asking_behind(
+    hand: u64,
+    at: u64,
+    last_heard: impl Fn(u8) -> Option<u64>,
+    before: impl Fn(u8) -> Option<u64>,
+    heard: &std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
+) -> Vec<u8> {
+    let mut out = std::collections::BTreeSet::new();
+    for ((k, s, _, _), voters) in heard {
+        for v in voters {
+            let behind = if k.saturating_add(1) == hand {
+                last_heard(*v).is_none() && before(*v).is_none_or(|l| l <= *s)
+            } else {
+                *k == hand && *s < at && last_heard(*v).is_none_or(|l| l <= *s)
+            };
+            if behind {
+                out.insert(*v);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// `S1-LB`: [`asking_behind`] for the running hand -- nobody in the control
+/// build (`P2P_POKER_CONTROL=s1lb`).
+fn behind_seats(
+    h: &crate::table::hand::Hand,
+    retained: Option<&crate::table::hand::Hand>,
+    heard: &std::collections::BTreeMap<(u64, u64, u8, bool), std::collections::BTreeSet<u8>>,
+) -> Vec<u8> {
+    if crate::table::hand::control("s1lb") {
+        return Vec::new();
+    }
+    let before = retained.filter(|p| p.hand_id().saturating_add(1) == h.hand_id());
+    asking_behind(
+        h.hand_id(),
+        h.stage_sequence(),
+        |s| h.last_heard_at(s),
+        |s| before.and_then(|p| p.last_heard_at(s)),
+        heard,
+    )
+}
+
+/// `S1-LB`: whether the other seats whose opening of the next hand is held
+/// here (`next_inits`) are two at least and more than half of the table this
+/// hand counts -- one seat dealing early, a rogue's, cuts no pause short.
+fn most_have_dealt(h: &crate::table::hand::Hand, next_inits: &[(u8, Vec<u8>)]) -> bool {
+    let me = h.my_seat();
+    let others = h.table_for_the_count().into_iter().filter(|s| *s != me).count();
+    let dealt: std::collections::BTreeSet<u8> = next_inits.iter().map(|(s, _)| *s).filter(|s| *s != me).collect();
+    dealt.len() >= 2 && dealt.len() * 2 > others
 }
 
 /// `S1-GL`: whether the table's group, as `(seen, want)`, holds every other seat
@@ -25508,5 +25783,77 @@ mod back_at_the_table {
             let at = code.find(rule).expect("the rule");
             assert!(code[at..at + 200].contains("cfg!(feature = \"fault-harness\") &&"), "{rule}");
         }
+    }
+}
+
+#[cfg(test)]
+mod answer_rotation_tests {
+    use super::*;
+
+    /// `S1-LB`: **the lowest candidate, or every candidate** -- never one
+    /// silent seat alone between the asker and the frame.
+    #[test]
+    fn the_lowest_answers_or_every_seat() {
+        let c = [1u8, 3, 4];
+        assert_eq!(answerers(&c, false), &[1]);
+        assert_eq!(answerers(&c, true), &[1, 3, 4]);
+        assert!(answerers(&[], true).is_empty());
+        assert!(answerers(&[], false).is_empty());
+    }
+
+    /// `S1-LB`: **a seat heard asking about an earlier stage, or about the
+    /// hand before, is behind and not silent** -- until this client accepts
+    /// something from it past what it asked about. A question about the stage
+    /// now open is no sign of being behind.
+    #[test]
+    fn a_seat_asking_behind_is_behind() {
+        let mut heard = std::collections::BTreeMap::new();
+        // Seat 3 asked about seat 2 at stage 9 of hand 7, the hand before.
+        heard.insert((7u64, 9u64, 2u8, false), [3u8].into_iter().collect::<std::collections::BTreeSet<u8>>());
+        // Seat 1 asked about seat 4 at stage 2 of hand 8, an earlier stage.
+        heard.insert((8, 2, 4, false), [1u8].into_iter().collect());
+        // Seat 4 asked about seat 0 at stage 5 of hand 8, the stage now open.
+        heard.insert((8, 5, 0, false), [4u8].into_iter().collect());
+        let nothing = |_: u8| -> Option<u64> { None };
+        assert_eq!(asking_behind(8, 5, nothing, nothing, &heard), vec![1, 3], "the hand before and an earlier stage");
+        let past_it_before = |s: u8| -> Option<u64> { (s == 3).then_some(10) };
+        assert_eq!(asking_behind(8, 5, nothing, past_it_before, &heard), vec![1], "heard past it in the hand before");
+        let caught_up = |s: u8| -> Option<u64> {
+            match s {
+                3 => Some(0),
+                1 => Some(3),
+                _ => None,
+            }
+        };
+        assert!(asking_behind(8, 5, caught_up, nothing, &heard).is_empty(), "heard past what it asked about");
+        let at_the_stage = |s: u8| -> Option<u64> { (s == 1).then_some(2) };
+        assert_eq!(asking_behind(8, 5, at_the_stage, nothing, &heard), vec![1, 3], "heard at the stage it asked about");
+        assert!(asking_behind(10, 0, nothing, nothing, &heard).is_empty(), "two hands on, nobody's");
+    }
+
+    /// `S1-LB`: **a question about the hand before reaches the retained hand**
+    /// -- the running one cannot read it, and it was dropped where the late
+    /// certificates went to the retained hand; the open questions are put again
+    /// on the tick before the votes, with the seats asking behind noted for them;
+    /// and the seats that dealt the next hand cut a late seat's pause short only
+    /// when they are most of the table and the hand ended by its settlement.
+    #[test]
+    fn a_question_about_the_hand_before_is_answered_from_the_retained_hand() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let arm = code
+            .find("&& kind == Some(crate::protocol::messages::EventType::TimeoutVote) {")
+            .expect("the arm for a vote of the hand before");
+        let tail: String = code[arm..].chars().take(2_000).collect();
+        assert!(tail.contains("let answer = answer_a_vote( p, ask,"), "answered from the retained hand");
+        let open = code.find("Some(running) => answer_open_questions(").expect("the open questions");
+        let behind = code.find("h.note_asking_behind(&behind);").expect("the seats behind");
+        let votes = code.find("h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery())").expect("the votes");
+        assert!(open < behind && behind < votes, "answered, then noted, then the votes");
+        assert!(
+            code.contains("let table_dealt = t.hand.as_ref().is_some_and(|h| h.aborted().is_none() && most_have_dealt(h, &t.next_inits));"),
+            "the pause"
+        );
     }
 }
