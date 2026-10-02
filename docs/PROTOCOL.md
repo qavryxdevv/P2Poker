@@ -3837,11 +3837,23 @@ subject digest; a redelivery is inert.
 **`0x0605 CHEAT_VOTE`** — *a voter's word, the shape of `0x0603` (`S1-KR`, D-090)*
 
 *Direction:* one voter, about one subject, once per hand.
-*Legal:* only about a seat dealt in to hand `k` that the voter holds **proven**: a
-reveal frame of the subject's own signing (`DEAL_PRIVATE`, `BOARD_REVEAL`,
-`SHOWDOWN_REVEAL`) whose `deck_tag` is the voter's own and one of whose shares is
-`Invalid` against the voter's own final deck, the subject's verified deck key and
-the context at the frame's own signed `sequence` (§4.5) -- the voter's own
+*Legal:* only about a seat dealt in to hand `k` that the voter holds **proven**,
+by frames of the subject's own signing, for one of three causes. `cause = 3`: a
+reveal frame (`DEAL_PRIVATE`, `BOARD_REVEAL`, `SHOWDOWN_REVEAL`) whose `deck_tag`
+is the voter's own and one of whose shares is `Invalid` against the voter's own
+final deck, the subject's verified deck key and the context at the frame's own
+signed `sequence` (§4.5). `cause = 7` (`S1-KS`, D-092): a `DECK_INIT` whose key does
+not decode, is the identity, or whose ownership proof does not hold at its own
+context -- table, session, hand, the frame's sequence and its sender, the same at
+every seat of the hand whatever else forked; a key equal to another seat's is
+arrival order and never evidence. `cause = 2` (`S1-KS`): a `SHUFFLE_STEP` whose body
+does not decode or whose deck is not fifty-two cards, or a step with the
+`SHUFFLE_PROOF` bound to it by parent (the proof's `previous_event_hash` is that
+step's stage hash) where the proof does not decode or names another round or an
+output that is not the step's deck -- bytes alone, no chain read. The shuffle
+argument itself is D-084's and not this band's: judged by a seat that may hold
+another deck stage, a rogue with two keys could frame an honest shuffler or split
+the table -- the voter's own
 stage's finding, another seat's `cause = 3` evidence, a seat's accusation of
 itself (§4.10), or a frame another seat's `CHEAT_VOTE` carries. Nothing else is
 evidence: a share that was not due yet, one that does not decode, a verifier
@@ -3866,18 +3878,24 @@ band (§13).
 |---|---|---|
 | `n(0) subject_seat` | `u8` | `< MAX_SEATS`, dealt in to hand `k`, not the voter |
 | `n(1) anchor` | `bytes[32]` | `ANCHOR(k)`, equal to the envelope's parent |
-| `n(2) cause` | `u16` | `3`: a card share that does not hold |
-| `n(3) evidence` | `bytes` | a complete signed reveal frame of the subject's own that the voter holds it proven by -- not in the digest |
+| `n(2) cause` | `u16` | `3` a card share, `2` a shuffle frame, `7` a deck key (above) |
+| `n(3) evidence` | `Vec<bytes>` | the frames of the subject's own signing that the voter holds it proven by: one reveal, one key, one step, or a step and its proof -- each within its type's frame ceiling; not in the digest |
 
 *Receiver must validate:* the envelope binding above; `subject_seat` is not the
 sender's seat; `anchor` is this receiver's own `ANCHOR(k)` (another genesis of the
-hand is another game: refused); `cause = 3`; the sender is dealt in to hand `k`;
+hand is another game: refused); `cause` is one of the three; the sender is dealt in
+to hand `k`; one judgement per voter and subject in a hand -- a second, different
+vote from a voter whose evidence about that subject was judged here is passed over,
+and every verdict is kept by the frames' hash, so a rogue re-signing votes around an
+honest seat's genuine frames costs a verification per frame, not per vote;
 and `evidence`, judged as a voter judges: a vote whose frame holds here is
 refused, one this receiver cannot judge yet is held, and a vote counts only once
-the subject is proven here. A voter heard from only after this receiver sealed
-its certificate is answered with it -- nobody says a certificate twice -- and a
-seat says its votes and certificates of hand `k` again while hand `k+1` opens.
-Payload cap `CHEAT_VOTE_CAP = 5 120`.
+the subject is proven here. A voter heard from only after this receiver voted
+is answered with its own vote and certificate -- nobody says them twice --
+and a seat says its votes and certificates of hand `k` again while hand `k+1`
+opens. **Two votes and the receiver's own judgement bank** (`S1-KS`), whether the
+receiver votes or not -- a seat not dealt in, or two votes about a shuffle, which
+no certificate carries. Payload cap `CHEAT_VOTE_CAP = 13 312`.
 
 **`0x0606 CHEAT_CERT`** — *two votes, each with its frame (`S1-KR`, D-090)*
 
@@ -3889,7 +3907,7 @@ parent.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 cheat-cert", [u8(subject_seat), anchor])` -- the seat and the hand, not the frame: a rogue that sends each judge another broken copy still meets two votes |
-| `n(1) votes` | `Vec<bytes>` | 2 … `MAX_SEATS - 1` complete `SignedEvent`s of `CHEAT_VOTE`s, ascending by voter seat, about one subject |
+| `n(1) votes` | `Vec<bytes>` | 2 … `MAX_SEATS - 1` complete `SignedEvent`s of `CHEAT_VOTE`s, each a byte string, ascending by voter seat, about one subject; two votes carrying a shuffle step and proof each exceed the cap and are never carried together |
 
 *Receiver must validate:* every carried vote, as above; one subject; no voter
 twice; every voter dealt in and none the subject; the certificate sealed at the

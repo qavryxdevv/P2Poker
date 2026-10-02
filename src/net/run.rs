@@ -3035,7 +3035,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // band's to answer first: the seat is named at the boundary if no
             // certificate put it out (`cheat_hold`).
             if let Some((seat, cause, true)) = $h.proven_cheat() {
-                if !(cause == 3 && $h.band_possible(seat)) {
+                // `S1-KS`: any seat the band holds proven, whatever the cause.
+                let in_the_band = $h.proven_seats().iter().any(|(s, _)| *s == seat);
+                if !(in_the_band && $h.band_possible(seat)) {
                     if let Some(k) = $h.key_of(seat) {
                         $t.cheats.insert(k, (seat, cause, true));
                     }
@@ -4254,7 +4256,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     let _ = events
                         .send(NodeEvent::Warning(format!(
-                            "seat {seat} is out of the table for good for a card share that does not hold (S1-KR): two seats certified it and this client's own check found it failing; it is removed from the table's group by the table's word and never invited again; its chips leave the table at the boundary"
+                            "seat {seat} is out of the table for good for a frame of its own that does not hold (S1-KR): two seats certified it and this client's own check found it so; it is removed from the table's group by the table's word and never invited again; its chips leave the table at the boundary"
                         )))
                         .await;
                     let _ = events.send(NodeEvent::SeatLeft { seat, quit: true, removed: true }).await;
@@ -12868,6 +12870,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // Retention ends when the running hand leaves stage 0: from
                     // there its genesis is what the table chained from.
                     if t.hand.as_ref().is_some_and(|h| h.slot().sequence >= 1) {
+                        // `S1-KS`: and the cheat votes and certificates about it,
+                        // said again into this hand only while a late bank could
+                        // still repair it: a vote of a shuffle frame is 13 KB.
+                        if let Some(old) = t.previous.as_ref().map(|p| p.hand_id()) {
+                            t.said.retain(|b| {
+                                !matches!(
+                                    crate::net::chained::peek(b, TABLE_FRAME_PEEK),
+                                    Ok((
+                                        crate::protocol::messages::EventType::CheatVote
+                                            | crate::protocol::messages::EventType::CheatCert,
+                                        hand,
+                                        _
+                                    )) if hand == old
+                                )
+                            });
+                        }
                         t.previous = None;
                     }
                     if let Some(o) = t.pending_repair.take() {
@@ -13840,7 +13858,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             t.cheat_hold = Some((hid, tokio::time::Instant::now()));
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
-                                    "hand #{hid}: holding the next deal for up to {} s from the hand's end while the table certifies seat(s) {awaiting:?} out for a card share that does not hold (S1-KR)",
+                                    "hand #{hid}: holding the next deal for up to {} s from the hand's end while the table certifies seat(s) {awaiting:?} out for a frame of its own that does not hold (S1-KR)",
                                     crate::protocol::constants::CHEAT_HOLD_MS / 1000
                                 )))
                                 .await;
@@ -14253,7 +14271,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 t.cheat_hold = Some((hid, s));
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
-                                        "hand #{hid}: holding the next deal for up to {} s while the table certifies seat(s) {awaiting:?} out for a card share that does not hold (S1-KR)",
+                                        "hand #{hid}: holding the next deal for up to {} s while the table certifies seat(s) {awaiting:?} out for a frame of its own that does not hold (S1-KR)",
                                         crate::protocol::constants::CHEAT_HOLD_MS / 1000
                                     )))
                                     .await;
@@ -14284,7 +14302,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if !out.is_empty() {
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
-                                    "hand #{}: seat(s) {out:?} certified out of the table for good for a card share that does not hold (S1-KR); the table plays on without them",
+                                    "hand #{}: seat(s) {out:?} certified out of the table for good for a frame of its own that does not hold (S1-KR); the table plays on without them",
                                     h.hand_id()
                                 )))
                                 .await;
@@ -14593,7 +14611,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     use crate::protocol::messages::EventType;
                     let mut terminal: Option<Vec<u8>> = None;
                     let mut checkpoint: Vec<Vec<u8>> = Vec::new();
-                    let going = t.hand.as_ref().map(|h| h.hand_id());
+                    // The hand going behind is the retained one by now (`t.hand`
+                    // was taken a few lines up): read there, this was `None` and
+                    // kept nothing (the refuter of `S1-KS`).
+                    let going = t.previous.as_ref().map(|h| h.hand_id());
                     for b in t.said.drain(..) {
                         match crate::net::chained::peek(&b, TABLE_FRAME_PEEK) {
                             Ok((EventType::HandComplete | EventType::HandAbort, _, _)) => {
@@ -16752,7 +16773,12 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
         })
     };
     if let Some((_, (seat, cause, _))) = t.cheats.iter().find(|(k, _)| playing(k)) {
-        let what = if *cause == 3 { "a card share" } else { "a shuffle proof" };
+        // `S1-KS`: and a deck key.
+        let what = match *cause {
+            3 => "a card share",
+            7 => "a deck key",
+            _ => "a shuffle step or proof",
+        };
         return Some(format!(
             "{} sent {what} that does not hold: its client does not play by the rules. Every hand it spoils is called off, and nothing here puts it out of the game.",
             seat_called(t, *seat)
@@ -19103,10 +19129,14 @@ fn publish_hand(
             // Nothing leaves. It is still put in `said`, because `said` is the
             // re-send buffer and a message that could not go out is exactly what
             // it exists to send later.
-            if said.len() >= 64 {
-                said.remove(0);
+            // One copy of a frame: `S1-KS`'s answers to a late voter say a vote
+            // again, and every copy kept was another re-send at every tick.
+            if !said.contains(&out) {
+                if said.len() >= 64 {
+                    said.remove(0);
+                }
+                said.push(out);
             }
-            said.push(out);
             continue;
         }
         if tox.is_on_tox() {
@@ -19117,10 +19147,12 @@ fn publish_hand(
         // No `else`. There is no second channel for a hand, by instruction and
         // by capacity. Without a Tox carrier the bytes wait in `said`, which is
         // what `said` is for.
-        if said.len() >= 64 {
-            said.remove(0);
+        if !said.contains(&out) {
+            if said.len() >= 64 {
+                said.remove(0);
+            }
+            said.push(out);
         }
-        said.push(out);
     }
 }
 

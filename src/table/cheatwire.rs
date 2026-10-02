@@ -33,10 +33,10 @@ use minicbor::{Decode, Encode};
 use crate::poker::state::{Hash, SeatIdx};
 use crate::protocol::constants::{CHEAT_SEQUENCE_BASE, MAX_SEATS};
 
-/// One voter's word: *this seat is proven here, by this frame* -- the frame
-/// itself, so that a seat the evidence never reached judges it from the vote:
-/// a rogue that accused itself to one seat only, an accomplice's abort sent to
-/// one. It does nothing alone, and nothing where its frame holds.
+/// One voter's word: *this seat is proven here, by these frames* -- the frames
+/// themselves, so that a seat the evidence never reached judges it from the
+/// vote: a rogue that accused itself to one seat only, an accomplice's abort
+/// sent to one. It does nothing alone, and nothing where its frames hold.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
 pub struct CheatVote {
@@ -46,13 +46,30 @@ pub struct CheatVote {
     /// `ANCHOR(k)`: the abort terminal of the hand the cheat was in.
     #[cbor(n(1), with = "minicbor::bytes")]
     pub anchor: Hash,
-    /// §4.10's cause the frame proves: `3`, a card share that does not hold.
+    /// What the frames prove: [`CAUSE_REVEAL`], [`CAUSE_SHUFFLE`] or
+    /// [`CAUSE_KEY`].
     #[n(2)]
     pub cause: u16,
-    /// A reveal frame of the subject's own signing that this voter holds it
-    /// proven by. Not in the digest: two judges may hold two broken frames.
-    #[cbor(n(3), with = "minicbor::bytes")]
-    pub evidence: Vec<u8>,
+    /// Frames of the subject's own signing that this voter holds it proven by:
+    /// one reveal; one deck key; one shuffle step, or a step and the proof
+    /// bound to it. Not in the digest: two judges may hold two broken frames.
+    #[n(3)]
+    pub evidence: Vec<minicbor::bytes::ByteVec>,
+}
+
+/// A card share that does not hold -- §4.10's `cause = 3` (`S1-KR`).
+pub const CAUSE_REVEAL: u16 = 3;
+/// A shuffle step or proof of the seat's own that is not well formed: a deck
+/// that is not fifty-two cards, bytes that do not decode, a proof whose round or
+/// output is not its step's (`S1-KS`). The argument itself is `D-084`'s.
+pub const CAUSE_SHUFFLE: u16 = 2;
+/// A deck key that does not hold: it does not decode, it is the identity, or its
+/// ownership proof fails at its own context (`S1-KS`). Not a cause of §4.10's.
+pub const CAUSE_KEY: u16 = 7;
+
+/// The causes the band knows.
+pub fn cause_known(cause: u16) -> bool {
+    matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY)
 }
 
 impl CheatVote {
@@ -78,16 +95,18 @@ pub fn subject_digest(subject: SeatIdx, anchor: &Hash) -> Hash {
 pub struct CheatCert {
     #[cbor(n(0), with = "minicbor::bytes")]
     pub subject_digest: Hash,
-    /// The signed `CHEAT_VOTE`s, one per voter, ascending by seat.
+    /// The signed `CHEAT_VOTE`s, one per voter, ascending by seat -- each a
+    /// byte string, not a list of numbers twice its size.
     #[n(1)]
-    pub votes: Vec<Vec<u8>>,
+    pub votes: Vec<minicbor::bytes::ByteVec>,
 }
 
-/// A vote is three fixed fields and one reveal frame: at most a
-/// `DEAL_PRIVATE` body and its envelope, with room to spare.
-pub const CHEAT_VOTE_CAP: usize = 5_120;
-/// Two signed votes, each under the vote's cap and its own envelope, with room
-/// to spare, under the frame cap the certificate itself is sealed in.
+/// A vote is three fixed fields and its frames: at most a shuffle step and the
+/// proof bound to it, each at its cap under the largest envelope.
+pub const CHEAT_VOTE_CAP: usize = 13_312;
+/// Two signed votes about a card share or a deck key, with room to spare, under
+/// the frame cap the certificate itself is sealed in. Two votes about a shuffle
+/// do not fit one frame: those bank as two votes, carried apart.
 pub const CHEAT_CERT_CAP: usize = 12_288;
 
 /// The one slot a cheat about `subject` is sealed at, for a vote and for the
@@ -154,21 +173,42 @@ mod tests {
         }
     }
 
-    /// A vote carrying the largest reveal frame there is -- a `DEAL_PRIVATE`
-    /// body at its cap under the largest envelope -- fits its cap, and two of
-    /// them signed fit the certificate's, under the frame cap.
+    fn frames(sizes: &[usize]) -> Vec<minicbor::bytes::ByteVec> {
+        sizes.iter().map(|n| minicbor::bytes::ByteVec::from(vec![9u8; *n])).collect()
+    }
+
+    /// The largest evidence there is -- a shuffle step and its proof, each at
+    /// its cap under the largest envelope -- fits a vote, and a vote fits a
+    /// frame; two votes about a card share fit a certificate.
     #[test]
     fn a_vote_encodes_within_its_cap_and_round_trips() {
-        let frame = vec![9u8; crate::table::hand::DEAL_PRIVATE_CAP + crate::table::hand::ENVELOPE_MAX];
-        let v = CheatVote { subject_seat: 7, anchor: [1; 32], cause: 3, evidence: frame };
+        use crate::table::hand::{
+            DEAL_PRIVATE_CAP, DECK_INIT_CAP, ENVELOPE_MAX, FRAME_CAP, SHUFFLE_PROOF_CAP, SHUFFLE_STEP_CAP,
+        };
+        let shuffle = frames(&[SHUFFLE_STEP_CAP + ENVELOPE_MAX, SHUFFLE_PROOF_CAP + ENVELOPE_MAX]);
+        let v = CheatVote { subject_seat: 7, anchor: [1; 32], cause: CAUSE_SHUFFLE, evidence: shuffle };
         let bytes = crate::protocol::serialization::to_canonical(&v).expect("encodes");
         assert!(bytes.len() <= CHEAT_VOTE_CAP, "{} bytes", bytes.len());
         let back: CheatVote =
             crate::protocol::serialization::from_canonical(&bytes, CHEAT_VOTE_CAP).expect("decodes");
         assert_eq!(back, v);
-        let vote_frame = bytes.len() + crate::table::hand::ENVELOPE_MAX;
-        assert!(2 * vote_frame + 64 <= CHEAT_CERT_CAP, "two votes fit a certificate: {vote_frame} bytes each");
-        assert!(CHEAT_CERT_CAP + crate::table::hand::ENVELOPE_MAX <= crate::table::hand::FRAME_CAP);
+        assert!(CHEAT_VOTE_CAP + ENVELOPE_MAX <= FRAME_CAP, "a vote fits a frame");
+        for (cause, size) in [(CAUSE_REVEAL, DEAL_PRIVATE_CAP), (CAUSE_KEY, DECK_INIT_CAP)] {
+            let v = CheatVote { subject_seat: 7, anchor: [1; 32], cause, evidence: frames(&[size + ENVELOPE_MAX]) };
+            let vote_frame = crate::protocol::serialization::to_canonical(&v).unwrap().len() + ENVELOPE_MAX;
+            assert!(2 * vote_frame + 64 <= CHEAT_CERT_CAP, "two votes fit a certificate: {vote_frame} bytes each");
+        }
+        assert!(CHEAT_CERT_CAP + ENVELOPE_MAX <= FRAME_CAP);
+    }
+
+    #[test]
+    fn the_band_knows_three_causes() {
+        for c in [CAUSE_REVEAL, CAUSE_SHUFFLE, CAUSE_KEY] {
+            assert!(cause_known(c));
+        }
+        for c in [0u16, 1, 4, 5, 6, 8] {
+            assert!(!cause_known(c), "{c}");
+        }
     }
 
     /// The digest is over the seat and the anchor and nothing else -- two
@@ -176,10 +216,10 @@ mod tests {
     /// its own domain.
     #[test]
     fn the_subject_digest_is_the_seat_and_the_anchor_in_its_own_domain() {
-        let base = CheatVote { subject_seat: 2, anchor: [1; 32], cause: 3, evidence: vec![2; 40] };
+        let base = CheatVote { subject_seat: 2, anchor: [1; 32], cause: 3, evidence: frames(&[40]) };
         let d = base.subject_digest();
         let mut other_frame = base.clone();
-        other_frame.evidence = vec![9; 40];
+        other_frame.evidence = frames(&[41]);
         assert_eq!(other_frame.subject_digest(), d, "the evidence is not in the digest");
         let mut seat = base.clone();
         seat.subject_seat = 3;

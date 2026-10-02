@@ -173,7 +173,10 @@ param(
     # `withhold-step` (it never takes its shuffle step), `bad-share` (its deal
     # shares are broken on the wire), `bad-share-late` (its showdown shares
     # are), `self-accuse` (a hand it lost, it accuses itself of a broken copy of
-    # its own last reveal in place of its settlement, `S1-KQ`); comma-separated. For
+    # its own last reveal in place of its settlement, `S1-KQ`), `bad-key` (its
+    # deck key's ownership proof is broken on the wire, `S1-KS`), `bad-step` (its
+    # shuffle step is a card short on the wire, `S1-KS`), `bad-proof-round` (its
+    # shuffle proof names another round on the wire, `S1-KS`); comma-separated. For
     # measuring what the honest seats do about it -- the table not safe, a hand
     # never held for ever. Needs a `--features fault-harness` binary.
     [string]$Rogue = '',

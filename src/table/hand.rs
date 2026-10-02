@@ -67,7 +67,8 @@ use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, B
 use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 use crate::table::cheatwire::{
-    cheat_sequence, subject_digest as cheat_digest, CheatCert, CheatVote, CHEAT_CERT_CAP, CHEAT_VOTE_CAP,
+    cause_known, cheat_sequence, subject_digest as cheat_digest, CheatCert, CheatVote, CAUSE_KEY, CAUSE_REVEAL,
+    CAUSE_SHUFFLE, CHEAT_CERT_CAP, CHEAT_VOTE_CAP,
 };
 
 /// What a step wants sent.
@@ -1830,12 +1831,13 @@ enum Judged {
     NotEvidence(&'static str),
 }
 
-/// `S1-KR`: a seat proven here to have signed a card share that does not hold:
-/// the cause (§4.10's `3`) and the first frame that proved it.
+/// `S1-KR`: a seat proven here to have signed a card share that does not hold
+/// -- `S1-KS`: or a deck key, or a shuffle frame -- with the cause and the first
+/// frames that proved it.
 #[derive(Debug, Clone)]
 struct Proven {
     cause: u16,
-    frame: Vec<u8>,
+    frames: Vec<Vec<u8>>,
 }
 
 /// `S1-KR`: the deck this client judges reveal shares against, kept when the
@@ -2080,6 +2082,13 @@ pub struct Hand {
     judge: Option<Box<Judge>>,
     /// `S1-KR`: the subjects this client has voted about in this hand.
     cheat_voted: BTreeSet<SeatIdx>,
+    /// `S1-KS`: the voters whose evidence about a subject was judged here --
+    /// once per hand each (the refuter's CPU bound).
+    judged_from: BTreeSet<(SeatIdx, SeatIdx)>,
+    /// `S1-KS`: every verdict reached about a set of frames, by their hash --
+    /// a rogue re-signing votes around an honest seat's genuine frames costs
+    /// this client one verification per frame, not one per vote.
+    verdicts: BTreeMap<Hash, Judged>,
     /// `S1-KR`: the cheat votes held, by subject and then by voter.
     cheat_votes: BTreeMap<SeatIdx, BTreeMap<SeatIdx, Vec<u8>>>,
     /// `S1-KR`: the subjects this client has sealed a certificate about.
@@ -2689,6 +2698,8 @@ impl Hand {
                 proven: BTreeMap::new(),
                 judge: None,
                 cheat_voted: BTreeSet::new(),
+                judged_from: BTreeSet::new(),
+                verdicts: BTreeMap::new(),
                 cheat_votes: BTreeMap::new(),
                 cheat_sealed: BTreeSet::new(),
                 cheat_certs: BTreeMap::new(),
@@ -2937,7 +2948,7 @@ impl Hand {
                 // `S1-KR`: and the seat is proven here -- the frame was taken at
                 // this client's own stage, naming its deck -- and voted about
                 // at once, so the table can put it out after the hand.
-                self.note_proven(seat, 3, bytes.to_vec());
+                self.note_proven(seat, CAUSE_REVEAL, vec![bytes.to_vec()]);
                 let mut out = self.abort_bad_reveal(seat, bytes.to_vec(), key, now_ms)?;
                 self.vote_on_cheats_into(&mut out, key, now_ms);
                 Ok(out)
@@ -3343,6 +3354,26 @@ impl Hand {
         // `Failed::NotYet` and the node then holds in a bounded queue that the
         // five-second re-send churns. It is refused everywhere it lands, and
         // sending it costs the sender the only thing that could still go wrong.
+        // `S1-KS` harness: a rogue's key proof, broken on the wire only -- its own
+        // stage takes the real one, as a modified client's would.
+        let bytes = if rogue("bad-key", self.open.hand_id) {
+            let mut broken = DeckInit { key: body.key.clone(), proof: body.proof.clone() };
+            if let Some(last) = broken.proof.last_mut() {
+                *last ^= 0x01;
+            }
+            chained::seal(
+                EventType::DeckInit,
+                &self.slot,
+                &broken,
+                key,
+                now_ms,
+                self.open.crypto_step_timeout_ms,
+                DECK_INIT_CAP,
+            )
+            .map_err(Failed::Wire)?
+        } else {
+            bytes
+        };
         Ok(if a_party {
             vec![Send::Broadcast(bytes)]
         } else {
@@ -3359,7 +3390,17 @@ impl Hand {
         let opened = self.opened(bytes, EventType::DeckInit)?;
         let seat = self.seat_of(&opened.sender)?;
         self.note_signed(seat);
-        let body: DeckInit = chained::payload(&opened, DECK_INIT_CAP).map_err(Failed::Wire)?;
+        // `S1-KS`: a deck key of the seat's own signing that does not decode,
+        // is the identity, or whose ownership proof fails at its own context is
+        // proven here, and goes to the cheat band; one equal to a key already
+        // seated is arrival order, and is refused as before.
+        let body: DeckInit = match chained::payload(&opened, DECK_INIT_CAP) {
+            Ok(b) => b,
+            Err(e) => {
+                self.note_proven(seat, CAUSE_KEY, vec![bytes.to_vec()]);
+                return Err(Failed::Wire(e));
+            }
+        };
 
         // An exact repeat is weather, and it must be answered before the key
         // is looked at: `verify_key` refuses a key already in the set, so the
@@ -3371,10 +3412,13 @@ impl Hand {
             }
         }
 
-        let wire_key = WireKey::decode(&body.key).map_err(|_| Failed::BadKey {
-            seat,
-            why: "not a point on the curve",
-        })?;
+        let Ok(wire_key) = WireKey::decode(&body.key) else {
+            self.note_proven(seat, CAUSE_KEY, vec![bytes.to_vec()]);
+            return Err(Failed::BadKey {
+                seat,
+                why: "not a point on the curve",
+            });
+        };
         // `D-033`: this seat's own key, said again by the table, must be the
         // one the kept secret answers for; otherwise the secret is another
         // hand's and this one can only be followed and folded. `S1-KK`: after
@@ -3386,11 +3430,23 @@ impl Hand {
                 }
             }
         }
-        let proof = WireKeyProof::decode(&body.proof).map_err(|_| Failed::BadKey {
-            seat,
-            why: "not a well-formed ownership proof",
-        })?;
+        let Ok(proof) = WireKeyProof::decode(&body.proof) else {
+            self.note_proven(seat, CAUSE_KEY, vec![bytes.to_vec()]);
+            return Err(Failed::BadKey {
+                seat,
+                why: "not a well-formed ownership proof",
+            });
+        };
         let ctx = self.deck_ctx(&opened.sender);
+        // The key and its proof alone, against no seated key: what fails here is
+        // the seat's own signing, whatever arrived before it.
+        if HandDeck::verify_key(wire_key, &proof, &[], &ctx).is_err() {
+            self.note_proven(seat, CAUSE_KEY, vec![bytes.to_vec()]);
+            return Err(Failed::BadKey {
+                seat,
+                why: "the ownership proof does not hold, or the key is the identity",
+            });
+        }
 
         let Phase::Deck {
             stage,
@@ -3552,6 +3608,24 @@ impl Hand {
         )
         .map_err(Failed::Wire)?;
         let step_hash = self.opened(&step, EventType::ShuffleStep)?.event_hash;
+        // `S1-KS` harness: a rogue's step, a card short on the wire only -- its
+        // own chain takes the real one, as a modified client's would.
+        let step = if rogue("bad-step", self.open.hand_id) {
+            let mut deck = flatten(&next);
+            deck.truncate(deck.len().saturating_sub(66));
+            chained::seal(
+                EventType::ShuffleStep,
+                &self.slot,
+                &ShuffleStep { shuffle_round: round, deck },
+                key,
+                now_ms,
+                self.open.crypto_step_timeout_ms,
+                SHUFFLE_STEP_CAP,
+            )
+            .map_err(Failed::Wire)?
+        } else {
+            step
+        };
 
         // **Nothing is moved until the chain has taken the step.** The slot used
         // to advance here, before the proof was even sealed, so any failure
@@ -3579,14 +3653,25 @@ impl Hand {
         };
         // `S1-JR` harness: a rogue's proof, broken on the wire only -- its own
         // chain takes the real one, as a modified client's would.
-        let wire = rogue("bad-shuffle", self.open.hand_id).then(|| {
-            let mut broken = body.clone();
-            let n = broken.proof.len();
-            if n > 0 {
-                broken.proof[n / 2] ^= 0xff;
-            }
-            broken
-        });
+        let wire = rogue("bad-shuffle", self.open.hand_id)
+            .then(|| {
+                let mut broken = body.clone();
+                let n = broken.proof.len();
+                if n > 0 {
+                    broken.proof[n / 2] ^= 0xff;
+                }
+                broken
+            })
+            // `S1-KS` harness: a proof naming another round than its step's, on
+            // the wire only -- evidence of a step and its proof, which no
+            // certificate carries two votes of.
+            .or_else(|| {
+                rogue("bad-proof-round", self.open.hand_id).then(|| {
+                    let mut broken = body.clone();
+                    broken.shuffle_round = broken.shuffle_round.wrapping_add(1);
+                    broken
+                })
+            });
         let proof_event = chained::seal(
             EventType::ShuffleProof,
             &after_step,
@@ -3654,9 +3739,25 @@ impl Hand {
         let opened = self.opened(bytes, EventType::ShuffleStep)?;
         let seat = self.seat_of(&opened.sender)?;
         self.note_signed(seat);
-        let body: ShuffleStep =
-            chained::payload(&opened, SHUFFLE_STEP_CAP).map_err(Failed::Wire)?;
+        // `S1-KS`: a step of the seat's own whose body does not decode, or whose
+        // deck is not fifty-two cards, is proven here by its bytes alone.
+        let body: ShuffleStep = match chained::payload(&opened, SHUFFLE_STEP_CAP) {
+            Ok(b) => b,
+            Err(e) => {
+                self.note_proven(seat, CAUSE_SHUFFLE, vec![bytes.to_vec()]);
+                return Err(Failed::Wire(e));
+            }
+        };
 
+        // `S1-KS`: the bytes before the chain -- a turn or a round this client's
+        // chain refuses would hide what the frame alone proves (the refuter).
+        let Some(deck) = unflatten(&body.deck) else {
+            self.note_proven(seat, CAUSE_SHUFFLE, vec![bytes.to_vec()]);
+            return Err(Failed::BadDeck {
+                seat,
+                why: "not fifty-two cards of sixty-six bytes",
+            });
+        };
         let Phase::Shuffling { chain, .. } = &self.phase else {
             return Err(Failed::NothingFurther);
         };
@@ -3670,10 +3771,6 @@ impl Hand {
                 why: "the round does not match the chain's position",
             });
         }
-        let deck = unflatten(&body.deck).ok_or(Failed::BadDeck {
-            seat,
-            why: "not fifty-two cards of sixty-six bytes",
-        })?;
 
         let hash = stage_hash_single(
             self.slot.sequence,
@@ -3716,8 +3813,21 @@ impl Hand {
             return Ok(Vec::new());
         }
         self.note_signed(seat);
-        let body: ShuffleProof =
-            chained::payload(&opened, SHUFFLE_PROOF_CAP).map_err(Failed::Wire)?;
+        // `S1-KS`: a proof of the seat's own that does not decode, with the
+        // step this client holds from it -- the proof's own parent binds the two.
+        let body: ShuffleProof = match chained::payload(&opened, SHUFFLE_PROOF_CAP) {
+            Ok(b) => b,
+            Err(e) => {
+                let held_step = match &self.phase {
+                    Phase::Shuffling { heard: Some(held), .. } if held.seat == seat => Some(held.bytes.clone()),
+                    _ => None,
+                };
+                if let Some(step) = held_step {
+                    self.note_proven(seat, CAUSE_SHUFFLE, vec![step, bytes.to_vec()]);
+                }
+                return Err(Failed::Wire(e));
+            }
+        };
 
         let Phase::Shuffling { deal, chain, heard } = &mut self.phase else {
             return Err(Failed::NothingFurther);
@@ -3733,23 +3843,32 @@ impl Hand {
             });
         }
         if held.round != body.shuffle_round {
+            // `S1-KS`: the seat's own step and proof, naming two rounds.
+            let step = held.bytes.clone();
+            self.note_proven(seat, CAUSE_SHUFFLE, vec![step, bytes.to_vec()]);
             return Err(Failed::BadDeck {
                 seat,
                 why: "the proof's round does not match the step's",
             });
         }
-        // The two cheap checks before the expensive one, in that order: this
-        // is what makes a lifted proof cost a hash rather than 42 ms.
+        // The two cheap checks before the expensive one: this is what makes a
+        // lifted proof cost a hash rather than 42 ms. `S1-KS`: the output first --
+        // the step and the proof are the seat's own, bound by parent, and their
+        // mismatch is proven by the bytes; the input is this client's chain's,
+        // and a branch this client is not on is no finding.
+        if body.output_deck_hash != deck_hash(&held.deck) {
+            // `S1-KS`: the seat's own proof naming an output its own step is not.
+            let step = held.bytes.clone();
+            self.note_proven(seat, CAUSE_SHUFFLE, vec![step, bytes.to_vec()]);
+            return Err(Failed::BadDeck {
+                seat,
+                why: "the proof names an output deck that is not the step's",
+            });
+        }
         if body.input_deck_hash != input_deck_hash(chain.last_verified()) {
             return Err(Failed::BadDeck {
                 seat,
                 why: "the proof names an input deck this client does not hold",
-            });
-        }
-        if body.output_deck_hash != deck_hash(&held.deck) {
-            return Err(Failed::BadDeck {
-                seat,
-                why: "the proof names an output deck that is not the step's",
             });
         }
 
@@ -6726,7 +6845,7 @@ impl Hand {
                         }
                         // `S1-KR`: proven here, by its own frame on this
                         // client's own deck.
-                        self.note_proven(seat, 3, frame.clone());
+                        self.note_proven(seat, CAUSE_REVEAL, vec![frame.clone()]);
                     }
                     // Nothing to check against here yet: the frame is held and
                     // judged at this client's own stage.
@@ -6750,7 +6869,7 @@ impl Hand {
                     body.attributed.first().and_then(|k| self.seat_of_key(k)),
                     body.evidence.as_slice(),
                 ) {
-                    self.note_proven(accused, 3, frame.clone());
+                    self.note_proven(accused, CAUSE_REVEAL, vec![frame.clone()]);
                 }
                 if matches!(self.phase, Phase::Aborted(_)) {
                     return Ok(Vec::new());
@@ -7097,6 +7216,9 @@ impl Hand {
             EventType::ShowdownReveal => SHOWDOWN_REVEAL_CAP,
             _ => return Judged::NotEvidence("the frame it carries were a reveal at all"),
         };
+        if frame.len() > frame_ceiling(kind) {
+            return Judged::NotEvidence("the frame were within its cap");
+        }
         // By chain identity, not position: the frame sits at the stage the
         // accused was at, which is not where this client's cursor is.
         let Ok(opened) = chained::open_in_hand(frame, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id) else {
@@ -7198,21 +7320,164 @@ impl Hand {
             return;
         };
         if self.judge_reveal(frame, accused) == Judged::Proven {
-            self.note_proven(accused, 3, frame.clone());
+            self.note_proven(accused, CAUSE_REVEAL, vec![frame.clone()]);
         }
     }
 
-    /// `S1-KR`: `seat` is proven here by `frame`, kept with the first frame that
-    /// proved it. Never this client's own seat; never a seat not dealt in,
-    /// which signs no share.
-    fn note_proven(&mut self, seat: SeatIdx, cause: u16, frame: Vec<u8>) {
+    /// `S1-KR`: `seat` is proven here by `frames`, kept with the first frames
+    /// that proved it. Never this client's own seat; never a seat not dealt in,
+    /// which signs nothing of the deck. `S1-KS`: never on a frame over its own
+    /// type's ceiling -- no vote could carry it, and no other seat would judge it.
+    fn note_proven(&mut self, seat: SeatIdx, cause: u16, frames: Vec<Vec<u8>>) {
         if seat == self.open.my_seat || !self.mine.dealt_in.contains(&seat) || self.proven.contains_key(&seat) {
             return;
         }
+        let fits = frames.iter().all(|f| {
+            chained::peek(f, PEEK_CAP).is_ok_and(|(kind, _, _)| f.len() <= frame_ceiling(kind))
+        });
+        if !fits {
+            return;
+        }
+        let what = match cause {
+            CAUSE_KEY => "a deck key that does not hold",
+            CAUSE_SHUFFLE => "a shuffle step or proof that is not well formed",
+            _ => "a card share that does not hold",
+        };
         self.cert_note.push(format!(
-            "seat {seat} is proven here to have signed a card share that does not hold; the table is asked to put it out (S1-KR)"
+            "seat {seat} is proven here to have signed {what}; the table is asked to put it out (S1-KR)"
         ));
-        self.proven.insert(seat, Proven { cause, frame });
+        self.proven.insert(seat, Proven { cause, frames });
+    }
+
+    /// `S1-KS`: what a vote's or a certificate's frames say about `accused`, by
+    /// their cause -- each set judged once per hand, the verdict kept by the
+    /// frames' hash (the refuter's CPU bound). A check that could not be run is
+    /// not kept: this client may yet catch up.
+    fn judge_evidence(&mut self, cause: u16, frames: &[Vec<u8>], accused: SeatIdx) -> Judged {
+        let memo = {
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(frames.len() + 2);
+            let cause_bytes = cause.to_be_bytes();
+            let seat_byte = [accused];
+            parts.push(&cause_bytes);
+            parts.push(&seat_byte);
+            for f in frames {
+                parts.push(f.as_slice());
+            }
+            h(Domain::CheatCert.context(), &parts)
+        };
+        if let Some(v) = self.verdicts.get(&memo) {
+            return *v;
+        }
+        let verdict = match (cause, frames) {
+            (CAUSE_REVEAL, [frame]) => self.judge_reveal(frame, accused),
+            (CAUSE_KEY, [frame]) => self.judge_key(frame, accused),
+            (CAUSE_SHUFFLE, [_] | [_, _]) => self.judge_shuffle_bytes(frames, accused),
+            _ => Judged::NotEvidence("the evidence were the frames its cause names"),
+        };
+        // Kept only where the frames are the accused's own and were judged:
+        // junk a rogue makes up at will (`NotEvidence`) would grow this without
+        // bound, and costs nothing to refuse again.
+        if matches!(verdict, Judged::Proven | Judged::Holds) {
+            self.verdicts.insert(memo, verdict);
+        }
+        verdict
+    }
+
+    /// `S1-KS`: what a `DECK_INIT` of `accused`'s own signing says about it,
+    /// judged by the frame alone at its own context -- the table, the session,
+    /// the hand, the frame's own signed sequence and its sender, which every
+    /// seat of the hand holds alike, whatever else forked. Proven where the key
+    /// does not decode, is the identity, or its ownership proof does not hold;
+    /// a key equal to another seat's is arrival order, never judged here.
+    fn judge_key(&self, frame: &[u8], accused: SeatIdx) -> Judged {
+        let Some(accused_key) = self.key_of(accused) else {
+            return Judged::NotEvidence("the seat it accuses were at this table");
+        };
+        if frame.len() > frame_ceiling(EventType::DeckInit) {
+            return Judged::NotEvidence("the frame were within its cap");
+        }
+        let Ok(opened) =
+            chained::open_in_hand(frame, FRAME_CAP, EventType::DeckInit, &self.open.table_id, self.open.hand_id)
+        else {
+            return Judged::NotEvidence("the frame opened in this hand as a deck key");
+        };
+        if opened.sender != accused_key {
+            return Judged::NotEvidence("the frame were signed by the seat it accuses");
+        }
+        let Ok(body) = chained::payload::<DeckInit>(&opened, DECK_INIT_CAP) else {
+            return Judged::Proven;
+        };
+        let (Ok(key), Ok(proof)) = (WireKey::decode(&body.key), WireKeyProof::decode(&body.proof)) else {
+            return Judged::Proven;
+        };
+        let ctx = self.deck_ctx_at(&accused_key, opened.envelope.sequence);
+        match HandDeck::verify_key(key, &proof, &[], &ctx) {
+            Ok(_) => Judged::Holds,
+            Err(VerifyOutcome::Invalid(_)) => Judged::Proven,
+            Err(_) => Judged::Unjudgeable,
+        }
+    }
+
+    /// `S1-KS`: what a shuffle step of `accused`'s own -- alone, or with the
+    /// proof bound to it by parent -- says about it, by its bytes alone: a deck
+    /// that is not fifty-two cards, a body that does not decode, a proof whose
+    /// round or output is not its step's. None of that asks this client's chain,
+    /// so a fork of the deck stage or the chain changes nothing here, and an
+    /// honest client never signs any of it. The argument is `D-084`'s, not this.
+    fn judge_shuffle_bytes(&self, frames: &[Vec<u8>], accused: SeatIdx) -> Judged {
+        let Some(accused_key) = self.key_of(accused) else {
+            return Judged::NotEvidence("the seat it accuses were at this table");
+        };
+        let open = |f: &[u8], kind: EventType| -> Option<chained::Opened> {
+            if f.len() > frame_ceiling(kind) {
+                return None;
+            }
+            chained::open_in_hand(f, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id)
+                .ok()
+                .filter(|o| o.sender == accused_key)
+        };
+        let (step_frame, proof_frame) = match frames {
+            [s] => (s, None),
+            [s, p] => (s, Some(p)),
+            _ => return Judged::NotEvidence("one step, or a step and its proof"),
+        };
+        let Some(step) = open(step_frame, EventType::ShuffleStep) else {
+            return Judged::NotEvidence("the step were the accused's own, within its cap");
+        };
+        let proof = match proof_frame {
+            None => None,
+            Some(p) => {
+                let Some(opened) = open(p, EventType::ShuffleProof) else {
+                    return Judged::NotEvidence("the proof were the accused's own, within its cap");
+                };
+                // Bound to that step by its parent: the accused itself put the
+                // two together, never the frame's carrier.
+                let bound =
+                    stage_hash_single(step.envelope.sequence, EventType::ShuffleStep.code(), accused, step.event_hash);
+                if opened.envelope.previous_event_hash != bound
+                    || opened.envelope.sequence != step.envelope.sequence.saturating_add(1)
+                {
+                    return Judged::NotEvidence("the proof were bound to the step it is carried with");
+                }
+                Some(opened)
+            }
+        };
+        let Ok(step_body) = chained::payload::<ShuffleStep>(&step, SHUFFLE_STEP_CAP) else {
+            return Judged::Proven;
+        };
+        let Some(deck) = unflatten(&step_body.deck) else {
+            return Judged::Proven;
+        };
+        let Some(proof) = proof else {
+            return Judged::Holds;
+        };
+        let Ok(proof_body) = chained::payload::<ShuffleProof>(&proof, SHUFFLE_PROOF_CAP) else {
+            return Judged::Proven;
+        };
+        if proof_body.shuffle_round != step_body.shuffle_round || proof_body.output_deck_hash != deck_hash(&deck) {
+            return Judged::Proven;
+        }
+        Judged::Holds
     }
 
     /// Whether this hand's own deadline has passed.
@@ -13111,6 +13376,7 @@ impl Hand {
             .keys()
             .copied()
             .filter(|s| !self.cheat_out.contains(s) && self.band_possible(*s) && self.cheat_voters_present(*s) >= 2)
+            .filter(|s| !self.out_for_good().contains(s))
             .collect()
     }
 
@@ -13132,20 +13398,22 @@ impl Hand {
     /// `S1-KR`: a vote about every seat proven here that this client has not
     /// voted about yet -- at once, whether the hand is over or not: the anchor
     /// is the hand's own -- and whatever certificate that completes. Each vote
-    /// carries the frame that proves its subject here.
+    /// carries the frames that prove its subject here. `S1-KS`: a vote that
+    /// would not seal is said and passed over; the others still go.
     pub fn vote_on_cheats(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let me = self.open.my_seat;
         let anchor = self.anchor();
-        let due: Vec<(SeatIdx, u16, Vec<u8>)> = self
+        let due: Vec<(SeatIdx, u16, Vec<Vec<u8>>)> = self
             .proven
             .iter()
             .filter(|(s, _)| {
                 !self.cheat_voted.contains(*s) && self.band_possible(**s) && self.cheat_voters(**s).contains(&me)
             })
-            .map(|(s, p)| (*s, p.cause, p.frame.clone()))
+            .map(|(s, p)| (*s, p.cause, p.frames.clone()))
             .collect();
         let mut out = Vec::new();
-        for (seat, cause, evidence) in due {
+        for (seat, cause, frames) in due {
+            self.cheat_voted.insert(seat);
             let Some(sequence) = cheat_sequence(seat) else {
                 continue;
             };
@@ -13153,10 +13421,10 @@ impl Hand {
                 subject_seat: seat,
                 anchor,
                 cause,
-                evidence,
+                evidence: frames.into_iter().map(minicbor::bytes::ByteVec::from).collect(),
             };
             let slot = self.slot().at(sequence, anchor);
-            let bytes = chained::seal(
+            let bytes = match chained::seal(
                 EventType::CheatVote,
                 &slot,
                 &vote,
@@ -13164,16 +13432,18 @@ impl Hand {
                 now_ms,
                 self.next_deadline_for(EventType::CheatVote),
                 CHEAT_VOTE_CAP,
-            )
-            .map_err(Failed::Wire)?;
-            self.cheat_voted.insert(seat);
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.cert_note.push(format!("cheat: a vote about seat {seat} would not seal: {e:?} (S1-KS)"));
+                    continue;
+                }
+            };
             self.cheat_votes.entry(seat).or_default().insert(me, bytes.clone());
             let held = self.cheat_votes.get(&seat).map_or(0, |m| m.len());
-            self.cert_note.push(format!("cheat: vote {held} about seat {seat} (mine), its card share failing here (S1-KR)"));
+            self.cert_note.push(format!("cheat: vote {held} about seat {seat} (mine), proven here (S1-KR)"));
             out.push(Send::Broadcast(bytes));
         }
-        // A certificate that would not seal is said, not raised: the votes
-        // above are this client's and are out.
         match self.certify_cheats(key, now_ms) {
             Ok(mut c) => out.append(&mut c),
             Err(e) => self.cert_note.push(format!("cheat: a certificate would not seal: {e} (S1-KR)")),
@@ -13181,13 +13451,17 @@ impl Hand {
         Ok(out)
     }
 
-    /// `S1-KR`: a cheat vote from a peer. It moves nothing by itself: the frame
-    /// it carries is judged here as any evidence is, and the vote counts only
-    /// once this client holds the subject proven -- by that frame or another.
-    /// A vote whose frame holds here is refused; one this client cannot judge
-    /// yet is held. A voter heard from only after this client sealed its
-    /// certificate is answered with it: nobody says a certificate twice, and
-    /// that voter may have missed it (the refuter's H1).
+    /// `S1-KR`: a cheat vote from a peer. It moves nothing by itself: the frames
+    /// it carries are judged here as any evidence is, and the vote counts only
+    /// once this client holds the subject proven -- by those frames or others.
+    /// A vote whose frames hold here is refused; one this client cannot judge
+    /// yet is held. A voter heard from only after this client voted is answered
+    /// with its own vote and certificate: nobody says them twice, and that voter
+    /// may have missed them (the refuter's H1). `S1-KS`: each voter's evidence
+    /// about a subject is judged once per hand (the refuter's CPU bound), and
+    /// two votes with this client's own judgement bank, whether this client
+    /// votes or not -- a seat not dealt in, or two votes about a shuffle, which
+    /// no certificate carries.
     fn on_cheat_vote(&mut self, bytes: &[u8], key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let opened = chained::open_in_hand(bytes, FRAME_CAP, EventType::CheatVote, &self.open.table_id, self.open.hand_id)
             .map_err(Failed::Wire)?;
@@ -13218,10 +13492,10 @@ impl Hand {
                 what: "the cheat vote were about this game's hand",
             });
         }
-        if body.cause != 3 {
+        if !cause_known(body.cause) {
             return Err(Failed::Elsewhere {
                 seat: voter,
-                what: "a cheat vote named the cause its frame proves, a card share",
+                what: "a cheat vote named a cause the band knows",
             });
         }
         if !self.cheat_voters(body.subject_seat).contains(&voter) {
@@ -13235,15 +13509,33 @@ impl Hand {
             return Ok(Vec::new());
         }
         if !self.proven.contains_key(&subject) {
-            match self.judge_reveal(&body.evidence, subject) {
-                Judged::Proven => self.note_proven(subject, 3, body.evidence.clone()),
+            // One judgement per voter and subject in a hand: an honest voter
+            // says one vote again byte for byte, and a rogue re-signing its vote
+            // around another seat's genuine frames is judged no further.
+            if !self.judged_from.insert((voter, subject)) {
+                return Ok(Vec::new());
+            }
+            let frames: Vec<Vec<u8>> = body.evidence.iter().map(|b| b.to_vec()).collect();
+            match self.judge_evidence(body.cause, &frames, subject) {
+                Judged::Proven => self.note_proven(subject, body.cause, frames),
                 Judged::Holds => {
                     return Err(Failed::Elsewhere {
                         seat: voter,
-                        what: "the share its cheat vote carries failed at this client",
+                        what: "the evidence its cheat vote carries failed at this client",
                     })
                 }
-                Judged::Unjudgeable => return Err(Failed::NotYet),
+                Judged::Unjudgeable if !self.over() => {
+                    self.judged_from.remove(&(voter, subject));
+                    return Err(Failed::NotYet);
+                }
+                // Over, this client's deck will not move again: held, the vote
+                // would be replayed for nothing at every tick.
+                Judged::Unjudgeable => {
+                    return Err(Failed::Elsewhere {
+                        seat: voter,
+                        what: "the evidence its cheat vote carries could be judged here before the hand ended",
+                    })
+                }
                 Judged::NotEvidence(what) => return Err(Failed::Elsewhere { seat: voter, what }),
             }
         }
@@ -13254,12 +13546,29 @@ impl Hand {
         let votes = self.cheat_votes.entry(subject).or_default();
         votes.insert(voter, bytes.to_vec());
         let held = votes.len();
+        let own = votes.get(&self.open.my_seat).cloned();
         self.cert_note.push(format!("cheat: vote {held} about seat {subject} (from seat {voter}) (S1-KR)"));
         let mut out = Vec::new();
+        if let Some(own) = own {
+            out.push(Send::Broadcast(own));
+        }
         if let Some(cert) = self.cheat_certs.get(&subject) {
             out.push(Send::Broadcast(cert.clone()));
         }
-        // A judge that has not voted votes now -- its vote carries its frame --
+        if held >= 2 && self.bank_cheat(subject) {
+            self.cert_note.push(format!("cheat: seat {subject} put out on two votes and this client's own judgement (S1-KS)"));
+            // Passed on, each under its voter's own signature: a seat that hears
+            // one voter only -- one not dealt in, which votes nothing -- banks on
+            // these as this client did, where no certificate carries two of them.
+            if let Some(m) = self.cheat_votes.get(&subject) {
+                for (v, b) in m {
+                    if *v != voter && *v != self.open.my_seat {
+                        out.push(Send::Broadcast(b.clone()));
+                    }
+                }
+            }
+        }
+        // A judge that has not voted votes now -- its vote carries its frames --
         // and seals once it holds two.
         self.vote_on_cheats_into(&mut out, key, now_ms);
         Ok(out)
@@ -13268,7 +13577,10 @@ impl Hand {
     /// `S1-KR`: seal and bank a certificate about every subject this client
     /// holds proven and two votes about, its own among them -- its own and the
     /// lowest other voter's, ascending. Two are the whole of it: banking asks
-    /// two voters and the receiver's own judgement of a frame they carry.
+    /// two voters and the receiver's own judgement of frames they carry.
+    /// `S1-KS`: two votes too large for one frame -- a shuffle step and its
+    /// proof each -- bank all the same: the certificate is only the two votes
+    /// carried together, and each went out on its own.
     fn certify_cheats(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let me = self.open.my_seat;
         let anchor = self.anchor();
@@ -13281,6 +13593,7 @@ impl Hand {
             .collect();
         let mut out = Vec::new();
         for seat in ready {
+            self.cheat_sealed.insert(seat);
             let (Some(held), Some(sequence)) = (self.cheat_votes.get(&seat), cheat_sequence(seat)) else {
                 continue;
             };
@@ -13290,17 +13603,17 @@ impl Hand {
             let Some(own_vote) = held.get(&me) else {
                 continue;
             };
-            let votes = if me < *other {
-                vec![own_vote.clone(), other_vote.clone()]
+            let votes: Vec<minicbor::bytes::ByteVec> = if me < *other {
+                vec![own_vote.clone().into(), other_vote.clone().into()]
             } else {
-                vec![other_vote.clone(), own_vote.clone()]
+                vec![other_vote.clone().into(), own_vote.clone().into()]
             };
             let body = CheatCert {
                 subject_digest: cheat_digest(seat, &anchor),
                 votes,
             };
             let slot = self.slot().at(sequence, anchor);
-            let bytes = chained::seal(
+            match chained::seal(
                 EventType::CheatCert,
                 &slot,
                 &body,
@@ -13308,12 +13621,21 @@ impl Hand {
                 now_ms,
                 self.next_deadline_for(EventType::CheatCert),
                 CHEAT_CERT_CAP,
-            )
-            .map_err(Failed::Wire)?;
-            self.cheat_sealed.insert(seat);
-            self.cheat_certs.insert(seat, bytes.clone());
+            ) {
+                Ok(bytes) => {
+                    self.cheat_certs.insert(seat, bytes.clone());
+                    out.push(Send::Broadcast(bytes));
+                }
+                Err(e) => {
+                    self.cert_note.push(format!(
+                        "cheat: two votes about seat {seat} do not fit one certificate ({e:?}); they bank as two votes, and the other is said again (S1-KS)"
+                    ));
+                    // Its own went out when it was sealed; the other voter's goes
+                    // now, so that a seat that heard one of the two banks too.
+                    out.push(Send::Broadcast(other_vote.clone()));
+                }
+            }
             self.bank_cheat(seat);
-            out.push(Send::Broadcast(bytes));
         }
         Ok(out)
     }
@@ -13327,7 +13649,7 @@ impl Hand {
         }
         self.late_roster = true;
         self.cert_note.push(format!(
-            "seat {seat} is out of the table for good from hand #{}: two seats certified that its card share does not hold, and this client's own check says so (S1-KR)",
+            "seat {seat} is out of the table for good from hand #{}: two seats certified that it cheated, and this client's own check says so (S1-KR)",
             self.open.hand_id.saturating_add(1)
         ));
         true
@@ -13335,7 +13657,7 @@ impl Hand {
 
     /// `S1-KR`: a cheat certificate from a peer. Its votes are checked as a
     /// return certificate's are; then the subject must be proven HERE --
-    /// before, or by a frame one of its votes carries, judged now. Two votes
+    /// before, or by frames one of its votes carries, judged now. Two votes
     /// about a seat whose frames hold here bank nothing, and a certificate
     /// about this client is never taken by it.
     fn on_cheat_cert(&mut self, bytes: &[u8], key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
@@ -13353,8 +13675,9 @@ impl Hand {
         let anchor = self.anchor();
         let mut voters: BTreeSet<SeatIdx> = BTreeSet::new();
         let mut subject: Option<SeatIdx> = None;
-        let mut carried: Vec<(SeatIdx, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut carried: Vec<(SeatIdx, Vec<u8>, u16, Vec<Vec<u8>>)> = Vec::new();
         for vote in &body.votes {
+            let vote: &[u8] = vote;
             let v = chained::open_in_hand(vote, FRAME_CAP, EventType::CheatVote, &self.open.table_id, self.open.hand_id)
                 .map_err(Failed::Wire)?;
             let voter = self.seat_of(&v.sender)?;
@@ -13381,6 +13704,12 @@ impl Hand {
                     what: "the subject were not a voter about itself",
                 });
             }
+            if !cause_known(named.cause) {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "every carried vote named a cause the band knows",
+                });
+            }
             let Some(sequence) = cheat_sequence(named.subject_seat) else {
                 return Err(Failed::Elsewhere {
                     seat: emitter,
@@ -13396,7 +13725,8 @@ impl Hand {
                     what: "each vote were sealed at its subject's slot on this hand's anchor",
                 });
             }
-            carried.push((voter, vote.clone(), named.evidence));
+            let frames: Vec<Vec<u8>> = named.evidence.iter().map(|b| b.to_vec()).collect();
+            carried.push((voter, vote.to_vec(), named.cause, frames));
         }
         let Some(subject) = subject else {
             return Err(Failed::Elsewhere {
@@ -13428,40 +13758,61 @@ impl Hand {
             return Ok(Vec::new());
         }
         // **Judged here, or nothing.** Not on the voters' word: two rogues can
-        // sign a certificate about anybody, and only a frame proves. One frame
-        // that proves the subject here is enough; one that cannot be judged yet
-        // holds the certificate; frames that hold refuse it.
+        // sign a certificate about anybody, and only frames prove. One set that
+        // proves the subject here is enough; one that cannot be judged yet holds
+        // the certificate; sets that hold refuse it. Each set judged once.
         if !self.proven.contains_key(&subject) {
             let mut unjudgeable = false;
             let mut refused: Option<&'static str> = None;
-            for (_, _, evidence) in &carried {
-                match self.judge_reveal(evidence, subject) {
+            let mut judged_before = false;
+            for (voter, _, cause, frames) in &carried {
+                // Once per voter and subject, as a vote of its own is.
+                if !self.judged_from.insert((*voter, subject)) {
+                    judged_before = true;
+                    continue;
+                }
+                match self.judge_evidence(*cause, frames, subject) {
                     Judged::Proven => {
-                        self.note_proven(subject, 3, evidence.clone());
+                        self.note_proven(subject, *cause, frames.clone());
                         unjudgeable = false;
                         refused = None;
                         break;
                     }
                     Judged::Holds => {
-                        refused = refused.or(Some("the share its certificate carries failed at this client"))
+                        refused = refused.or(Some("the evidence its certificate carries failed at this client"))
                     }
-                    Judged::Unjudgeable => unjudgeable = true,
+                    Judged::Unjudgeable => {
+                        self.judged_from.remove(&(*voter, subject));
+                        unjudgeable = true;
+                    }
                     Judged::NotEvidence(what) => refused = refused.or(Some(what)),
                 }
             }
             if !self.proven.contains_key(&subject) {
-                if unjudgeable {
+                if unjudgeable && !self.over() {
                     return Err(Failed::NotYet);
                 }
                 if let Some(what) = refused {
                     return Err(Failed::Elsewhere { seat: emitter, what });
+                }
+                if unjudgeable {
+                    return Err(Failed::Elsewhere {
+                        seat: emitter,
+                        what: "the evidence its certificate carries could be judged here before the hand ended",
+                    });
+                }
+                if judged_before {
+                    return Err(Failed::Elsewhere {
+                        seat: emitter,
+                        what: "the votes it carries were judged here already and failed at this client",
+                    });
                 }
                 // `note_proven` takes no certificate about this client's own seat.
                 return Ok(Vec::new());
             }
         }
         // Its votes count here as votes do.
-        for (voter, raw, _) in carried {
+        for (voter, raw, _, _) in carried {
             self.cheat_votes.entry(subject).or_default().entry(voter).or_insert(raw);
         }
         if self.bank_cheat(subject) {
@@ -17604,8 +17955,8 @@ mod tests {
         let mut refused = Vec::new();
         pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
         assert_ne!(
-            hands[1].proven.get(&0).map(|p| p.frame.clone()),
-            hands[2].proven.get(&0).map(|p| p.frame.clone()),
+            hands[1].proven.get(&0).map(|p| p.frames.clone()),
+            hands[2].proven.get(&0).map(|p| p.frames.clone()),
             "each judge holds another broken copy"
         );
         for s in [1usize, 2] {
@@ -17628,7 +17979,7 @@ mod tests {
             .expect("seat 0 dealt");
         let slot = hands[1].slot().at(cheat_sequence(0).unwrap(), anchor);
         let vote_of = |seat: usize| {
-            let v = CheatVote { subject_seat: 0, anchor, cause: 3, evidence: deal0.clone() };
+            let v = CheatVote { subject_seat: 0, anchor, cause: 3, evidence: vec![deal0.clone().into()] };
             chained::seal(EventType::CheatVote, &slot, &v, &keys[seat], NOW, 30_000, CHEAT_VOTE_CAP).unwrap()
         };
         let (v2, v3) = (vote_of(2), vote_of(3));
@@ -17640,7 +17991,7 @@ mod tests {
             );
         }
         assert!(hands[1].cheat_out().is_empty(), "votes alone bank nothing");
-        let cert = CheatCert { subject_digest: cheat_digest(0, &anchor), votes: vec![v2, v3] };
+        let cert = CheatCert { subject_digest: cheat_digest(0, &anchor), votes: vec![v2.into(), v3.into()] };
         let bytes = chained::seal(EventType::CheatCert, &slot, &cert, &keys[2], NOW, 30_000, CHEAT_CERT_CAP).unwrap();
         let err = hands[1].on_event(&bytes, &keys[1], NOW).expect_err("refused");
         assert!(
@@ -17739,7 +18090,7 @@ mod tests {
         let anchor = hands[1].anchor();
         let deal0 = said[0].iter().find(|b| is_kind(b, EventType::DealPrivate)).cloned().expect("seat 0 dealt");
         let vote = |subject: SeatIdx, at: Slot, signer: usize| {
-            let v = CheatVote { subject_seat: subject, anchor, cause: 3, evidence: deal0.clone() };
+            let v = CheatVote { subject_seat: subject, anchor, cause: 3, evidence: vec![deal0.clone().into()] };
             chained::seal(EventType::CheatVote, &at, &v, &keys[signer], NOW, 30_000, CHEAT_VOTE_CAP).unwrap()
         };
         let why = |r: Result<Vec<Send>, Failed>| match r {
@@ -17841,6 +18192,180 @@ mod tests {
         let late: Vec<Send> = stash.borrow().iter().map(|b| Send::Broadcast(b.clone())).collect();
         pump_cheat(&mut hands, &keys, vec![(3, late)], &|_, _, b: &[u8]| Some(b.to_vec()), &mut refused);
         assert_eq!(hands[3].cheat_out(), vec![0], "answered with a sealed certificate, it banks");
+    }
+
+    // `S1-KS`: deck keys and malformed shuffle frames through the cheat band.
+
+    /// `S1-KS`: the frames a seat said in a pump, of one kind, captured by `route`.
+    fn capture(store: &std::cell::RefCell<Vec<Vec<u8>>>, from: usize, who: usize, b: &[u8], kind: EventType) {
+        if from == who && is_kind(b, kind) {
+            store.borrow_mut().push(b.to_vec());
+        }
+    }
+
+    /// `S1-KS`: every seat's votes about the seats it proved, pumped round the
+    /// table as the node's tick would send them.
+    fn tick_votes(hands: &mut [Hand], keys: &[SigningKey], refused: &mut Vec<(usize, String)>) {
+        let mut pending = Vec::new();
+        for s in 0..hands.len() {
+            let sends = hands[s].vote_on_cheats(&keys[s], NOW).expect("votes seal");
+            if !sends.is_empty() {
+                pending.push((s, sends));
+            }
+        }
+        pump_cheat(hands, keys, pending, &|_, _, b: &[u8]| Some(b.to_vec()), refused);
+    }
+
+    /// `S1-KS`: **a deck key whose ownership proof does not hold is proven at
+    /// every seat that receives it -- by the frame alone, at its own context --
+    /// and the seat is put out of the table for good**, where before it was a
+    /// key refused and a stage left to its deadline.
+    #[test]
+    fn a_deck_key_that_does_not_hold_is_proven_and_put_out() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 0 && to == 1 && is_kind(b, EventType::DeckInit) {
+                let at = slot_of(b, EventType::DeckInit);
+                return Some(tamper::<DeckInit>(b, EventType::DeckInit, &at, DECK_INIT_CAP, |d| {
+                    let n = d.proof.len();
+                    d.proof[n - 1] ^= 0x01;
+                }));
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert_eq!(hands[1].proven.get(&0).map(|p| p.cause), Some(CAUSE_KEY), "seat 1 proves seat 0");
+        assert!(hands[2].proven.is_empty(), "seat 2 took a good key");
+        tick_votes(&mut hands, &keys, &mut refused);
+        assert_eq!(hands[2].proven.get(&0).map(|p| p.cause), Some(CAUSE_KEY), "seat 2 proves it from seat 1's vote");
+        for s in [1usize, 2] {
+            assert_eq!(hands[s].cheat_out(), vec![0], "seat {s}: out of the table for good");
+        }
+    }
+
+    /// `S1-KS`: a deck key that holds is never proven, wherever it is judged.
+    #[test]
+    fn a_deck_key_that_holds_is_never_proven() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let inits: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&inits, from, 0, b, EventType::DeckInit);
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let init0 = inits.borrow().first().cloned().expect("seat 0 said its key");
+        assert_eq!(hands[1].judge_key(&init0, 0), Judged::Holds);
+        assert!(hands[1].proven.is_empty());
+    }
+
+    /// `S1-KS`: **a shuffle step whose deck is not fifty-two cards is proven by
+    /// its bytes alone, and the seat put out**.
+    #[test]
+    fn a_step_that_is_not_fifty_two_cards_is_proven_and_put_out() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 0 && to == 1 && is_kind(b, EventType::ShuffleStep) {
+                let at = slot_of(b, EventType::ShuffleStep);
+                return Some(tamper::<ShuffleStep>(b, EventType::ShuffleStep, &at, SHUFFLE_STEP_CAP, |s| {
+                    let n = s.deck.len();
+                    s.deck.truncate(n - 66);
+                }));
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        assert_eq!(hands[1].proven.get(&0).map(|p| p.cause), Some(CAUSE_SHUFFLE), "seat 1 proves seat 0");
+        assert!(hands[2].proven.is_empty(), "seat 2 took a good step");
+        tick_votes(&mut hands, &keys, &mut refused);
+        assert_eq!(hands[2].proven.get(&0).map(|p| p.cause), Some(CAUSE_SHUFFLE), "seat 2 proves it from the vote");
+        for s in [1usize, 2] {
+            assert_eq!(hands[s].cheat_out(), vec![0], "seat {s}");
+        }
+    }
+
+    /// `S1-KS`: **a proof naming another round than its own step is proven by
+    /// the two frames the seat bound together**, and -- two votes carrying a step
+    /// and a proof each being too large for one certificate -- the seats bank on
+    /// the two votes.
+    #[test]
+    fn a_proof_whose_round_is_not_its_steps_is_proven_and_banks_on_two_votes() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 0 && to == 1 && is_kind(b, EventType::ShuffleProof) {
+                let at = slot_of(b, EventType::ShuffleProof);
+                return Some(tamper::<ShuffleProof>(b, EventType::ShuffleProof, &at, SHUFFLE_PROOF_CAP, |p| {
+                    p.shuffle_round = p.shuffle_round.wrapping_add(1);
+                }));
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let p = hands[1].proven.get(&0).expect("seat 1 proves seat 0");
+        assert_eq!((p.cause, p.frames.len()), (CAUSE_SHUFFLE, 2), "the step and its proof");
+        assert!(hands[2].proven.is_empty(), "seat 2 took the good proof");
+        tick_votes(&mut hands, &keys, &mut refused);
+        assert!(hands[2].proven.contains_key(&0), "seat 2 proves it from the step and proof seat 1's vote carries");
+        for s in [1usize, 2] {
+            assert_eq!(hands[s].cheat_out(), vec![0], "seat {s}: banked on two votes");
+            assert!(hands[s].cheat_certs.is_empty(), "seat {s}: no certificate carries two such votes");
+        }
+    }
+
+    /// `S1-KS`: a proof is evidence only with the step it is bound to by its
+    /// parent: carried with another, it proves nobody.
+    #[test]
+    fn a_proof_carried_with_another_step_proves_nobody() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let frames: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            capture(&frames, from, 0, b, EventType::ShuffleStep);
+            capture(&frames, from, 0, b, EventType::ShuffleProof);
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let said = frames.borrow().clone();
+        let step = said.iter().find(|b| is_kind(b, EventType::ShuffleStep)).cloned().expect("a step");
+        let proof = said.iter().find(|b| is_kind(b, EventType::ShuffleProof)).cloned().expect("a proof");
+        assert_eq!(hands[1].judge_shuffle_bytes(&[step.clone(), proof.clone()], 0), Judged::Holds, "the honest pair");
+        // The same proof, broken and sealed again on another parent: not bound.
+        let at = slot_of(&proof, EventType::ShuffleProof);
+        let elsewhere = Slot { previous_event_hash: [7; 32], ..at };
+        let mut body: ShuffleProof = chained::payload(
+            &chained::open(&proof, FRAME_CAP, EventType::ShuffleProof, &at).unwrap(),
+            SHUFFLE_PROOF_CAP,
+        )
+        .unwrap();
+        body.shuffle_round = body.shuffle_round.wrapping_add(1);
+        let loose =
+            chained::seal(EventType::ShuffleProof, &elsewhere, &body, &key(10), NOW, 30_000, SHUFFLE_PROOF_CAP).unwrap();
+        assert!(matches!(hands[1].judge_shuffle_bytes(&[step, loose], 0), Judged::NotEvidence(_)));
+    }
+
+    /// `S1-KS` (the refuter's CPU bound): **a rogue that re-signs its vote about
+    /// an honest seat is judged once** -- the second, different vote from the
+    /// same voter about the same seat is passed over unjudged.
+    #[test]
+    fn a_voter_re_signing_its_vote_is_judged_once() {
+        let (mut hands, keys, said) = n_seats_to_the_bet(4);
+        let anchor = hands[1].anchor();
+        let deal0 = said[0].iter().find(|b| is_kind(b, EventType::DealPrivate)).cloned().expect("seat 0 dealt");
+        let slot = hands[1].slot().at(cheat_sequence(0).unwrap(), anchor);
+        let vote_at = |at: u64| {
+            let v = CheatVote { subject_seat: 0, anchor, cause: CAUSE_REVEAL, evidence: vec![deal0.clone().into()] };
+            chained::seal(EventType::CheatVote, &slot, &v, &keys[2], at, 30_000, CHEAT_VOTE_CAP).unwrap()
+        };
+        let first = hands[1].on_event(&vote_at(NOW), &keys[1], NOW).expect_err("judged, and its share holds");
+        assert!(matches!(&first, Failed::Elsewhere { what, .. } if what.contains("failed at this client")), "{first}");
+        let verdicts = hands[1].verdicts.len();
+        let again = hands[1].on_event(&vote_at(NOW + 1), &keys[1], NOW).expect("passed over");
+        assert!(again.is_empty());
+        assert_eq!(hands[1].verdicts.len(), verdicts, "nothing judged again");
+        assert!(hands[1].cheat_out().is_empty());
     }
 
     /// Evidence that is not a reveal at all is refused before any share is
