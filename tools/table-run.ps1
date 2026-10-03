@@ -353,6 +353,15 @@ param(
     [ValidateRange(1, 1000)][int]$CrashHand = 2,
     [ValidateRange(0, 9)][int]$CrashNode = 1,
     [ValidateRange(0, 600)][int]$CrashFor = 0,
+    # `-CrashLoseJournal` (G11-R phase D2): the crashed node's journal folder is
+    # removed before it starts again -- a lost journal, the provisional road.
+    [switch]$CrashLoseJournal,
+    # `-JournalFailNode <i> -JournalFail <n> -JournalHangMs <ms>` (G11-R phase D2):
+    # node i's signing journal fails every n-th write, and stalls that long before
+    # one write in fifty. Needs --features fault-harness.
+    [ValidateRange(-1, 9)][int]$JournalFailNode = -1,
+    [ValidateRange(0, 100000)][int]$JournalFail = 0,
+    [ValidateRange(0, 600000)][int]$JournalHangMs = 0,
     # `-NoSayAgain` (S1-KB's control): no node says another seat's betting action
     # again. Needs `--features fault-harness`.
     [switch]$NoSayAgain,
@@ -613,7 +622,9 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $rogueList = @("$RogueNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
     if ($rogueList.Count -eq 0) { $rogueList = @($RogueNode) }
     $rogueForNode = if ($Rogue -and ($rogueList -contains $i)) { $Rogue } else { '' }
-    $crashForNode = if ($CrashAt -and $i -eq $CrashNode) { "$CrashAt|$CrashHand" } else { '' }
+    $crashPart = if ($CrashAt -and $i -eq $CrashNode) { "$CrashAt|$CrashHand" } else { '|' }
+    $journalPart = if ($i -eq $JournalFailNode) { "$JournalFail|$JournalHangMs" } else { '|' }
+    $crashForNode = if ($crashPart -ne '|' -or $journalPart -ne '|') { "$crashPart|$journalPart" } else { '' }
     $afkForNode = if ($AfkAt -gt 0 -and $i -eq $AfkNode) { $AfkAt } else { 0 }
     $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
     # `D-051`. Not `$floodNodes`: a local of that name IS the parameter.
@@ -643,8 +654,12 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
         if ($stays) { $env:P2P_POKER_STAYS = '1' }
         if ($crash) {
             $crashParts = $crash.Split('|')
-            $env:P2P_POKER_CRASH_AT = $crashParts[0]
-            $env:P2P_POKER_CRASH_HAND = $crashParts[1]
+            if ($crashParts[0]) {
+                $env:P2P_POKER_CRASH_AT = $crashParts[0]
+                $env:P2P_POKER_CRASH_HAND = $crashParts[1]
+            }
+            if ($crashParts.Length -gt 2 -and $crashParts[2] -and $crashParts[2] -ne '0') { $env:P2P_POKER_JOURNAL_FAIL = $crashParts[2] }
+            if ($crashParts.Length -gt 3 -and $crashParts[3] -and $crashParts[3] -ne '0') { $env:P2P_POKER_JOURNAL_HANG_MS = $crashParts[3] }
         }
         if ($rogue) {
             $env:P2P_POKER_ROGUE = "$rogue"
@@ -915,8 +930,8 @@ if ($KillAt -gt 0) {
 if ($CrashAt -and $CrashFor -gt 0) {
     Write-Host "==> n$CrashNode ends at its crash point ($CrashAt from hand $CrashHand) and is started again $CrashFor s after, same profile, without it"
     $crashProfile = Join-Path $work "n$CrashNode"
-    $jobs += Start-Job -Name 'crashed-again' -ArgumentList $Exe, $exeFile, $work, $table, $Seconds, $CrashFor, $CrashNode, $crashProfile -ScriptBlock {
-        param($exe, $procFile, $work, $table, $seconds, $after, $dn, $profile)
+    $jobs += Start-Job -Name 'crashed-again' -ArgumentList $Exe, $exeFile, $work, $table, $Seconds, $CrashFor, $CrashNode, $crashProfile, ([bool]$CrashLoseJournal) -ScriptBlock {
+        param($exe, $procFile, $work, $table, $seconds, $after, $dn, $profile, $loseJournal)
         $start = Get-Date
         $seen = $false
         $ended = $false
@@ -929,6 +944,10 @@ if ($CrashAt -and $CrashFor -gt 0) {
         if (-not $ended) { return }
         Start-Sleep -Seconds $after
         Remove-Item Env:P2P_POKER_CRASH_AT -ErrorAction SilentlyContinue
+        if ($loseJournal) {
+            Remove-Item -Recurse -Force (Join-Path $profile 'journal') -ErrorAction SilentlyContinue
+            "journal removed before the restart" | Out-File -FilePath (Join-Path $work "n$dn-lost-journal.txt") -Encoding utf8
+        }
         $log = Join-Path $work "n$dn-again.log"
         $t0 = Get-Date
         $inv = [System.Globalization.CultureInfo]::InvariantCulture

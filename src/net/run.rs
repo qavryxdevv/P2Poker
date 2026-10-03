@@ -17614,12 +17614,13 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             seat_called(t, *seat)
         ));
     }
-    // `G11-R` phase D2c: armed, this client's own disk kept it out of two
-    // hands of the last five -- it signs nothing it cannot record first.
+    // `G11-R` phase D2c/D3: armed, this client's own disk kept it out of two
+    // hands of this game -- it signs nothing it cannot record first, and four
+    // such absences put a seat out for good (`D-047`): told at the second,
+    // however far apart (bed_d2 fail3: four, four hands apart, no word).
     if journal_armed() && hand_now != 0 {
         if let Some(j) = t.journal.as_ref() {
-            let out = j.silenced_hands().iter().filter(|k| **k <= hand_now && hand_now - **k < 5).count();
-            if out >= 2 {
+            if j.sat_out_total() >= 2 {
                 let why = j.refusal_words().unwrap_or("the disk did not record its moves in time");
                 return Some(format!(
                     "your client sits hands out because it cannot record its own moves on this computer first -- {why}: free space on the disk, or move the game's folder to a local disk, or leave the table."
@@ -20271,17 +20272,13 @@ fn crash_at_the_boundary(hand: u64) {
 }
 
 /// `G11-R`, phase D: whether a refused frame sits its hand out (armed) or is
-/// noted and sent (shadow). **Shadow in every build until phase C** -- a restart
-/// replays nothing yet, so an ordinary one re-seals at a slot its journal holds,
-/// and armed that would sit an honest seat out at every restart
-/// (`p2p-poker-local/audit_1002/REFUTE_JOURNAL_D.md`); the fault harness arms it
-/// for its beds with `P2P_POKER_JOURNAL_ARMED`.
+/// noted and sent (shadow). **Armed in every build since phase D3** (`D-100`):
+/// phase C replays a restart's journaled frames, so an honest restart re-seals
+/// nothing -- the crash bed's every kill point, armed, signed no second body and
+/// sat no hand out -- and the measured writes are milliseconds against the
+/// bound. One switch with the engine's bit ([`crate::table::hand::journal_armed`]).
 fn journal_armed() -> bool {
-    if !cfg!(feature = "fault-harness") {
-        return false;
-    }
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| std::env::var("P2P_POKER_JOURNAL_ARMED").is_ok())
+    crate::table::hand::journal_armed()
 }
 
 /// `G11-R` phase C: what the table's signing journal holds of `hand`, for the

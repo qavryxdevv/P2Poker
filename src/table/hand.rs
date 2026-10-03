@@ -558,7 +558,9 @@ impl Opening {
             }
             // `S1-KT`: never a copy of another engine -- this client would
             // refuse every copy of that hand and adopt it again, for ever.
-            if body.engine != crate::protocol::constants::engine_id() {
+            // `D-100`: nor of a client that signs otherwise than through its
+            // armed journal.
+            if body.engine != hand_engine() {
                 continue;
             }
             let entry = groups
@@ -819,6 +821,35 @@ pub fn take_deck_secret(hash: &Hash) -> Option<[u8; 32]> {
     let mut left = OWN_DECK_SECRETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let at = left.iter().position(|(_, h, _)| h == hash)?;
     left.remove(at).map(|(_, _, kept)| kept)
+}
+
+/// `G11-R` (`D-100`, phase D3): whether a frame the signing journal refuses
+/// sits its hand out -- in every build. The fault harness keeps the shadow,
+/// which notes such a frame and sends it, as a control (`P2P_POKER_CONTROL=g11d`).
+pub(crate) fn journal_armed() -> bool {
+    !control("g11d")
+}
+
+/// `G11-R` (`D-100`): whether this client signs every frame of a hand's chain
+/// through an armed signing journal -- never two bodies at one slot. Not in
+/// the harness's controls (`g11d`: the shadow; `g11r`: no journal), nor in a
+/// build that disarms: [`journal_armed`] is the one switch.
+pub(crate) fn signs_through_the_journal() -> bool {
+    journal_armed() && !control("g11r")
+}
+
+/// `S1-KT`, `D-100`: the engine this client's `HAND_INIT` names -- the
+/// engine's own digest and, where this client signs through its armed journal,
+/// that fact: a client that can sign two bodies at one slot never completes a
+/// stage 0 with one that judges two bodies as a cheat (`REFUTE_G11_v2` M1).
+pub(crate) fn hand_engine() -> Hash {
+    let id = crate::protocol::constants::engine_id();
+    if !signs_through_the_journal() {
+        return id;
+    }
+    let mut parts = id.to_vec();
+    parts.extend_from_slice(b"signs through an armed journal");
+    *blake3::hash(&parts).as_bytes()
 }
 
 /// `S1-LL`: whether `frame` is a `TIMEOUT_VOTE` that asks a question
@@ -1322,7 +1353,7 @@ fn derive_init(o: &Opening) -> Result<HandInit, Failed> {
 
         let mine = HandInit {
             // `S1-KT`: the engine this client decides the hand by (`D-093`).
-            engine: crate::protocol::constants::engine_id(),
+            engine: hand_engine(),
             hand_id: o.hand_id,
             button_position: button,
             sb_position,
@@ -21875,7 +21906,7 @@ mod tests {
             chained::open_in_hand(&copy, FRAME_CAP, EventType::HandInit, &hands[0].open.table_id, hands[0].open.hand_id)
                 .unwrap();
         let body: HandInit = chained::payload(&opened, HAND_INIT_CAP).unwrap();
-        assert_eq!(body.engine, crate::protocol::constants::engine_id(), "the wire copy carries the engine");
+        assert_eq!(body.engine, hand_engine(), "the wire copy carries the engine");
         hands[2].mine.engine = [9; 32];
         let mut refused = Vec::new();
         pump_cheat(&mut hands, &keys, pending, &|_, _, b: &[u8]| Some(b.to_vec()), &mut refused);
@@ -21885,6 +21916,20 @@ mod tests {
         );
         assert!(hands[2].turn().is_none(), "and plays nothing with them");
         assert!(hands[2].take_dealt_note().is_some_and(|n| n.contains("another engine")), "and says so, once");
+    }
+
+    /// `G11-R` (`D-100`): **a client signing through its armed journal names
+    /// it in its engine** -- so it never shares a hand with one that can sign two
+    /// bodies at one slot: a control of the harness, a build that disarms.
+    #[test]
+    fn the_engine_names_an_armed_journal() {
+        let id = crate::protocol::constants::engine_id();
+        if signs_through_the_journal() {
+            assert!(journal_armed());
+            assert_ne!(hand_engine(), id, "an armed client's engine is not a control's");
+        } else {
+            assert_eq!(hand_engine(), id);
+        }
     }
 
     /// `S1-KT`: a hand given up -- or past its betting -- reaches no later

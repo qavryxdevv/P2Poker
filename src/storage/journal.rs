@@ -363,6 +363,8 @@ impl Files {
             Ok(touched) => touched.into_iter().find_map(|hand| {
                 let synced = if self.injected_sync_failure() {
                     Err(io::Error::other("a failed sync asked for by a test"))
+                } else if harness_no_sync() {
+                    Ok(())
                 } else {
                     self.segment(hand).and_then(|f| f.sync_all())
                 };
@@ -598,6 +600,18 @@ fn harness_hang(write: u64) {
     }
 }
 
+/// fault-harness, `G11-R` phase D3: `P2P_POKER_JOURNAL_NO_SYNC` -- records are
+/// written and never synced: a diagnostic of what the sync costs a table's pace
+/// (the D3 pace beds: a hand half a second slower than the control's, the write
+/// itself 0-2 ms). Never in a build without the feature.
+fn harness_no_sync() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static NO_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_SYNC.get_or_init(|| std::env::var("P2P_POKER_JOURNAL_NO_SYNC").is_ok())
+}
+
 /// fault-harness, `G11-R` phase D2: `P2P_POKER_JOURNAL_FAIL=<n>` -- every n-th
 /// write fails as an I/O error, nothing of it written. Never in a build without
 /// the feature.
@@ -672,6 +686,9 @@ pub struct Handle {
     /// Phase D2c: what the disk did the last time a batch was refused, in the
     /// player's words (`Handle::note_refusal`).
     refusal: std::sync::Mutex<Option<&'static str>>,
+    /// Phase D3: the hands sat out in this handle's life, all told -- the
+    /// silenced set is pruned with the hands, the count is not.
+    sat_out: std::sync::atomic::AtomicU32,
     /// Phase D2b: the floor this life set to vouch from, kept so a retry writes
     /// the same one and never recedes with the hands this life opens.
     vouch_floor: std::sync::Mutex<Option<u64>>,
@@ -915,6 +932,7 @@ impl Handle {
             vouches: std::sync::atomic::AtomicBool::new(vouched),
             vouch_floor: std::sync::Mutex::new(None),
             refusal: std::sync::Mutex::new(None),
+            sat_out: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -940,6 +958,7 @@ impl Handle {
             vouches: std::sync::atomic::AtomicBool::new(false),
             vouch_floor: std::sync::Mutex::new(None),
             refusal: std::sync::Mutex::new(Some("the table's journal would not open in the game's folder")),
+            sat_out: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -954,6 +973,7 @@ impl Handle {
     pub fn silence(&self, hand: u64, why: &str) {
         let fresh = self.silenced.lock().unwrap_or_else(PoisonError::into_inner).insert(hand);
         if fresh {
+            self.sat_out.fetch_add(1, Ordering::SeqCst);
             self.note(format!(
                 "this seat sits hand #{hand} out: {why} -- nothing of it is said, so nobody can hold two versions of a \
                  frame of it signed by this client (G11-R)"
@@ -976,6 +996,12 @@ impl Handle {
             JournalError::Conflict { .. } | JournalError::Uncovered => return,
         };
         *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = Some(words);
+    }
+
+    /// Phase D3: the hands sat out in this handle's life, all told -- with
+    /// those carried from a handle it replaced (`keep_silenced`).
+    pub fn sat_out_total(&self) -> u32 {
+        self.sat_out.load(Ordering::SeqCst)
     }
 
     /// Phase D2c: the words of the last refusal, if any.
@@ -1049,7 +1075,10 @@ impl Handle {
 
     /// Phase D2: sit `hands` out, as another handle of this table had (M4).
     pub fn keep_silenced(&self, hands: &BTreeSet<u64>) {
-        self.silenced.lock().unwrap_or_else(PoisonError::into_inner).extend(hands.iter().copied());
+        let mut silenced = self.silenced.lock().unwrap_or_else(PoisonError::into_inner);
+        let fresh = hands.iter().filter(|h| !silenced.contains(h)).count();
+        silenced.extend(hands.iter().copied());
+        self.sat_out.fetch_add(u32::try_from(fresh).unwrap_or(u32::MAX), Ordering::SeqCst);
     }
 
     /// Phase D2 (`R6`): `hand` uncovered for good -- in this life at once, and
