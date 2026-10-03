@@ -773,6 +773,54 @@ pub(crate) fn control(_name: &str) -> bool {
     false
 }
 
+/// `G11-R` phase C: the deck secrets of this client's own `DECK_INIT`s, by the
+/// frame's event hash, with when each was left -- left as the frame is made,
+/// taken by the node's signing journal into that frame's own record
+/// ([`take_deck_secret`]), so the key and its secret are durable in one sync and
+/// a restart takes them back instead of drawing another key at the same slot.
+/// One process-wide table: a frame's first emission is the node's, at any of its
+/// call sites, and none of them holds the hand. Taken within the same pass of
+/// the node; one left [`OWN_DECK_SECRET_FOR`], or past [`OWN_DECK_SECRETS_KEPT`],
+/// goes -- a client without a journal (a test, the control build) takes none.
+static OWN_DECK_SECRETS: std::sync::Mutex<VecDeque<(std::time::Instant, Hash, [u8; 32])>> =
+    std::sync::Mutex::new(VecDeque::new());
+
+/// How long an own deck secret waits for the journal at most.
+const OWN_DECK_SECRET_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many own deck secrets wait at most.
+const OWN_DECK_SECRETS_KEPT: usize = 256;
+
+/// `G11-R` phase C: leave `kept` ([`HandSecret::keep`]) for the own `DECK_INIT`
+/// `frame` says the key of.
+fn leave_deck_secret(frame: &[u8], kept: [u8; 32]) {
+    let Some(hash) = chained::event_hash_of(frame, FRAME_CAP) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut left = OWN_DECK_SECRETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    left.retain(|(at, _, _)| now.duration_since(*at) < OWN_DECK_SECRET_FOR);
+    while left.len() >= OWN_DECK_SECRETS_KEPT {
+        left.pop_front();
+    }
+    left.push_back((now, hash, kept));
+}
+
+/// [`leave_deck_secret`], for the node's tests.
+#[cfg(test)]
+pub(crate) fn leave_deck_secret_for_test(frame: &[u8], kept: [u8; 32]) {
+    leave_deck_secret(frame, kept);
+}
+
+/// `G11-R` phase C: the deck secret of this client's own `DECK_INIT` whose
+/// event hash is `hash`, taken -- for the signing journal's record of that
+/// frame. `None` for any other frame.
+pub fn take_deck_secret(hash: &Hash) -> Option<[u8; 32]> {
+    let mut left = OWN_DECK_SECRETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = left.iter().position(|(_, h, _)| h == hash)?;
+    left.remove(at).map(|(_, _, kept)| kept)
+}
+
 /// `S1-LL`: whether `frame` is a `TIMEOUT_VOTE` that asks a question
 /// (`CAUSE_QUESTION`, `D-065`'s early question) rather than votes.
 pub fn is_question(frame: &[u8]) -> bool {
@@ -3588,6 +3636,7 @@ impl Hand {
         // The key is generated either way: `Phase::Deck` needs a `HandSecret`,
         // and a secret nothing is encrypted to is inert.
         let (secret, wire_key, proof) = self.params.keygen(&ctx);
+        let kept = secret.keep();
         let body = DeckInit {
             key: wire_key.encode(),
             proof: proof.encode(),
@@ -3666,11 +3715,12 @@ impl Hand {
         } else {
             bytes
         };
-        Ok(if a_party {
-            vec![Send::Broadcast(bytes)]
-        } else {
-            Vec::new()
-        })
+        if !a_party {
+            return Ok(Vec::new());
+        }
+        // `G11-R` phase C: the key's secret, for the journal's record of it.
+        leave_deck_secret(&bytes, kept);
+        Ok(vec![Send::Broadcast(bytes)])
     }
 
     fn on_deck_init(
@@ -13640,6 +13690,7 @@ impl Hand {
         let me_key = self.open.seats[self.seat_index()].1;
         let ctx = self.deck_ctx(&me_key);
         let (secret, wire_key, proof) = self.params.keygen(&ctx);
+        let kept = secret.keep();
         let body = DeckInit {
             key: wire_key.encode(),
             proof: proof.encode(),
@@ -13679,6 +13730,8 @@ impl Hand {
         };
         // A key of this seat's own making: the hand can be played out.
         self.fold_only = false;
+        // `G11-R` phase C: its secret, for the journal's record of it.
+        leave_deck_secret(&bytes, kept);
         let mut out = vec![Send::Broadcast(bytes)];
         if complete {
             let parent = {
@@ -25431,6 +25484,26 @@ mod tests {
             let more = deliver(&mut hands[to], &sends, &keys[to]);
             queue.push((to, more));
         }
+    }
+
+    /// `G11-R` phase C: **a seat's own `DECK_INIT` leaves its deck secret for
+    /// the signing journal**, by the frame's event hash -- the secret the hand
+    /// holds -- taken once; another frame's hash takes nothing.
+    #[test]
+    fn an_own_deck_init_leaves_its_secret_for_the_journal() {
+        let keys = [key(10), key(11)];
+        let (mut a, _) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
+        let (_, from_b) = Hand::open(heads_up_opening(1), &keys[1], NOW, 30_000).unwrap();
+        let out = deliver(&mut a, &from_b, &keys[0]);
+        let deck_init = bytes_of(&out)
+            .into_iter()
+            .find(|b| chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, _)| k == EventType::DeckInit))
+            .expect("stage 0 complete: the deck key said");
+        let hash = chained::event_hash_of(&deck_init, FRAME_CAP).unwrap();
+        assert_eq!(take_deck_secret(&hash), Some(a.secret().expect("held").keep()));
+        assert_eq!(take_deck_secret(&hash), None, "taken once");
+        let other = chained::event_hash_of(&bytes_of(&from_b)[0], FRAME_CAP).unwrap();
+        assert_eq!(take_deck_secret(&other), None, "a HAND_INIT carries no secret");
     }
 
     /// What the survivor says again to a seat back from a restart: the frames

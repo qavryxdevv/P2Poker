@@ -342,6 +342,15 @@ param(
     # `-DeafToCerts` (S1-LF's bed): with `-DeafToFor`, only that seat's
     # certificate copies go unheard -- a copy given to some seats only.
     [switch]$DeafToCerts,
+    # `-CrashAt <kind>:<synced|sent>`, `-CrashHand <n>`, `-CrashNode <i>`, `-CrashFor <s>`
+    # (G11-R phase B2): node i's process ends at once the first time it publishes a
+    # frame of that kind of a hand from n on, once its journal holds it or once it
+    # is said; it is started again, same profile (`--resume`), without the crash
+    # point, `-CrashFor` seconds after its process ended. Needs --features fault-harness.
+    [string]$CrashAt = '',
+    [ValidateRange(1, 1000)][int]$CrashHand = 2,
+    [ValidateRange(0, 9)][int]$CrashNode = 1,
+    [ValidateRange(0, 600)][int]$CrashFor = 0,
     # `-NoSayAgain` (S1-KB's control): no node says another seat's betting action
     # again. Needs `--features fault-harness`.
     [switch]$NoSayAgain,
@@ -602,6 +611,7 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $rogueList = @("$RogueNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
     if ($rogueList.Count -eq 0) { $rogueList = @($RogueNode) }
     $rogueForNode = if ($Rogue -and ($rogueList -contains $i)) { $Rogue } else { '' }
+    $crashForNode = if ($CrashAt -and $i -eq $CrashNode) { "$CrashAt|$CrashHand" } else { '' }
     $afkForNode = if ($AfkAt -gt 0 -and $i -eq $AfkNode) { $AfkAt } else { 0 }
     $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
     # `D-051`. Not `$floodNodes`: a local of that name IS the parameter.
@@ -626,9 +636,14 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # P2P_POKER_STAYS, every mute was on-turn, every stranger flooded and every
     # return sat out (found by -NoVote reaching all five nodes, S1-AQ,
     # 2026-09-18). In parentheses it is an expression and a bool.
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode), ([bool]$noAnswerForNode), $deafToForNode, $rogueForNode, $RogueFromHand -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote, $noAnswer, $deafTo, $rogue, $rogueFrom)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, ([bool]$MuteOnTurn), $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, ([bool]$StrangerFlood), $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, ([bool]$staysForNode), ([bool]$noVoteForNode), ([bool]$noAnswerForNode), $deafToForNode, $rogueForNode, $RogueFromHand, $crashForNode -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays, $noVote, $noAnswer, $deafTo, $rogue, $rogueFrom, $crash)
         if ($stays) { $env:P2P_POKER_STAYS = '1' }
+        if ($crash) {
+            $crashParts = $crash.Split('|')
+            $env:P2P_POKER_CRASH_AT = $crashParts[0]
+            $env:P2P_POKER_CRASH_HAND = $crashParts[1]
+        }
         if ($rogue) {
             $env:P2P_POKER_ROGUE = "$rogue"
             $env:P2P_POKER_ROGUE_FROM_HAND = "$rogueFrom"
@@ -893,6 +908,33 @@ if ($KillAt -gt 0) {
                 ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
                 Out-File -FilePath $log -Encoding utf8
         }
+    }
+}
+if ($CrashAt -and $CrashFor -gt 0) {
+    Write-Host "==> n$CrashNode ends at its crash point ($CrashAt from hand $CrashHand) and is started again $CrashFor s after, same profile, without it"
+    $crashProfile = Join-Path $work "n$CrashNode"
+    $jobs += Start-Job -Name 'crashed-again' -ArgumentList $Exe, $exeFile, $work, $table, $Seconds, $CrashFor, $CrashNode, $crashProfile -ScriptBlock {
+        param($exe, $procFile, $work, $table, $seconds, $after, $dn, $profile)
+        $start = Get-Date
+        $seen = $false
+        $ended = $false
+        while (((Get-Date) - $start).TotalSeconds -lt ($seconds - 30)) {
+            $alive = @(Get-CimInstance Win32_Process -Filter "Name = '$procFile'" |
+                Where-Object { $_.CommandLine -like "*$profile *" -or $_.CommandLine -like "*$profile" }).Count -gt 0
+            if ($alive) { $seen = $true } elseif ($seen) { $ended = $true; break }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ended) { return }
+        Start-Sleep -Seconds $after
+        Remove-Item Env:P2P_POKER_CRASH_AT -ErrorAction SilentlyContinue
+        $log = Join-Path $work "n$dn-again.log"
+        $t0 = Get-Date
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $left = [int]($seconds - ((Get-Date) - $start).TotalSeconds)
+        if ($left -lt 30) { $left = 30 }
+        & $exe --headless --autoplay --for "$left" --profile $profile --join $table --resume 2>&1 |
+            ForEach-Object { ((((Get-Date) - $t0).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
+            Out-File -FilePath $log -Encoding utf8
     }
 }
 if ($Kill2At -gt 0) {

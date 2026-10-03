@@ -19808,8 +19808,17 @@ fn publish_hand(
     // about the hand speaks for a branch nobody is on. Not in the control build
     // (`P2P_POKER_CONTROL=g11r`), which has no journal.
     let journal = journal.filter(|_| !crate::table::hand::control("g11r"));
+    // fault-harness, `G11-R` phase B2: a crash point this batch reaches.
+    let crash = crash_point().filter(|(kind, _, from)| {
+        sends.iter().any(|crate::table::hand::Send::Broadcast(b)| {
+            crate::net::chained::peek(b, TABLE_FRAME_PEEK).is_ok_and(|(k, h, _)| k == *kind && h >= *from)
+        })
+    });
     if let Some(j) = journal {
         journal_ahead(j, &sends);
+    }
+    if crash.is_some_and(|(_, sent, _)| !sent) {
+        std::process::exit(86);
     }
     for crate::table::hand::Send::Broadcast(out) in sends {
         if journal.is_some_and(|j| sat_out(j, &out)) {
@@ -19876,6 +19885,9 @@ fn publish_hand(
             }
             said.push(out);
         }
+    }
+    if crash.is_some_and(|(_, sent, _)| sent) {
+        std::process::exit(86);
     }
 }
 
@@ -19978,6 +19990,33 @@ const JOURNAL_OPEN: std::time::Duration = std::time::Duration::from_millis(2_000
 const JOURNAL_WRITE: std::time::Duration = std::time::Duration::from_millis(1_500);
 const JOURNAL_CLOSE: std::time::Duration = std::time::Duration::from_millis(2_000);
 
+/// fault-harness, `G11-R` phase B2: `P2P_POKER_CRASH_AT=<kind>:<synced|sent>` --
+/// a kind as the protocol's type names it (`DeckInit`, `ActionCall`, ...) -- and
+/// `P2P_POKER_CRASH_HAND=<n>` (2 when unset): this process ends at once, no
+/// goodbye, the first time it publishes a frame of that kind of a hand from `n`
+/// on, once its journal holds it (`synced`) or once it is said (`sent`) -- the
+/// crash points of the restart beds. `None` in every build without the feature.
+fn crash_point() -> Option<(crate::protocol::messages::EventType, bool, u64)> {
+    if !cfg!(feature = "fault-harness") {
+        return None;
+    }
+    static POINT: std::sync::OnceLock<Option<(crate::protocol::messages::EventType, bool, u64)>> = std::sync::OnceLock::new();
+    *POINT.get_or_init(|| {
+        let at = std::env::var("P2P_POKER_CRASH_AT").ok()?;
+        let (name, when) = at.trim().split_once(':')?;
+        let sent = match when {
+            "synced" => false,
+            "sent" => true,
+            _ => return None,
+        };
+        let from = std::env::var("P2P_POKER_CRASH_HAND").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2);
+        (0u16..=0x0fff)
+            .filter_map(|c| crate::protocol::messages::EventType::try_from(c).ok())
+            .find(|k| format!("{k:?}") == name)
+            .map(|k| (k, sent, from))
+    })
+}
+
 /// `G11-R`, phase D: whether a refused frame sits its hand out (armed) or is
 /// noted and sent (shadow). **Shadow in every build until phase C** -- a restart
 /// replays nothing yet, so an ordinary one re-seals at a slot its journal holds,
@@ -20021,7 +20060,13 @@ fn journal_ahead_as(j: &crate::storage::journal::Handle, sends: &[crate::table::
                 parent: crate::net::chained::parent_of(b, TABLE_FRAME_PEEK)?,
                 kind: kind.code(),
                 frame: b.clone(),
-                secret: None,
+                // Phase C: a `DECK_INIT`'s secret rides in its own record, in the
+                // same sync, from where the hand left it.
+                secret: (kind == crate::protocol::messages::EventType::DeckInit)
+                    .then(|| crate::net::chained::event_hash_of(b, TABLE_FRAME_PEEK))
+                    .flatten()
+                    .and_then(|h| crate::table::hand::take_deck_secret(&h))
+                    .map(|k| minicbor::bytes::ByteVec::from(k.to_vec())),
             })
         })
         .collect();
@@ -24284,6 +24329,35 @@ mod late_roster_tests {
         let before = j.take_notes().len();
         journal_check_own_as(&j, &held, true);
         assert_eq!(j.take_notes().len(), 0, "{before} note(s) before; none for a frame it holds");
+        assert!(j.close(std::time::Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `G11-R` phase C: **a `DECK_INIT`'s deck secret rides in its own record**,
+    /// written with the frame from where the hand left it; no other record
+    /// carries one.
+    #[test]
+    fn a_deck_secret_rides_in_its_deck_init_record() {
+        use crate::protocol::messages::EventType;
+        let dir = std::env::temp_dir().join(format!("p2p-run-journal-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let me = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let j = crate::storage::journal::Handle::open(&dir, [1; 32], me.verifying_key().to_bytes(), 1).unwrap();
+        let seal = |kind: EventType, sequence: u64| {
+            let slot = crate::net::chained::Slot { table_id: [1; 32], hand_id: 3, sequence, previous_event_hash: [2; 32] };
+            crate::net::chained::seal(kind, &slot, &0u8, &me, 1_000, 30_000, 4096).unwrap()
+        };
+        let deck = seal(EventType::DeckInit, 1);
+        let action = seal(EventType::ActionCall, 9);
+        crate::table::hand::leave_deck_secret_for_test(&deck, [9; 32]);
+        journal_ahead_as(
+            &j,
+            &[crate::table::hand::Send::Broadcast(deck), crate::table::hand::Send::Broadcast(action)],
+            true,
+        );
+        let held = j.lookup(3, 1, &[2; 32]).expect("journaled");
+        assert_eq!(held.secret.map(|s| s.to_vec()), Some(vec![9u8; 32]), "the secret in its record");
+        assert!(j.lookup(3, 9, &[2; 32]).is_some_and(|e| e.secret.is_none()), "none in another's");
         assert!(j.close(std::time::Duration::from_secs(5)));
         let _ = std::fs::remove_dir_all(&dir);
     }

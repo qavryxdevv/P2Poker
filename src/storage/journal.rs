@@ -34,7 +34,11 @@
 //! sends it a batch and waits a bounded time ([`Handle::write`]). The writer
 //! checks the whole batch first -- a second body at a key it holds is refused
 //! -- appends, syncs, and only then indexes; a write that fails is cut back to
-//! where it began. A write that fails or does not return in time is an error
+//! where it began. A batch is written highest (hand, sequence) first: a crash
+//! between two of its records leaves a later frame alone, chained from an
+//! earlier one that never left, at a parent no later life reaches -- never an
+//! earlier frame without the later one, which may be one nothing can make again
+//! (a shuffle's step without its proof: the permutation is gone). A write that fails or does not return in time is an error
 //! to the caller, who must then send nothing of the batch: a frame never
 //! leaves before its record is durable. A write that lands after its timeout
 //! is durable and never sent -- harmless -- and until it lands every later
@@ -842,6 +846,21 @@ impl Handle {
         self.index.read().unwrap_or_else(PoisonError::into_inner).entries.get(&(hand, sequence, *parent)).cloned()
     }
 
+    /// Phase C: every own frame of `hand` the journal holds, by (sequence,
+    /// parent) -- or `None` where it cannot vouch for the hand
+    /// ([`Handle::is_uncovered`], or a journal that would not open): there
+    /// every slot is to be taken as signed, not as free.
+    pub fn entries_of(&self, hand: u64) -> Option<Vec<Entry>> {
+        if self.refusing || hand < self.covers_from() {
+            return None;
+        }
+        let idx = self.index.read().unwrap_or_else(PoisonError::into_inner);
+        if idx.uncovered.contains(&hand) {
+            return None;
+        }
+        Some(idx.entries.range((hand, 0, [0; 32])..=(hand, u64::MAX, [0xff; 32])).map(|(_, e)| e.clone()).collect())
+    }
+
     /// Whether the journal cannot vouch for `hand`: before the first hand it
     /// covers, or damaged in a way it does not cut. Every slot of an uncovered
     /// hand is to be taken as signed.
@@ -854,10 +873,13 @@ impl Handle {
     /// frame; anything else means the batch must not be sent. A write that
     /// times out may land later -- durable, never sent, harmless -- and until
     /// it does every write fails at once.
-    pub fn write(&self, entries: Vec<Entry>, timeout: Duration) -> Result<(), JournalError> {
+    pub fn write(&self, mut entries: Vec<Entry>, timeout: Duration) -> Result<(), JournalError> {
         if entries.is_empty() {
             return Ok(());
         }
+        // Phase C: highest (hand, sequence) first -- what a crash between two
+        // records leaves is a later frame alone (the module's head).
+        entries.sort_by(|a, b| (b.hand, b.sequence).cmp(&(a.hand, a.sequence)));
         let (reply_tx, reply_rx) = mpsc::channel();
         let n = self.send(Job::Write(entries, reply_tx))?;
         self.wait(n, &reply_rx, timeout, true)
@@ -1059,6 +1081,55 @@ mod tests {
         let j = open(&p, 1);
         assert_eq!(j.lookup(1, 5, &[5; 32]).unwrap().frame, vec![5; 100], "a copy is written once");
         assert!(j.close(T));
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// Phase C: **a batch is written highest (hand, sequence) first**, so a
+    /// crash between two of its records leaves the later frame alone -- read as
+    /// signed, the earlier slot free -- never the earlier one without the later.
+    #[test]
+    fn a_batch_is_written_highest_first() {
+        let p = temp_profile("order");
+        let dir = journal_dir(&p, &[1; 32]);
+        let j = open(&p, 1);
+        j.write(vec![entry(1, 3, 7), entry(1, 4, 8), entry(2, 0, 9)], T).unwrap();
+        assert!(j.close(T));
+        let path = segment_path(&dir, 1);
+        let bytes = fs::read(&path).unwrap();
+        let (first, used) = parse_record(&bytes).unwrap();
+        assert_eq!(first.sequence, 4, "the later frame first");
+        // The process gone after that record.
+        let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(u64::try_from(used).unwrap()).unwrap();
+        drop(f);
+        let j = open(&p, 1);
+        assert!(!j.is_uncovered(1));
+        assert!(j.lookup(1, 4, &[8; 32]).is_some(), "the later frame, alone");
+        assert!(j.lookup(1, 3, &[7; 32]).is_none(), "the earlier slot free");
+        assert!(j.lookup(2, 0, &[9; 32]).is_some(), "the higher hand first of all");
+        assert!(j.close(T));
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// Phase C: **a hand's own frames, or nothing to vouch with** -- every
+    /// record of one hand by (sequence, parent), none of another; `None` before
+    /// the first covered hand, for a damaged one and for a journal that would
+    /// not open.
+    #[test]
+    fn entries_of_gives_one_hand_or_says_it_cannot_vouch() {
+        let p = temp_profile("entries");
+        let j = open(&p, 2);
+        j.write(vec![entry(2, 4, 8), entry(2, 3, 7), entry(3, 1, 1)], T).unwrap();
+        let of2 = j.entries_of(2).unwrap();
+        assert_eq!(of2.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(j.entries_of(3).unwrap().len(), 1);
+        assert!(j.entries_of(4).unwrap().is_empty(), "covered, nothing signed");
+        assert!(j.entries_of(1).is_none(), "before the first covered hand");
+        j.test_job(Job::FailSync);
+        assert!(j.write(vec![entry(4, 1, 1)], T).is_err());
+        assert!(j.entries_of(4).is_none(), "a failed sync: nothing to vouch with");
+        assert!(j.close(T));
+        assert!(Handle::refusing([2; 32]).entries_of(5).is_none());
         let _ = fs::remove_dir_all(&p);
     }
 
