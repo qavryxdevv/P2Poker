@@ -2864,11 +2864,11 @@ the disposition of J2, and the clause it replaces is deleted (D-013):**
 > accepted copy of a **chain-`k`** event, which no replay of an older chain can
 > forge (§2.4). §4.9's box carries the argument in full.
 >
-> **It may shrink, by one road, and only after an abort.** A verified `TIMEOUT_CERT`
-> of a hand `k` this receiver ended by an abort, arriving before `HAND_INIT(k+1)`
-> has completed here, removes its subject from `R(k+1)` exactly as the same
-> certificate arriving in time would have (D-024 point 1: the roster half is
-> position-free), keyed on the subject digest so a replay removes nothing twice.
+> **It may shrink, by one road, and only after an abort.** A `TIMEOUT_CERT` set of
+> a hand `k` this receiver ended by an abort, whole here (every voter's own copy,
+> §4.8) before `HAND_INIT(k+1)` has completed here, removes its subject from
+> `R(k+1)` exactly as the same set whole in time would have, keyed on the subject
+> digest so a replay removes nothing twice; one copy is never the set (`S1-LF`).
 > The terminal does not move — `ABORT_TERMINAL(k)` is a function of `GENESIS(k)`
 > alone — so the only quantity that moves is `R(k+1)`, and with it
 > `GENESIS(k+1)`. After a *settled* terminal nothing moves: that terminal is the
@@ -3826,6 +3826,25 @@ There is no timer, no tie-break and no assembler privilege. Certificate bodies
 differ only in `sender_public_key` and `emitted_at_unix_ms`, which no longer
 matters, because the collective `stage_hash` is taken over the whole set rather
 than over one chosen copy.
+
+**A certificate acts on its whole set alone (`S1-LF`, D-099).** A receiver keeps
+every verified copy by its set -- stage, parent, subject digest -- and takes none
+on one copy. In position the certificate stage closes as above; off position, or
+after the hand, a set acts once it is *whole* here: some held copy's voter set
+contains the receiver's own for it -- the seats dealt in less the ones named,
+less the seats and silent voters every set named at an earlier stage, applied on
+its chain or whole here -- and every seat of that voter set has a copy held. A
+whole set taken off position never moves the hand being played: `OUT(k)` at a
+settled terminal is the subjects of the kind-1 certificates hand `k`'s chain
+applied, and at an abort terminal those and the subjects of every set whole here
+(§8.3.1). A whole kind-2 set ends a hand not settled, given up from the stage's own
+parent, so a late settlement at that parent is still taken (§4.10); a seat's word
+for good from a hand given up while it was settling waits for the deal. Every
+client holding a set whole says every copy of it again -- at once, 5 s later, and
+again 10, 20 and 40 s apart -- until its next hand leaves stage 0, behind the hand's own frames and
+paced, so a silent completer holds nobody back. One copy acting wherever it landed
+was the roster's word on one message: a rogue that sealed after its subject acted
+and handed the copy to some seats had the next hand open at two geneses.
 
 This replaces the earlier rule, which had every peer wait `CERT_SETTLE_MS` and
 then chain the certificate from the lowest seat index that had emitted a valid
@@ -8176,7 +8195,9 @@ supersede D-006 and there is no auto-action event of any kind.
 > R(k+1) = ((R(k) \ OUT(k)) ∪ IN(k)) ∩ ALIVE(k+1)
 > ```
 >
-> where `OUT(k)` is the subject set of complete `TIMEOUT_CERT`s of hand `k` and
+> where `OUT(k)` is the subject set of complete `TIMEOUT_CERT`s of hand `k` -- at a
+> settled terminal the kind-1 ones its chain applied, at an abort terminal those
+> and every set whole at the receiver (`S1-LF`, §4.8) -- and
 > `IN(k)` the subject set of complete `RETURN_CERT`s of hand `k` (§4.8). Both
 > directions are certificate-gated: neither `P(k)` nor §4.9's per-receiver
 > readmission set `A` ever reaches a required emitter set, which is what D-012

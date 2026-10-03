@@ -1248,6 +1248,8 @@ struct TableRun {
     /// is stuck at 0 and holding everything after it, and only the stage-0 bytes
     /// release it. Capped, because it is a buffer and every buffer here is.
     said: Vec<Vec<u8>>,
+    /// `S1-LF`: the whole certificate sets this client says again ([`CertLane`]).
+    cert_lane: CertLane,
     /// `G11-R`: the table's signing journal -- every own frame of a hand's
     /// chain recorded before it leaves (phase B: in shadow, `journal_ahead`).
     /// Opened as the table is set or taken up again; closed, and the table
@@ -1984,6 +1986,7 @@ impl TableRun {
             said: Vec::new(),
             journal: None,
             journal_tried_ms: 0,
+            cert_lane: CertLane::default(),
             ever_dealt: false,
             boundaries: crate::table::boundary::Boundaries::new(),
             crossed_for: None,
@@ -4395,7 +4398,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
     macro_rules! remove_by_the_word {
-        ($t:ident, $h:expr) => {{
+        ($t:ident, $h:expr) => {
+            remove_by_the_word!($t, $h, false)
+        };
+        ($t:ident, $h:expr, $at_the_deal:expr) => {{
             let id = $h.hand_id();
             let cert: Vec<u8> = $h.certified_seats().to_vec();
             if $t.required_seen.0 != id {
@@ -4468,7 +4474,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // kept out all the same.) Said for the hand the deal is about to put
             // behind it too (`deal_the_next_hand`): a hand this client gave up on
             // its own budget is followed by the deal 800 ms later, before any tick.
-            if $h.over() {
+            // `S1-LF` (rule 7): a hand given up while it was settling may still be
+            // closed late, which takes its abort back: its words for good wait for
+            // the deal, which reads the terminal the next hand is derived from.
+            if $h.over() && ($at_the_deal || !$h.late_close_open()) {
                 for seat in $h.certified_seats().to_vec() {
                     let flooded = $h.named_for_flooding(seat);
                     let cheated = $h.named_for_cheating(seat);
@@ -4696,6 +4705,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = j.close(JOURNAL_CLOSE);
             }
             $t.journal_tried_ms = 0;
+            $t.cert_lane = CertLane::default();
             $t.table_closed = false;
             $t.tournament_started = false;
             $t.table_over_at = None;
@@ -10954,6 +10964,46 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if !t.tox_sink.is_on_tox() {
                         continue;
                     }
+                    // `S1-LF` (rule 3): the sets newly whole in the running hand or
+                    // the one retained, said at once and on the lane's ticks; one copy
+                    // at a time while the driver has nothing waiting, paced to the
+                    // floor rate; dropped once the running hand has left stage 0 -- by
+                    // then every seat of it agrees about the hand before.
+                    {
+                        let now = super::node::now_unix_ms();
+                        if let Some(h) = t.hand.as_mut() {
+                            let hid = h.hand_id();
+                            let sets = h.take_newly_whole();
+                            t.cert_lane.feed(hid, sets, now);
+                            if h.slot().sequence >= 1 {
+                                t.cert_lane.drop_before(hid);
+                            }
+                        }
+                        if let Some(p) = t.previous.as_mut() {
+                            let pid = p.hand_id();
+                            let sets = p.take_newly_whole();
+                            t.cert_lane.feed(pid, sets, now);
+                        }
+                        t.cert_lane.tick(now);
+                        // fault-harness, `harvest-cert`: the parked copies, said now.
+                        if cfg!(feature = "fault-harness") {
+                            for copy in harvest_due(t.hand.as_ref().map(|h| (h.hand_id(), h.slot().sequence))) {
+                                t.tox_sink.try_broadcast(&copy);
+                            }
+                        }
+                        if t.tox_sink.trouble().1 == 0 && !nothing_leaves() {
+                            if let Some(copy) = t.cert_lane.next_copy(now) {
+                                let seats = t.table.as_ref().map_or(2, |f| f.roster().seats().len());
+                                // fault-harness `-NoVote`: no certificate copy either;
+                                // `G11-R`: nothing of a hand this client sits out.
+                                let withheld = withholds_votes()
+                                    || t.journal.as_ref().is_some_and(|j| sat_out(j, &copy));
+                                if withheld || t.tox_sink.try_broadcast(&copy) {
+                                    t.cert_lane.sent(now, seats);
+                                }
+                            }
+                        }
+                    }
                     // `S1-GS`: this client's own line by the library's verdict, once a
                     // seat was on the line here -- for the reading of its founder and
                     // of its seats (`own_line_suspect`).
@@ -14797,7 +14847,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                             // `S1-KA`: and its word for good, before it goes.
                             if let Some(h) = t.hand.as_ref() {
-                                remove_by_the_word!(t, h);
+                                remove_by_the_word!(t, h, true);
                             }
                             t.previous = t.hand.take();
                             continue;
@@ -14925,7 +14975,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // goes -- a hand this client gave up on its own budget is dealt on
                 // 800 ms later, before any tick has read it over.
                 if let Some(h) = t.hand.as_ref() {
-                    remove_by_the_word!(t, h);
+                    remove_by_the_word!(t, h, true);
                 }
                 // Retained, not dropped: a certificate about this hand that
                 // arrives during the next one still banks here (`S1-BS`).
@@ -18578,6 +18628,31 @@ fn answers_votes() -> bool {
     !*NO.get_or_init(|| std::env::var("P2P_POKER_NO_ANSWER").is_ok())
 }
 
+/// fault-harness: the `harvest-cert` rogue's parked copies, by the hand and
+/// stage each is about.
+static HARVEST: std::sync::Mutex<Vec<(u64, u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
+/// fault-harness: park one copy until the rogue's own hand has moved past its
+/// stage -- the subject acted -- and while that hand is still being played.
+fn park_harvest(bytes: Vec<u8>) {
+    if let Ok((_, hand, sequence)) = crate::net::chained::peek(&bytes, TABLE_FRAME_PEEK) {
+        HARVEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((hand, sequence, bytes));
+    }
+}
+
+/// fault-harness: the parked copies whose stage the hand at `at` (hand, sequence)
+/// has moved past -- said after the subject acted, before its hand settles.
+fn harvest_due(at: Option<(u64, u64)>) -> Vec<Vec<u8>> {
+    let Some((hand, sequence)) = at else {
+        return Vec::new();
+    };
+    let mut parked = HARVEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (due, wait): (Vec<_>, Vec<_>) =
+        parked.drain(..).partition(|(h, s, _)| *h < hand || (*h == hand && *s < sequence));
+    *parked = wait;
+    due.into_iter().map(|(_, _, b)| b).collect()
+}
+
 /// fault-harness: frames dropped by [`deaf_to_member`], for the log.
 static DEAF_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -18623,11 +18698,16 @@ fn deaf_to_member(member: [u8; 32], bytes: &[u8], h: &crate::table::hand::Hand) 
     // writer before a seat that keeps its action from that seat.
     static ACTIONS_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let only_actions = *ACTIONS_ONLY.get_or_init(|| std::env::var("P2P_POKER_DEAF_TO_ACTIONS").is_ok());
+    // `-DeafToCerts` (`S1-LF`'s bed): its certificate copies alone -- a copy
+    // given to some seats only.
+    static CERTS_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let only_certs = *CERTS_ONLY.get_or_init(|| std::env::var("P2P_POKER_DEAF_TO_CERTS").is_ok());
+    let kind = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK).ok().map(|(kind, _, _)| kind);
     age >= at
         && age < at.saturating_add(dur)
         && *learnt == Some(member)
-        && (!only_actions
-            || crate::net::chained::peek(bytes, TABLE_FRAME_PEEK).is_ok_and(|(kind, _, _)| is_betting_action(kind)))
+        && (!only_actions || kind.is_some_and(is_betting_action))
+        && (!only_certs || kind == Some(crate::protocol::messages::EventType::TimeoutCert))
 }
 
 /// A betting action's event type -- the five a betting stage takes.
@@ -18898,6 +18978,22 @@ async fn reopen_hand(
 ) -> bool {
     use crate::table::hand::{Hand, Voice};
     let Some(mut old) = hand.take() else { return false };
+    // `S1-LF`: nor a hand a kind-2 set ended in position at stage 0 -- it gives
+    // the hand up from its own stage, so the hand never left it; master's slot
+    // move refused it here.
+    if old.closed_at_its_stage() {
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "a certificate about hand #{} re-derives hand #{} at genesis {}, but hand #{} is over here, ended by a certificate at its stage; not re-opened",
+                opening.hand_id.saturating_sub(1),
+                opening.hand_id,
+                short_hash(&opening.genesis),
+                old.hand_id()
+            )))
+            .await;
+        *hand = Some(old);
+        return false;
+    }
     if old.hand_id() != opening.hand_id || old.slot().sequence != 0 {
         let _ = events
             .send(NodeEvent::Warning(format!(
@@ -18946,6 +19042,9 @@ async fn reopen_hand(
             h.note_line_down_recently(old.line_down_recently());
             purge_hand_from_said(said, h.hand_id());
             let carried = early.len();
+            // `S1-LF`: and the certificate copies it keeps, which hold what
+            // `early` held before -- moved only once the new hand stands.
+            h.adopt_store(old.take_store());
             for b in early {
                 let _ = h.hold(b);
             }
@@ -19720,7 +19819,22 @@ fn publish_hand(
         // so the window starts at the action this client owed rather than at a
         // second on the clock. A no-op in every other mode and in every build
         // without the harness.
-        if let Ok((kind, _, _)) = crate::net::chained::peek(&out, TABLE_FRAME_PEEK) {
+        if let Ok((kind, hand, _)) = crate::net::chained::peek(&out, TABLE_FRAME_PEEK) {
+            // fault-harness, `S1-LF`'s rogue `harvest-cert`: its votes are never
+            // said, so no honest voter can seal before the subject acts; its own
+            // certificate copy, sealed from every vote it holds, is parked and
+            // said once its hand moved past that stage -- the subject acted --
+            // while the hand is still being played.
+            if crate::table::hand::rogue("harvest-cert", hand) {
+                match kind {
+                    crate::protocol::messages::EventType::TimeoutVote => continue,
+                    crate::protocol::messages::EventType::TimeoutCert => {
+                        park_harvest(out);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             // fault-harness, `-NoVote`: not said and not kept for a re-send.
             if withholds_votes()
                 && matches!(
@@ -19761,6 +19875,99 @@ fn publish_hand(
                 said.remove(0);
             }
             said.push(out);
+        }
+    }
+}
+
+/// `S1-LF` rule 3: the whole certificate sets this client holds, said again --
+/// every copy at once when the set is whole, then 5 s later and again 10, 20 and
+/// 40 s apart (up to a quarter more, by the set) -- one copy at a time behind the hand's own
+/// frames, paced to `LANE_BITS_PER_MS`, so a set never stands long between this
+/// client and its next frame of the hand. Said until this client's next hand
+/// leaves stage 0: by then every seat of it agrees about the hand before, and a
+/// seat short of a set is behind it for good. Every completer says, not the
+/// lowest: a silent rogue completer holds nobody back.
+#[derive(Default)]
+struct CertLane {
+    /// (hand, the set's first copy's event hash) -> its copies, the ticks said,
+    /// the next tick.
+    sets: std::collections::BTreeMap<(u64, [u8; 32]), (Vec<Vec<u8>>, u8, u64)>,
+    /// Copies waiting for the wire, oldest first, with their hand.
+    queue: std::collections::VecDeque<(u64, Vec<u8>)>,
+    /// The earliest moment the next copy may go.
+    next_at_ms: u64,
+}
+
+/// `S1-LF`: the lane's ticks after the say at completion.
+const LANE_TICKS: u8 = 4;
+/// `S1-LF`: the first tick, doubling after it.
+const LANE_FIRST_MS: u64 = 5_000;
+/// `S1-LF`: the floor rate the lane paces to, 1 Mbit/s -- per copy, its bytes to
+/// every other seat.
+const LANE_BITS_PER_MS: u64 = 1_000;
+
+impl CertLane {
+    /// The sets newly whole at hand `hand`, said at once.
+    fn feed(&mut self, hand: u64, sets: Vec<Vec<Vec<u8>>>, now_ms: u64) {
+        for copies in sets {
+            let Some(id) = copies.first().and_then(|c| crate::net::chained::event_hash_of(c, TABLE_FRAME_PEEK)) else {
+                continue;
+            };
+            if self.sets.contains_key(&(hand, id)) {
+                continue;
+            }
+            self.enqueue(hand, &copies);
+            let first = LANE_FIRST_MS + LANE_FIRST_MS * u64::from(id[0] % 64) / 256;
+            self.sets.insert((hand, id), (copies, 0, now_ms.saturating_add(first)));
+        }
+    }
+
+    /// Each set whose tick has come, said again.
+    fn tick(&mut self, now_ms: u64) {
+        let mut due: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
+        for ((hand, id), (copies, ticks, next)) in self.sets.iter_mut() {
+            if *ticks < LANE_TICKS && now_ms >= *next {
+                *ticks += 1;
+                let gap = LANE_FIRST_MS << *ticks;
+                *next = now_ms.saturating_add(gap + gap * u64::from(id[1] % 64) / 256);
+                due.push((*hand, copies.clone()));
+            }
+        }
+        for (hand, copies) in due {
+            self.enqueue(hand, &copies);
+        }
+    }
+
+    /// The copies queued, each once at a time.
+    fn enqueue(&mut self, hand: u64, copies: &[Vec<u8>]) {
+        for c in copies {
+            if !self.queue.iter().any(|(h, q)| *h == hand && q == c) {
+                self.queue.push_back((hand, c.clone()));
+            }
+        }
+    }
+
+    /// Every set of a hand before `running`, dropped: its next hand left stage 0.
+    fn drop_before(&mut self, running: u64) {
+        self.sets.retain(|(h, _), _| *h >= running);
+        self.queue.retain(|(h, _)| *h >= running);
+    }
+
+    /// The next copy, if the pace lets one go now.
+    fn next_copy(&self, now_ms: u64) -> Option<Vec<u8>> {
+        if now_ms < self.next_at_ms {
+            return None;
+        }
+        self.queue.front().map(|(_, c)| c.clone())
+    }
+
+    /// The copy `next_copy` gave went out, to `seats` seats in all: the next waits
+    /// its bytes to the others at the floor rate.
+    fn sent(&mut self, now_ms: u64, seats: usize) {
+        if let Some((_, c)) = self.queue.pop_front() {
+            let others = u64::try_from(seats.saturating_sub(1).max(1)).unwrap_or(1);
+            let bits = u64::try_from(c.len()).unwrap_or(u64::MAX).saturating_mul(8).saturating_mul(others);
+            self.next_at_ms = now_ms.saturating_add(bits / LANE_BITS_PER_MS);
         }
     }
 }
@@ -23984,6 +24191,50 @@ mod ad_is_admissible {
 mod late_roster_tests {
     use super::*;
 
+    /// `S1-LF` rule 3: **a whole set is said at once and on four ticks, one copy
+    /// at a time at the floor rate, and dropped once the next hand has left
+    /// stage 0.**
+    #[test]
+    fn the_lane_says_a_whole_set_at_once_and_on_four_ticks() {
+        use crate::protocol::messages::EventType;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let copy = |byte: u8| {
+            let slot = crate::net::chained::Slot { table_id: [1; 32], hand_id: 3, sequence: 9, previous_event_hash: [byte; 32] };
+            crate::net::chained::seal(EventType::TimeoutCert, &slot, &0u8, &key, 1_000, 30_000, 4096).unwrap()
+        };
+        let set = vec![copy(1), copy(2)];
+        let mut lane = CertLane::default();
+        lane.feed(3, vec![set.clone()], 0);
+        lane.feed(3, vec![set.clone()], 0);
+        assert_eq!(lane.queue.len(), 2, "said at once, once");
+        let mut said = 0;
+        let mut now = 0u64;
+        let mut times = Vec::new();
+        while now < 120_000 {
+            lane.tick(now);
+            if let Some(c) = lane.next_copy(now) {
+                assert!(set.contains(&c));
+                lane.sent(now, 10);
+                said += 1;
+                times.push(now);
+            }
+            now += 250;
+        }
+        assert_eq!(said, 2 * (1 + usize::from(LANE_TICKS)), "at once and on four ticks: {times:?}");
+        assert!(times.windows(2).all(|w| w[1] > w[0]), "one copy at a time");
+        // The says, by their first copy: at once, then 5 s, 10 s, 20 s and 40 s
+        // apart, each up to a quarter more.
+        let says: Vec<u64> = times.iter().step_by(2).copied().collect();
+        assert_eq!(says[0], 0, "at once");
+        for (i, w) in says.windows(2).enumerate() {
+            let gap = LANE_FIRST_MS << i;
+            assert!(w[1] - w[0] >= gap && w[1] - w[0] <= gap + gap / 4 + 500, "say {}: {} ms apart, {gap} wanted", i + 1, w[1] - w[0]);
+        }
+        lane.feed(3, vec![vec![copy(3)]], now);
+        lane.drop_before(4);
+        assert!(lane.queue.is_empty() && lane.sets.is_empty(), "dropped once hand 4 left stage 0");
+    }
+
     /// `G11-R` phase D: **the batch's own frames of a hand's chain are recorded
     /// before anything leaves, and nothing else is** -- a vote, another seat's
     /// frame and a frame of hand 0 pass by; a second body at a held slot sits the
@@ -25315,14 +25566,14 @@ mod a_joiner_before_the_first_hand {
         assert!(code.contains("let at_the_limit = flooded || cheated || resigned || $h.out_after_absences(seat);"), "out for good");
         // `S1-KA`: once the hand is over, for every seat it certified.
         assert!(
-            code.contains("if $h.over() { for seat in $h.certified_seats().to_vec() { let flooded = $h.named_for_flooding(seat); let cheated = $h.named_for_cheating(seat);"),
+            code.contains("if $h.over() && ($at_the_deal || !$h.late_close_open()) { for seat in $h.certified_seats().to_vec() { let flooded = $h.named_for_flooding(seat); let cheated = $h.named_for_cheating(seat);"),
             "the group's word for good, once the hand is over"
         );
         assert!(code.contains("let resigned = $h.named_by_its_own_word(seat); let at_the_limit ="), "the word, the cheat and the flood alike");
         assert!(code.contains("h.out_for_good_decided().contains(&me).then_some((me, flooded, cheated))"), "this client, once decided");
         assert!(code.contains("let why = if h.over() { Some(h) } else { t.previous.as_ref() };"), "and why, from the hand that decided it");
         let behind = code.find("// Retained, not dropped: a certificate about this hand that").expect("the deal");
-        assert!(code[behind - 400..behind].contains("if let Some(h) = t.hand.as_ref() { remove_by_the_word!(t, h); }"), "the word before the deal puts the hand behind");
+        assert!(code[behind - 400..behind].contains("if let Some(h) = t.hand.as_ref() { remove_by_the_word!(t, h, true); }"), "the word before the deal puts the hand behind");
         assert!(code.contains("if !alone || !(flooded || cheated || absent) { return None; }"), "the lobby word");
     }
 

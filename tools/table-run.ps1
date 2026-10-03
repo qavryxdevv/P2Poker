@@ -339,6 +339,9 @@ param(
     # `-DeafToActions` (S1-KB's bed): with `-DeafToFor`, only that seat's betting
     # actions go unheard -- the writer before a seat keeping its action from it.
     [switch]$DeafToActions,
+    # `-DeafToCerts` (S1-LF's bed): with `-DeafToFor`, only that seat's
+    # certificate copies go unheard -- a copy given to some seats only.
+    [switch]$DeafToCerts,
     # `-NoSayAgain` (S1-KB's control): no node says another seat's betting action
     # again. Needs `--features fault-harness`.
     [switch]$NoSayAgain,
@@ -501,6 +504,7 @@ $t0 = Get-Date
 # `S1-KB`: for every node -- the jobs, and the nodes they start, take this
 # process's environment -- and cleared otherwise, so no run inherits the last.
 if ($DeafToActions) { $env:P2P_POKER_DEAF_TO_ACTIONS = '1' } else { Remove-Item Env:P2P_POKER_DEAF_TO_ACTIONS -ErrorAction SilentlyContinue }
+if ($DeafToCerts) { $env:P2P_POKER_DEAF_TO_CERTS = '1' } else { Remove-Item Env:P2P_POKER_DEAF_TO_CERTS -ErrorAction SilentlyContinue }
 if ($NoSayAgain) { $env:P2P_POKER_NO_SAY_AGAIN = '1' } else { Remove-Item Env:P2P_POKER_NO_SAY_AGAIN -ErrorAction SilentlyContinue }
 # `S1-KI`: every node reads them; only the stranger node makes puppets.
 if ($Puppets -gt 0) { $env:P2P_POKER_PUPPETS = "$Puppets" } else { Remove-Item Env:P2P_POKER_PUPPETS -ErrorAction SilentlyContinue }

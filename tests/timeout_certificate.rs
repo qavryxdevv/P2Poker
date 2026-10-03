@@ -888,26 +888,26 @@ fn a_settlement_that_arrives_after_an_abort_replaces_its_terminal() {
 /// **The author of a certificate and its reader derive the same roster.**
 ///
 /// At three seats the voter set is two, so a certificate about the third
-/// completes its collective stage only if BOTH voters' copies arrive. If one of
-/// them is the peer that has gone quiet — which is the ordinary case, since a
-/// table loses one seat at a time — the author never completes the stage, never
-/// reaches `apply_certificate`, and, while the roster effect was banked only on
-/// receipt, never shrank its own roster.
+/// completes its collective stage only if BOTH voters' copies arrive. Measured
+/// over the network before `S1-LF`: the subject banked the certificate about
+/// itself and opened the next hand with `[1, 2]` while the peer that had written
+/// that certificate opened it with `[0, 1, 2]` -- and the cure then was to bank a
+/// copy at seal, which let one copy move a roster wherever it landed.
 ///
-/// Measured over the network before it was written down: the subject banked the
-/// certificate about itself and opened the next hand with `[1, 2]` while the
-/// peer that had written that certificate opened it with `[0, 1, 2]`. Two
-/// genesis hashes, one table, no refusal anywhere until they tried to speak.
+/// `S1-LF`: a set counts only whole -- every voter's copy held. The reader that
+/// takes the author's copy seals its own from the votes it carries and holds the
+/// set whole; the author, short of the reader's copy, keeps the subject for now.
+/// The reader says the set (rule 3), the author's hand takes the copy late, and
+/// the next hand is derived again: one roster, one genesis.
 ///
-/// **To make this fail:** take the `self.bank(...)` call out of
-/// `Hand::note_own_certificate`.
+/// **To make this fail:** let one copy count -- bank a set short of a voter's
+/// copy -- or drop the late road's re-derivation.
 #[test]
-fn the_author_of_a_certificate_banks_it_like_everybody_else() {
+fn the_author_of_a_certificate_and_its_reader_derive_one_roster() {
     let (mut t, opening) = Table::open_with_seat_two_silent();
     t.settle(opening, NOW);
 
-    // Both survivors vote. Seat 1 is given both votes; seat 0 keeps only its
-    // own, so only seat 1 can assemble a certificate.
+    // Both survivors vote and each takes the other's vote, so each seals a copy.
     let mut votes: Vec<(usize, Vec<u8>)> = Vec::new();
     for s in 0..2usize {
         for Send::Broadcast(b) in t.hands[s]
@@ -927,15 +927,13 @@ fn the_author_of_a_certificate_banks_it_like_everybody_else() {
             certs.push(b);
         }
     }
-    assert!(!certs.is_empty(), "somebody should certify once both votes are in");
+    assert_eq!(certs.len(), 2, "each survivor sealed its copy");
 
-    // Seat 1's certificate reaches seat 0. **Seat 0's never reaches seat 1** —
-    // in the case this is about, the other voter is the one that went away, so
-    // seat 1's collective stage stays one copy short for ever.
+    // Seat 1's copy reaches seat 0, whose stage closes on both. Seat 0's copy
+    // does not reach seat 1 yet.
     let _ = t.hands[0].on_event(&certs[0], &t.keys[0], LATE);
 
-    // Both give the hand up on their own deadline, which is what happened over
-    // the network, and is the only way either gets a terminal here.
+    // Both give the hand up on their own deadline.
     for s in 0..2usize {
         let _ = t.hands[s].abort_now(
             p2p_poker::table::hand::Abort::Deadline,
@@ -943,19 +941,17 @@ fn the_author_of_a_certificate_banks_it_like_everybody_else() {
             LATE,
         );
     }
-
     let zero = t.hands[0].next_hand().expect("seat 0 opens the next hand");
-    let one = t.hands[1].next_hand().expect("seat 1 opens the next hand");
-    assert_eq!(
-        one.required, zero.required,
-        "the author of the certificate kept a roster its reader had already shrunk"
-    );
-    assert_eq!(one.genesis, zero.genesis, "and so they forked at the genesis");
-    assert!(
-        !one.required.contains(&2),
-        "the certified seat is still required: {:?}",
-        one.required
-    );
+    let short = t.hands[1].next_hand().expect("seat 1 opens the next hand");
+    assert!(!zero.required.contains(&2), "the reader holds the set whole: {:?}", zero.required);
+    assert!(short.required.contains(&2), "the author, short of the reader's copy, counts one copy nowhere");
+
+    // The reader says the set; its copy reaches the author's hand late.
+    let _ = t.hands[1].on_event(&certs[1], &t.keys[1], LATE);
+    assert!(t.hands[1].take_late_roster(), "whole at the author now: the next hand is derived again");
+    let one = t.hands[1].next_hand().expect("seat 1 derives it again");
+    assert_eq!(one.required, zero.required, "one roster");
+    assert_eq!(one.genesis, zero.genesis, "one genesis");
 }
 
 
