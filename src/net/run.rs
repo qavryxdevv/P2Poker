@@ -4685,6 +4685,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // `G11-R` phase C: back from a restart, what the previous
                             // life recorded of the hands up to the record's goes out
                             // again.
+                            // `REFUTE_JOURNAL_D2` M4: a hand sat out stays out
+                            // under the journal opened in the refusing one's place.
+                            if let Some(old) = $t.journal.as_ref() {
+                                j.keep_silenced(&old.silenced_hands());
+                            }
                             if let crate::storage::journal::Mode::Resume { newest_seen } = mode {
                                 // The first open only: the minute retry's hand is
                                 // this life's own.
@@ -20285,14 +20290,27 @@ fn journal_ahead_as(j: &crate::storage::journal::Handle, sends: &[crate::table::
     }
     let started = std::time::Instant::now();
     let hands: std::collections::BTreeSet<u64> = entries.iter().map(|e| e.hand).collect();
-    match j.write(entries, JOURNAL_WRITE) {
+    let written = j.write(entries, JOURNAL_WRITE);
+    // fault-harness, phase D2: the write's time and how it ended.
+    j.note_write(
+        u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        matches!(&written, Err(e) if !matches!(e, crate::storage::journal::JournalError::Conflict { .. } | crate::storage::journal::JournalError::Timeout)),
+        matches!(&written, Err(crate::storage::journal::JournalError::Timeout)),
+    );
+    match written {
         Ok(()) => {}
         Err(crate::storage::journal::JournalError::Conflict { hand, .. })
             if crate::table::hand::rogue("bad-action", hand) => {}
-        Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) if armed => j.silence(
-            hand,
-            &format!("it was about to sign a second frame (type {kind:#06x}) at sequence {sequence} beside the one its journal holds"),
-        ),
+        // `REFUTE_JOURNAL_D2` N1: the whole batch was refused -- every hand of
+        // it sits out, as for any other refusal.
+        Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) if armed => {
+            let why = format!(
+                "it was about to sign a second frame (type {kind:#06x}) at hand #{hand} sequence {sequence} beside the one its journal holds"
+            );
+            for h in &hands {
+                j.silence(*h, &why);
+            }
+        }
         Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) => j.note(format!(
             "would have signed twice: a frame of type {kind:#06x} at hand #{hand} sequence {sequence} beside the one its journal holds (G11-R, shadow: sent)"
         )),
@@ -20343,6 +20361,11 @@ fn journal_check_own_as(j: &crate::storage::journal::Handle, bytes: &[u8], armed
     );
     if armed {
         j.silence(hand, &why);
+        // Phase D2 (`R6`): and for every later life -- what else was signed
+        // there is unknown.
+        if let Err(e) = j.mark_uncovered(hand, JOURNAL_WRITE) {
+            j.note(format!("hand #{hand}: the signing journal could not mark it uncovered on disk: {e} (G11-R)"));
+        }
     } else {
         j.note(format!("hand #{hand}: {why} (G11-R, shadow)"));
     }

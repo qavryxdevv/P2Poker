@@ -72,6 +72,10 @@ pub const WRITER_QUEUE: usize = 32;
 /// Bytes before a record's body: its length and its checksum.
 const RECORD_HEAD: usize = 4 + 16;
 
+/// `R6`, phase D2: the kind of the mark record that leaves a hand uncovered for
+/// good ([`Handle::mark_uncovered`]) -- written as a record of another hand.
+const MARK_KIND: u16 = 0xFFFF;
+
 /// How long a journal left untouched stays in the profile: a table not played
 /// for a week is not resumed, and its journal serves nothing.
 pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -416,10 +420,13 @@ impl Files {
         false
     }
 
-    /// Move the first covered hand to `keep_from`, durably, then remove every
-    /// segment of a hand before it: a pruned hand reads as uncovered, never as
-    /// unsigned.
-    fn prune(&mut self, keep_from: u64) -> io::Result<()> {
+    /// Move the first covered hand to `keep_from`, durably -- a pruned hand
+    /// reads as uncovered, never as unsigned -- and say which segments lie
+    /// before it, for the cleaner to remove: below a durable first covered hand
+    /// nothing reads or writes them, and a slow delete (a scanner holding a
+    /// file) must not keep the writer from the next batch (`REFUTE_JOURNAL_D2`
+    /// S4).
+    fn prune(&mut self, keep_from: u64) -> io::Result<Vec<PathBuf>> {
         if keep_from > self.header.covers_from {
             let mut h = self.header.clone();
             h.covers_from = keep_from;
@@ -428,12 +435,27 @@ impl Files {
             self.covers_from.store(keep_from, Ordering::SeqCst);
         }
         self.segments.retain(|hand, _| *hand >= keep_from);
-        for hand in hands_on_disk(&self.dir)? {
-            if hand < keep_from {
-                fs::remove_file(segment_path(&self.dir, hand))?;
-            }
-        }
-        sync_dir(&self.dir)
+        Ok(hands_on_disk(&self.dir)?
+            .into_iter()
+            .filter(|hand| *hand < keep_from)
+            .map(|hand| segment_path(&self.dir, hand))
+            .collect())
+    }
+
+    /// `R6`, phase D2: mark `hand` uncovered for good -- a record of another
+    /// hand appended to its segment, synced: every reader, of this format or
+    /// the first, takes a complete record of another hand as a segment it
+    /// cannot vouch for, and keeps the file. Once a hand.
+    fn mark(&mut self, hand: u64) -> io::Result<()> {
+        let body = minicbor::to_vec(Entry { hand: u64::MAX, sequence: hand, parent: [0; 32], kind: MARK_KIND, frame: Vec::new(), secret: None })
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut rec = Vec::with_capacity(RECORD_HEAD + body.len());
+        rec.extend_from_slice(&u32::try_from(body.len()).expect("a small record").to_le_bytes());
+        rec.extend_from_slice(&checksum(&body));
+        rec.extend_from_slice(&body);
+        let f = self.segment(hand)?;
+        f.write_all(&rec)?;
+        f.sync_all()
     }
 }
 
@@ -542,11 +564,51 @@ fn parse_record(bytes: &[u8]) -> Option<(Entry, usize)> {
     Some((entry, RECORD_HEAD + len))
 }
 
+/// fault-harness, `G11-R` phase D2: `P2P_POKER_JOURNAL_HANG_MS=<ms>` -- the
+/// writer sleeps that long before one write in fifty (the 25th, the 75th, ...):
+/// a disk that stalls now and then. Nothing in a build without the feature.
+fn harness_hang(write: u64) {
+    if !cfg!(feature = "fault-harness") {
+        return;
+    }
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("P2P_POKER_JOURNAL_HANG_MS").ok()?.trim().parse().ok());
+    if let Some(ms) = ms.filter(|_| write % 50 == 25) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// fault-harness, `G11-R` phase D2: `P2P_POKER_JOURNAL_FAIL=<n>` -- every n-th
+/// write fails as an I/O error, nothing of it written. Never in a build without
+/// the feature.
+fn harness_fail(write: u64) -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    EVERY
+        .get_or_init(|| std::env::var("P2P_POKER_JOURNAL_FAIL").ok()?.trim().parse().ok())
+        .is_some_and(|every| every > 0 && write % every == 0)
+}
+
+/// fault-harness, `G11-R` phase D2: the journal's write times, a line per
+/// `WRITE_STATS_EVERY` batches.
+#[derive(Default)]
+struct WriteStats {
+    ms: Vec<u32>,
+    failed: u32,
+    timed_out: u32,
+}
+
+/// fault-harness: the batches a write-time line is said for.
+const WRITE_STATS_EVERY: usize = 100;
+
 type Reply = mpsc::Sender<Result<(), JournalError>>;
 
 enum Job {
     Write(Vec<Entry>, Reply),
     Prune(u64, Reply),
+    Mark(u64, Reply),
     #[cfg(test)]
     Stall(Duration),
     #[cfg(test)]
@@ -580,6 +642,10 @@ pub struct Handle {
     /// that failed, a second body refused -- at most `NOTES_CAP`, the oldest
     /// dropped first.
     notes: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// fault-harness, phase D2: the write times since the last line.
+    stats: std::sync::Mutex<WriteStats>,
+    /// The longest prune's header move, ms, since the last line.
+    prune_max: Arc<AtomicU64>,
 }
 
 /// The notes a journal keeps for the node at most.
@@ -687,6 +753,8 @@ impl Handle {
         let (opened_tx, opened_rx) = mpsc::channel();
         let finished = Arc::new(AtomicU64::new(0));
         let done = Arc::clone(&finished);
+        let prune_max = Arc::new(AtomicU64::new(0));
+        let prune_seen = Arc::clone(&prune_max);
         let thread = std::thread::Builder::new()
             .name("signing-journal".into())
             .spawn(move || {
@@ -700,16 +768,37 @@ impl Handle {
                 let shared = Arc::new(RwLock::new(index));
                 let cover = Arc::clone(&files.covers_from);
                 let id = files.header.id;
+                // The prune's deletions, off the writer: segments below a durable
+                // first covered hand, which nothing reads or writes again.
+                let (cleaner, cleaned) = mpsc::channel::<Vec<PathBuf>>();
+                let clean_dir = files.dir.clone();
+                let _ = std::thread::Builder::new().name("signing-journal-cleaner".into()).spawn(move || {
+                    for paths in cleaned {
+                        for p in paths {
+                            let _ = fs::remove_file(p);
+                        }
+                        let _ = sync_dir(&clean_dir);
+                    }
+                });
+                let prune_ms = Arc::clone(&prune_max);
                 if opened_tx.send(Ok((id, Arc::clone(&cover), Arc::clone(&shared)))).is_err() {
                     // Nobody waits: the open timed out. The lock goes with `files`.
                     return;
                 }
+                let mut writes = 0u64;
                 for (n, job) in rx {
                     match job {
                         Job::Write(entries, reply) => {
+                            writes += 1;
+                            harness_hang(writes);
                             let planned = {
                                 let idx = shared.read().unwrap_or_else(PoisonError::into_inner);
                                 plan(&idx, cover.load(Ordering::SeqCst), &entries)
+                            };
+                            let planned = if harness_fail(writes) {
+                                Err(JournalError::Io(io::Error::other("a failed write asked for by the harness")))
+                            } else {
+                                planned
                             };
                             let result = planned.and_then(|(fresh, bodies)| {
                                 let mut broken = Vec::new();
@@ -726,12 +815,30 @@ impl Handle {
                             let _ = reply.send(result);
                         }
                         Job::Prune(keep_from, reply) => {
+                            let started = Instant::now();
                             let result = files.prune(keep_from).map_err(JournalError::Io);
-                            if result.is_ok() {
+                            let result = result.map(|gone| {
                                 let mut idx = shared.write().unwrap_or_else(PoisonError::into_inner);
                                 idx.entries.retain(|(hand, _, _), _| *hand >= keep_from);
                                 idx.uncovered.retain(|hand| *hand >= keep_from);
-                            }
+                                drop(idx);
+                                if !gone.is_empty() {
+                                    let _ = cleaner.send(gone);
+                                }
+                            });
+                            prune_ms.fetch_max(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), Ordering::SeqCst);
+                            done.store(n, Ordering::SeqCst);
+                            let _ = reply.send(result);
+                        }
+                        Job::Mark(hand, reply) => {
+                            let already = shared.read().unwrap_or_else(PoisonError::into_inner).uncovered.contains(&hand);
+                            let result = if already || hand < cover.load(Ordering::SeqCst) {
+                                Ok(())
+                            } else {
+                                files.mark(hand).map_err(JournalError::Io)
+                            };
+                            // Uncovered in this life whatever the disk did.
+                            shared.write().unwrap_or_else(PoisonError::into_inner).uncovered.insert(hand);
                             done.store(n, Ordering::SeqCst);
                             let _ = reply.send(result);
                         }
@@ -765,6 +872,8 @@ impl Handle {
             refusing: false,
             silenced: std::sync::Mutex::new(BTreeSet::new()),
             notes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            stats: std::sync::Mutex::new(WriteStats::default()),
+            prune_max: prune_seen,
         })
     }
 
@@ -785,6 +894,8 @@ impl Handle {
             refusing: true,
             silenced: std::sync::Mutex::new(BTreeSet::new()),
             notes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            stats: std::sync::Mutex::new(WriteStats::default()),
+            prune_max: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -806,6 +917,29 @@ impl Handle {
         }
     }
 
+    /// Phase D2 (`REFUTE_JOURNAL_D2` M4): the hands sat out -- carried to the
+    /// journal opened in this one's place, so a hand sat out stays out.
+    pub fn silenced_hands(&self) -> BTreeSet<u64> {
+        self.silenced.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Phase D2: sit `hands` out, as another handle of this table had (M4).
+    pub fn keep_silenced(&self, hands: &BTreeSet<u64>) {
+        self.silenced.lock().unwrap_or_else(PoisonError::into_inner).extend(hands.iter().copied());
+    }
+
+    /// Phase D2 (`R6`): `hand` uncovered for good -- in this life at once, and
+    /// on the disk by a mark record (`Files::mark`) a later life reads, waiting
+    /// at most `timeout`. Once a hand.
+    pub fn mark_uncovered(&self, hand: u64, timeout: Duration) -> Result<(), JournalError> {
+        if self.refusing || self.is_uncovered(hand) {
+            return Ok(());
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let n = self.send(Job::Mark(hand, reply_tx))?;
+        self.wait(n, &reply_rx, timeout, false)
+    }
+
     /// Whether `hand` is sat out ([`Handle::silence`]).
     pub fn is_silenced(&self, hand: u64) -> bool {
         self.silenced.lock().unwrap_or_else(PoisonError::into_inner).contains(&hand)
@@ -823,6 +957,41 @@ impl Handle {
             notes.pop_front();
         }
         notes.push_back(line);
+    }
+
+    /// fault-harness, phase D2: one batch's write, `ms` long, and how it ended;
+    /// every `WRITE_STATS_EVERY` batches a line of the times -- p50, p99, max --
+    /// and the failures and timeouts among them. Nothing without the feature.
+    pub fn note_write(&self, ms: u32, failed: bool, timed_out: bool) {
+        if !cfg!(feature = "fault-harness") {
+            return;
+        }
+        let line = {
+            let mut s = self.stats.lock().unwrap_or_else(PoisonError::into_inner);
+            s.ms.push(ms);
+            s.failed += u32::from(failed);
+            s.timed_out += u32::from(timed_out);
+            if s.ms.len() < WRITE_STATS_EVERY {
+                return;
+            }
+            let mut ms = std::mem::take(&mut s.ms);
+            ms.sort_unstable();
+            let at = |q: usize| ms[(ms.len() - 1) * q / 100];
+            let line = format!(
+                "fault-harness: the signing journal recorded {} batch(es): p50 {} ms, p99 {} ms, max {} ms; {} failed, {} timed out; longest prune {} ms (G11-R D2)",
+                ms.len(),
+                at(50),
+                at(99),
+                ms[ms.len() - 1],
+                s.failed,
+                s.timed_out,
+                self.prune_max.swap(0, Ordering::SeqCst)
+            );
+            s.failed = 0;
+            s.timed_out = 0;
+            line
+        };
+        self.note(line);
     }
 
     /// Every note kept since the last call.
@@ -1133,6 +1302,59 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
     }
 
+    /// Phase D2 (fault-harness): **a line of write times every hundred batches**
+    /// -- p50, p99, max, the failures and timeouts among them -- and none
+    /// without the feature.
+    #[test]
+    fn write_times_are_said_every_hundred_batches() {
+        let j = Handle::refusing([2; 32]);
+        for ms in 1..=99u32 {
+            j.note_write(ms, ms == 7, false);
+        }
+        assert!(j.take_notes().is_empty(), "not before the hundredth");
+        j.note_write(500, false, true);
+        let notes = j.take_notes();
+        if cfg!(feature = "fault-harness") {
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(
+                notes[0].contains("p50 50 ms") && notes[0].contains("p99 99 ms") && notes[0].contains("max 500 ms"),
+                "{notes:?}"
+            );
+            assert!(notes[0].contains("1 failed, 1 timed out"), "{notes:?}");
+        } else {
+            assert!(notes.is_empty());
+        }
+    }
+
+    /// Phase D2 (`R6`): **a hand marked uncovered stays so for every later life**
+    /// -- the mark a record of another hand, which this format and the first
+    /// read alike -- and nothing more is written there; another hand is not
+    /// touched; the silenced set carries to another handle.
+    #[test]
+    fn a_marked_hand_stays_uncovered() {
+        let p = temp_profile("mark");
+        let j = open(&p, 1);
+        j.write(vec![entry(3, 3, 7)], T).unwrap();
+        j.mark_uncovered(3, T).unwrap();
+        j.mark_uncovered(3, T).unwrap();
+        assert!(j.is_uncovered(3) && !j.is_uncovered(4));
+        assert!(matches!(j.write(vec![entry(3, 4, 8)], T), Err(JournalError::Uncovered)));
+        j.write(vec![entry(4, 3, 7)], T).unwrap();
+        j.silence(3, "a test");
+        let silenced = j.silenced_hands();
+        assert!(j.close(T));
+        let j = open(&p, 1);
+        assert!(j.is_uncovered(3), "read back");
+        assert!(!j.is_uncovered(4) && j.lookup(4, 3, &[7; 32]).is_some());
+        let dir = journal_dir(&p, &[1; 32]);
+        let (_, uncovered) = read_segment(&segment_path(&dir, 3), 3).unwrap();
+        assert!(uncovered, "a record of another hand: what a first-format reader sees too");
+        j.keep_silenced(&silenced);
+        assert!(j.is_silenced(3), "carried to the journal opened again");
+        assert!(j.close(T));
+        let _ = fs::remove_dir_all(&p);
+    }
+
     /// **A failed write leaves nothing behind**: cut back to where it began,
     /// the hand still covered, the records before it whole.
     #[test]
@@ -1285,6 +1507,11 @@ mod tests {
             }
         }
         let dir = journal_dir(&p, &[1; 32]);
+        // The cleaner removes them off the writer.
+        let until = Instant::now() + T;
+        while hands_on_disk(&dir).unwrap() != vec![39, 40] && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(hands_on_disk(&dir).unwrap(), vec![39, 40]);
         let size: u64 = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
         assert!(size < 4_096, "forty hands played, two kept: {size} bytes");
@@ -1318,6 +1545,10 @@ mod tests {
         let j = open(&p, 1);
         assert!(j.is_uncovered(1) && j.lookup(1, 3, &[7; 32]).is_none());
         j.prune(2, T).unwrap();
+        let until = Instant::now() + T;
+        while hands_on_disk(&dir).unwrap() != vec![2] && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(hands_on_disk(&dir).unwrap(), vec![2]);
         assert!(j.close(T));
         let _ = fs::remove_dir_all(&p);
