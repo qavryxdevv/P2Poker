@@ -26664,6 +26664,50 @@ mod tests {
         assert_eq!(a.on_event(&bytes_of(&other_body)[0], &keys[0], NOW), Err(Failed::Equivocation { seat: 1 }));
     }
 
+    /// `G11-R` (`REFUTE_JOURNAL_D` R4, `REFUTE_JOURNAL_D2` S7): **no judge counts a
+    /// frame outside the hand's chain as a version** -- the journal records the
+    /// chain alone, so anything else a seat says again after a restart is signed
+    /// anew: two votes of one seat about one stage at two moments are no second
+    /// version; a checkpoint, an acknowledgement, a dispute, a sit-in or a leave,
+    /// twice with two stamps, is refused as no frame of the hand, never as one.
+    #[test]
+    fn no_judge_counts_a_frame_outside_the_chain_as_a_version() {
+        let (mut hands, keys) = three_to_the_bet();
+        let at = hands[0].slot();
+        let seal_at = |kind: EventType, by: &SigningKey, stamp: u64| {
+            chained::seal(kind, &at, &0u8, by, stamp, 30_000, FRAME_CAP).unwrap()
+        };
+        // Past the stage, two votes of seat 1 about it, two stamps.
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let action = if hands[up].turn().unwrap().legal.can_check { Action::Check } else { Action::Call };
+        let sends = hands[up].act(action, &keys[up], NOW).unwrap();
+        for i in (0..3).filter(|i| *i != up) {
+            let _ = deliver(&mut hands[i], &sends, &keys[i]);
+        }
+        let watcher = (0..3).find(|i| *i != up && *i != 1).unwrap_or(0);
+        assert!(hands[watcher].slot().sequence > at.sequence, "the stage left");
+        for stamp in [NOW, NOW + 5_000] {
+            let vote = seal_at(EventType::TimeoutVote, &keys[1], stamp);
+            assert!(
+                !matches!(hands[watcher].on_event(&vote, &keys[watcher], NOW + 6_000), Err(Failed::Equivocation { .. })),
+                "a vote is no version"
+            );
+        }
+        for kind in [EventType::StateHash, EventType::StateAck, EventType::Dispute, EventType::PlayerSitIn, EventType::TableLeave] {
+            for stamp in [NOW, NOW + 5_000] {
+                // Not chained at all: no judge of the chain ever sees one.
+                let Ok(frame) = chained::seal(kind, &at, &0u8, &keys[1], stamp, 30_000, FRAME_CAP) else {
+                    continue;
+                };
+                assert_eq!(
+                    hands[watcher].on_event(&frame, &keys[watcher], NOW + 6_000),
+                    Err(Failed::Wire(WireError::WrongType)),
+                    "{kind:?} is no frame of the hand"
+                );
+            }
+        }
+    }
+
     /// What the survivor says again to a seat back from a restart: the frames
     /// it accepted (its transcript) and its own -- replayed into the restored
     /// hand, which holds what is early.

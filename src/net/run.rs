@@ -1258,6 +1258,10 @@ struct TableRun {
     /// When the journal was last tried, so one that will not open is tried
     /// again a minute on and not at every tick.
     journal_tried_ms: u64,
+    /// `G11-R` phase D2b: the newest hand of this table an own frame was seen
+    /// of on the wire, verified -- a source of the floor a provisional journal
+    /// vouches from.
+    newest_own_seen: u64,
     /// Whether this table has ever dealt a hand.
     ///
     /// The two roads into the first hand fire again on **every later table
@@ -1990,6 +1994,7 @@ impl TableRun {
             said: Vec::new(),
             journal: None,
             journal_tried_ms: 0,
+            newest_own_seen: 0,
             cert_lane: CertLane::default(),
             ever_dealt: false,
             boundaries: crate::table::boundary::Boundaries::new(),
@@ -4690,6 +4695,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(old) = $t.journal.as_ref() {
                                 j.keep_silenced(&old.silenced_hands());
                             }
+                            // Phase D2b: a shadow life sends what its journal
+                            // refuses, so its journal vouches for nothing.
+                            if !journal_armed() && j.vouches() {
+                                let _ = j.unvouch(JOURNAL_WRITE);
+                            }
                             if let crate::storage::journal::Mode::Resume { newest_seen } = mode {
                                 // The first open only: the minute retry's hand is
                                 // this life's own.
@@ -4715,10 +4725,47 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     )))
                                     .await;
                             }
-                            $t.journal = Some(crate::storage::journal::Handle::refusing(
-                                app_key.verifying_key().to_bytes(),
-                            ));
+                            let refusing = crate::storage::journal::Handle::refusing(app_key.verifying_key().to_bytes());
+                            // `REFUTE_JOURNAL_D2b` M4: refusing to refusing keeps the
+                            // hands sat out.
+                            if let Some(old) = $t.journal.as_ref() {
+                                refusing.keep_silenced(&old.silenced_hands());
+                            }
+                            $t.journal = Some(refusing);
                         }
+                    }
+                }
+            }
+        }};
+    }
+
+    // `G11-R` phase D2b: a journal that cannot vouch yet -- made new on a
+    // resume, written by a shadow life, or raised by rule 2 -- has its first
+    // covered hand set past everything a previous life could have signed,
+    // once, before the first hand opened after: 2 + the newest of this table's
+    // record, the journal's own newest hand, the newest own frame of this table
+    // seen, and this life's running and retained hands (`REFUTE_JOURNAL_D2b`'s
+    // one-shot). Armed only: a shadow life vouches for nothing.
+    macro_rules! settle_vouching {
+        ($t:ident) => {{
+            if journal_armed() {
+                if let Some(j) = $t.journal.as_ref().filter(|j| !j.is_refusing() && !j.vouches()) {
+                    let own_key = $t.table.as_ref().and_then(|f| if f.is_founder() { Some(f.table_id()) } else { $t.joined_key });
+                    let record = $t.resume.as_ref().filter(|r| Some(r.table_key) == own_key).map_or(0, |r| r.hand_id);
+                    let floor = vouching_floor(&[
+                        record,
+                        j.newest_held().unwrap_or(0),
+                        $t.newest_own_seen,
+                        $t.hand.as_ref().map_or(0, |h| h.hand_id()),
+                        $t.previous.as_ref().map_or(0, |h| h.hand_id()),
+                    ]);
+                    match j.vouch_from(floor, JOURNAL_WRITE) {
+                        Ok(at) => j.note(format!(
+                            "the signing journal vouches from hand #{at} on: a previous life may have signed the hands before it, which this seat sits out (G11-R)"
+                        )),
+                        Err(e) => j.note(format!(
+                            "the signing journal could not vouch from hand #{floor} on disk ({e}): this life sits out to it, the next sets it again (G11-R)"
+                        )),
                     }
                 }
             }
@@ -4734,6 +4781,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = j.close(JOURNAL_CLOSE);
             }
             $t.journal_tried_ms = 0;
+            $t.newest_own_seen = 0;
             $t.cert_lane = CertLane::default();
             $t.table_closed = false;
             $t.tournament_started = false;
@@ -10086,6 +10134,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         journal_check_own(j, &item.bytes);
                     }
                 }
+                // `G11-R` phase D2b: the newest hand of this table an own frame was
+                // seen of -- verified under the table, never a peer's word.
+                if let Some(table_id) = t.table.as_ref().map(|f| f.table_id()) {
+                    if let Some(hand) = own_frame_hand(&item.bytes, &table_id, &my_app_key) {
+                        t.newest_own_seen = t.newest_own_seen.max(hand);
+                    }
+                }
                 // `S1-CR`: a ratification copy arriving after this client's
                 // session is set is a seat that lacks the others' -- a restarted
                 // client, whose gossipsub copy of ours is a Duplicate for two
@@ -12927,6 +12982,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 // `D-033`: a copy of this seat's own opening among
                                                 // the table's means the previous life signed this
                                                 // hand: it is taken up where it stood, not opened anew.
+                                                // `G11-R` phase D2b: a provisional journal vouches first.
+                                                settle_vouching!(t);
                                                 // `G11-R` phase C: what the journal holds of the hand --
                                                 // the table's own copy of this seat's opening first.
                                                 let own = app_key.verifying_key().to_bytes();
@@ -13280,6 +13337,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // one lets it go, because a latched client is about to
                             // drop the branch the repair is for and rejoin from the
                             // table's copies (`D-038`), which is the repair.
+                            // `G11-R` phase D2b: a provisional journal vouches first.
+                            settle_vouching!(t);
                             let reopened = reopen_hand(
                                 o,
                                 &mut t.hand,
@@ -15206,6 +15265,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let voice = quiet_if_contested(&opening, &t.next_inits);
                         // `S1-LC`: the relays asked for in the hand before carry over.
                         let relay_seats = relay_members(&t.relays, opening.hand_id);
+                        // `G11-R` phase D2b: a provisional journal vouches first.
+                        settle_vouching!(t);
                         begin_hand_with(
                             opening,
                             voice,
@@ -20327,6 +20388,27 @@ fn journal_ahead_as(j: &crate::storage::journal::Handle, sends: &[crate::table::
     }
 }
 
+/// `G11-R` phase D2b: the floor a provisional journal vouches from -- two past
+/// the newest of `sources` (a previous life signed at most the hand after the
+/// newest it could have seen).
+fn vouching_floor(sources: &[u64]) -> u64 {
+    sources.iter().copied().max().unwrap_or(0).saturating_add(2)
+}
+
+/// `G11-R` phase D2b: the hand of `bytes` where it is a frame of this table's
+/// hands signed by `me` -- its signature checked, never a peer's claim.
+fn own_frame_hand(bytes: &[u8], table_id: &[u8; 32], me: &[u8; 32]) -> Option<u64> {
+    if crate::net::chained::sender_of(bytes, TABLE_FRAME_PEEK)? != *me {
+        return None;
+    }
+    let (kind, hand, _) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK).ok()?;
+    if hand == 0 || !of_the_chain(kind) {
+        return None;
+    }
+    crate::net::chained::open_in_hand(bytes, TABLE_FRAME_PEEK, kind, table_id, hand).ok()?;
+    Some(hand)
+}
+
 /// `G11-R`, phase D: an own frame of a hand's chain heard from the table
 /// ([`journal_check_own_as`]).
 fn journal_check_own(j: &crate::storage::journal::Handle, bytes: &[u8]) {
@@ -20365,6 +20447,11 @@ fn journal_check_own_as(j: &crate::storage::journal::Handle, bytes: &[u8], armed
         // there is unknown.
         if let Err(e) = j.mark_uncovered(hand, JOURNAL_WRITE) {
             j.note(format!("hand #{hand}: the signing journal could not mark it uncovered on disk: {e} (G11-R)"));
+        }
+        // Phase D2b (`REFUTE_JOURNAL_D2b` S1): the life that signed it may have
+        // opened the next hand -- covered from two past it, no longer vouching.
+        if let Err(e) = j.raise_unvouched(hand, JOURNAL_WRITE) {
+            j.note(format!("hand #{hand}: the signing journal could not move past it on disk: {e} (G11-R)"));
         }
     } else {
         j.note(format!("hand #{hand}: {why} (G11-R, shadow)"));
@@ -24593,6 +24680,28 @@ mod late_roster_tests {
         assert!(j.lookup(3, 9, &[2; 32]).is_some_and(|e| e.secret.is_none()), "none in another's");
         assert!(j.close(std::time::Duration::from_secs(5)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `G11-R` phase D2b: **the floor is two past the newest source**, and an own
+    /// frame counts only signed by this seat for this table.
+    #[test]
+    fn a_provisional_journal_vouches_two_past_the_newest() {
+        assert_eq!(vouching_floor(&[3, 7, 0, 5]), 9);
+        assert_eq!(vouching_floor(&[]), 2);
+        let me = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let seal = |by: &ed25519_dalek::SigningKey, table: u8, hand_id: u64| {
+            let slot = crate::net::chained::Slot { table_id: [table; 32], hand_id, sequence: 4, previous_event_hash: [2; 32] };
+            crate::net::chained::seal(crate::protocol::messages::EventType::ActionCall, &slot, &0u8, by, 1_000, 30_000, 4096).unwrap()
+        };
+        let mine = me.verifying_key().to_bytes();
+        assert_eq!(own_frame_hand(&seal(&me, 1, 9), &[1; 32], &mine), Some(9));
+        assert_eq!(own_frame_hand(&seal(&other, 1, 9), &[1; 32], &mine), None, "another seat's");
+        assert_eq!(own_frame_hand(&seal(&me, 2, 9), &[1; 32], &mine), None, "another table's");
+        let mut forged = seal(&me, 1, 9);
+        let n = forged.len();
+        forged[n - 1] ^= 1;
+        assert_eq!(own_frame_hand(&forged, &[1; 32], &mine), None, "a signature that does not hold");
     }
 
     /// `G11-R` phase C: **back from a restart, this seat's settlement of the

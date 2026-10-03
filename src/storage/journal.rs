@@ -120,6 +120,14 @@ pub struct Header {
     /// holds: uncovered. Moved forward, durably, before a prune removes anything.
     #[n(4)]
     pub covers_from: u64,
+    /// Phase D2b: whether this journal vouches for every own frame of the hands
+    /// it covers -- every one that left was recorded first. Not where it was
+    /// made new on a resume (the old one lost), by a shadow life (it sends what
+    /// the journal refuses), or read from a header without it (an older
+    /// binary's): such a journal is provisional until its first covered hand is
+    /// set past what a previous life could have signed (`Handle::vouch_from`).
+    #[cbor(n(5), default)]
+    pub vouches: bool,
 }
 
 /// One own signed frame, at its slot key. The key is (hand, sequence, parent)
@@ -442,6 +450,18 @@ impl Files {
             .collect())
     }
 
+    /// Phase D2b: the first covered hand at least `floor` -- and at least what
+    /// this life holds in memory -- and `vouches`, in one header rename.
+    fn vouch(&mut self, floor: u64, vouches: bool) -> io::Result<()> {
+        let mut h = self.header.clone();
+        h.covers_from = h.covers_from.max(floor).max(self.covers_from.load(Ordering::SeqCst));
+        h.vouches = vouches;
+        write_header(&self.dir, &h)?;
+        self.covers_from.fetch_max(h.covers_from, Ordering::SeqCst);
+        self.header = h;
+        Ok(())
+    }
+
     /// `R6`, phase D2: mark `hand` uncovered for good -- a record of another
     /// hand appended to its segment, synced: every reader, of this format or
     /// the first, takes a complete record of another hand as a segment it
@@ -609,6 +629,7 @@ enum Job {
     Write(Vec<Entry>, Reply),
     Prune(u64, Reply),
     Mark(u64, Reply),
+    Vouch(u64, bool, Reply),
     #[cfg(test)]
     Stall(Duration),
     #[cfg(test)]
@@ -646,6 +667,11 @@ pub struct Handle {
     stats: std::sync::Mutex<WriteStats>,
     /// The longest prune's header move, ms, since the last line.
     prune_max: Arc<AtomicU64>,
+    /// Phase D2b: whether the journal vouches ([`Header::vouches`]).
+    vouches: std::sync::atomic::AtomicBool,
+    /// Phase D2b: the floor this life set to vouch from, kept so a retry writes
+    /// the same one and never recedes with the hands this life opens.
+    vouch_floor: std::sync::Mutex<Option<u64>>,
 }
 
 /// The notes a journal keeps for the node at most.
@@ -676,7 +702,10 @@ fn open_files(dir: PathBuf, table_id: [u8; 32], signer: [u8; 32], mode: Mode) ->
             let id = crate::security::rng::array::<16>()
                 .map_err(|e| JournalError::Io(io::Error::other(format!("no randomness for the journal's id: {e}"))))?;
             let past = on_disk.last().map_or(0, |h| h + 1);
-            let h = Header { id, format: JOURNAL_FORMAT, table_id, signer, covers_from: mode.first_covered().max(past) };
+            // Phase D2b: a fresh table's journal vouches from its first hand; one
+            // made new on a resume, or beside segments a lost header left, cannot.
+            let vouches = matches!(mode, Mode::Fresh { .. }) && on_disk.is_empty();
+            let h = Header { id, format: JOURNAL_FORMAT, table_id, signer, covers_from: mode.first_covered().max(past), vouches };
             write_header(&dir, &h)?;
             Ok(h)
         };
@@ -781,7 +810,8 @@ impl Handle {
                     }
                 });
                 let prune_ms = Arc::clone(&prune_max);
-                if opened_tx.send(Ok((id, Arc::clone(&cover), Arc::clone(&shared)))).is_err() {
+                let vouched = files.header.vouches;
+                if opened_tx.send(Ok((id, Arc::clone(&cover), Arc::clone(&shared), vouched))).is_err() {
                     // Nobody waits: the open timed out. The lock goes with `files`.
                     return;
                 }
@@ -830,6 +860,11 @@ impl Handle {
                             done.store(n, Ordering::SeqCst);
                             let _ = reply.send(result);
                         }
+                        Job::Vouch(floor, vouches, reply) => {
+                            let result = files.vouch(floor, vouches).map_err(JournalError::Io);
+                            done.store(n, Ordering::SeqCst);
+                            let _ = reply.send(result);
+                        }
                         Job::Mark(hand, reply) => {
                             let already = shared.read().unwrap_or_else(PoisonError::into_inner).uncovered.contains(&hand);
                             let result = if already || hand < cover.load(Ordering::SeqCst) {
@@ -853,7 +888,7 @@ impl Handle {
                 }
             })
             .map_err(JournalError::Io)?;
-        let (id, covers_from, index) = match opened_rx.recv_timeout(timeout) {
+        let (id, covers_from, index, vouched) = match opened_rx.recv_timeout(timeout) {
             Ok(Ok(opened)) => opened,
             Ok(Err(e)) => return Err(e),
             Err(mpsc::RecvTimeoutError::Timeout) => return Err(JournalError::Timeout),
@@ -874,6 +909,8 @@ impl Handle {
             notes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             stats: std::sync::Mutex::new(WriteStats::default()),
             prune_max: prune_seen,
+            vouches: std::sync::atomic::AtomicBool::new(vouched),
+            vouch_floor: std::sync::Mutex::new(None),
         })
     }
 
@@ -896,6 +933,8 @@ impl Handle {
             notes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             stats: std::sync::Mutex::new(WriteStats::default()),
             prune_max: Arc::new(AtomicU64::new(0)),
+            vouches: std::sync::atomic::AtomicBool::new(false),
+            vouch_floor: std::sync::Mutex::new(None),
         }
     }
 
@@ -915,6 +954,64 @@ impl Handle {
                  frame of it signed by this client (G11-R)"
             ));
         }
+    }
+
+    /// Phase D2b: whether this journal vouches for every own frame of the
+    /// hands it covers ([`Header::vouches`]); `false` is provisional.
+    pub fn vouches(&self) -> bool {
+        !self.refusing && self.vouches.load(Ordering::SeqCst)
+    }
+
+    /// Phase D2b: the newest hand this journal holds anything of.
+    pub fn newest_held(&self) -> Option<u64> {
+        let idx = self.index.read().unwrap_or_else(PoisonError::into_inner);
+        idx.entries.keys().map(|(hand, _, _)| *hand).chain(idx.uncovered.iter().copied()).max()
+    }
+
+    /// Phase D2b: vouch from `floor` -- the first covered hand at least there at
+    /// once in this life, then the header, `vouches` with it, in one rename.
+    /// The first floor this life asked for stands for the life: asked again
+    /// (the write failed), the same one is written.
+    pub fn vouch_from(&self, floor: u64, timeout: Duration) -> Result<u64, JournalError> {
+        if self.refusing {
+            return Err(JournalError::Uncovered);
+        }
+        let floor = *self.vouch_floor.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(floor);
+        self.covers_from.fetch_max(floor, Ordering::SeqCst);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let n = self.send(Job::Vouch(floor, true, reply_tx))?;
+        self.wait(n, &reply_rx, timeout, false)?;
+        self.vouches.store(true, Ordering::SeqCst);
+        Ok(floor)
+    }
+
+    /// Phase D2b: no longer vouch -- a shadow life, which sends what the
+    /// journal refuses -- at once in this life, and in the header.
+    pub fn unvouch(&self, timeout: Duration) -> Result<(), JournalError> {
+        self.vouches.store(false, Ordering::SeqCst);
+        if self.refusing {
+            return Ok(());
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let n = self.send(Job::Vouch(0, false, reply_tx))?;
+        self.wait(n, &reply_rx, timeout, false)
+    }
+
+    /// Phase D2b (`REFUTE_JOURNAL_D2b` S1): an own frame of hand `hand` signed
+    /// somewhere this journal never saw -- the life that signed it may have
+    /// opened the next: covered from `hand + 2` at once, no longer vouching,
+    /// and the next hand opened sets the floor again.
+    pub fn raise_unvouched(&self, hand: u64, timeout: Duration) -> Result<(), JournalError> {
+        let floor = hand.saturating_add(2);
+        self.vouches.store(false, Ordering::SeqCst);
+        *self.vouch_floor.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.covers_from.fetch_max(floor, Ordering::SeqCst);
+        if self.refusing {
+            return Ok(());
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let n = self.send(Job::Vouch(floor, false, reply_tx))?;
+        self.wait(n, &reply_rx, timeout, false)
     }
 
     /// Phase D2 (`REFUTE_JOURNAL_D2` M4): the hands sat out -- carried to the
@@ -1324,6 +1421,61 @@ mod tests {
         } else {
             assert!(notes.is_empty());
         }
+    }
+
+    /// Phase D2b: **a journal vouches only where nothing could have been signed
+    /// unrecorded** -- a fresh table's from its first hand; one made new on a
+    /// resume, or read from a header without the field, is provisional; vouching
+    /// moves the floor in memory at once and durably with the flag, the first
+    /// floor standing for the life; unvouching and rule 2's raise clear it.
+    #[test]
+    fn a_journal_vouches_only_where_nothing_was_signed_unrecorded() {
+        let p = temp_profile("vouch");
+        let j = open(&p, 1);
+        assert!(j.vouches(), "a fresh table's");
+        j.write(vec![entry(3, 3, 7)], T).unwrap();
+        assert_eq!(j.newest_held(), Some(3));
+        j.unvouch(T).unwrap();
+        assert!(!j.vouches(), "a shadow life");
+        assert!(j.close(T));
+        let j = open(&p, 1);
+        assert!(!j.vouches(), "read back provisional");
+        assert_eq!(j.vouch_from(6, T).unwrap(), 6);
+        assert!(j.vouches() && j.covers_from() == 6 && j.is_uncovered(5) && !j.is_uncovered(6));
+        assert_eq!(j.vouch_from(9, T).unwrap(), 6, "the first floor stands for the life");
+        j.raise_unvouched(7, T).unwrap();
+        assert!(!j.vouches() && j.covers_from() == 9, "rule 2: two past the hand");
+        assert!(j.close(T));
+        let j = open(&p, 1);
+        assert!(!j.vouches() && j.covers_from() == 9, "durably");
+        assert!(j.close(T));
+        // A resume that finds no journal: provisional.
+        let q = temp_profile("vouch-resume");
+        let j = Handle::open_with(&q, [1; 32], [2; 32], Mode::Resume { newest_seen: 4 }, T).unwrap();
+        assert!(!j.vouches());
+        assert!(j.close(T));
+        // A header written before the field: provisional, its id kept.
+        let dir = journal_dir(&q, &[1; 32]);
+        #[derive(minicbor::Encode)]
+        struct OldHeader {
+            #[cbor(n(0), with = "minicbor::bytes")]
+            id: [u8; 16],
+            #[n(1)]
+            format: u16,
+            #[cbor(n(2), with = "minicbor::bytes")]
+            table_id: [u8; 32],
+            #[cbor(n(3), with = "minicbor::bytes")]
+            signer: [u8; 32],
+            #[n(4)]
+            covers_from: u64,
+        }
+        let old = OldHeader { id: [5; 16], format: JOURNAL_FORMAT, table_id: [1; 32], signer: [2; 32], covers_from: 6 };
+        fs::write(dir.join("header"), minicbor::to_vec(&old).unwrap()).unwrap();
+        let j = Handle::open_with(&q, [1; 32], [2; 32], Mode::Resume { newest_seen: 4 }, T).unwrap();
+        assert!(!j.vouches() && j.id() == [5; 16] && j.covers_from() == 6, "an older binary's header");
+        assert!(j.close(T));
+        let _ = fs::remove_dir_all(&p);
+        let _ = fs::remove_dir_all(&q);
     }
 
     /// Phase D2 (`R6`): **a hand marked uncovered stays so for every later life**
