@@ -12820,6 +12820,26 @@ impl Hand {
         self.genesis_note.take()
     }
 
+    /// `S1-LN`: whether this client's hand ended by an abort at a stage -- its
+    /// own give-up for want of a frame, or an abort it took -- and the same hand
+    /// then named it in a whole certificate about a LATER stage: the table went
+    /// on past that stage, and counted this client absent after. A rogue pair
+    /// that keeps a frame from two honest seats makes one give up first and the
+    /// other go on (`S1-LN`, `RETRACE_S1LN_v2`); one that sends a seat a second,
+    /// failing version has it end the hand alone (`S1-LJ`, `S1-LH`). Nothing the
+    /// table holds tells that seat from a rogue that ends a hand on purpose, so
+    /// it is the player who is told (`no_progress_reason`). At three seats or
+    /// more.
+    pub fn named_after_giving_up(&self) -> bool {
+        if self.aborted().is_none() {
+            return false;
+        }
+        // The slot never moves once the hand is given up: the stage it ended at.
+        let at = self.slot.sequence;
+        let me = self.open.my_seat;
+        self.mine.dealt_in.len() >= 3 && self.completed.named.iter().any(|(seat, stage)| *seat == me && *stage > at)
+    }
+
     /// Whether a certificate banked after this hand's abort terminal since
     /// the last time this was asked: the next hand's roster is to be
     /// re-derived through [`next_hand`](Hand::next_hand).
@@ -26587,6 +26607,35 @@ mod tests {
         assert!(said[1].iter().any(|f| kind_of(f) == Some(EventType::ShuffleStep)), "a step of this life's");
         assert!(hands[0].over() && hands[1].over(), "played out");
         assert_eq!(hands[0].terminal(), hands[1].terminal());
+    }
+
+    /// `S1-LN`: **a seat whose hand ended by an abort and was then named for a
+    /// later stage of it is told** -- its own give-up or an abort it took, only a
+    /// certificate about a stage after the one it ended at, at three seats or
+    /// more.
+    #[test]
+    fn a_seat_named_after_giving_up_is_told() {
+        let (mut hands, keys) = three_to_the_bet();
+        let me = hands[0].open.my_seat;
+        let at = hands[0].slot().sequence;
+        assert!(!hands[0].named_after_giving_up(), "nothing ended");
+        hands[0].completed.named.insert((me, at + 2));
+        assert!(!hands[0].named_after_giving_up(), "named, the hand not ended here");
+        hands[0].completed.named.clear();
+        let _ = hands[0].abort_now(Abort::Deadline, &keys[0], NOW).unwrap();
+        assert!(!hands[0].named_after_giving_up(), "given up, named for nothing");
+        hands[0].completed.named.insert((me, at));
+        assert!(!hands[0].named_after_giving_up(), "named for the stage it gave up at: its own absence");
+        hands[0].completed.named.insert((me + 1, at + 3));
+        assert!(!hands[0].named_after_giving_up(), "another seat named");
+        hands[0].completed.named.insert((me, at + 2));
+        assert!(hands[0].named_after_giving_up(), "named for a later stage");
+        // An abort it took counts as one it said: the hand ended here all the
+        // same while the table went on.
+        hands[1].give_up(Abort::Told { cause: 2 });
+        let other = hands[1].open.my_seat;
+        hands[1].completed.named.insert((other, hands[1].slot().sequence + 2));
+        assert!(hands[1].named_after_giving_up(), "an abort it took");
     }
 
     /// What the survivor says again to a seat back from a restart: the frames

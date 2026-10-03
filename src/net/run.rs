@@ -1432,6 +1432,10 @@ struct TableRun {
     /// ended without being played out (a bit each, the latest lowest), and the
     /// last hand counted.
     voided_recent: (u8, Option<u64>),
+    /// `S1-LN`: the hands this client's hand ended by an abort at a stage the
+    /// table went on from, and was then named for a later stage of
+    /// (`Hand::named_after_giving_up`), its own line up -- the last few.
+    named_after_give_up: std::collections::BTreeSet<u64>,
     /// `S1-JR`: the seats a hand here was voided over for a proof that does not
     /// hold, by application key -- the seat, the cause, and whether this
     /// client's own check found it.
@@ -2028,6 +2032,7 @@ impl TableRun {
             unsafe_held_at: None,
             overlong: Vec::new(),
             voided_recent: (0, None),
+            named_after_give_up: std::collections::BTreeSet::new(),
             cheats: std::collections::BTreeMap::new(),
             equivocators: std::collections::BTreeMap::new(),
             back_from_restart: std::collections::BTreeMap::new(),
@@ -4832,6 +4837,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.unsafe_held_at = None;
             $t.overlong.clear();
             $t.voided_recent = (0, None);
+            $t.named_after_give_up.clear();
             $t.cheats.clear();
             $t.equivocators.clear();
             $t.back_from_restart.clear();
@@ -13192,6 +13198,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning(note)).await;
                         }
                     }
+                    // `S1-LN`: a hand given up for want of a frame and then named
+                    // for a later stage of it -- the running one or the retained.
+                    for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
+                        // Not while this client's own line was down -- the hand's
+                        // word, frozen at its end, or the node's own verdict since.
+                        if h.named_after_giving_up()
+                            && !h.line_down_recently()
+                            && !line_down_within(t.line_down_at)
+                            && t.named_after_give_up.insert(h.hand_id())
+                        {
+                            let floor = h.hand_id().saturating_sub(8);
+                            t.named_after_give_up.retain(|k| *k >= floor);
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{}: this seat's hand ended at a step the table went on from, and the table then counted this seat absent for a later step (S1-LN)",
+                                    h.hand_id()
+                                )))
+                                .await;
+                        }
+                    }
                     // `G11-R` phase C: what the hand took from the journal -- the
                     // running one, or the retained one it moved to before the tick.
                     for h in [t.hand.as_mut(), t.previous.as_mut()].into_iter().flatten() {
@@ -16970,6 +16996,18 @@ fn group_locked_words(peer_limit: Option<u16>, password: bool) -> String {
     )
 }
 
+/// `S1-LN`: this many hands of the last five that this client's hand ended by
+/// an abort at a stage the table went on from, then named for a later stage of,
+/// make the table not safe.
+const NAMED_AFTER_GIVE_UP_LIMIT: usize = 2;
+
+/// `S1-LN`: whether `named` holds `NAMED_AFTER_GIVE_UP_LIMIT` hands within the
+/// last five of the running one, `hand_now` -- nothing without a running hand,
+/// or the window asked about hands long past (a rejoin, a seat outside).
+fn named_twice_lately(named: &std::collections::BTreeSet<u64>, hand_now: u64) -> bool {
+    hand_now != 0 && named.iter().filter(|k| **k <= hand_now && hand_now - **k < 5).count() >= NAMED_AFTER_GIVE_UP_LIMIT
+}
+
 /// `S1-JR`: this many of the last five hands called off before they were
 /// played out make the table not safe -- a rate and not a run, so a rogue that
 /// lets a hand through now and then is still counted.
@@ -17494,6 +17532,14 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             "{} sent two different versions of one step in more than one recent hand: the players can end up in different games.",
             seat_called(t, *seat)
         ));
+    }
+    // `S1-LN`: twice within the last five hands this client ended a hand the
+    // table went on with, and was counted absent for a later stage of it.
+    if named_twice_lately(&t.named_after_give_up, hand_now) {
+        return Some(
+            "twice in the last five hands your client ended a hand at a step the other players went on from, and was then counted absent for a later step: a player may be keeping frames from your client, or sending it a version the others did not get, to have it put out of the game -- or your line keeps failing."
+                .to_string(),
+        );
     }
     // Counted at hands of three seats or more only, and cleared by one of two.
     if t.voided_recent.0.count_ones() >= VOIDED_LIMIT {
@@ -25597,6 +25643,24 @@ mod a_joiner_before_the_first_hand {
         assert_eq!(origin_rank(&origin, &[32u8; 32], &renamed), None, "seat 2's table of another name");
         let founders_other = TableAd::sng(6, "Table".into(), [1u8; 32], vec![1], now);
         assert_eq!(origin_rank(&origin, &[11u8; 32], &founders_other), None, "the origin's founder's other table");
+    }
+
+    /// `S1-LN`: **twice in five hands named after the hand ended is not safe**
+    /// -- once is not, nor two hands five apart, nor anything without a running
+    /// hand.
+    #[test]
+    fn named_twice_after_giving_up_is_not_safe() {
+        let named: std::collections::BTreeSet<u64> = [3u64].into_iter().collect();
+        assert!(!named_twice_lately(&named, 4), "once");
+        let named: std::collections::BTreeSet<u64> = [3u64, 9].into_iter().collect();
+        assert!(!named_twice_lately(&named, 9), "six apart");
+        let named: std::collections::BTreeSet<u64> = [3u64, 7, 9].into_iter().collect();
+        assert!(named_twice_lately(&named, 10), "twice in five");
+        assert!(!named_twice_lately(&named, 0), "no running hand: nothing");
+        assert!(!named_twice_lately(&named, 40), "long past");
+        // And the window's words carry it.
+        let src = include_str!("run.rs");
+        assert!(src.contains("if named_twice_lately(&t.named_after_give_up, hand_now) {"));
     }
 
     /// `S1-GX`: a founder whose own line was cut gave every seat back once its
