@@ -12916,6 +12916,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 // `D-033`: a copy of this seat's own opening among
                                                 // the table's means the previous life signed this
                                                 // hand: it is taken up where it stood, not opened anew.
+                                                // `G11-R` phase C: what the journal holds of the hand --
+                                                // the table's own copy of this seat's opening first.
+                                                let own = app_key.verifying_key().to_bytes();
+                                                let table_copy = copies
+                                                    .iter()
+                                                    .find(|c| crate::net::chained::sender_of(c, TABLE_FRAME_PEEK) == Some(own))
+                                                    .filter(|_| signers.contains(&o.my_seat))
+                                                    .cloned();
+                                                let view = journal_view(t.journal.as_ref(), hid).with_table_opening(table_copy.as_deref());
                                                 let signed_before = signers.contains(&o.my_seat);
                                                 let kept: Option<[u8; 32]> = t.resume
                                                     .as_ref()
@@ -12936,6 +12945,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         o.required.sort_unstable();
                                                     }
                                                 }
+                                                // `G11-R` phase C: or this seat's journal holds its
+                                                // opening of the hand at this genesis, the body it
+                                                // derives -- recorded, and maybe never sent: the
+                                                // restoring road says it. Asked of the opening as
+                                                // it is opened.
+                                                let signed_before = signed_before || view.takes_opening(&o);
                                                 let deadline = o.crypto_step_timeout_ms;
                                                 let seat = o.my_seat;
                                                 // A member's opening goes out; a bystander's
@@ -12970,7 +12985,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         deadline,
                                                         crate::table::hand::Voice::Speak,
                                                         signed_before.then_some(kept),
-                                                        journal_view(t.journal.as_ref(), hid),
+                                                        view,
                                                     )
                                                 };
                                                 match opened {
@@ -12978,8 +12993,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         // `D-066`: told before its copies, which may
                                                         // carry a certificate naming this seat.
                                                         h.note_line_down_recently(line_down_within(t.line_down_at));
-                                                        if member && !signed_before {
+                                                        // `G11-R` phase C: a restored opening from the journal
+                                                        // goes out too; one from the wire is none of these.
+                                                        if member {
                                                             publish_hand(opening_sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
+                                                        }
+                                                        if let Some(line) = journal_bystander(t.journal.as_ref(), &h) {
+                                                            let _ = events.send(NodeEvent::Warning(line)).await;
                                                         }
                                                         for c in &copies {
                                                             match h.on_event(c, &app_key, now) {
@@ -13170,6 +13190,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(j) = t.journal.as_ref() {
                         for note in j.take_notes() {
                             let _ = events.send(NodeEvent::Warning(note)).await;
+                        }
+                    }
+                    // `G11-R` phase C: what the hand took from the journal -- the
+                    // running one, or the retained one it moved to before the tick.
+                    for h in [t.hand.as_mut(), t.previous.as_mut()].into_iter().flatten() {
+                        let n = h.take_journal_taken();
+                        if n > 0 {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{}: {n} frame(s) of this seat's own taken from its signing journal (G11-R)",
+                                    h.hand_id()
+                                )))
+                                .await;
                         }
                     }
                     // Retention ends when the running hand leaves stage 0: from
@@ -14842,6 +14875,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);
                         }
                     }
+                    // fault-harness: the `unsent` crash point ends here, whatever
+                    // the record did.
+                    crash_at_the_boundary(h.hand_id());
                 }
                 // `S1-CR`: a resumed client still outside the roster derives
                 // nothing. Its `required` is the set that signed the copies it
@@ -19065,6 +19101,9 @@ async fn reopen_hand(
     let view = journal_view(journal, opening.hand_id);
     match Hand::open_journaled(opening, app_key, now, deadline, voice, None, view) {
         Ok((mut h, sends)) => {
+            if let Some(line) = journal_bystander(journal, &h) {
+                let _ = events.send(NodeEvent::Warning(line)).await;
+            }
             // `D-066`: the old hand's word, before the held events replay.
             h.note_line_down_recently(old.line_down_recently());
             purge_hand_from_said(said, h.hand_id());
@@ -19157,6 +19196,9 @@ async fn begin_hand_with(
     let view = journal_view(journal, opening.hand_id);
     match Hand::open_journaled(opening, app_key, now, deadline, voice, None, view) {
         Ok((mut h, sends)) => {
+            if let Some(line) = journal_bystander(journal, &h) {
+                let _ = events.send(NodeEvent::Warning(line)).await;
+            }
             // `D-066`: before the early copies replay -- a certificate among
             // them may name this seat.
             h.note_line_down_recently(line_down);
@@ -19837,18 +19879,31 @@ fn publish_hand(
     // about the hand speaks for a branch nobody is on. Not in the control build
     // (`P2P_POKER_CONTROL=g11r`), which has no journal.
     let journal = journal.filter(|_| !crate::table::hand::control("g11r"));
-    // fault-harness, `G11-R` phase B2: a crash point this batch reaches.
-    let crash = crash_point().filter(|(kind, _, from)| {
-        sends.iter().any(|crate::table::hand::Send::Broadcast(b)| {
-            crate::net::chained::peek(b, TABLE_FRAME_PEEK).is_ok_and(|(k, h, _)| k == *kind && h >= *from)
-        })
+    // fault-harness, `G11-R` phase B2: the crash point this batch reaches -- the
+    // first batch to reach it, alone -- with the hand of its frame.
+    let crash = crash_point().and_then(|(kind, when, from)| {
+        let hand = sends.iter().find_map(|crate::table::hand::Send::Broadcast(b)| {
+            crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok().filter(|(k, h, _)| *k == kind && *h >= from).map(|(_, h, _)| h)
+        })?;
+        (!CRASH_FIRED.swap(true, std::sync::atomic::Ordering::SeqCst)).then_some((kind, when, hand))
     });
     if let Some(j) = journal {
         journal_ahead(j, &sends);
     }
-    if crash.is_some_and(|(_, sent, _)| !sent) {
+    if let Some((kind, CRASH_SYNCED, hand)) = crash {
+        eprintln!("fault-harness: crash point {kind:?}:synced at hand #{hand} -- the process ends here (G11-R B2)");
         std::process::exit(86);
     }
+    // `unsent`: the batch never leaves -- nor waits in `said` -- and the process
+    // ends once its hand's boundary record is written (`crash_at_the_boundary`).
+    let unsent = match crash {
+        Some((kind, CRASH_UNSENT, hand)) => {
+            CRASH_AT_BOUNDARY.store(hand, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("fault-harness: crash point {kind:?}:unsent at hand #{hand} -- kept from the wire, the process ends at the hand's boundary (G11-R B2)");
+            true
+        }
+        _ => false,
+    };
     for crate::table::hand::Send::Broadcast(out) in sends {
         if journal.is_some_and(|j| sat_out(j, &out)) {
             continue;
@@ -19885,6 +19940,9 @@ fn publish_hand(
             }
             arm_the_mute(kind);
         }
+        if unsent {
+            continue;
+        }
         let down = nothing_leaves();
         if down {
             // Nothing leaves. It is still put in `said`, because `said` is the
@@ -19915,7 +19973,8 @@ fn publish_hand(
             said.push(out);
         }
     }
-    if crash.is_some_and(|(_, sent, _)| sent) {
+    if let Some((kind, CRASH_SENT, hand)) = crash {
+        eprintln!("fault-harness: crash point {kind:?}:sent at hand #{hand} -- the process ends here (G11-R B2)");
         std::process::exit(86);
     }
 }
@@ -20022,31 +20081,53 @@ const JOURNAL_OPEN: std::time::Duration = std::time::Duration::from_millis(2_000
 const JOURNAL_WRITE: std::time::Duration = std::time::Duration::from_millis(1_500);
 const JOURNAL_CLOSE: std::time::Duration = std::time::Duration::from_millis(2_000);
 
-/// fault-harness, `G11-R` phase B2: `P2P_POKER_CRASH_AT=<kind>:<synced|sent>` --
-/// a kind as the protocol's type names it (`DeckInit`, `ActionCall`, ...) -- and
-/// `P2P_POKER_CRASH_HAND=<n>` (2 when unset): this process ends at once, no
+/// fault-harness, `G11-R` phase B2: `P2P_POKER_CRASH_AT=<kind>:<synced|sent|unsent>`
+/// -- a kind as the protocol's type names it (`DeckInit`, `ActionCall`, ...) --
+/// and `P2P_POKER_CRASH_HAND=<n>` (2 when unset): this process ends at once, no
 /// goodbye, the first time it publishes a frame of that kind of a hand from `n`
-/// on, once its journal holds it (`synced`) or once it is said (`sent`) -- the
-/// crash points of the restart beds. `None` in every build without the feature.
-fn crash_point() -> Option<(crate::protocol::messages::EventType, bool, u64)> {
+/// on, once its journal holds it (`synced`) or once it is said (`sent`); or
+/// (`unsent`) that batch never leaves and the process ends once the hand's
+/// boundary record is written -- a settlement published while the link was
+/// down. The crash points of the restart beds; `None` in every build without
+/// the feature.
+fn crash_point() -> Option<(crate::protocol::messages::EventType, u8, u64)> {
     if !cfg!(feature = "fault-harness") {
         return None;
     }
-    static POINT: std::sync::OnceLock<Option<(crate::protocol::messages::EventType, bool, u64)>> = std::sync::OnceLock::new();
+    static POINT: std::sync::OnceLock<Option<(crate::protocol::messages::EventType, u8, u64)>> = std::sync::OnceLock::new();
     *POINT.get_or_init(|| {
         let at = std::env::var("P2P_POKER_CRASH_AT").ok()?;
         let (name, when) = at.trim().split_once(':')?;
-        let sent = match when {
-            "synced" => false,
-            "sent" => true,
+        let when = match when {
+            "synced" => CRASH_SYNCED,
+            "sent" => CRASH_SENT,
+            "unsent" => CRASH_UNSENT,
             _ => return None,
         };
         let from = std::env::var("P2P_POKER_CRASH_HAND").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2);
         (0u16..=0x0fff)
             .filter_map(|c| crate::protocol::messages::EventType::try_from(c).ok())
             .find(|k| format!("{k:?}") == name)
-            .map(|k| (k, sent, from))
+            .map(|k| (k, when, from))
     })
+}
+
+/// fault-harness, `G11-R` phase B2: the crash points' moments.
+const CRASH_SYNCED: u8 = 0;
+const CRASH_SENT: u8 = 1;
+const CRASH_UNSENT: u8 = 2;
+/// fault-harness: the crash point fired (once a process).
+static CRASH_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// fault-harness: the hand whose boundary ends the process (`unsent`), 0 for none.
+static CRASH_AT_BOUNDARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// fault-harness, `G11-R` phase B2: the `unsent` crash point's end -- the
+/// process ends once its hand's boundary record is written.
+fn crash_at_the_boundary(hand: u64) {
+    if cfg!(feature = "fault-harness") && hand != 0 && CRASH_AT_BOUNDARY.load(std::sync::atomic::Ordering::SeqCst) == hand {
+        eprintln!("fault-harness: crash point at hand #{hand}'s boundary, its record written -- the process ends here (G11-R B2)");
+        std::process::exit(86);
+    }
 }
 
 /// `G11-R`, phase D: whether a refused frame sits its hand out (armed) or is
@@ -20086,6 +20167,17 @@ fn journal_view(j: Option<&crate::storage::journal::Handle>, hand: u64) -> crate
                 .collect(),
         ),
     }
+}
+
+/// `G11-R` phase C: a hand this seat opened as a bystander -- its journal holds
+/// another opening of it, or cannot vouch for it while armed -- sat out armed
+/// (nothing of it leaves), and the line to say.
+fn journal_bystander(j: Option<&crate::storage::journal::Handle>, h: &crate::table::hand::Hand) -> Option<String> {
+    let why = h.journal_bystander()?;
+    if let Some(j) = j.filter(|_| journal_armed()) {
+        j.silence(h.hand_id(), why);
+    }
+    Some(format!("hand #{}: this seat signs nothing in it -- {why} (G11-R)", h.hand_id()))
 }
 
 /// `G11-R` phase C: on a resume, this seat's own settlement of the session

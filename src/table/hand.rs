@@ -1240,6 +1240,204 @@ enum Journaled {
     Refused,
 }
 
+impl JournalView {
+    /// `G11-R` phase C: whether a hand opened from `o` takes this client's
+    /// opening from the journal -- at `o`'s genesis, the body this client derives
+    /// (`opening_from_journal`'s `Taken`): a previous life signed the hand there.
+    pub fn takes_opening(&self, o: &Opening) -> bool {
+        let Some(me) = o.seats.iter().find(|(s, _, _)| *s == o.my_seat).map(|(_, k, _)| *k) else {
+            return false;
+        };
+        derive_init(o).is_ok_and(|mine| {
+            matches!(opening_from_journal(self, o, &mine, &me, true, Voice::Speak, true), JournalOpening::Taken(_))
+        })
+    }
+
+    /// `G11-R` phase C: the view with this client's openings set aside but the
+    /// one the table holds (`copy`, its own frame among the table's): the table's
+    /// copy is what stage 0 heard; another journaled beside it would be heard and
+    /// said as this seat's, a second version (`REVIEW_JOURNAL_C3_impl` 2).
+    pub fn with_table_opening(self, copy: Option<&[u8]>) -> Self {
+        match (self, copy) {
+            (JournalView::Covered(frames), Some(copy)) => {
+                JournalView::Covered(frames.into_iter().filter(|f| f.sequence != 0 || f.frame == copy).collect())
+            }
+            (view, _) => view,
+        }
+    }
+}
+
+/// `G11-R` phase C: what this client's journal says of its opening of the hand
+/// being opened.
+enum JournalOpening {
+    /// Nothing journaled at stage 0 at this genesis, or no journal: the
+    /// opening is signed as it always was. An opening of the hand journaled at
+    /// another genesis only is no bar: the journal's key -- and the one `G11`
+    /// proves equivocation by -- is the exact slot (hand, sequence, parent), so
+    /// two openings at two geneses are two branches, not two versions; a seat
+    /// back on the table's branch after a divergence (`D-038`, `D-039`) plays
+    /// the hand as master did.
+    Fresh,
+    /// Its opening at this very genesis, the body this client derives now:
+    /// taken, not signed again.
+    Taken(Vec<u8>),
+    /// Another body at this very genesis -- a second version wherever the
+    /// first was taken -- or, armed, signing anew, a journal that cannot vouch
+    /// for the hand: this seat signs nothing in it.
+    Bystander(&'static str),
+}
+
+/// The body of this client's `HAND_INIT` for the hand `o` opens -- positions,
+/// dealt-in seats, stacks -- derived, and checked against itself.
+fn derive_init(o: &Opening) -> Result<HandInit, Failed> {
+        let occupied: Vec<SeatIdx> = o.seats.iter().map(|(s, _, _)| *s).collect();
+        let button = o
+            .button
+            .unwrap_or_else(|| provisional_button(&o.session_id, &occupied));
+        // Keyed on **chips**, not on occupancy. A busted seat is still an
+        // occupied seat, so "two seats at the table" and "two players with
+        // chips" part company the moment somebody busts — and heads-up is a
+        // rule about the second of those.
+        let mut alive = vec![false; usize::from(o.max_players)];
+        for (seat, _, stack) in &o.seats {
+            let Some(slot) = alive.get_mut(usize::from(*seat)) else {
+                return Err(Failed::NotAtThisTable);
+            };
+            *slot = *stack > 0;
+        }
+        // `S1-KV`: the positions the previous hand's rotation laid out -- TDA
+        // 32's dead button and dead small blind with them -- where they still
+        // fit; laid out from the button alone only for the first hand. Laid out
+        // again every hand, a big blind that busted moved the blinds past a
+        // seat, which skipped the big blind.
+        let Positions {
+            button,
+            small_blind: sb_position,
+            big_blind: bb_seat,
+        } = o
+            .blinds
+            .and_then(|(sb, bb)| carried_positions(button, sb, bb, &alive, o.max_players))
+            .or_else(|| initial_positions(button, &alive, o.max_players))
+            .ok_or(Failed::NotInThisStage)?;
+
+        let mine = HandInit {
+            // `S1-KT`: the engine this client decides the hand by (`D-093`).
+            engine: crate::protocol::constants::engine_id(),
+            hand_id: o.hand_id,
+            button_position: button,
+            sb_position,
+            bb_seat,
+            level: o.level,
+            small_blind: o.small_blind,
+            big_blind: o.big_blind,
+            ante: 0,
+            // **Who took part, not who is sitting there.**
+            //
+            // `STATE_MACHINE.md` §5.3 step 4: `dealt_in` is the seats that are
+            // active *and* in `signed_this_hand`, with chips. The required set
+            // this hand was opened with **is** that — for hand one it is the
+            // signers of `TABLE_READY`, and for every hand after it is `P(k-1)`
+            // (D-013) — so this filters it by chips and nothing more.
+            //
+            // Dealing in whoever happens to occupy a seat was the defect that
+            // made one disconnection kill a whole table rather than cost one
+            // hand: an absent seat stayed a **required** contributor of a deck
+            // key and a shuffle, so every subsequent hand stalled to the hand
+            // deadline, for ever. It still pays blinds from its position, which
+            // is what a tournament's dead money is and is handled by
+            // `post_blinds` reading the stack rather than the deal.
+            // A seat that has burned its reconnection allowance is not
+            // dealt back in, however present it becomes. Its stack stays and
+            // the blinds keep taking it, which is the tournament's answer to a
+            // seat nobody can play against — and it can earn its way back in
+            // by being present for [`REPLENISH_AFTER`] hands.
+            dealt_in: {
+                let mut d: Vec<SeatIdx> = o
+                    .required
+                    .iter()
+                    .copied()
+                    .filter(|s| {
+                        o.seats
+                            .iter()
+                            .any(|(seat, _, stack)| seat == s && *stack > 0)
+                            && o.grace.get(usize::from(*s)).copied().unwrap_or(0) > 0
+                    })
+                    .collect();
+                d.sort_unstable();
+                d.dedup();
+                d
+            },
+            stacks: o.seats.iter().map(|(_, _, stack)| *stack).collect(),
+            roster_hash: o.roster_hash,
+            // A buy-in enters the ledger here and nowhere earlier, which is
+            // what makes an abandoned formation move no chips (§4.3).
+            ledger_delta: o
+                .seats
+                .iter()
+                .map(|(seat, _, stack)| (*seat, *stack as i64))
+                .collect(),
+        };
+        mine.self_consistent(o.max_players)
+            .map_err(|what| Failed::Disagrees {
+                seat: o.my_seat,
+                what,
+            })?;
+        Ok(mine)
+}
+
+/// `G11-R` phase C: [`JournalOpening`] for this seat's opening `mine` of `o`.
+fn opening_from_journal(
+    view: &JournalView,
+    o: &Opening,
+    mine: &HandInit,
+    me: &[u8; 32],
+    restoring: bool,
+    voice: Voice,
+    a_member: bool,
+) -> JournalOpening {
+    // A seat in no `R` of the hand signs nothing at stage 0 whatever its
+    // journal says -- and its sit-in must leave (`REVIEW_JOURNAL_C3_impl` 4).
+    if !a_member {
+        return JournalOpening::Fresh;
+    }
+    let frames = match view {
+        JournalView::None | JournalView::Uncovered { armed: false } => return JournalOpening::Fresh,
+        // A restoring hand takes its opening from the wire, and signs nothing
+        // anew until its restore ends -- where the journal refuses it, armed.
+        JournalView::Uncovered { armed: true } if restoring => return JournalOpening::Fresh,
+        JournalView::Uncovered { armed: true } => {
+            return JournalOpening::Bystander("its signing journal cannot vouch for the hand")
+        }
+        JournalView::Covered(frames) => frames,
+    };
+    let openings: Vec<&JournaledFrame> = frames
+        .iter()
+        .filter(|f| {
+            f.sequence == 0
+                && chained::peek(&f.frame, PEEK_CAP).is_ok_and(|(k, h, s)| k == EventType::HandInit && h == o.hand_id && s == 0)
+                && chained::sender_of(&f.frame, FRAME_CAP) == Some(*me)
+                && chained::parent_of(&f.frame, FRAME_CAP) == Some(f.parent)
+        })
+        .collect();
+    if openings.is_empty() {
+        return JournalOpening::Fresh;
+    }
+    // The exact one wins where two lives left both.
+    match openings.iter().find(|f| f.parent == o.genesis) {
+        Some(f) => match chained::payload_unverified::<HandInit>(&f.frame, FRAME_CAP, HAND_INIT_CAP) {
+            Some(theirs) if mine.disagreement(&theirs).is_ok() => JournalOpening::Taken(f.frame.clone()),
+            _ => JournalOpening::Bystander("its signing journal holds another opening of the hand at this genesis"),
+        },
+        // S1-BS's muted re-open: it spoke at another genesis, and its unsent
+        // opening here closed its own stage 0 and sent its deck key at a parent
+        // nobody holds (`REFUTE_JOURNAL_D` A4).
+        None if voice == Voice::Muted => {
+            JournalOpening::Bystander("its signing journal holds its spoken opening of the hand at another genesis")
+        }
+        None => JournalOpening::Fresh,
+    }
+}
+
 /// `G11-R` phase C: one of this client's own frames of the hand being opened,
 /// as its signing journal holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2702,6 +2900,12 @@ pub struct Hand {
     /// `G11-R` phase C: the deck secrets journaled with this seat's own
     /// `DECK_INIT`s, by the frame's (sequence, parent).
     journal_secrets: BTreeMap<(u64, Hash), [u8; 32]>,
+    /// `G11-R` phase C: why this seat signs nothing in this hand, where its
+    /// journal makes it a bystander ([`JournalOpening::Bystander`]).
+    journal_bystander: Option<&'static str>,
+    /// `G11-R` phase C: own frames taken from the journal since the node last
+    /// asked -- the bed's coverage.
+    journal_taken: u32,
     /// `D-033`: no secret for this hand (none kept, or not this hand's): the
     /// hand can be followed and folded, not played out -- no share of this
     /// seat's is ever made, its cards are not read, and at a showdown it mucks.
@@ -2846,98 +3050,7 @@ impl Hand {
         let restoring = restore.is_some();
         let fold_only = matches!(restore, Some(None));
         let restored_secret = restore.flatten();
-        let occupied: Vec<SeatIdx> = o.seats.iter().map(|(s, _, _)| *s).collect();
-        let button = o
-            .button
-            .unwrap_or_else(|| provisional_button(&o.session_id, &occupied));
-        // Keyed on **chips**, not on occupancy. A busted seat is still an
-        // occupied seat, so "two seats at the table" and "two players with
-        // chips" part company the moment somebody busts — and heads-up is a
-        // rule about the second of those.
-        let mut alive = vec![false; usize::from(o.max_players)];
-        for (seat, _, stack) in &o.seats {
-            let Some(slot) = alive.get_mut(usize::from(*seat)) else {
-                return Err(Failed::NotAtThisTable);
-            };
-            *slot = *stack > 0;
-        }
-        // `S1-KV`: the positions the previous hand's rotation laid out -- TDA
-        // 32's dead button and dead small blind with them -- where they still
-        // fit; laid out from the button alone only for the first hand. Laid out
-        // again every hand, a big blind that busted moved the blinds past a
-        // seat, which skipped the big blind.
-        let Positions {
-            button,
-            small_blind: sb_position,
-            big_blind: bb_seat,
-        } = o
-            .blinds
-            .and_then(|(sb, bb)| carried_positions(button, sb, bb, &alive, o.max_players))
-            .or_else(|| initial_positions(button, &alive, o.max_players))
-            .ok_or(Failed::NotInThisStage)?;
-
-        let mine = HandInit {
-            // `S1-KT`: the engine this client decides the hand by (`D-093`).
-            engine: crate::protocol::constants::engine_id(),
-            hand_id: o.hand_id,
-            button_position: button,
-            sb_position,
-            bb_seat,
-            level: o.level,
-            small_blind: o.small_blind,
-            big_blind: o.big_blind,
-            ante: 0,
-            // **Who took part, not who is sitting there.**
-            //
-            // `STATE_MACHINE.md` §5.3 step 4: `dealt_in` is the seats that are
-            // active *and* in `signed_this_hand`, with chips. The required set
-            // this hand was opened with **is** that — for hand one it is the
-            // signers of `TABLE_READY`, and for every hand after it is `P(k-1)`
-            // (D-013) — so this filters it by chips and nothing more.
-            //
-            // Dealing in whoever happens to occupy a seat was the defect that
-            // made one disconnection kill a whole table rather than cost one
-            // hand: an absent seat stayed a **required** contributor of a deck
-            // key and a shuffle, so every subsequent hand stalled to the hand
-            // deadline, for ever. It still pays blinds from its position, which
-            // is what a tournament's dead money is and is handled by
-            // `post_blinds` reading the stack rather than the deal.
-            // A seat that has burned its reconnection allowance is not
-            // dealt back in, however present it becomes. Its stack stays and
-            // the blinds keep taking it, which is the tournament's answer to a
-            // seat nobody can play against — and it can earn its way back in
-            // by being present for [`REPLENISH_AFTER`] hands.
-            dealt_in: {
-                let mut d: Vec<SeatIdx> = o
-                    .required
-                    .iter()
-                    .copied()
-                    .filter(|s| {
-                        o.seats
-                            .iter()
-                            .any(|(seat, _, stack)| seat == s && *stack > 0)
-                            && o.grace.get(usize::from(*s)).copied().unwrap_or(0) > 0
-                    })
-                    .collect();
-                d.sort_unstable();
-                d.dedup();
-                d
-            },
-            stacks: o.seats.iter().map(|(_, _, stack)| *stack).collect(),
-            roster_hash: o.roster_hash,
-            // A buy-in enters the ledger here and nowhere earlier, which is
-            // what makes an abandoned formation move no chips (§4.3).
-            ledger_delta: o
-                .seats
-                .iter()
-                .map(|(seat, _, stack)| (*seat, *stack as i64))
-                .collect(),
-        };
-        mine.self_consistent(o.max_players)
-            .map_err(|what| Failed::Disagrees {
-                seat: o.my_seat,
-                what,
-            })?;
+        let mine = derive_init(&o)?;
 
         let slot = Slot {
             table_id: o.table_id,
@@ -2945,16 +3058,32 @@ impl Hand {
             sequence: 0,
             previous_event_hash: o.genesis,
         };
-        let bytes = chained::seal(
-            EventType::HandInit,
-            &slot,
-            &mine,
-            key,
-            now_ms,
-            next_deadline_ms,
-            HAND_INIT_CAP,
-        )
-        .map_err(Failed::Wire)?;
+        // `G11-R` phase C: this seat's opening as its journal holds it at this
+        // very genesis is taken, not signed again; one held otherwise makes the
+        // seat a bystander of the hand.
+        let me_key = o.seats.iter().find(|(s, _, _)| *s == o.my_seat).map(|(_, k, _)| *k).ok_or(Failed::NotAtThisTable)?;
+        let is_member = o.required.contains(&o.my_seat) || o.readmitted.contains(&o.my_seat);
+        let from_journal = opening_from_journal(&view, &o, &mine, &me_key, restoring, voice, is_member);
+        let bytes = match &from_journal {
+            JournalOpening::Taken(bytes) => bytes.clone(),
+            // A bystander's would never be heard nor said.
+            JournalOpening::Bystander(_) => Vec::new(),
+            JournalOpening::Fresh => chained::seal(
+                EventType::HandInit,
+                &slot,
+                &mine,
+                key,
+                now_ms,
+                next_deadline_ms,
+                HAND_INIT_CAP,
+            )
+            .map_err(Failed::Wire)?,
+        };
+        let taken = matches!(from_journal, JournalOpening::Taken(_));
+        let journal_bystander = match from_journal {
+            JournalOpening::Bystander(why) => Some(why),
+            _ => None,
+        };
 
         // **Required is `P(k-1)`; accepted is `P(k-1) ∪ A`.** The distinction is
         // §4.9's and `Collective` has carried it from the start: `hear` counts a
@@ -3003,8 +3132,11 @@ impl Hand {
         let a_member = accepted.contains(&o.my_seat);
         let mut signed = vec![false; usize::from(o.max_players)];
         // `D-033`: a restored member's opening is the one its previous life
-        // signed, and it comes from the wire.
-        if a_member && !restoring {
+        // signed, and it comes from the wire -- `G11-R` phase C: or from its
+        // journal, and is said: one recorded and never sent reaches the table.
+        // A bystander's is neither heard nor said.
+        let speaks = a_member && journal_bystander.is_none() && (!restoring || taken);
+        if speaks {
             let own_hash = chained::open(&bytes, FRAME_CAP, EventType::HandInit, &slot)
                 .map_err(Failed::Wire)?
                 .event_hash;
@@ -3018,7 +3150,7 @@ impl Hand {
         // or muted hand is a member like any other — its own copy is in its
         // own stage, so the stage completes the moment the table's copies
         // land — and only the wire is withheld.
-        let (sends, own_init) = match (a_member && !restoring, voice) {
+        let (sends, own_init) = match (speaks, voice) {
             (true, Voice::Speak) => (vec![Send::Broadcast(bytes)], None),
             (true, Voice::Quiet) => (Vec::new(), Some(bytes)),
             (true, Voice::Muted) | (false, _) => (Vec::new(), None),
@@ -3118,6 +3250,8 @@ impl Hand {
                 journal_held: Vec::new(),
                 journal_unsaid: BTreeSet::new(),
                 journal_secrets: BTreeMap::new(),
+                journal_bystander: None,
+                journal_taken: 0,
                 fold_only,
                 hold_muck: false,
                 showdown_opened_ms: None,
@@ -3167,6 +3301,17 @@ impl Hand {
         );
         // `G11-R` phase C: and what the journal holds of it.
         opened.0.take_view(view);
+        if taken && speaks {
+            opened.0.journal_taken = opened.0.journal_taken.saturating_add(1);
+            opened.0.cert_note.push(format!(
+                "G11-R: this seat's opening of the hand taken from its signing journal{}",
+                if restoring { ", on the restoring road" } else { "" }
+            ));
+        }
+        if let Some(why) = journal_bystander {
+            opened.0.journal_bystander = Some(why);
+            opened.0.cert_note.push(format!("G11-R: this seat signs nothing in this hand: {why}"));
+        }
         Ok(opened)
     }
 
@@ -3478,6 +3623,19 @@ impl Hand {
         self.journal_held = held;
     }
 
+    /// `G11-R` phase C: how many own frames this hand took from the journal since
+    /// the last call.
+    pub fn take_journal_taken(&mut self) -> u32 {
+        std::mem::take(&mut self.journal_taken)
+    }
+
+    /// `G11-R` phase C: why this seat signs nothing in this hand -- its journal
+    /// holds another opening of it, or cannot vouch for it while armed -- for
+    /// the node, which sits the hand out (armed).
+    pub fn journal_bystander(&self) -> Option<&'static str> {
+        self.journal_bystander
+    }
+
     /// `G11-R` phase C: where `journal_held` holds this seat's own frame at the
     /// slot now open -- of any type: one slot holds one frame of a seat.
     fn journal_at_slot(&self) -> Option<usize> {
@@ -3517,6 +3675,7 @@ impl Hand {
         if let Some(e) = failed {
             self.cert_note.push(format!("this seat's own journaled frame was taken, and then: {e} (G11-R, S1-KX)"));
         }
+        self.journal_taken = self.journal_taken.saturating_add(1);
         let mut out = Vec::new();
         if chained::event_hash_of(&bytes, FRAME_CAP).is_some_and(|h| self.journal_unsaid.remove(&h)) {
             out.push(Send::Broadcast(bytes));
@@ -3631,6 +3790,12 @@ impl Hand {
         // reaches here occupies its stage (the abort, the certificate and the
         // return pair are answered above the sequence gate).
         if kind == EventType::TimeoutVote {
+            return None;
+        }
+        // `G11-R`: an opening at another genesis is another branch, not another
+        // version of the one taken here -- the journal's key and `G11`'s are the
+        // exact slot, the parent in it.
+        if kind == EventType::HandInit && chained::parent_of(bytes, FRAME_CAP) != Some(self.open.genesis) {
             return None;
         }
         let sender = chained::sender_of(bytes, FRAME_CAP)?;
@@ -25958,7 +26123,7 @@ mod tests {
         let mut hands = [a, b];
         let (mut journal, mut a_said, mut order) = (Vec::new(), Vec::new(), Vec::new());
         let mut batch = 0usize;
-        let mut queue: Vec<(usize, Vec<Send>)> = vec![(1, from_b), (0, from_a)];
+        let mut queue: Vec<(usize, Vec<Send>)> = vec![(0, from_a), (1, from_b)];
         for _ in 0..600 {
             if queue.is_empty() {
                 if hands[0].over() || hands[1].over() {
@@ -25979,6 +26144,14 @@ mod tests {
             if from == 1 && !frames.is_empty() {
                 journal.extend(frames.iter().map(|f| journaled(f)));
                 if kill(batch, &frames) {
+                    // What the first seat had said by then: made and queued here,
+                    // sent there.
+                    for (f, s) in &queue {
+                        if *f == 0 {
+                            a_said.extend(bytes_of(s));
+                            order.extend(bytes_of(s));
+                        }
+                    }
                     let [mut a, _] = hands;
                     if sent {
                         order.extend(bytes_of(&sends));
@@ -26013,8 +26186,8 @@ mod tests {
         let (mut b2, opened) =
             Hand::open_journaled(o, &keys[1], NOW, 30_000, Voice::Speak, Some(None), JournalView::Covered(journal.to_vec()))
                 .unwrap();
-        assert!(opened.is_empty(), "a restored opening says nothing at stage 0");
-        let mut out: Vec<Send> = Vec::new();
+        assert_eq!(bytes_of(&opened), vec![journal[0].frame.clone()], "the journaled opening, said again");
+        let mut out: Vec<Send> = opened;
         let table: Vec<Vec<u8>> = a.transcript().iter().chain(a_said.iter()).cloned().collect();
         for bytes in &table {
             match b2.on_event(bytes, &keys[1], NOW) {
@@ -26261,6 +26434,158 @@ mod tests {
         assert!(!said[1].contains(&step), "the lone step is never said");
         assert!(said[1].iter().any(|f| kind_of(f) == Some(EventType::ShuffleStep)), "a step of this life's");
         assert!(hands[0].over() && hands[1].over(), "and the hand goes on");
+        assert_eq!(hands[0].terminal(), hands[1].terminal());
+    }
+
+    /// `G11-R` phase C: **a journaled opening is taken, not signed again, and
+    /// said** -- the second seat killed with its `HAND_INIT` recorded and never
+    /// sent: the next life, on the restoring road and on a plain open alike,
+    /// says that very frame, and the hand is played out at one settlement.
+    #[test]
+    fn the_journaled_opening_is_taken_and_said() {
+        let keys = [key(10), key(11)];
+        let (a, journal, a_said, _) = killed_at(|batch, _| batch == 0).expect("an opening");
+        let opening = journal[0].frame.clone();
+        assert!(a.transcript().is_empty(), "the table never had it");
+        // A plain open takes it too.
+        let (_, plain) =
+            Hand::open_journaled(heads_up_opening(1), &keys[1], NOW, 30_000, Voice::Speak, None, JournalView::Covered(journal.clone()))
+                .unwrap();
+        assert_eq!(bytes_of(&plain), vec![opening.clone()], "taken, not signed again");
+        let (mut b2, sends) = Hand::open_journaled(
+            heads_up_opening(1),
+            &keys[1],
+            NOW,
+            30_000,
+            Voice::Speak,
+            Some(None),
+            JournalView::Covered(journal.clone()),
+        )
+        .unwrap();
+        assert_eq!(bytes_of(&sends), vec![opening.clone()], "the restoring road says it");
+        assert_eq!(b2.take_journal_taken(), 1, "and counts it");
+        let mut out = Vec::new();
+        for bytes in &a_said {
+            match b2.on_event(bytes, &keys[1], NOW) {
+                Ok(mut more) => out.append(&mut more),
+                Err(Failed::NotYet) => {
+                    let _ = b2.hold(bytes.clone());
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        out.append(&mut b2.restore_done(&keys[1], NOW).unwrap());
+        let mut hands = [a, b2];
+        let mut said = [Vec::new(), Vec::new()];
+        pump_holding(&mut hands, &keys, 1, sends, &mut said);
+        pump_holding(&mut hands, &keys, 1, out, &mut said);
+        play_out_holding(&mut hands, &keys, &mut said);
+        assert!(hands[0].over() && hands[1].over(), "played out");
+        assert_eq!(hands[0].terminal(), hands[1].terminal(), "one settlement");
+        signs_no_other(&journal, &said[1], "the opening");
+    }
+
+    /// `G11-R` phase C: **an opening journaled with another body at this very
+    /// genesis makes a bystander** -- nothing heard or said at stage 0, and
+    /// the reason kept for the node; one at another genesis does not (two
+    /// branches, not two versions); armed, a journal that cannot vouch for the
+    /// hand does too, in shadow it signs as before.
+    #[test]
+    fn another_opening_in_the_journal_makes_a_bystander() {
+        let keys = [key(10), key(11)];
+        let (_, from_b) = Hand::open(heads_up_opening(1), &keys[1], NOW, 30_000).unwrap();
+        let mine = bytes_of(&from_b)[0].clone();
+        let mut elsewhere = heads_up_opening(1);
+        elsewhere.genesis = [7; 32];
+        let (_, other_genesis) = Hand::open(elsewhere, &keys[1], NOW, 30_000).unwrap();
+        let mut richer = heads_up_opening(1);
+        richer.seats[1].2 += 1;
+        let (_, other_body) = Hand::open(richer, &keys[1], NOW, 30_000).unwrap();
+        let (h, sends) = Hand::open_journaled(
+            heads_up_opening(1),
+            &keys[1],
+            NOW,
+            30_000,
+            Voice::Speak,
+            None,
+            JournalView::Covered(vec![journaled(&bytes_of(&other_body)[0])]),
+        )
+        .unwrap();
+        assert!(sends.is_empty(), "another body: nothing said");
+        assert!(h.journal_bystander().is_some(), "another body: a bystander");
+        assert!(h.counted_at_stage_zero().is_empty() && !h.spoke(), "another body: nothing heard");
+        let (h, sends) = Hand::open_journaled(
+            heads_up_opening(1),
+            &keys[1],
+            NOW,
+            30_000,
+            Voice::Speak,
+            None,
+            JournalView::Covered(vec![journaled(&bytes_of(&other_genesis)[0])]),
+        )
+        .unwrap();
+        assert_eq!(sends.len(), 1, "another genesis: signed at this one");
+        assert!(h.journal_bystander().is_none() && h.spoke(), "another genesis: no bystander");
+        // Both held, the exact one wins.
+        let (h, sends) = Hand::open_journaled(
+            heads_up_opening(1),
+            &keys[1],
+            NOW,
+            30_000,
+            Voice::Speak,
+            None,
+            JournalView::Covered(vec![journaled(&bytes_of(&other_genesis)[0]), journaled(&mine)]),
+        )
+        .unwrap();
+        assert_eq!(bytes_of(&sends), vec![mine.clone()]);
+        assert!(h.journal_bystander().is_none());
+        // A muted re-open whose journal holds its spoken opening elsewhere stays out.
+        let (h, sends) = Hand::open_journaled(
+            heads_up_opening(1),
+            &keys[1],
+            NOW,
+            30_000,
+            Voice::Muted,
+            None,
+            JournalView::Covered(vec![journaled(&bytes_of(&other_genesis)[0])]),
+        )
+        .unwrap();
+        assert!(sends.is_empty() && h.journal_bystander().is_some(), "muted, spoken elsewhere: a bystander");
+        // The table's own copy beats the journal's other body; the journal's
+        // half of `signed_before` is the same decision.
+        let view = JournalView::Covered(vec![journaled(&bytes_of(&other_body)[0])]);
+        assert!(!view.takes_opening(&heads_up_opening(1)), "another body is not taken");
+        assert!(JournalView::Covered(vec![journaled(&mine)]).takes_opening(&heads_up_opening(1)));
+        let view = view.with_table_opening(Some(&mine));
+        assert_eq!(view, JournalView::Covered(Vec::new()), "the journal's other body set aside");
+        // Not a member: never a bystander.
+        let mut outside = heads_up_opening(1);
+        outside.required.retain(|s| *s != 1);
+        let (h, _) = Hand::open_journaled(outside, &keys[1], NOW, 30_000, Voice::Speak, None, JournalView::Uncovered { armed: true }).unwrap();
+        assert!(h.journal_bystander().is_none(), "a seat in no R is no bystander");
+        let (h, sends) = Hand::open_journaled(heads_up_opening(1), &keys[1], NOW, 30_000, Voice::Speak, None, JournalView::Uncovered { armed: true }).unwrap();
+        assert!(sends.is_empty() && h.journal_bystander().is_some(), "armed, uncovered: a bystander");
+        let (h, sends) = Hand::open_journaled(heads_up_opening(1), &keys[1], NOW, 30_000, Voice::Speak, None, JournalView::Uncovered { armed: false }).unwrap();
+        assert_eq!(sends.len(), 1, "in shadow, signed as before");
+        assert!(h.journal_bystander().is_none());
+    }
+
+    /// `G11-R` phase C: **a shuffle proof journaled without its step never
+    /// leaves** -- a process killed between a batch's records, written highest
+    /// first, leaves the proof alone: the next life makes its step again, and
+    /// the orphan's parent is never reached.
+    #[test]
+    fn a_journaled_proof_without_its_step_never_leaves() {
+        let keys = [key(10), key(11)];
+        let (a, mut journal, a_said, _) =
+            killed_at(|_, frames| frames.iter().any(|f| kind_of(f) == Some(EventType::ShuffleStep))).expect("a step");
+        let proof = journal.iter().find(|f| kind_of(&f.frame) == Some(EventType::ShuffleProof)).unwrap().frame.clone();
+        journal.retain(|f| kind_of(&f.frame) != Some(EventType::ShuffleStep));
+        let (mut hands, mut said) = next_life(a, &journal, &a_said);
+        play_out_holding(&mut hands, &keys, &mut said);
+        assert!(!said[1].contains(&proof), "the orphan proof never leaves");
+        assert!(said[1].iter().any(|f| kind_of(f) == Some(EventType::ShuffleStep)), "a step of this life's");
+        assert!(hands[0].over() && hands[1].over(), "played out");
         assert_eq!(hands[0].terminal(), hands[1].terminal());
     }
 

@@ -342,11 +342,13 @@ param(
     # `-DeafToCerts` (S1-LF's bed): with `-DeafToFor`, only that seat's
     # certificate copies go unheard -- a copy given to some seats only.
     [switch]$DeafToCerts,
-    # `-CrashAt <kind>:<synced|sent>`, `-CrashHand <n>`, `-CrashNode <i>`, `-CrashFor <s>`
+    # `-CrashAt <kind>:<synced|sent|unsent>`, `-CrashHand <n>`, `-CrashNode <i>`, `-CrashFor <s>`
     # (G11-R phase B2): node i's process ends at once the first time it publishes a
     # frame of that kind of a hand from n on, once its journal holds it or once it
-    # is said; it is started again, same profile (`--resume`), without the crash
-    # point, `-CrashFor` seconds after its process ended. Needs --features fault-harness.
+    # is said -- or (`unsent`) that batch never leaves and the process ends once the
+    # hand's boundary record is written; it is started again, same profile
+    # (`--resume`), without the crash point, `-CrashFor` seconds after its process
+    # ended. Needs --features fault-harness.
     [string]$CrashAt = '',
     [ValidateRange(1, 1000)][int]$CrashHand = 2,
     [ValidateRange(0, 9)][int]$CrashNode = 1,
