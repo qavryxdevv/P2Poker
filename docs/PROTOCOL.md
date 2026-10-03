@@ -3424,6 +3424,18 @@ of the showdown stage's budget is left to the seats behind it; below 2 000 ms it
 does not wait. Receivers see only the one message
 that ends the wait, and nothing about it is legal that was not legal before.
 
+**The showdown waits on one seat at a time (`S1-LM`).** A seat speaks at the
+showdown only after every seat ahead of it in the order, so the stage waits on
+the first seat of the order not heard -- its speaker -- and a `TIMEOUT_VOTE`
+there is about that seat alone: the folded seats and every seat behind it vote,
+and a silent revealer is certified by itself. A seat that became the speaker at
+the voter less than `SHOW_MARGIN_MS` ago is asked about (the early question,
+below) and voted about once that margin is spent, and a `D-059` wait is counted
+from then -- the vote's `deadline_ms` is the stage's, unchanged. Before, the stage
+waited on every seat not heard: a silent revealer had the seats behind it voted
+absent with it, and struck, or -- where that set failed §8.3's floor -- the hand
+voided with nobody named.
+
 Whether `TDA_MUCK` is offered at all is **OPEN QUESTION Q-01** (§12). The
 mechanism is specified now because it costs nothing to specify and because the
 collective-stage required set must be well-defined either way; it is not enabled.
@@ -3698,7 +3710,8 @@ in a later hand, and no question is kept about a stage the receiver has not
 reached. A receiver that answered a question about another seat's event of the
 running hand says that seat's later events again, once each as it takes them,
 for that hand and the next three (`S1-LC`): a seat kept from one member's events
-gets them without a question each. A vote about the receiver itself is answered with
+gets them without a question each -- unless the answer was betting actions alone,
+which every seat says again anyway (`S1-KB`, `S1-LM`). A vote about the receiver itself is answered with
 the receiver's own events of that stage, and one with `cause = 2` about it with
 its own votes and copies there and every event of that stage it holds -- what it
 did not vote about may be what it has. Once per hand, stage, seat and cause at
@@ -3723,6 +3736,13 @@ an ordinary vote, on the reasoning that the seat that moved past would never vot
 about `s` at `x` -- true of an honest seat only: a rogue that planted a frame of a
 later stage had every honest voter vote about a seat still thinking five seconds
 in, voted too, and the certificate was unanimous.
+**It goes five seconds in without such an event too** (`S1-LL`, `S1-LM`), at a hand
+dealt to three seats or more: at a cryptographic stage -- the deck's keys, a
+shuffle step or proof, the commitment, the deal, the board -- and at the showdown,
+where no seat thinks and an event five seconds late is one the voter was not sent;
+and at a turn after a stage at which the voter asked or voted, turn by turn, the
+chain ending at its own turn -- a seat behind whose copies of the actions a rogue
+had dropped from its queue asks each turn at once. Never at the settlement.
 The one field that varies freely is the advisory `emitted_at_unix_ms`, which is
 why §5.2's re-emission rule is normative: a peer that must send its vote again
 sends the stored bytes and never re-signs.

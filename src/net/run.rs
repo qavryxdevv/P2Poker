@@ -3201,6 +3201,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     && ask.seat != $h.my_seat()
                                     && !$h.over()
                                     && !crate::table::hand::control("s1lc")
+                                    && (crate::table::hand::control("s1lm") || !answer_is_betting_only(&answer))
                                 {
                                     let hid = $h.hand_id();
                                     add_relay(&mut $t.relays, hid, ask.voter, ask.seat);
@@ -13246,9 +13247,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `S1-LC`: another member's frame of the running hand said
                         // in answer: its later frames are relayed.
                         let running = t.hand.as_ref().map(|h| (h.hand_id(), h.my_seat()));
-                        for (ask, _, hand) in &answers {
+                        for (ask, frames, hand) in &answers {
                             if let Some((hid, me)) = running {
-                                if *hand == hid && !ask.silent && ask.seat != me && !crate::table::hand::control("s1lc") {
+                                if *hand == hid
+                                    && !ask.silent
+                                    && ask.seat != me
+                                    && !crate::table::hand::control("s1lc")
+                                    && (crate::table::hand::control("s1lm") || !answer_is_betting_only(frames))
+                                {
                                     add_relay(&mut t.relays, hid, ask.voter, ask.seat);
                                 }
                             }
@@ -16172,6 +16178,29 @@ fn add_relay(relays: &mut std::collections::BTreeSet<(u64, u8, u8)>, hand: u64, 
     }
     relays.insert((hand, asker, member));
     true
+}
+
+/// `S1-LM`: whether an answer is betting actions alone -- which `S1-KB` has
+/// every seat say again as it takes them, so the answer starts no relay. A seat
+/// asked about at a turn it then took (a chain of turn questions) was otherwise
+/// answered late at the asker's next slow turn and relayed for four hands.
+fn answer_is_betting_only(frames: &[Vec<u8>]) -> bool {
+    use crate::protocol::messages::EventType;
+    !frames.is_empty()
+        && frames.iter().all(|b| {
+            matches!(
+                crate::net::chained::peek(b, TABLE_FRAME_PEEK),
+                Ok((
+                    EventType::ActionCheck
+                        | EventType::ActionCall
+                        | EventType::ActionBet
+                        | EventType::ActionRaise
+                        | EventType::ActionFold,
+                    _,
+                    _
+                ))
+            )
+        })
 }
 
 /// `S1-LC`: the members relayed for at hand `hand`, each once.

@@ -735,7 +735,8 @@ fn diverge_if_asked(state_hash: Hash, _hand_id: u64) -> Hash {
 /// never takes its shuffle step; `bad-share`: its deal shares are broken on the
 /// wire; `bad-share-late`: its showdown shares are; `self-accuse`: a hand it
 /// lost, it accuses itself of a broken copy of its own last reveal in place of
-/// its settlement, `S1-KQ`), from hand `P2P_POKER_ROGUE_FROM_HAND` (1 when
+/// its settlement, `S1-KQ`; `withhold-show`: it never speaks at the showdown,
+/// `S1-LM`), from hand `P2P_POKER_ROGUE_FROM_HAND` (1 when
 /// unset). For measuring what the honest seats do about a rogue; a build
 /// without `--features fault-harness` reads neither and plays none.
 #[cfg(feature = "fault-harness")]
@@ -2259,6 +2260,13 @@ pub struct Hand {
     /// `S1-JS`: the (stage, seat) pairs this client has asked about early --
     /// `D-065`'s question, once each.
     questions: BTreeSet<(u64, SeatIdx)>,
+    /// `S1-LM`: whether this client asked or voted at the stage now open, and at
+    /// the stage before it -- a turn after a stage it asked or voted at is asked
+    /// about five seconds in.
+    asked_here: bool,
+    asked_before: bool,
+    /// `S1-LM`: the showdown's speaker as this client last saw it, and since when.
+    speaker_at: Option<(SeatIdx, u64)>,
     /// `D-052`: the pots this hand settled into, in the settlement's own
     /// order -- the main pot first, then each side pot -- with what each held
     /// and which seats took it. Kept when the settlement is applied, because
@@ -2886,6 +2894,9 @@ impl Hand {
                 cheat_out: BTreeSet::new(),
                 cert_ended: false,
                 questions: BTreeSet::new(),
+                asked_here: false,
+                asked_before: false,
+                speaker_at: None,
                 settled_pots: Vec::new(),
                 settled_gain: Vec::new(),
                 forked: None,
@@ -5468,6 +5479,11 @@ impl Hand {
         // `D-033`: restoring, what this seat said at the showdown comes from the wire.
         // `S1-KK`: and after, where the previous life's word is held.
         if self.restoring || self.own_frame_held(&[EventType::ShowdownReveal, EventType::ShowdownMuck]) {
+            return Ok(Vec::new());
+        }
+        // `S1-LM` harness: a rogue that never speaks at the showdown -- every
+        // seat behind it in the order waits on it.
+        if rogue("withhold-show", self.open.hand_id) {
             return Ok(Vec::new());
         }
         let me = self.open.my_seat;
@@ -8739,6 +8755,8 @@ impl Hand {
         }
         self.stage_seq = self.slot.sequence;
         self.stage_at_ms = now_ms;
+        // `S1-LM`: whether this client asked or voted at the stage just left.
+        self.asked_before = std::mem::take(&mut self.asked_here);
 
         // Everything about the stage just left goes with it. A vote and a
         // certificate are bound to one stage — a vote for a stage nobody is
@@ -9020,11 +9038,12 @@ impl Hand {
                     owing = true;
                 }
                 format!(
-                    "seat {s}: subject {}, voters {:?}, I voted {voted}, votes held {held}, mid-delivery {}, asking behind {}",
+                    "seat {s}: subject {}, voters {:?}, I voted {voted}, votes held {held}, mid-delivery {}, asking behind {}, speaker's floor {}",
                     if subject.is_some() { "yes" } else { "NONE" },
                     self.voters(*s),
                     (mid_delivery >> u32::from((*s).min(31))) & 1 == 1,
-                    self.asking_behind.contains(s)
+                    self.asking_behind.contains(s),
+                    self.speaker_floor(*s, now_ms)
                 )
             })
             .collect();
@@ -9140,6 +9159,12 @@ impl Hand {
         };
         let age = now_ms.saturating_sub(self.stage_at_ms);
         let mut out = Vec::new();
+        // `S1-LM`: the showdown's speaker, and when it became the speaker here.
+        if let Some(first) = self.showdown_speaker() {
+            if self.speaker_at.map(|(s, _)| s) != Some(first) {
+                self.speaker_at = Some((first, now_ms));
+            }
+        }
         for seat in self.waiting_for() {
             // Never about oneself, and never twice.
             if seat == self.open.my_seat {
@@ -9151,7 +9176,14 @@ impl Hand {
             // receiver checks, and a certificate needs every voter: the table
             // votes a seat out when the most patient voter's clock says so.
             let after = self.vote_after_ms(seat, owed);
-            if age < after {
+            // `S1-LM`: a seat the showdown made the speaker only now is voted
+            // about no sooner than `SHOW_MARGIN_MS` after it became the speaker
+            // here -- a revealer just past the stage's clock left the next seat
+            // one tick to speak before the table voted it out -- and is asked
+            // about meanwhile, at once: its reveal kept from this seat alone is
+            // answered by every holder before anybody votes.
+            let floor = after > 0 && self.speaker_floor(seat, now_ms);
+            if age < after || floor {
                 // `D-065`'s early question: a seat whose event of this stage
                 // another seat has visibly moved past is asked for it five
                 // seconds in, not at the deadline -- that seat holds the event.
@@ -9164,13 +9196,14 @@ impl Hand {
                 // thinking, voted too, and the seat was folded and certified out.
                 // The vote goes at the deadline, like any other.
                 if age >= crate::protocol::constants::QUESTION_AFTER_MS
-                    && (self.moved_past_by_another(seat) || self.asks_unprompted(owed))
+                    && (self.moved_past_by_another(seat) || self.asks_unprompted(owed) || self.asks_after_asking(owed))
                     && self.questions.insert((self.slot.sequence, seat))
                 {
                     if let Some(mut question) = self.subject_now(seat) {
                         question.cause = Some(CAUSE_QUESTION);
                         let bytes =
                             self.say_at(EventType::TimeoutVote, &question, TIMEOUT_VOTE_CAP, key, now_ms)?;
+                        self.asked_here = true;
                         out.push(Send::Broadcast(bytes));
                     }
                 }
@@ -9277,6 +9310,8 @@ impl Hand {
             )?;
             self.voted.insert(digest);
             self.voted_about.insert(seat);
+            // `S1-LM`: a vote here, for the turn after it.
+            self.asked_here = true;
             // **`S1-BB`: the carrier, sampled where the accusation is made.**
             // Read from the same `mid_delivery` word the lever above consulted,
             // so the two cannot drift; recorded after `say_at` has succeeded,
@@ -9470,26 +9505,62 @@ impl Hand {
     /// cryptographic stage (the deck's keys, the shuffle's steps and proofs, the
     /// commitment, the deal, the board), where no seat thinks and a frame five
     /// seconds late is one this seat was not sent; never at a turn, where a seat
-    /// may think its whole clock, nor at the showdown or the settlement; at three
-    /// seats dealt in or more, where a third seat can hold the frame. A rogue that
+    /// may think its whole clock, nor at the settlement; at three seats dealt in
+    /// or more, where a third seat can hold the frame. `S1-LM`: and at the
+    /// showdown, which waits on its speaker alone. A rogue that
     /// kept its frame from the next seat to act or to shuffle -- which holds no
     /// later frame of anybody's, the table waiting on it -- had it asked for only
     /// by its vote at the stage's clock, and the table's clock on its own next
     /// obligation ran out first: folded and struck. Answered as any question is
     /// (`D-065`, `S1-LB`'s rotation once the table stands on the asker). Not in
-    /// the control build (`P2P_POKER_CONTROL=s1ll`).
+    /// the control build (`P2P_POKER_CONTROL=s1ll`; the showdown's, `s1lm`).
     fn asks_unprompted(&self, owed: EventType) -> bool {
-        !control("s1ll")
-            && self.mine.dealt_in.len() >= 3
-            && matches!(
-                owed,
-                EventType::DeckInit
-                    | EventType::ShuffleStep
-                    | EventType::ShuffleProof
-                    | EventType::DeckCommit
-                    | EventType::DealPrivate
-                    | EventType::BoardReveal
-            )
+        self.mine.dealt_in.len() >= 3
+            && ((!control("s1ll")
+                && matches!(
+                    owed,
+                    EventType::DeckInit
+                        | EventType::ShuffleStep
+                        | EventType::ShuffleProof
+                        | EventType::DeckCommit
+                        | EventType::DealPrivate
+                        | EventType::BoardReveal
+                ))
+                // `S1-LM`: and the showdown, which waits on its speaker alone --
+                // a reveal kept from this seat while the rest took it.
+                || (!control("s1lm") && matches!(owed, EventType::ShowdownReveal | EventType::ShowdownMuck)))
+    }
+
+    /// `S1-LM`: whether this client asks about the seat to act five seconds into
+    /// a turn without a later frame of a third seat -- where it asked or voted at
+    /// the stage just left, at three seats dealt in or more: a seat behind, which
+    /// the rogues kept from their actions while the table moved on (and whose
+    /// queue of held frames a rogue can fill so the table's copies are dropped),
+    /// asked about each turn only by its vote at the turn's clock and was voted
+    /// out at its own before. Chained turn by turn; the answer is a frame of the
+    /// stage it stands at, taken at once, never held. A seat still thinking has
+    /// nothing to answer with: a question counts towards nothing.
+    fn asks_after_asking(&self, owed: EventType) -> bool {
+        !control("s1lm") && self.asked_before && self.mine.dealt_in.len() >= 3 && owed == EventType::ActionFold
+    }
+
+    /// `S1-LM`: whether `seat` became the showdown's speaker here less than
+    /// `SHOW_MARGIN_MS` ago -- asked about, not yet voted about.
+    fn speaker_floor(&self, seat: SeatIdx, now_ms: u64) -> bool {
+        self.showdown_speaker() == Some(seat)
+            && self.speaker_at.is_some_and(|(s, at)| s == seat && now_ms.saturating_sub(at) < SHOW_MARGIN_MS)
+    }
+
+    /// `S1-LM`: the seat the showdown waits on, where the hand is at the
+    /// showdown; `None` elsewhere and in the control build.
+    fn showdown_speaker(&self) -> Option<SeatIdx> {
+        if control("s1lm") {
+            return None;
+        }
+        match &self.phase {
+            Phase::Playing { play, .. } if matches!(play.step, Step::Showdown { .. }) => self.waiting_for().first().copied(),
+            _ => None,
+        }
     }
 
     /// `D-065`'s early question: whether this hand holds, from a seat other than
@@ -12030,6 +12101,10 @@ impl Hand {
         rebase(&mut self.opened_at_ms, by_ms);
         rebase_opt(&mut self.showdown_opened_ms, by_ms);
         rebase_opt(&mut self.muck_held_until_ms, by_ms);
+        // `S1-LM`: when the showdown's speaker became the speaker here.
+        if let Some((_, at)) = self.speaker_at.as_mut() {
+            rebase(at, by_ms);
+        }
         // `D-084`: a proven cheat's fallback runs on this clock too; a clock
         // that jumped ahead fired it before the certificate could form.
         if let Some(p) = self.pending_cheat.as_mut() {
@@ -12058,8 +12133,18 @@ impl Hand {
         if seats.is_empty() {
             return None;
         }
+        // `S1-LM`: the showdown's speaker is charged from when it became the
+        // speaker here -- a late predecessor or a muck's hold is no wait of its;
+        // a speaker this client has not yet seen become one became one now.
+        let since = match self.showdown_speaker() {
+            Some(first) => match self.speaker_at {
+                Some((s, at)) if s == first => at.max(self.stage_at_ms),
+                _ => now_ms,
+            },
+            None => self.stage_at_ms,
+        };
         let stood = if self.crypto_stage() {
-            now_ms.saturating_sub(self.stage_at_ms) >= crate::protocol::constants::WAIT_FROM_MS
+            now_ms.saturating_sub(since) >= crate::protocol::constants::WAIT_FROM_MS
         } else {
             self.past_stage_deadline(now_ms)
         };
@@ -12638,6 +12723,16 @@ impl Hand {
             // this question and would have found nobody to vote about.
             Phase::Playing { play, .. } => match &play.step {
                 Step::Acting { to_act } => vec![*to_act],
+                // `S1-LM`: a seat speaks at the showdown only after every seat
+                // ahead of it in the order, so the stage waits on the first one
+                // not heard alone: naming every seat behind a silent revealer had
+                // them voted absent with it and struck, and a silent first
+                // revealer's set failed the floor -- an unnamed void. Not in the
+                // control build (`P2P_POKER_CONTROL=s1lm`).
+                Step::Showdown { stage, order } if !control("s1lm") => {
+                    let waiting = stage.waiting_for();
+                    order.iter().copied().find(|s| waiting.contains(s)).into_iter().collect()
+                }
                 Step::Opening { stage, .. }
                 | Step::Showdown { stage, .. }
                 | Step::Settling { stage, .. } => stage.waiting_for(),
@@ -18796,6 +18891,18 @@ mod tests {
         route: &dyn Fn(usize, usize, &[u8]) -> Option<Vec<u8>>,
         refused: &mut Vec<(usize, String)>,
     ) {
+        pump_cheat_at(hands, keys, pending, route, refused, NOW);
+    }
+
+    /// [`pump_cheat`], every receiver's clock at `now`.
+    fn pump_cheat_at(
+        hands: &mut [Hand],
+        keys: &[SigningKey],
+        pending: Vec<(usize, Vec<Send>)>,
+        route: &dyn Fn(usize, usize, &[u8]) -> Option<Vec<u8>>,
+        refused: &mut Vec<(usize, String)>,
+        now: u64,
+    ) {
         let mut pending = pending;
         for _ in 0..512 {
             if pending.is_empty() {
@@ -18812,7 +18919,7 @@ mod tests {
                         let Some(given) = route(from, to, bytes) else {
                             continue;
                         };
-                        match hands[to].on_event(&given, &keys[to], NOW) {
+                        match hands[to].on_event(&given, &keys[to], now) {
                             Ok(mut more) => out.append(&mut more),
                             Err(Failed::NotYet) => {
                                 let _ = hands[to].hold(given.clone());
@@ -18820,7 +18927,7 @@ mod tests {
                             Err(e) => refused.push((to, e.to_string())),
                         }
                     }
-                    let (mut more, _) = hands[to].replay_early(&keys[to], NOW);
+                    let (mut more, _) = hands[to].replay_early(&keys[to], now);
                     out.append(&mut more);
                     if !out.is_empty() {
                         next.push((to, out));
@@ -19104,6 +19211,204 @@ mod tests {
     /// at a cryptographic stage five seconds in is none.
     fn votes_in(sends: Vec<Send>) -> Vec<Vec<u8>> {
         bytes_of_sends(sends).into_iter().filter(|b| !is_question(b)).collect()
+    }
+
+    /// `S1-LM`: **the showdown waits on its speaker alone** -- the first seat of
+    /// the order not heard; the seats behind a silent revealer are named by
+    /// nobody's vote (they were voted absent with it, and struck).
+    #[test]
+    fn the_showdown_waits_on_its_speaker_alone() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let first = usize::from(hands[0].mine.sb_position);
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == first && (is_kind(b, EventType::ShowdownReveal) || is_kind(b, EventType::ShowdownMuck)) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..48 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &route, &mut refused);
+        }
+        let other = (first + 1) % 4;
+        let order = hands[other].showdown_order();
+        assert_eq!(order.first(), Some(&(first as u8)), "at the showdown, the silent seat first: {refused:?}");
+        assert_eq!(hands[other].waiting_for(), vec![first as u8], "its speaker alone, not the seats behind it");
+    }
+
+    /// `S1-LM`: every seat checked and called down to the showdown, each frame
+    /// given as `route` says.
+    fn check_down(hands: &mut [Hand], keys: &[SigningKey], route: &dyn Fn(usize, usize, &[u8]) -> Option<Vec<u8>>) {
+        let mut refused = Vec::new();
+        for _ in 0..64 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(hands, keys, vec![(s, sends)], route, &mut refused);
+        }
+    }
+
+    fn is_reveal(b: &[u8]) -> bool {
+        is_kind(b, EventType::ShowdownReveal) || is_kind(b, EventType::ShowdownMuck)
+    }
+
+    /// `S1-LM`: **a silent first revealer is certified alone** -- asked about
+    /// five seconds in, voted about at the stage's clock by every other seat,
+    /// and the certificate names it and nobody behind it: the next hand is the
+    /// table less that seat. Before, every seat behind it was voted about too,
+    /// and with nobody folded no certificate could form: a void, nobody named.
+    #[test]
+    fn a_silent_first_revealer_is_certified_alone() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let first = usize::from(hands[0].mine.sb_position);
+        let route = move |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            (from != first || !is_reveal(b)).then(|| b.to_vec())
+        };
+        check_down(&mut hands, &keys, &route);
+        let honest: Vec<usize> = (0..4).filter(|s| *s != first).collect();
+        for &h in &honest {
+            assert_eq!(hands[h].waiting_for(), vec![first as u8], "seat {h} at the showdown, on its speaker");
+            assert!(hands[h].vote_on_timeouts(&keys[h], NOW, 0).unwrap().is_empty());
+            let asked = bytes_of_sends(hands[h].vote_on_timeouts(&keys[h], NOW + 5_000, 0).unwrap());
+            assert!(asked.len() == 1 && is_question(&asked[0]), "seat {h} asks about its speaker five seconds in");
+        }
+        let t1 = NOW + 30_000;
+        let mut sends = Vec::new();
+        for &h in &honest {
+            let v = hands[h].vote_on_timeouts(&keys[h], t1, 0).unwrap();
+            assert_eq!(votes_in(v.clone()).len(), 1, "seat {h} votes about its speaker alone");
+            sends.push((h, v));
+        }
+        let mut refused = Vec::new();
+        pump_cheat_at(&mut hands, &keys, sends, &route, &mut refused, t1);
+        for &h in &honest {
+            assert!(hands[h].over(), "seat {h}: the certificate ends the hand ({refused:?})");
+            let next = hands[h].next_hand().expect("a successor");
+            assert!(!next.required.contains(&(first as u8)), "seat {h}: the silent revealer is out");
+            assert_eq!(next.required.len(), 3, "seat {h}: nobody behind it struck");
+        }
+    }
+
+    /// `S1-LM`: **the next speaker is asked about at once and voted about
+    /// `SHOW_MARGIN_MS` after it became the speaker** -- a revealer that spoke
+    /// just past the stage's clock leaves the seat behind it its margin, not one
+    /// tick -- and the margin is time that passed, across a clock set back.
+    #[test]
+    fn the_next_speaker_is_asked_at_once_and_voted_after_its_margin() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let first = usize::from(hands[0].mine.sb_position);
+        let second = (first + 1) % 4;
+        let third = (first + 2) % 4;
+        let held: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if is_reveal(b) && from == first {
+                held.borrow_mut().push(b.to_vec());
+                return None;
+            }
+            (from != second || !is_reveal(b)).then(|| b.to_vec())
+        };
+        check_down(&mut hands, &keys, &route);
+        let order = hands[third].showdown_order();
+        assert_eq!(&order[..2], &[first as u8, second as u8], "the order this test assumes");
+        assert!(hands[third].vote_on_timeouts(&keys[third], NOW, 0).unwrap().is_empty());
+        // The first revealer speaks one second past the stage's clock.
+        let t = NOW + 31_000;
+        let reveal = held.borrow()[0].clone();
+        assert!(hands[third].on_event(&reveal, &keys[third], t).is_ok());
+        assert_eq!(hands[third].waiting_for(), vec![second as u8], "the next speaker");
+        let asked = bytes_of_sends(hands[third].vote_on_timeouts(&keys[third], t, 0).unwrap());
+        assert!(asked.len() == 1 && is_question(&asked[0]), "asked about at once, past the stage's clock");
+        assert!(votes_in(hands[third].vote_on_timeouts(&keys[third], t + 7_900, 0).unwrap()).is_empty(), "inside its margin");
+        // The clock set back an hour: the margin is still eight seconds of time.
+        let back: i64 = -3_600_000;
+        hands[third].rebase_clock(back);
+        let t = t.saturating_add_signed(back);
+        assert!(votes_in(hands[third].vote_on_timeouts(&keys[third], t + 7_900, 0).unwrap()).is_empty());
+        let votes = votes_in(hands[third].vote_on_timeouts(&keys[third], t + 8_000, 0).unwrap());
+        assert_eq!(votes.len(), 1, "voted about once its margin is spent");
+    }
+
+    /// `S1-LM`: **a wait at the showdown is its speaker's alone, counted from
+    /// when it became the speaker** (`D-059`) -- the seats behind it make the
+    /// table wait for nothing, and a late predecessor is no wait of the next.
+    #[test]
+    fn a_showdown_wait_is_the_speakers_from_when_it_became_one() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let first = usize::from(hands[0].mine.sb_position);
+        let second = (first + 1) % 4;
+        let third = (first + 2) % 4;
+        let held: std::cell::RefCell<Vec<Vec<u8>>> = std::cell::RefCell::new(Vec::new());
+        let route = |from: usize, _to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if is_reveal(b) && from == first {
+                held.borrow_mut().push(b.to_vec());
+                return None;
+            }
+            (from != second || !is_reveal(b)).then(|| b.to_vec())
+        };
+        check_down(&mut hands, &keys, &route);
+        assert!(hands[third].vote_on_timeouts(&keys[third], NOW, 0).unwrap().is_empty());
+        let wait = crate::protocol::constants::WAIT_FROM_MS;
+        assert_eq!(hands[third].stall_now(NOW + wait).unwrap().waits, vec![first as u8], "the speaker alone");
+        let t = NOW + 20_000;
+        let reveal = held.borrow()[0].clone();
+        assert!(hands[third].on_event(&reveal, &keys[third], t).is_ok());
+        assert!(hands[third].stall_now(t + 1_000).unwrap().waits.is_empty(), "a speaker not yet seen become one");
+        assert!(hands[third].vote_on_timeouts(&keys[third], t + 1_000, 0).unwrap().len() <= 1);
+        assert!(hands[third].stall_now(t + 1_000 + wait - 1).unwrap().waits.is_empty(), "not from the stage's start");
+        assert_eq!(hands[third].stall_now(t + 1_000 + wait).unwrap().waits, vec![second as u8]);
+    }
+
+    /// `S1-LM`: **asking rotates with the stage and stops at this client's own
+    /// turn** -- a question or vote marks the stage, the next stage reads the
+    /// mark and drops it; at its own turn a client asks nobody, so the chain of
+    /// turn questions ends there.
+    #[test]
+    fn asking_rotates_with_the_stage_and_stops_at_my_own_turn() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let me = usize::from(hands[0].turn().expect("a seat to act").seat);
+        let other = (me + 1) % 3;
+        {
+            let h = &mut hands[other];
+            h.asked_here = true;
+            h.stage_seq = h.slot.sequence.wrapping_sub(1);
+            h.mark_stage(NOW);
+            assert!(h.asked_before && !h.asked_here, "the mark moves to the stage before");
+            h.stage_seq = h.slot.sequence.wrapping_sub(1);
+            h.mark_stage(NOW);
+            assert!(!h.asked_before, "and goes a stage later");
+        }
+        hands[me].asked_before = true;
+        assert!(hands[me].vote_on_timeouts(&keys[me], NOW + 6_000, 0).unwrap().is_empty(), "nobody to ask at my own turn");
+        assert!(!hands[me].asked_here, "so the next turn asks nobody unprompted");
+        hands[other].asked_before = true;
+        let asked = bytes_of_sends(hands[other].vote_on_timeouts(&keys[other], NOW + 6_000, 0).unwrap());
+        assert!(asked.len() == 1 && is_question(&asked[0]), "the seat to act asked about by the seat behind");
+        assert!(hands[other].asked_here, "and the chain goes on");
+    }
+
+    /// `S1-LM`: **a turn after a stage this client asked or voted at is asked
+    /// about five seconds in** -- at three seats dealt in or more; not before a
+    /// question or vote, not heads-up.
+    #[test]
+    fn a_turn_after_a_stage_asked_at_is_asked_about() {
+        let (mut hands, _keys, _) = n_seats_to_the_bet(3);
+        let h = &mut hands[0];
+        assert!(!h.asks_after_asking(EventType::ActionFold), "no question or vote before");
+        h.asked_before = true;
+        assert!(h.asks_after_asking(EventType::ActionFold));
+        assert!(!h.asks_after_asking(EventType::DealPrivate), "a turn alone");
+        let (mut two, _keys, _) = n_seats_to_the_bet(2);
+        two[0].asked_before = true;
+        assert!(!two[0].asks_after_asking(EventType::ActionFold), "heads-up nobody else holds the frame");
     }
 
     /// `S1-LL`: **a frame kept from the next seat to act is asked for five
