@@ -4655,7 +4655,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // nothing else changes.
     macro_rules! open_journal {
         ($t:ident, $mode:expr) => {{
-            if $t.journal.is_none() {
+            if $t.journal.as_ref().is_none_or(|j| j.is_refusing()) && !crate::table::hand::control("g11r") {
                 if let Some(key) = $t.table.as_ref().map(|f| f.table_id()) {
                     $t.journal_tried_ms = super::node::now_unix_ms();
                     match crate::storage::journal::Handle::open_with(
@@ -4667,11 +4667,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     ) {
                         Ok(j) => $t.journal = Some(j),
                         Err(e) => {
-                            let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "the table's signing journal did not open: {e} (G11-R, shadow: nothing changes)"
-                                )))
-                                .await;
+                            // Fails closed: no frame of a hand's chain leaves without
+                            // its record, so this seat sits the hands out until the
+                            // journal opens -- tried again a minute on.
+                            if $t.journal.is_none() {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "the table's signing journal did not open: {e} -- tried again a minute on; armed, this seat would sit every hand out until it opens (G11-R)"
+                                    )))
+                                    .await;
+                            }
+                            $t.journal = Some(crate::storage::journal::Handle::refusing(
+                                app_key.verifying_key().to_bytes(),
+                            ));
                         }
                     }
                 }
@@ -4681,13 +4689,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
     macro_rules! leave_the_table {
         ($t:ident) => {{
-            // `G11-R`: the table's signing journal closed and, the table being
-            // left, removed -- a journal serves the table it was kept at alone.
+            // `G11-R`: the table's signing journal closed -- and kept: a journal
+            // of this table and signer is what stops a return to it re-signing
+            // a slot of its last hands; the start's sweep takes it a week on.
             if let Some(j) = $t.journal.take() {
                 let _ = j.close(JOURNAL_CLOSE);
-            }
-            if let Some(key) = $t.table.as_ref().map(|f| f.table_id()) {
-                let _ = crate::storage::journal::remove(&profile_dir, &key);
             }
             $t.journal_tried_ms = 0;
             $t.table_closed = false;
@@ -10031,6 +10037,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if link_is_down() {
                     continue;
                 }
+                // `G11-R`, phase D: a frame of a hand's chain signed by this
+                // client that the table says and the journal does not hold -- a
+                // previous life's, a second process's -- sits that hand out: this
+                // life cannot know what else was signed there.
+                if let (Some(j), Some(h)) = (t.journal.as_ref(), t.hand.as_ref()) {
+                    if signer_of(&item.bytes, h) == Some(my_app_key) {
+                        journal_check_own(j, &item.bytes);
+                    }
+                }
                 // `S1-CR`: a ratification copy arriving after this client's
                 // session is set is a seat that lacks the others' -- a restarted
                 // client, whose gossipsub copy of ours is a Duplicate for two
@@ -13067,11 +13082,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         cheat_out_by_the_word!(t, p);
                     }
                     // `G11-R`: a table set without its signing journal -- one that
-                    // would not open -- is tried again a minute on, covering only
-                    // the hands after the newest this client has seen; and what the
-                    // journal noted since the last tick is said.
+                    // would not open, sat out meanwhile -- is tried again a minute
+                    // on, covering only the hands after the newest this client has
+                    // seen; and what the journal noted since the last tick is said.
                     if t.table.is_some()
-                        && t.journal.is_none()
+                        && t.journal.as_ref().is_none_or(|j| j.is_refusing())
                         && super::node::now_unix_ms().saturating_sub(t.journal_tried_ms) >= 60_000
                     {
                         let newest = t.hand.as_ref().map(|h| h.hand_id()).max(t.resume.as_ref().map(|r| r.hand_id));
@@ -19687,13 +19702,20 @@ fn publish_hand(
     journal: Option<&crate::storage::journal::Handle>,
 ) {
     let _ = swarm;
-    // `G11-R`, phase B: the batch's own frames of a hand's chain recorded before
-    // anything of it leaves -- in shadow. Not in the control build
-    // (`P2P_POKER_CONTROL=g11r`), which measures what the journal costs.
-    if let Some(j) = journal.filter(|_| !crate::table::hand::control("g11r")) {
+    // `G11-R`: the batch's own frames of a hand's chain recorded before anything
+    // of it leaves; armed (phase D, the harness alone until phase C), a batch
+    // the journal refuses sits its hand out and nothing more of a hand sat out
+    // leaves -- its state holds a frame nobody else has, so whatever it says
+    // about the hand speaks for a branch nobody is on. Not in the control build
+    // (`P2P_POKER_CONTROL=g11r`), which has no journal.
+    let journal = journal.filter(|_| !crate::table::hand::control("g11r"));
+    if let Some(j) = journal {
         journal_ahead(j, &sends);
     }
     for crate::table::hand::Send::Broadcast(out) in sends {
+        if journal.is_some_and(|j| sat_out(j, &out)) {
+            continue;
+        }
         // **Arm the on-turn mute before asking whether anything may leave**,
         // so the window starts at the action this client owed rather than at a
         // second on the clock. A no-op in every other mode and in every build
@@ -19749,38 +19771,41 @@ const JOURNAL_OPEN: std::time::Duration = std::time::Duration::from_millis(2_000
 const JOURNAL_WRITE: std::time::Duration = std::time::Duration::from_millis(1_500);
 const JOURNAL_CLOSE: std::time::Duration = std::time::Duration::from_millis(2_000);
 
-/// `G11-R`, phase B: the frames of a hand's chain this client signs --
-/// `HAND_INIT` to `HAND_COMPLETE`, one slot a frame of a seat -- recorded in the
-/// table's signing journal before anything of the batch leaves. **In shadow**: a
-/// second body at a slot the journal holds is noted ("would have signed twice")
-/// and the batch still goes, as one the journal could not record does; phase D
-/// sends neither. What happened is said at the node's next tick.
+/// `G11-R`, phase D: whether a refused frame sits its hand out (armed) or is
+/// noted and sent (shadow). **Shadow in every build until phase C** -- a restart
+/// replays nothing yet, so an ordinary one re-seals at a slot its journal holds,
+/// and armed that would sit an honest seat out at every restart
+/// (`p2p-poker-local/audit_1002/REFUTE_JOURNAL_D.md`); the fault harness arms it
+/// for its beds with `P2P_POKER_JOURNAL_ARMED`.
+fn journal_armed() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var("P2P_POKER_JOURNAL_ARMED").is_ok())
+}
+
+/// `G11-R`: the frames of a hand's chain this client signs -- `HAND_INIT` to
+/// `HAND_COMPLETE`, one slot a frame of a seat -- recorded in the table's signing
+/// journal before anything of the batch leaves ([`journal_ahead_as`]).
 fn journal_ahead(j: &crate::storage::journal::Handle, sends: &[crate::table::hand::Send]) {
-    use crate::protocol::messages::EventType as E;
+    journal_ahead_as(j, sends, journal_armed());
+}
+
+/// [`journal_ahead`]. A batch the journal refuses -- a second body at a slot it
+/// holds, a write that failed or did not return in time, a journal that would
+/// not open -- is, `armed`, sat out with its hand
+/// ([`crate::storage::journal::Handle::silence`]): publish_hand sends nothing
+/// more of it; in shadow it is noted ("would have signed twice") and sent. The
+/// fault harness's `bad-action` rogue, which signs a second action at its slot
+/// on purpose, is let through. What happened is said at the node's next tick.
+fn journal_ahead_as(j: &crate::storage::journal::Handle, sends: &[crate::table::hand::Send], armed: bool) {
     let mine = j.signer();
     let entries: Vec<crate::storage::journal::Entry> = sends
         .iter()
         .filter_map(|crate::table::hand::Send::Broadcast(b)| {
             let (kind, hand, sequence) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok()?;
-            let of_the_chain = matches!(
-                kind,
-                E::HandInit
-                    | E::DeckInit
-                    | E::ShuffleStep
-                    | E::ShuffleProof
-                    | E::DeckCommit
-                    | E::DealPrivate
-                    | E::ActionCheck
-                    | E::ActionCall
-                    | E::ActionBet
-                    | E::ActionRaise
-                    | E::ActionFold
-                    | E::BoardReveal
-                    | E::ShowdownReveal
-                    | E::ShowdownMuck
-                    | E::HandComplete
-            );
-            if hand == 0 || !of_the_chain || crate::net::chained::sender_of(b, TABLE_FRAME_PEEK)? != mine {
+            if hand == 0 || !of_the_chain(kind) || crate::net::chained::sender_of(b, TABLE_FRAME_PEEK)? != mine {
                 return None;
             }
             Some(crate::storage::journal::Entry {
@@ -19797,17 +19822,21 @@ fn journal_ahead(j: &crate::storage::journal::Handle, sends: &[crate::table::han
         return;
     }
     let started = std::time::Instant::now();
-    match j.write(entries.clone(), JOURNAL_WRITE) {
+    let hands: std::collections::BTreeSet<u64> = entries.iter().map(|e| e.hand).collect();
+    match j.write(entries, JOURNAL_WRITE) {
         Ok(()) => {}
-        Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) => {
-            j.note(format!(
-                "would have signed twice: a frame of type {kind:#06x} at hand #{hand} sequence {sequence} beside the one                  the signing journal holds (G11-R, shadow: sent)"
-            ));
-            // In shadow the rest of the batch is still recorded.
-            let rest: Vec<crate::storage::journal::Entry> =
-                entries.into_iter().filter(|e| j.lookup(e.hand, e.sequence, &e.parent).is_none()).collect();
-            if let Err(e) = j.write(rest, JOURNAL_WRITE) {
-                j.note(format!("the signing journal did not record the rest of a batch: {e} (G11-R, shadow: sent)"));
+        Err(crate::storage::journal::JournalError::Conflict { hand, .. })
+            if crate::table::hand::rogue("bad-action", hand) => {}
+        Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) if armed => j.silence(
+            hand,
+            &format!("it was about to sign a second frame (type {kind:#06x}) at sequence {sequence} beside the one its journal holds"),
+        ),
+        Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) => j.note(format!(
+            "would have signed twice: a frame of type {kind:#06x} at hand #{hand} sequence {sequence} beside the one its journal holds (G11-R, shadow: sent)"
+        )),
+        Err(e) if armed => {
+            for hand in hands {
+                j.silence(hand, &format!("its signing journal did not record a frame of it ({e})"));
             }
         }
         Err(e) => j.note(format!("the signing journal did not record a batch: {e} (G11-R, shadow: sent)")),
@@ -19816,6 +19845,75 @@ fn journal_ahead(j: &crate::storage::journal::Handle, sends: &[crate::table::han
     if took >= std::time::Duration::from_millis(200) {
         j.note(format!("the signing journal took {} ms to record a batch (G11-R)", took.as_millis()));
     }
+}
+
+/// `G11-R`, phase D: an own frame of a hand's chain heard from the table
+/// ([`journal_check_own_as`]).
+fn journal_check_own(j: &crate::storage::journal::Handle, bytes: &[u8]) {
+    journal_check_own_as(j, bytes, journal_armed());
+}
+
+/// [`journal_check_own`]: where the journal covers the frame's hand and does not
+/// hold this frame at its slot -- something this life did not record was signed
+/// there -- the hand is, `armed`, sat out; in shadow it is noted.
+fn journal_check_own_as(j: &crate::storage::journal::Handle, bytes: &[u8], armed: bool) {
+    if j.is_refusing() {
+        return;
+    }
+    let Ok((kind, hand, sequence)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
+        return;
+    };
+    if hand == 0 || hand < j.covers_from() || !of_the_chain(kind) {
+        return;
+    }
+    let Some(parent) = crate::net::chained::parent_of(bytes, TABLE_FRAME_PEEK) else {
+        return;
+    };
+    if j.lookup(hand, sequence, &parent).is_some_and(|e| e.frame == bytes) {
+        return;
+    }
+    if crate::table::hand::rogue("bad-action", hand) {
+        return;
+    }
+    let why = format!(
+        "the table holds a frame of it (type {:#06x}, sequence {sequence}) signed by this client that its journal does not",
+        kind.code()
+    );
+    if armed {
+        j.silence(hand, &why);
+    } else {
+        j.note(format!("hand #{hand}: {why} (G11-R, shadow)"));
+    }
+}
+
+/// `G11-R`, phase D: whether `bytes` is a frame of a hand this client sits out --
+/// anything of it, the chain's or not.
+fn sat_out(j: &crate::storage::journal::Handle, bytes: &[u8]) -> bool {
+    crate::net::chained::peek(bytes, TABLE_FRAME_PEEK).is_ok_and(|(_, hand, _)| hand >= 1 && j.is_silenced(hand))
+}
+
+/// `G11-R`: the frames of a hand's chain -- one slot a frame of a seat, from
+/// `HAND_INIT` to `HAND_COMPLETE`.
+fn of_the_chain(kind: crate::protocol::messages::EventType) -> bool {
+    use crate::protocol::messages::EventType as E;
+    matches!(
+        kind,
+        E::HandInit
+            | E::DeckInit
+            | E::ShuffleStep
+            | E::ShuffleProof
+            | E::DeckCommit
+            | E::DealPrivate
+            | E::ActionCheck
+            | E::ActionCall
+            | E::ActionBet
+            | E::ActionRaise
+            | E::ActionFold
+            | E::BoardReveal
+            | E::ShowdownReveal
+            | E::ShowdownMuck
+            | E::HandComplete
+    )
 }
 
 /// Take one frame of the next hand into the pre-open buffer, evicting the
@@ -23886,14 +23984,14 @@ mod ad_is_admissible {
 mod late_roster_tests {
     use super::*;
 
-    /// `G11-R` phase B: **the batch's own frames of a hand's chain are recorded
+    /// `G11-R` phase D: **the batch's own frames of a hand's chain are recorded
     /// before anything leaves, and nothing else is** -- a vote, another seat's
-    /// frame and a frame of hand 0 pass by; a second body at a held slot is
-    /// noted and, in shadow, still sent.
+    /// frame and a frame of hand 0 pass by; a second body at a held slot sits the
+    /// hand out.
     #[test]
-    fn own_chain_frames_are_journaled_ahead_and_a_second_body_is_noted() {
+    fn own_chain_frames_are_journaled_ahead_and_a_second_body_sits_the_hand_out() {
         use crate::protocol::messages::EventType;
-        let dir = std::env::temp_dir().join(format!("p2p-journal-ahead-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("p2p-run-journal-ahead-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let me = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
@@ -23904,7 +24002,7 @@ mod late_roster_tests {
                 crate::net::chained::seal(kind, &slot, &payload, by, 1_000, 30_000, 4096).unwrap(),
             )
         };
-        journal_ahead(
+        journal_ahead_as(
             &j,
             &[
                 seal(EventType::ActionCall, 3, &me, 0),
@@ -23912,14 +24010,54 @@ mod late_roster_tests {
                 seal(EventType::ActionCall, 5, &other, 0),
                 seal(EventType::HandInit, 0, &me, 0),
             ],
+            true,
         );
         assert!(j.lookup(3, 9, &[2; 32]).is_some_and(|e| e.kind == EventType::ActionCall.code()));
         assert!(j.lookup(4, 9, &[2; 32]).is_none() && j.lookup(5, 9, &[2; 32]).is_none() && j.lookup(0, 9, &[2; 32]).is_none());
         assert!(j.take_notes().is_empty());
-        journal_ahead(&j, &[seal(EventType::ActionFold, 3, &me, 1), seal(EventType::ActionCheck, 6, &me, 0)]);
-        let notes = j.take_notes();
-        assert!(notes.iter().any(|n| n.contains("would have signed twice")), "{notes:?}");
-        assert!(j.lookup(6, 9, &[2; 32]).is_some(), "the rest of the batch still recorded");
+        // In shadow a second body is noted and sent; armed it sits the hand out.
+        journal_ahead_as(&j, &[seal(EventType::ActionFold, 3, &me, 1)], false);
+        assert!(!j.is_silenced(3) && j.take_notes().iter().any(|n| n.contains("would have signed twice")));
+        journal_ahead_as(&j, &[seal(EventType::ActionFold, 3, &me, 1)], true);
+        assert!(j.is_silenced(3), "a second body sits the hand out");
+        assert!(j.take_notes().iter().any(|n| n.contains("sits hand #3 out")));
+        assert!(!j.is_silenced(6));
+        // An own frame from the wire the journal lacks sits its hand out too;
+        // one it holds does not.
+        let crate::table::hand::Send::Broadcast(held) = seal(EventType::ActionCall, 3, &me, 0);
+        let crate::table::hand::Send::Broadcast(lacking) = seal(EventType::ActionCall, 7, &me, 0);
+        journal_check_own_as(&j, &lacking, false);
+        assert!(!j.is_silenced(7) && j.take_notes().iter().any(|n| n.contains("shadow")));
+        journal_check_own_as(&j, &lacking, true);
+        assert!(j.is_silenced(7));
+        let before = j.take_notes().len();
+        journal_check_own_as(&j, &held, true);
+        assert_eq!(j.take_notes().len(), 0, "{before} note(s) before; none for a frame it holds");
+        assert!(j.close(std::time::Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `G11-R` phase D: **nothing of a hand sat out leaves**, the frames of other
+    /// hands still do; a journal that would not open sits every hand out.
+    #[test]
+    fn nothing_of_a_hand_sat_out_leaves() {
+        use crate::protocol::messages::EventType;
+        let me = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let seal = |kind: EventType, hand_id: u64| {
+            let slot = crate::net::chained::Slot { table_id: [1; 32], hand_id, sequence: 9, previous_event_hash: [2; 32] };
+            crate::table::hand::Send::Broadcast(crate::net::chained::seal(kind, &slot, &0u8, &me, 1_000, 30_000, 4096).unwrap())
+        };
+        let refusing = crate::storage::journal::Handle::refusing(me.verifying_key().to_bytes());
+        journal_ahead_as(&refusing, &[seal(EventType::ActionCall, 4)], true);
+        assert!(refusing.is_silenced(4), "a journal that would not open records nothing: the hand is sat out");
+        let dir = std::env::temp_dir().join(format!("p2p-run-journal-silence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let j = crate::storage::journal::Handle::open(&dir, [1; 32], me.verifying_key().to_bytes(), 1).unwrap();
+        j.silence(5, "a test");
+        let crate::table::hand::Send::Broadcast(vote) = seal(EventType::TimeoutVote, 5);
+        let crate::table::hand::Send::Broadcast(other) = seal(EventType::ActionCheck, 6);
+        assert!(sat_out(&j, &vote), "the vote of the hand sat out does not leave");
+        assert!(!sat_out(&j, &other), "the other hand's frame does");
         assert!(j.close(std::time::Duration::from_secs(5)));
         let _ = std::fs::remove_dir_all(&dir);
     }

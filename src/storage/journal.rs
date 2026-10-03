@@ -566,6 +566,12 @@ pub struct Handle {
     thread: Option<std::thread::JoinHandle<()>>,
     /// The application key whose frames this journal records.
     signer: [u8; 32],
+    /// A journal that would not open (`Handle::refusing`): every write fails,
+    /// every hand is uncovered -- the table's journal fails closed.
+    refusing: bool,
+    /// Phase D: the hands this client sits out because the journal refused a
+    /// frame of them -- nothing more of such a hand leaves (`silence`).
+    silenced: std::sync::Mutex<BTreeSet<u64>>,
     /// What the node is to say about the journal at its next tick -- a write
     /// that failed, a second body refused -- at most `NOTES_CAP`, the oldest
     /// dropped first.
@@ -593,30 +599,34 @@ fn open_files(dir: PathBuf, table_id: [u8; 32], signer: [u8; 32], mode: Mode) ->
             Err(crate::storage::profile::LockError::Unavailable(e)) => return Err(JournalError::Io(e)),
         };
         let on_disk = hands_on_disk(&dir)?;
+        // A header lost -- or one that does not decode, which is the same loss:
+        // a new one, covering none of the hands of the segments still beside it,
+        // whose records it is not this header's to vouch for.
+        let fresh_header = || -> Result<Header, JournalError> {
+            let id = crate::security::rng::array::<16>()
+                .map_err(|e| JournalError::Io(io::Error::other(format!("no randomness for the journal's id: {e}"))))?;
+            let past = on_disk.last().map_or(0, |h| h + 1);
+            let h = Header { id, format: JOURNAL_FORMAT, table_id, signer, covers_from: mode.first_covered().max(past) };
+            write_header(&dir, &h)?;
+            Ok(h)
+        };
         let header = match fs::read(dir.join("header")) {
-            Ok(bytes) => {
-                let h: Header = minicbor::decode(&bytes).map_err(|_| JournalError::Foreign("a header that does not decode"))?;
-                if h.format != JOURNAL_FORMAT {
-                    return Err(JournalError::Foreign("another format"));
+            Ok(bytes) => match minicbor::decode::<Header>(&bytes) {
+                Ok(h) => {
+                    if h.format != JOURNAL_FORMAT {
+                        return Err(JournalError::Foreign("another format"));
+                    }
+                    if h.table_id != table_id {
+                        return Err(JournalError::Foreign("another table"));
+                    }
+                    if h.signer != signer {
+                        return Err(JournalError::Foreign("another signer"));
+                    }
+                    h
                 }
-                if h.table_id != table_id {
-                    return Err(JournalError::Foreign("another table"));
-                }
-                if h.signer != signer {
-                    return Err(JournalError::Foreign("another signer"));
-                }
-                h
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let id = crate::security::rng::array::<16>()
-                    .map_err(|e| JournalError::Io(io::Error::other(format!("no randomness for the journal's id: {e}"))))?;
-                // A lost header with segments still beside it covers none of
-                // their hands: what they hold is not this header's to vouch for.
-                let past = on_disk.last().map_or(0, |h| h + 1);
-                let h = Header { id, format: JOURNAL_FORMAT, table_id, signer, covers_from: mode.first_covered().max(past) };
-                write_header(&dir, &h)?;
-                h
-            }
+                Err(_) => fresh_header()?,
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fresh_header()?,
             Err(e) => return Err(JournalError::Io(e)),
         };
         let mut index = Index::default();
@@ -748,8 +758,53 @@ impl Handle {
             stuck: AtomicU64::new(0),
             thread: Some(thread),
             signer,
+            refusing: false,
+            silenced: std::sync::Mutex::new(BTreeSet::new()),
             notes: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    /// The journal of a table whose own would not open: it records nothing and
+    /// covers no hand, so every frame of a hand's chain is refused and its hand
+    /// sat out (phase D) -- the table's journal fails closed until it opens.
+    pub fn refusing(signer: [u8; 32]) -> Handle {
+        Handle {
+            id: [0; 16],
+            covers_from: Arc::new(AtomicU64::new(u64::MAX)),
+            index: Arc::new(RwLock::new(Index::default())),
+            tx: None,
+            sent: AtomicU64::new(0),
+            finished: Arc::new(AtomicU64::new(0)),
+            stuck: AtomicU64::new(0),
+            thread: None,
+            signer,
+            refusing: true,
+            silenced: std::sync::Mutex::new(BTreeSet::new()),
+            notes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Whether this is [`Handle::refusing`]'s stand-in for a journal that would
+    /// not open.
+    pub fn is_refusing(&self) -> bool {
+        self.refusing
+    }
+
+    /// Phase D: sit `hand` out -- nothing more of it leaves this client -- and
+    /// say why, once.
+    pub fn silence(&self, hand: u64, why: &str) {
+        let fresh = self.silenced.lock().unwrap_or_else(PoisonError::into_inner).insert(hand);
+        if fresh {
+            self.note(format!(
+                "this seat sits hand #{hand} out: {why} -- nothing of it is said, so nobody can hold two versions of a \
+                 frame of it signed by this client (G11-R)"
+            ));
+        }
+    }
+
+    /// Whether `hand` is sat out ([`Handle::silence`]).
+    pub fn is_silenced(&self, hand: u64) -> bool {
+        self.silenced.lock().unwrap_or_else(PoisonError::into_inner).contains(&hand)
     }
 
     /// The application key whose frames this journal records.
@@ -805,7 +860,7 @@ impl Handle {
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         let n = self.send(Job::Write(entries, reply_tx))?;
-        self.wait(n, &reply_rx, timeout)
+        self.wait(n, &reply_rx, timeout, true)
     }
 
     /// Remove every segment of a hand before `keep_from` -- the boundary's
@@ -814,8 +869,12 @@ impl Handle {
     /// to `keep_from` first, durably.
     pub fn prune(&self, keep_from: u64, timeout: Duration) -> Result<(), JournalError> {
         let (reply_tx, reply_rx) = mpsc::channel();
+        // A prune that does not return in time is housekeeping that ran long:
+        // it does not fail the next write at once (a write's own timeout does).
         let n = self.send(Job::Prune(keep_from, reply_tx))?;
-        self.wait(n, &reply_rx, timeout)
+        self.wait(n, &reply_rx, timeout, false)?;
+        self.silenced.lock().unwrap_or_else(PoisonError::into_inner).retain(|h| *h >= keep_from);
+        Ok(())
     }
 
     /// Stop the writer and wait at most `timeout` for it, so the lock is free
@@ -850,11 +909,19 @@ impl Handle {
         Ok(n)
     }
 
-    fn wait(&self, n: u64, reply: &mpsc::Receiver<Result<(), JournalError>>, timeout: Duration) -> Result<(), JournalError> {
+    fn wait(
+        &self,
+        n: u64,
+        reply: &mpsc::Receiver<Result<(), JournalError>>,
+        timeout: Duration,
+        stuck_on_timeout: bool,
+    ) -> Result<(), JournalError> {
         match reply.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.stuck.fetch_max(n, Ordering::SeqCst);
+                if stuck_on_timeout {
+                    self.stuck.fetch_max(n, Ordering::SeqCst);
+                }
                 Err(JournalError::Timeout)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(JournalError::Gone),
@@ -1241,6 +1308,47 @@ mod tests {
         assert_eq!(sweep(&p, Duration::ZERO), 1, "the free one goes, the held one stays");
         assert!(journal_dir(&p, &[3; 32]).exists() && !journal_dir(&p, &[1; 32]).exists());
         assert!(b.close(T));
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// **A journal that would not open refuses everything**: no write lands,
+    /// every hand is uncovered; a silenced hand is said once and forgotten
+    /// with the hands a prune drops.
+    #[test]
+    fn a_refusing_journal_refuses_and_a_silenced_hand_is_said_once() {
+        let r = Handle::refusing([2; 32]);
+        assert!(r.is_refusing() && r.is_uncovered(1) && r.is_uncovered(u64::MAX - 1));
+        assert!(r.write(vec![entry(1, 3, 7)], T).is_err());
+        assert!(r.lookup(1, 3, &[7; 32]).is_none());
+        let p = temp_profile("silence");
+        let j = open(&p, 1);
+        assert!(!j.is_refusing());
+        j.silence(4, "a test");
+        j.silence(4, "a test");
+        assert!(j.is_silenced(4) && !j.is_silenced(5));
+        assert_eq!(j.take_notes().len(), 1, "said once");
+        j.prune(5, T).unwrap();
+        assert!(!j.is_silenced(4), "forgotten with the hand");
+        assert!(j.close(T));
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// **A header that does not decode is a lost one**: a new header, covering
+    /// none of the hands of the segments beside it -- never a table refused for
+    /// its life.
+    #[test]
+    fn a_header_that_does_not_decode_is_a_lost_one() {
+        let p = temp_profile("garbled");
+        let j = open(&p, 1);
+        j.write(vec![entry(3, 3, 7)], T).unwrap();
+        let id = j.id();
+        assert!(j.close(T));
+        fs::write(journal_dir(&p, &[1; 32]).join("header"), b"not cbor at all").unwrap();
+        let j = open(&p, 1);
+        assert_ne!(j.id(), id, "a new header");
+        assert_eq!(j.covers_from(), 4, "past the segment beside it");
+        assert!(j.is_uncovered(3));
+        assert!(j.close(T));
         let _ = fs::remove_dir_all(&p);
     }
 
