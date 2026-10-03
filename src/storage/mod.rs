@@ -1,6 +1,7 @@
 //! The portable profile beside the executable: identity, settings, history.
 //! Nothing outside this directory, no registry, no installer.
 pub mod backup;
+pub mod journal;
 pub mod notes;
 pub mod profile;
 pub mod progress;

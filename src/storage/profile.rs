@@ -306,7 +306,7 @@ pub fn lock_profile(dir: &Path) -> Result<ProfileLock, LockError> {
 }
 
 #[cfg(windows)]
-fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
+pub(crate) fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
     use std::os::windows::fs::OpenOptionsExt;
     /// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION`.
     const HELD: [i32; 2] = [32, 33];
@@ -318,7 +318,7 @@ fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
 }
 
 #[cfg(not(windows))]
-fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
+pub(crate) fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
