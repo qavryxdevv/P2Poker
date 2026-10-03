@@ -4748,6 +4748,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // one-shot). Armed only: a shadow life vouches for nothing.
     macro_rules! settle_vouching {
         ($t:ident) => {{
+            // Phase D2 (`REFUTE_JOURNAL_D2` C2): a journal that would not open is
+            // tried again before each hand opened -- five seconds apart at the
+            // most, an earlier open's thread let finish -- not a minute on: one
+            // sharing violation at the set costs a hand, not a minute of them.
+            if $t.table.is_some()
+                && $t.journal.as_ref().is_some_and(|j| j.is_refusing())
+                && super::node::now_unix_ms().saturating_sub($t.journal_tried_ms) >= 5_000
+            {
+                let own_key = $t.table.as_ref().and_then(|f| if f.is_founder() { Some(f.table_id()) } else { $t.joined_key });
+                let record = $t.resume.as_ref().filter(|r| Some(r.table_key) == own_key).map_or(0, |r| r.hand_id);
+                let newest = record
+                    .max($t.hand.as_ref().map_or(0, |h| h.hand_id()))
+                    .max($t.previous.as_ref().map_or(0, |h| h.hand_id()));
+                open_journal!($t, crate::storage::journal::Mode::Resume { newest_seen: newest });
+            }
             if journal_armed() {
                 if let Some(j) = $t.journal.as_ref().filter(|j| !j.is_refusing() && !j.vouches()) {
                     let own_key = $t.table.as_ref().and_then(|f| if f.is_founder() { Some(f.table_id()) } else { $t.joined_key });
@@ -10129,16 +10144,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // client that the table says and the journal does not hold -- a
                 // previous life's, a second process's -- sits that hand out: this
                 // life cannot know what else was signed there.
-                if let (Some(j), Some(h)) = (t.journal.as_ref(), t.hand.as_ref()) {
-                    if signer_of(&item.bytes, h) == Some(my_app_key) {
-                        journal_check_own(j, &item.bytes);
-                    }
-                }
-                // `G11-R` phase D2b: the newest hand of this table an own frame was
-                // seen of -- verified under the table, never a peer's word.
+                // Phase D2 (`REFUTE_JOURNAL_D2` S1): with a hand or without one --
+                // a client resuming stashes frames it feeds the hand it adopts --
+                // its signature checked under this table, never a peer's word.
+                // Phase D2b: and the newest hand an own frame was seen of.
                 if let Some(table_id) = t.table.as_ref().map(|f| f.table_id()) {
                     if let Some(hand) = own_frame_hand(&item.bytes, &table_id, &my_app_key) {
                         t.newest_own_seen = t.newest_own_seen.max(hand);
+                        if let Some(j) = t.journal.as_ref() {
+                            journal_check_own(j, &item.bytes);
+                        }
                     }
                 }
                 // `S1-CR`: a ratification copy arriving after this client's
@@ -17599,6 +17614,19 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             seat_called(t, *seat)
         ));
     }
+    // `G11-R` phase D2c: armed, this client's own disk kept it out of two
+    // hands of the last five -- it signs nothing it cannot record first.
+    if journal_armed() && hand_now != 0 {
+        if let Some(j) = t.journal.as_ref() {
+            let out = j.silenced_hands().iter().filter(|k| **k <= hand_now && hand_now - **k < 5).count();
+            if out >= 2 {
+                let why = j.refusal_words().unwrap_or("the disk did not record its moves in time");
+                return Some(format!(
+                    "your client sits hands out because it cannot record its own moves on this computer first -- {why}: free space on the disk, or move the game's folder to a local disk, or leave the table."
+                ));
+            }
+        }
+    }
     // `S1-LN`: twice within the last five hands this client ended a hand the
     // table went on with, and was counted absent for a later stage of it.
     if named_twice_lately(&t.named_after_give_up, hand_now) {
@@ -20376,6 +20404,7 @@ fn journal_ahead_as(j: &crate::storage::journal::Handle, sends: &[crate::table::
             "would have signed twice: a frame of type {kind:#06x} at hand #{hand} sequence {sequence} beside the one its journal holds (G11-R, shadow: sent)"
         )),
         Err(e) if armed => {
+            j.note_refusal(&e);
             for hand in hands {
                 j.silence(hand, &format!("its signing journal did not record a frame of it ({e})"));
             }

@@ -669,6 +669,9 @@ pub struct Handle {
     prune_max: Arc<AtomicU64>,
     /// Phase D2b: whether the journal vouches ([`Header::vouches`]).
     vouches: std::sync::atomic::AtomicBool,
+    /// Phase D2c: what the disk did the last time a batch was refused, in the
+    /// player's words (`Handle::note_refusal`).
+    refusal: std::sync::Mutex<Option<&'static str>>,
     /// Phase D2b: the floor this life set to vouch from, kept so a retry writes
     /// the same one and never recedes with the hands this life opens.
     vouch_floor: std::sync::Mutex<Option<u64>>,
@@ -911,6 +914,7 @@ impl Handle {
             prune_max: prune_seen,
             vouches: std::sync::atomic::AtomicBool::new(vouched),
             vouch_floor: std::sync::Mutex::new(None),
+            refusal: std::sync::Mutex::new(None),
         })
     }
 
@@ -935,6 +939,7 @@ impl Handle {
             prune_max: Arc::new(AtomicU64::new(0)),
             vouches: std::sync::atomic::AtomicBool::new(false),
             vouch_floor: std::sync::Mutex::new(None),
+            refusal: std::sync::Mutex::new(Some("the table's journal would not open in the game's folder")),
         }
     }
 
@@ -954,6 +959,28 @@ impl Handle {
                  frame of it signed by this client (G11-R)"
             ));
         }
+    }
+
+    /// Phase D2c: a batch refused for `e` -- kept in the player's words: the
+    /// disk full, too slow, not writable, held by another copy of the game.
+    /// A second body or an uncovered hand is no disk's doing and is not kept.
+    pub fn note_refusal(&self, e: &JournalError) {
+        let words = match e {
+            JournalError::Io(io) if io.kind() == io::ErrorKind::StorageFull || matches!(io.raw_os_error(), Some(28 | 112)) => {
+                "the disk is full"
+            }
+            JournalError::Timeout | JournalError::Full => "the disk answered too slowly",
+            JournalError::Io(_) | JournalError::TooLarge | JournalError::Gone => "the game's folder could not be written",
+            JournalError::Locked => "another copy of the game holds this table's journal",
+            JournalError::Foreign(_) => "the game's folder holds another table's journal",
+            JournalError::Conflict { .. } | JournalError::Uncovered => return,
+        };
+        *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = Some(words);
+    }
+
+    /// Phase D2c: the words of the last refusal, if any.
+    pub fn refusal_words(&self) -> Option<&'static str> {
+        *self.refusal.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Phase D2b: whether this journal vouches for every own frame of the
@@ -1505,6 +1532,23 @@ mod tests {
         assert!(j.is_silenced(3), "carried to the journal opened again");
         assert!(j.close(T));
         let _ = fs::remove_dir_all(&p);
+    }
+
+    /// Phase D2c: **a refusal is kept in the player's words** -- the disk full,
+    /// too slow, not writable, held by another copy -- and a second body, which
+    /// is no disk's doing, keeps nothing.
+    #[test]
+    fn a_refusal_is_kept_in_the_players_words() {
+        let j = Handle::refusing([2; 32]);
+        assert!(j.refusal_words().is_some(), "a journal that would not open says so");
+        j.note_refusal(&JournalError::Timeout);
+        assert_eq!(j.refusal_words(), Some("the disk answered too slowly"));
+        j.note_refusal(&JournalError::Io(io::Error::new(io::ErrorKind::StorageFull, "full")));
+        assert_eq!(j.refusal_words(), Some("the disk is full"));
+        j.note_refusal(&JournalError::Conflict { hand: 1, sequence: 2, kind: 3 });
+        assert_eq!(j.refusal_words(), Some("the disk is full"), "a second body keeps nothing");
+        j.note_refusal(&JournalError::Locked);
+        assert_eq!(j.refusal_words(), Some("another copy of the game holds this table's journal"));
     }
 
     /// **A failed write leaves nothing behind**: cut back to where it began,
