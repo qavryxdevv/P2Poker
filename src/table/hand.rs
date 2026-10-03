@@ -1215,6 +1215,43 @@ pub enum Voice {
     Muted,
 }
 
+/// `G11-R` phase C: what this client's signing journal holds of the hand being
+/// opened -- the node's snapshot of it, read once, at the open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum JournalView {
+    /// No journal -- a test, a control build: the hand signs as it always did.
+    #[default]
+    None,
+    /// The journal cannot vouch for the hand -- made new on a resume, a damaged
+    /// segment, one that would not open: every slot of it is to be taken as
+    /// signed. `armed`: the node sits such a hand out.
+    Uncovered { armed: bool },
+    /// The journal covers the hand: this client's own frames of it, as signed.
+    Covered(Vec<JournaledFrame>),
+}
+
+/// `G11-R` phase C: what taking a journaled frame came to.
+enum Journaled {
+    /// Taken (and said, the first time): what goes out.
+    Taken(Vec<Send>),
+    /// The stage not ready for it: held again.
+    Held,
+    /// Refused: dropped, and said.
+    Refused,
+}
+
+/// `G11-R` phase C: one of this client's own frames of the hand being opened,
+/// as its signing journal holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournaledFrame {
+    pub sequence: u64,
+    pub parent: Hash,
+    /// The frame's bytes, as they left -- or were to leave.
+    pub frame: Vec<u8>,
+    /// A `DECK_INIT`'s deck secret ([`HandSecret::keep`]), journaled with it.
+    pub secret: Option<[u8; 32]>,
+}
+
 /// How many roster seats must name one foreign genesis at sequence 0 of this
 /// hand before this client says so: the same floor `adrift_now` uses for
 /// *a hand ahead*, and for the same reason — one seat's word is one seat's
@@ -2653,6 +2690,18 @@ pub struct Hand {
     /// `D-033`: the previous process's deck secret, from the session record,
     /// until the deck stage takes it.
     restored_secret: Option<HandSecret>,
+    /// `G11-R` phase C: this seat's own frames of this hand that its signing
+    /// journal holds and the hand has not taken yet -- taken where the hand
+    /// would sign (`own_frame_held`, `replay_journaled`, `act`), never signed
+    /// again, never given up for room.
+    journal_held: Vec<Vec<u8>>,
+    /// `G11-R` phase C: the event hashes of journaled frames this life has not
+    /// said -- each said as the hand takes it, so one its previous life
+    /// recorded and never sent reaches the table.
+    journal_unsaid: BTreeSet<Hash>,
+    /// `G11-R` phase C: the deck secrets journaled with this seat's own
+    /// `DECK_INIT`s, by the frame's (sequence, parent).
+    journal_secrets: BTreeMap<(u64, Hash), [u8; 32]>,
     /// `D-033`: no secret for this hand (none kept, or not this hand's): the
     /// hand can be followed and folded, not played out -- no share of this
     /// seat's is ever made, its cards are not read, and at a showdown it mucks.
@@ -2746,7 +2795,7 @@ impl Hand {
         next_deadline_ms: u32,
         voice: Voice,
     ) -> Result<(Hand, Vec<Send>), Failed> {
-        Self::open_inner(o, key, now_ms, next_deadline_ms, voice, None)
+        Self::open_inner(o, key, now_ms, next_deadline_ms, voice, None, JournalView::None)
     }
 
     /// `D-033`: open a hand whose stage 0 this seat signed in its previous
@@ -2764,7 +2813,25 @@ impl Hand {
         kept: Option<&[u8; 32]>,
     ) -> Result<Hand, Failed> {
         let secret = kept.and_then(HandSecret::kept);
-        Self::open_inner(o, key, now_ms, next_deadline_ms, Voice::Speak, Some(secret)).map(|(h, _)| h)
+        Self::open_inner(o, key, now_ms, next_deadline_ms, Voice::Speak, Some(secret), JournalView::None).map(|(h, _)| h)
+    }
+
+    /// `G11-R` phase C: [`open_with`](Hand::open_with) -- or, `restoring`
+    /// carrying the session record's deck secret for the hand if it has one,
+    /// [`open_restoring`](Hand::open_restoring) -- with what this client's
+    /// signing journal holds of the hand: its own frames there are taken where
+    /// the hand would sign them, and said as each is taken.
+    pub fn open_journaled(
+        o: Opening,
+        key: &SigningKey,
+        now_ms: u64,
+        next_deadline_ms: u32,
+        voice: Voice,
+        restoring: Option<Option<[u8; 32]>>,
+        view: JournalView,
+    ) -> Result<(Hand, Vec<Send>), Failed> {
+        let restore = restoring.map(|kept| kept.as_ref().and_then(HandSecret::kept));
+        Self::open_inner(o, key, now_ms, next_deadline_ms, voice, restore, view)
     }
 
     fn open_inner(
@@ -2774,6 +2841,7 @@ impl Hand {
         next_deadline_ms: u32,
         voice: Voice,
         restore: Option<Option<HandSecret>>,
+        view: JournalView,
     ) -> Result<(Hand, Vec<Send>), Failed> {
         let restoring = restore.is_some();
         let fold_only = matches!(restore, Some(None));
@@ -2956,7 +3024,7 @@ impl Hand {
             (true, Voice::Muted) | (false, _) => (Vec::new(), None),
         };
         let opened_at_ms = now_ms;
-        Ok((
+        let mut opened = (
             Hand {
                 signed,
                 last_heard_at: vec![None; usize::from(o.max_players)],
@@ -3047,6 +3115,9 @@ impl Hand {
                 restoring,
                 restored: restoring,
                 restored_secret,
+                journal_held: Vec::new(),
+                journal_unsaid: BTreeSet::new(),
+                journal_secrets: BTreeMap::new(),
                 fold_only,
                 hold_muck: false,
                 showdown_opened_ms: None,
@@ -3093,7 +3164,10 @@ impl Hand {
             // Nothing goes out from a seat that is in no `R` of this hand,
             // and nothing from a quiet or muted one.
             sends,
-        ))
+        );
+        // `G11-R` phase C: and what the journal holds of it.
+        opened.0.take_view(view);
+        Ok(opened)
     }
 
     /// Take one event off the wire.
@@ -3294,17 +3368,221 @@ impl Hand {
     /// or a certificate is sealed at the stage's own sequence and is no part
     /// of it, and a frame of another parent is never taken there -- read as
     /// this seat's part, either left the stage waiting on it for good.
+    ///
+    /// `G11-R` phase C: and where this seat's signing journal holds it, in a
+    /// hand opened from any road -- the frame its previous life recorded,
+    /// whether or not it left.
     fn own_frame_held(&self, kinds: &[EventType]) -> bool {
-        if !self.restored || kinds.is_empty() {
+        if kinds.is_empty() {
             return false;
         }
         let me = self.open.seats[self.seat_index()].1;
         let (hand, sequence, parent) = (self.open.hand_id, self.slot.sequence, self.slot.previous_event_hash);
-        self.early.iter().any(|b| {
+        let at_stage = |b: &Vec<u8>| {
             chained::sender_of(b, FRAME_CAP) == Some(me)
                 && chained::peek(b, PEEK_CAP).is_ok_and(|(k, h, s)| h == hand && s == sequence && kinds.contains(&k))
                 && chained::parent_of(b, FRAME_CAP) == Some(parent)
+        };
+        self.journal_held.iter().any(at_stage) || (self.restored && self.early.iter().any(at_stage))
+    }
+
+    /// `G11-R` phase C: the journal's view of this hand, taken at the open.
+    /// This seat's own frames of this hand past stage 0 (the opening is
+    /// [`open_inner`]'s) go to `journal_held` and make the hand one taken up
+    /// from a previous life's (`restored`, `S1-KK`'s gates); a `DECK_INIT`'s
+    /// secret is kept by its slot. A shuffle step journaled without its proof
+    /// is set aside, said: written by a life killed between the two records
+    /// (or torn by a power cut), it never left, and only the wire could bring a
+    /// proof of it -- replayed, the shuffle stalled for good.
+    fn take_view(&mut self, view: JournalView) {
+        let JournalView::Covered(frames) = view else {
+            return;
+        };
+        let me = self.open.seats[self.seat_index()].1;
+        let hand = self.open.hand_id;
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        for f in frames {
+            // Read, then believed: the journal is this signer's, and a frame of
+            // another hand, slot or signer is nothing here.
+            if chained::sender_of(&f.frame, FRAME_CAP) != Some(me)
+                || !chained::peek(&f.frame, PEEK_CAP).is_ok_and(|(_, h, s)| h == hand && s == f.sequence)
+                || chained::parent_of(&f.frame, FRAME_CAP) != Some(f.parent)
+            {
+                continue;
+            }
+            if let Some(secret) = f.secret {
+                self.journal_secrets.insert((f.sequence, f.parent), secret);
+            }
+            if f.sequence >= 1 {
+                held.push(f.frame);
+            }
+        }
+        let me_seat = self.open.my_seat;
+        let lone: Vec<Vec<u8>> = held
+            .iter()
+            .filter(|b| {
+                let Ok((EventType::ShuffleStep, _, sequence)) = chained::peek(b, PEEK_CAP) else {
+                    return false;
+                };
+                let Some(step) = chained::event_hash_of(b, FRAME_CAP) else {
+                    return true;
+                };
+                let after = stage_hash_single(sequence, EventType::ShuffleStep.code(), me_seat, step);
+                !held.iter().any(|p| {
+                    chained::peek(p, PEEK_CAP).is_ok_and(|(k, _, s)| k == EventType::ShuffleProof && s == sequence + 1)
+                        && chained::parent_of(p, FRAME_CAP) == Some(after)
+                })
+            })
+            .cloned()
+            .collect();
+        // A deck key journaled without its secret (a journal older than the
+        // secret's record) and no session record's secret for the hand: replayed,
+        // the key reads no card of this seat's -- the hand voided where a fresh
+        // key plays it. Set aside: the stage keys again, and the journal decides.
+        if self.restored_secret.is_none() {
+            let secretless: Vec<Vec<u8>> = held
+                .iter()
+                .filter(|b| {
+                    chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, s)| {
+                        k == EventType::DeckInit
+                            && chained::parent_of(b, FRAME_CAP).is_some_and(|p| !self.journal_secrets.contains_key(&(s, p)))
+                    })
+                })
+                .cloned()
+                .collect();
+            if !secretless.is_empty() {
+                self.cert_note.push(
+                    "G11-R: this seat's journal holds its deck key without the secret; not replayed -- the key is made \
+                     again, and the journal decides"
+                        .to_string(),
+                );
+            }
+            held.retain(|b| !secretless.contains(b));
+        }
+        for step in &lone {
+            let at = chained::peek(step, PEEK_CAP).map(|(_, _, s)| s).unwrap_or(0);
+            self.cert_note.push(format!(
+                "G11-R: this seat's journal holds its shuffle step at sequence {at} without the proof; never sent, it is \
+                 not replayed -- the step is made again, and the journal decides about it"
+            ));
+        }
+        held.retain(|b| !lone.contains(b));
+        for b in &held {
+            if let Some(h) = chained::event_hash_of(b, FRAME_CAP) {
+                self.journal_unsaid.insert(h);
+            }
+        }
+        if !held.is_empty() {
+            self.restored = true;
+        }
+        self.journal_held = held;
+    }
+
+    /// `G11-R` phase C: where `journal_held` holds this seat's own frame at the
+    /// slot now open -- of any type: one slot holds one frame of a seat.
+    fn journal_at_slot(&self) -> Option<usize> {
+        let (sequence, parent) = (self.slot.sequence, self.slot.previous_event_hash);
+        self.journal_held.iter().position(|b| {
+            chained::peek(b, PEEK_CAP).is_ok_and(|(_, _, s)| s == sequence) && chained::parent_of(b, FRAME_CAP) == Some(parent)
         })
+    }
+
+    /// `G11-R` phase C: one journaled own frame of the slot now open, taken:
+    /// applied as the table's copy of it would be, and said ahead of what it
+    /// caused the first time this life takes it. Held again where the stage is
+    /// not ready for it; one the hand refuses is dropped and said -- the
+    /// stage's maker then signs, and the journal decides (armed, the hand is
+    /// sat out; in shadow, as before). One the hand took and failed after --
+    /// the slot moved (`S1-KX`) -- is said all the same.
+    fn take_journaled(&mut self, bytes: Vec<u8>, key: &SigningKey, now_ms: u64) -> Journaled {
+        let at = (self.slot.sequence, self.slot.previous_event_hash);
+        let result = self.on_event(&bytes, key, now_ms);
+        let moved = at != (self.slot.sequence, self.slot.previous_event_hash);
+        let (more, failed) = match result {
+            Ok(more) => (more, None),
+            Err(Failed::NotYet) if !moved => {
+                self.journal_held.push(bytes);
+                return Journaled::Held;
+            }
+            Err(e) if moved => (Vec::new(), Some(e)),
+            Err(e) => {
+                let (kind, sequence) = chained::peek(&bytes, PEEK_CAP).map(|(k, _, s)| (k.code(), s)).unwrap_or((0, 0));
+                self.cert_note.push(format!(
+                    "G11-R: this seat's own frame of type {kind:#06x} at sequence {sequence}, from its signing journal, was \
+                     refused here ({e}); not replayed"
+                ));
+                return Journaled::Refused;
+            }
+        };
+        if let Some(e) = failed {
+            self.cert_note.push(format!("this seat's own journaled frame was taken, and then: {e} (G11-R, S1-KX)"));
+        }
+        let mut out = Vec::new();
+        if chained::event_hash_of(&bytes, FRAME_CAP).is_some_and(|h| self.journal_unsaid.remove(&h)) {
+            out.push(Send::Broadcast(bytes));
+        }
+        out.extend(more);
+        Journaled::Taken(out)
+    }
+
+    /// `G11-R` phase C: whether a certificate copy about this seat at the slot
+    /// now open is held, not yet acted on -- the table answering this seat's
+    /// part there by its word (a turn acted for, a stage given up). This seat's
+    /// journaled frame of the slot waits for it: whole, the certificate is the
+    /// table's, and the frame taken before it forked this seat from the table
+    /// (`REVIEW_JOURNAL_C2_impl` 1); short, the table cannot move either.
+    fn certified_at_slot_about_me(&self) -> bool {
+        let (sequence, parent, me) = (self.slot.sequence, self.slot.previous_event_hash, self.open.my_seat);
+        self.store.iter().any(|((s, p, _), set)| {
+            *s == sequence && *p == parent && !set.acted && set.copies.values().any(|c| c.subject.subject_seats.contains(&me))
+        })
+    }
+
+    /// `G11-R` phase C: whether the journaled frame `bytes` may be taken now: not
+    /// at a slot [`Hand::certified_at_slot_about_me`] holds back, nor -- while
+    /// restoring, the table's re-say and its certificates still coming in -- a
+    /// part a certificate acts for (a turn, a showdown's).
+    fn journal_may_take(&self, bytes: &[u8]) -> bool {
+        if self.certified_at_slot_about_me() {
+            return false;
+        }
+        !(self.restoring
+            && chained::peek(bytes, PEEK_CAP)
+                .is_ok_and(|(k, _, _)| is_betting_action(k) || matches!(k, EventType::ShowdownReveal | EventType::ShowdownMuck)))
+    }
+
+    /// `G11-R` phase C: this seat's own journaled frames, each taken once the
+    /// hand stands at its slot -- one at a time, the rest still held, so a
+    /// stage one of them opens finds the next (`own_frame_held`). A frame of a
+    /// stage passed, or of the stage now open at another parent, is dropped
+    /// unsaid: a dead branch never leaves. Whether anything was taken.
+    fn replay_journaled(&mut self, key: &SigningKey, now_ms: u64) -> (Vec<Send>, bool) {
+        let mut sends = Vec::new();
+        let mut took = false;
+        let mut tried: BTreeSet<Hash> = BTreeSet::new();
+        loop {
+            let (sequence, parent) = (self.slot.sequence, self.slot.previous_event_hash);
+            self.journal_held.retain(|b| {
+                chained::peek(b, PEEK_CAP).is_ok_and(|(_, _, s)| {
+                    s > sequence || (s == sequence && chained::parent_of(b, FRAME_CAP) == Some(parent))
+                })
+            });
+            let Some(at) = self.journal_held.iter().position(|b| {
+                chained::peek(b, PEEK_CAP).is_ok_and(|(_, _, s)| s == sequence)
+                    && chained::event_hash_of(b, FRAME_CAP).is_some_and(|h| !tried.contains(&h))
+                    && self.journal_may_take(b)
+            }) else {
+                return (sends, took);
+            };
+            let bytes = self.journal_held.remove(at);
+            if let Some(h) = chained::event_hash_of(&bytes, FRAME_CAP) {
+                tried.insert(h);
+            }
+            if let Journaled::Taken(out) = self.take_journaled(bytes, key, now_ms) {
+                took = true;
+                sends.extend(out);
+            }
+        }
     }
 
     /// `S1-KK`: the kinds of this seat's part of the stage now open, for
@@ -3608,12 +3886,25 @@ impl Hand {
         // (`deck_mine`).
         if self.restoring || self.restored {
             let (fresh, _, _) = self.params.keygen(&ctx);
-            let secret = match self.restored_secret.take() {
-                Some(s) => s,
-                None => {
-                    self.fold_only = true;
-                    fresh
+            // `G11-R` phase C: the secret journaled with this seat's key at this
+            // very slot first -- the key is then the journaled frame's, replayed
+            // -- and the session record's after it.
+            let journaled = self
+                .journal_secrets
+                .get(&(self.slot.sequence, self.slot.previous_event_hash))
+                .and_then(HandSecret::kept);
+            let secret = match journaled {
+                Some(s) => {
+                    self.fold_only = false;
+                    s
                 }
+                None => match self.restored_secret.take() {
+                    Some(s) => s,
+                    None => {
+                        self.fold_only = true;
+                        fresh
+                    }
+                },
             };
             let stage = Collective::closed(
                 self.slot.sequence,
@@ -4986,6 +5277,26 @@ impl Hand {
             };
             (kind, body)
         };
+
+        // `G11-R` phase C: a turn this seat's journal answers is played as
+        // journaled, whoever asks now -- the player, the clock, autoplay, a
+        // seat sat out, the fold of a hand without its material. A second
+        // action at that slot would be a second version of the seat's turn.
+        if let Some(at) = self.journal_at_slot() {
+            // Not before the table's word on it, nor while restoring: nothing is
+            // signed, and the replay takes the frame when it may.
+            if !self.journal_may_take(&self.journal_held[at]) {
+                return Ok(Vec::new());
+            }
+            let bytes = self.journal_held.remove(at);
+            match self.take_journaled(bytes, key, now_ms) {
+                Journaled::Taken(out) => return Ok(out),
+                Journaled::Held => return Ok(Vec::new()),
+                // Refused and said: the turn is signed below, and the journal
+                // decides about it.
+                Journaled::Refused => {}
+            }
+        }
 
         // `S1-KT` harness: a rogue first signs, at the same slot, an action the
         // rules refuse -- a check facing a bet, a call with nothing owed -- and
@@ -12421,12 +12732,25 @@ impl Hand {
         let mut sends = Vec::new();
         let mut failures = Vec::new();
         loop {
+            // `G11-R` phase C: the stored certificate sets first where the journal
+            // holds frames -- the table's word on a slot before this seat's own
+            // record of it (`REVIEW_JOURNAL_C2_impl` 1) -- then the journal's.
+            let mut took = false;
+            if !self.journal_held.is_empty() && !control("s1lf") {
+                let (out, acted, errs) = self.judge_stored_all(key, now_ms);
+                sends.extend(out);
+                failures.extend(errs);
+                took = acted;
+            }
+            let (mut journaled, replayed) = self.replay_journaled(key, now_ms);
+            sends.append(&mut journaled);
+            let took = took || replayed;
             // `S1-KK`: one at a time, the rest still held while each is taken --
             // a stage that opens on one of them asks what else is held (whether
             // this seat's own frame for it is, `own_frame_held`), and a queue
             // drained up front answered *nothing*.
             let waiting = self.early.len();
-            let mut applied = false;
+            let mut applied = took;
             for _ in 0..waiting {
                 let Some(bytes) = self.early.pop_front() else {
                     break;
@@ -12645,7 +12969,9 @@ impl Hand {
         };
         Some(Turn {
             seat: to_act,
-            mine: to_act == self.open.my_seat,
+            // `G11-R` phase C: a turn this seat's journal answers is not the
+            // player's, nor the clock's -- the replay plays it.
+            mine: to_act == self.open.my_seat && self.journal_at_slot().is_none(),
             street: play.street,
             to_call: play.round.to_call(to_act),
             legal: play.round.legal(to_act)?,
@@ -13580,6 +13906,18 @@ impl Hand {
         }
         self.restoring = false;
         let mut out = self.stage_mine(key, now_ms)?;
+        // `G11-R` phase C: and what the journal holds for the stage now open --
+        // here, not a tick on, when a fold or the clock could sign that slot --
+        // after the stored certificates: the table's word first.
+        if !self.journal_held.is_empty() && !control("s1lf") {
+            let (more, _, errs) = self.judge_stored_all(key, now_ms);
+            out.extend(more);
+            for e in errs {
+                self.cert_note.push(format!("a stored certificate at the restore's end: {e}"));
+            }
+        }
+        let (mut journaled, _) = self.replay_journaled(key, now_ms);
+        out.append(&mut journaled);
         // `S1-KK`: and a certificate held back while restoring, where its
         // previous life voted for none of it.
         if self.cert_owed_since.is_some() && self.certifying.as_ref().is_some_and(|c| !self.voted_in_a_previous_life(&c.subject)) {
@@ -25504,6 +25842,426 @@ mod tests {
         assert_eq!(take_deck_secret(&hash), None, "taken once");
         let other = chained::event_hash_of(&bytes_of(&from_b)[0], FRAME_CAP).unwrap();
         assert_eq!(take_deck_secret(&other), None, "a HAND_INIT carries no secret");
+    }
+
+    /// `G11-R` phase C: the frames of a hand's chain, as the node journals them.
+    fn of_the_chain(kind: EventType) -> bool {
+        matches!(
+            kind,
+            EventType::HandInit
+                | EventType::DeckInit
+                | EventType::ShuffleStep
+                | EventType::ShuffleProof
+                | EventType::DeckCommit
+                | EventType::DealPrivate
+                | EventType::ActionCheck
+                | EventType::ActionCall
+                | EventType::ActionBet
+                | EventType::ActionRaise
+                | EventType::ActionFold
+                | EventType::BoardReveal
+                | EventType::ShowdownReveal
+                | EventType::ShowdownMuck
+                | EventType::HandComplete
+        )
+    }
+
+    fn kind_of(f: &[u8]) -> Option<EventType> {
+        chained::peek(f, PEEK_CAP).ok().map(|(k, _, _)| k)
+    }
+
+    /// `G11-R` phase C: an own frame as the node's journal records it -- a deck
+    /// key's secret taken from where the hand left it.
+    fn journaled(f: &[u8]) -> JournaledFrame {
+        let (kind, _, sequence) = chained::peek(f, PEEK_CAP).unwrap();
+        JournaledFrame {
+            sequence,
+            parent: chained::parent_of(f, FRAME_CAP).unwrap(),
+            frame: f.to_vec(),
+            secret: (kind == EventType::DeckInit)
+                .then(|| chained::event_hash_of(f, FRAME_CAP))
+                .flatten()
+                .and_then(|h| take_deck_secret(&h)),
+        }
+    }
+
+    /// `sends` into `to`, an early frame held, the held replayed after.
+    fn deliver_holding(to: &mut Hand, sends: &[Send], key: &SigningKey) -> Vec<Send> {
+        let mut out = Vec::new();
+        for Send::Broadcast(b) in sends {
+            match to.on_event(b, key, NOW) {
+                Ok(mut more) => out.append(&mut more),
+                Err(Failed::NotYet) => {
+                    let _ = to.hold(b.clone());
+                }
+                Err(e) => panic!("a frame of the other seat refused: {e}"),
+            }
+        }
+        let (mut more, failures) = to.replay_early(key, NOW);
+        assert!(failures.is_empty(), "{failures:?}");
+        out.append(&mut more);
+        out
+    }
+
+    /// `sends` of seat `from` carried to the other, the replies back, until
+    /// nothing more is said; what each side said appended to `said`.
+    fn pump_holding(hands: &mut [Hand; 2], keys: &[SigningKey; 2], from: usize, sends: Vec<Send>, said: &mut [Vec<Vec<u8>>; 2]) {
+        let mut queue: Vec<(usize, Vec<Send>)> = vec![(from, sends)];
+        while !queue.is_empty() {
+            let (from, sends) = queue.remove(0);
+            if sends.is_empty() {
+                continue;
+            }
+            said[from].extend(bytes_of(&sends));
+            let to = 1 - from;
+            let more = deliver_holding(&mut hands[to], &sends, &keys[to]);
+            queue.push((to, more));
+        }
+    }
+
+    /// Whoever is to act checks or calls, through `act`, until the hand is
+    /// over at both seats.
+    fn play_out_holding(hands: &mut [Hand; 2], keys: &[SigningKey; 2], said: &mut [Vec<Vec<u8>>; 2]) {
+        for _ in 0..80 {
+            if hands[0].over() && hands[1].over() {
+                return;
+            }
+            let Some(turn) = hands[0].turn().or_else(|| hands[1].turn()) else {
+                return;
+            };
+            let actor = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[actor].act(action, &keys[actor], NOW).unwrap();
+            pump_holding(hands, keys, actor, sends, said);
+        }
+    }
+
+    /// `G11-R` phase C: a heads-up hand played (check or call) until the second
+    /// seat makes a batch of frames `kill` picks -- by its index, its opening
+    /// being batch 0 -- recorded in its journal with every one before it and
+    /// never sent: the seat killed. The first seat, the second's journal (the
+    /// deck key's secret in it), what the first said, and every frame
+    /// delivered, in order; `None` where the hand ended first.
+    fn killed_at(kill: impl Fn(usize, &[Vec<u8>]) -> bool) -> Option<(Hand, Vec<JournaledFrame>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+        killed_after(kill, false)
+    }
+
+    /// [`killed_at`], the batch picked `sent` first -- the table holds it, and so
+    /// does the journal.
+    fn killed_after(
+        kill: impl Fn(usize, &[Vec<u8>]) -> bool,
+        sent: bool,
+    ) -> Option<(Hand, Vec<JournaledFrame>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+        let keys = [key(10), key(11)];
+        let (a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
+        let (b, from_b) = Hand::open(heads_up_opening(1), &keys[1], NOW, 30_000).unwrap();
+        let mut hands = [a, b];
+        let (mut journal, mut a_said, mut order) = (Vec::new(), Vec::new(), Vec::new());
+        let mut batch = 0usize;
+        let mut queue: Vec<(usize, Vec<Send>)> = vec![(1, from_b), (0, from_a)];
+        for _ in 0..600 {
+            if queue.is_empty() {
+                if hands[0].over() || hands[1].over() {
+                    return None;
+                }
+                let turn = hands[0].turn().or_else(|| hands[1].turn())?;
+                let actor = usize::from(turn.seat);
+                let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+                queue.push((actor, hands[actor].act(action, &keys[actor], NOW).unwrap()));
+                continue;
+            }
+            let (from, sends) = queue.remove(0);
+            if sends.is_empty() {
+                continue;
+            }
+            let frames: Vec<Vec<u8>> =
+                bytes_of(&sends).into_iter().filter(|f| kind_of(f).is_some_and(of_the_chain)).collect();
+            if from == 1 && !frames.is_empty() {
+                journal.extend(frames.iter().map(|f| journaled(f)));
+                if kill(batch, &frames) {
+                    let [mut a, _] = hands;
+                    if sent {
+                        order.extend(bytes_of(&sends));
+                        let more = bytes_of(&deliver_holding(&mut a, &sends, &keys[0]));
+                        a_said.extend(more.iter().cloned());
+                        order.extend(more);
+                    }
+                    return Some((a, journal, a_said, order));
+                }
+                batch += 1;
+            } else if from == 0 {
+                a_said.extend(bytes_of(&sends));
+            }
+            order.extend(bytes_of(&sends));
+            let to = 1 - from;
+            let more = deliver_holding(&mut hands[to], &sends, &keys[to]);
+            queue.push((to, more));
+        }
+        panic!("the hand neither ended nor reached the batch");
+    }
+
+    /// `G11-R` phase C: the second seat's next life after `killed_at`: adopted
+    /// from both openings, restoring with `journal` as its journal's view and
+    /// no session record, the table's frames replayed into it, the restore
+    /// ended, and what it said meanwhile carried to the first seat. Both hands,
+    /// and what each said from there.
+    fn next_life(a: Hand, journal: &[JournaledFrame], a_said: &[Vec<u8>]) -> ([Hand; 2], [Vec<Vec<u8>>; 2]) {
+        let keys = [key(10), key(11)];
+        let theirs = a_said.iter().find(|f| kind_of(f) == Some(EventType::HandInit)).expect("its opening").clone();
+        let copies = vec![theirs, journal[0].frame.clone()];
+        let o = Opening::adopt(heads_up_opening(1), &copies).expect("both openings");
+        let (mut b2, opened) =
+            Hand::open_journaled(o, &keys[1], NOW, 30_000, Voice::Speak, Some(None), JournalView::Covered(journal.to_vec()))
+                .unwrap();
+        assert!(opened.is_empty(), "a restored opening says nothing at stage 0");
+        let mut out: Vec<Send> = Vec::new();
+        let table: Vec<Vec<u8>> = a.transcript().iter().chain(a_said.iter()).cloned().collect();
+        for bytes in &table {
+            match b2.on_event(bytes, &keys[1], NOW) {
+                Ok(mut more) => out.append(&mut more),
+                Err(Failed::NotYet) => {
+                    let _ = b2.hold(bytes.clone());
+                }
+                Err(e) => panic!("a frame the table holds: {e}"),
+            }
+        }
+        let (mut more, failures) = b2.replay_early(&keys[1], NOW);
+        assert!(failures.is_empty(), "{failures:?}");
+        out.append(&mut more);
+        out.append(&mut b2.restore_done(&keys[1], NOW).unwrap());
+        let mut hands = [a, b2];
+        let mut said = [Vec::new(), Vec::new()];
+        pump_holding(&mut hands, &keys, 1, out, &mut said);
+        (hands, said)
+    }
+
+    /// `G11-R` phase C: nothing in `said` is a second body at a slot `journal`
+    /// holds.
+    fn signs_no_other(journal: &[JournaledFrame], said: &[Vec<u8>], at: &str) {
+        for bytes in said {
+            let Some(kind) = kind_of(bytes).filter(|k| of_the_chain(*k)) else {
+                continue;
+            };
+            let sequence = chained::peek(bytes, PEEK_CAP).map(|(_, _, s)| s).unwrap();
+            let parent = chained::parent_of(bytes, FRAME_CAP).unwrap();
+            if let Some(j) = journal.iter().find(|f| f.sequence == sequence && f.parent == parent) {
+                assert!(&j.frame == bytes, "{at}: a second body ({kind:?}) at sequence {sequence}");
+            }
+        }
+    }
+
+    /// `G11-R` phase C: **wherever a life was killed, the next signs nothing it
+    /// signed** -- a heads-up hand, the second seat killed once each of its
+    /// batches past the opening is journaled and before it is sent: its next
+    /// life, restored with that journal and no session record, takes its
+    /// frames from the journal where it would sign, says the batch the table
+    /// never had, signs no second body at any journaled slot, and the hand ends
+    /// at one settlement on both sides.
+    #[test]
+    fn wherever_a_life_was_killed_the_next_signs_nothing_it_signed() {
+        let keys = [key(10), key(11)];
+        for sent in [false, true] {
+            let mut m = 1;
+            while let Some((a, journal, a_said, _)) = killed_after(|batch, _| batch == m, sent) {
+                let at = format!("killed at batch {m}, {}", if sent { "sent" } else { "never sent" });
+                let (mut hands, mut said) = next_life(a, &journal, &a_said);
+                play_out_holding(&mut hands, &keys, &mut said);
+                assert!(hands[0].over() && hands[1].over(), "{at}: played out on both sides");
+                assert_eq!(hands[0].terminal(), hands[1].terminal(), "{at}: one settlement");
+                assert!(hands[1].can_play_on(), "{at}: the deck key's secret came back");
+                signs_no_other(&journal, &said[1], &at);
+                let last = &journal.last().expect("a batch").frame;
+                if !sent {
+                    assert!(said[1].contains(last), "{at}: the batch the table never had was said");
+                }
+                m += 1;
+            }
+            assert!(m >= 8, "only {m} batches to kill at");
+        }
+    }
+
+    /// `G11-R` phase C (`REVIEW_JOURNAL_C2_impl` 1): **the table's word on a turn
+    /// beats this seat's record of it** -- three seats, the seat to act killed
+    /// after recording its action and before sending it; the other two certify
+    /// its turn and play on. Its next life, the certificate's copies come in
+    /// before the table's frames, takes the certificate at the turn: the
+    /// journaled action is never taken nor said, and the hand stands where the
+    /// table's does.
+    #[test]
+    fn a_certificate_about_a_journaled_turn_is_followed() {
+        let (mut hands, keys, said) = n_seats_to_the_bet(3);
+        let turn = hands[0].turn().expect("somebody is to act");
+        let x = usize::from(turn.seat);
+        let up = hands[x].turn().expect("its turn");
+        let turn_slot = hands[x].slot();
+        let action = if up.legal.can_check { Action::Check } else { Action::Call };
+        let acted = bytes_of(&hands[x].act(action, &keys[x], NOW).unwrap());
+        let mine = acted.iter().find(|f| kind_of(f).is_some_and(is_betting_action)).expect("the action").clone();
+        let journal: Vec<JournaledFrame> = said[x]
+            .iter()
+            .chain(acted.iter())
+            .filter(|f| kind_of(f).is_some_and(of_the_chain))
+            .map(|f| journaled(f))
+            .collect();
+        let kept = hands[x].secret().expect("dealt in").keep();
+        // The other two vote the silent seat out of its turn and certify it.
+        let others: Vec<usize> = (0..3).filter(|i| *i != x).collect();
+        let t1 = NOW + 120_000;
+        let votes: Vec<Vec<Vec<u8>>> = (0..3)
+            .map(|i| if others.contains(&i) { bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()) } else { Vec::new() })
+            .collect();
+        assert!(others.iter().all(|i| !votes[*i].is_empty()), "both vote");
+        let copies: Vec<Vec<u8>> =
+            cross(&mut hands, &keys, &others, &votes, t1 + 500).into_iter().flat_map(certs_of).collect();
+        assert_eq!(copies.len(), 2, "both seal");
+        for &i in &others {
+            for c in &copies {
+                let _ = hands[i].on_event(c, &keys[i], t1 + 1_000);
+            }
+            let (_, failures) = hands[i].replay_early(&keys[i], t1 + 1_000);
+            assert!(failures.is_empty(), "{failures:?}");
+        }
+        let table_at = hands[others[0]].slot();
+        assert_eq!(table_at, hands[others[1]].slot(), "the two stand together");
+        assert!(table_at.sequence > turn_slot.sequence, "past the certified turn");
+        // The next life: restored with its journal, the copies first, then the
+        // table's frames and votes.
+        let (mut x2, _) = Hand::open_journaled(
+            hashed_opening(opening_n(3, x as u8)),
+            &keys[x],
+            t1 + 2_000,
+            30_000,
+            Voice::Speak,
+            Some(Some(kept)),
+            JournalView::Covered(journal.clone()),
+        )
+        .unwrap();
+        let mut x2_said: Vec<Vec<u8>> = Vec::new();
+        let mut table: Vec<Vec<u8>> = Vec::new();
+        for &i in &others {
+            table.extend(hands[i].transcript().iter().cloned());
+            table.extend(said[i].iter().cloned());
+            table.extend(votes[i].iter().cloned());
+        }
+        // The copies and the table's frames before the deal's stage first; the
+        // restore ends there; then the deal's frames, which open the turn: the
+        // pass that brings the hand to it is followed by one that finds the
+        // certificate stored -- and, before the fix, the journaled action first.
+        let deal_at = turn_slot.sequence.saturating_sub(1);
+        let (late, early): (Vec<Vec<u8>>, Vec<Vec<u8>>) = table.into_iter().partition(|b| {
+            chained::peek(b, PEEK_CAP).is_ok_and(|(k, _, s)| s >= deal_at && k != EventType::TimeoutCert)
+        });
+        let feed = |x2: &mut Hand, frames: &[Vec<u8>], at: u64, out: &mut Vec<Vec<u8>>| {
+            for bytes in frames {
+                match x2.on_event(bytes, &keys[x], at) {
+                    Ok(o) => out.extend(bytes_of(&o)),
+                    Err(_) => {
+                        let _ = x2.hold(bytes.clone());
+                    }
+                }
+                let (o, _) = x2.replay_early(&keys[x], at);
+                out.extend(bytes_of(&o));
+            }
+        };
+        let mut first = copies.clone();
+        first.extend(early);
+        feed(&mut x2, &first, t1 + 2_000, &mut x2_said);
+        x2_said.extend(bytes_of(&x2.restore_done(&keys[x], t1 + 5_000).unwrap()));
+        assert!(x2.slot().sequence <= deal_at, "the restore ends before the turn");
+        feed(&mut x2, &late, t1 + 6_000, &mut x2_said);
+        assert!(!x2_said.contains(&mine), "the journaled action is never said");
+        assert_eq!(x2.slot(), table_at, "it stands where the table does");
+    }
+
+
+    /// `G11-R` phase C: **a turn the journal answers is played as journaled**
+    /// -- the second seat killed after recording its first action and before
+    /// sending it; its next life, at that turn with the action held, is asked
+    /// to fold (the clock, the fold of a hand without its material) and plays
+    /// the journaled action.
+    #[test]
+    fn a_journaled_action_beats_the_clock_and_the_fold() {
+        let keys = [key(10), key(11)];
+        let (a, journal, a_said, order) =
+            killed_at(|_, frames| frames.iter().any(|f| kind_of(f).is_some_and(is_betting_action))).expect("an action");
+        let action = journal
+            .iter()
+            .rev()
+            .find(|f| kind_of(&f.frame).is_some_and(is_betting_action))
+            .expect("the action")
+            .frame
+            .clone();
+        assert_ne!(kind_of(&action), Some(EventType::ActionFold), "check or call");
+        let theirs = a_said.iter().find(|f| kind_of(f) == Some(EventType::HandInit)).expect("its opening").clone();
+        let o = Opening::adopt(heads_up_opening(1), &[theirs, journal[0].frame.clone()]).expect("both openings");
+        let (mut b2, _) =
+            Hand::open_journaled(o, &keys[1], NOW, 30_000, Voice::Speak, Some(None), JournalView::Covered(journal.clone()))
+                .unwrap();
+        // The table's frames in the order they were said, nothing replayed.
+        for bytes in &order {
+            match b2.on_event(bytes, &keys[1], NOW) {
+                Ok(_) | Err(Failed::NotYet) => {}
+                Err(e) => panic!("a frame the table holds: {e}"),
+            }
+        }
+        let turn = b2.turn().expect("a turn");
+        assert_eq!(turn.seat, 1, "its turn, the journaled action held for it");
+        assert!(!turn.mine, "not the player's, nor the clock's: the journal answers it");
+        // Asked anyway while restoring -- the table's word may still come in:
+        // nothing is signed.
+        assert!(b2.act(Action::Fold, &keys[1], NOW).unwrap().is_empty(), "no fold while restoring");
+        // The restore over, the journaled action is played and said.
+        let out = b2.restore_done(&keys[1], NOW).unwrap();
+        assert!(bytes_of(&out).contains(&action), "the journaled action, said");
+        assert!(b2.turn().is_none_or(|t| t.seat != 1), "the turn is played");
+        assert!(
+            !bytes_of(&out).iter().any(|f| kind_of(f) == Some(EventType::ActionFold)),
+            "and no fold of this life's"
+        );
+        let mut hands = [a, b2];
+        let mut said = [Vec::new(), Vec::new()];
+        pump_holding(&mut hands, &keys, 1, out, &mut said);
+        play_out_holding(&mut hands, &keys, &mut said);
+        assert!(hands[0].over() && hands[1].over(), "played out");
+        assert_eq!(hands[0].terminal(), hands[1].terminal(), "one settlement");
+        signs_no_other(&journal, &said[1], "the journaled turn");
+    }
+
+    /// `G11-R` phase C: **a journaled frame of another parent never leaves** --
+    /// one at a slot the hand never stands at is dropped when the hand passes
+    /// its sequence, unsaid; the rest replays as before.
+    #[test]
+    fn a_journaled_frame_of_another_parent_never_leaves() {
+        let keys = [key(10), key(11)];
+        let (a, mut journal, a_said, _) = killed_at(|batch, _| batch == 2).expect("a third batch");
+        let slot = Slot { table_id: [1; 32], hand_id: 1, sequence: 3, previous_event_hash: [9; 32] };
+        let dead = chained::seal(EventType::DeckCommit, &slot, &0u8, &keys[1], NOW, 30_000, 4096).unwrap();
+        journal.push(journaled(&dead));
+        let (mut hands, mut said) = next_life(a, &journal, &a_said);
+        play_out_holding(&mut hands, &keys, &mut said);
+        assert!(!said[1].contains(&dead), "a dead branch never leaves");
+        assert!(hands[0].over() && hands[1].over(), "played out");
+        assert_eq!(hands[0].terminal(), hands[1].terminal());
+    }
+
+    /// `G11-R` phase C: **a shuffle step journaled without its proof is never
+    /// replayed** -- a batch torn between its records: nothing can make that
+    /// proof again, so the step is set aside and said, the stage signs as
+    /// before (the journal decides about it), and the hand goes on.
+    #[test]
+    fn a_journaled_step_without_its_proof_is_never_replayed() {
+        let keys = [key(10), key(11)];
+        let (a, mut journal, a_said, _) =
+            killed_at(|_, frames| frames.iter().any(|f| kind_of(f) == Some(EventType::ShuffleStep))).expect("a step");
+        let step = journal.iter().find(|f| kind_of(&f.frame) == Some(EventType::ShuffleStep)).unwrap().frame.clone();
+        journal.retain(|f| kind_of(&f.frame) != Some(EventType::ShuffleProof));
+        let (mut hands, mut said) = next_life(a, &journal, &a_said);
+        assert!(hands[1].take_cert_note().is_some_and(|n| n.contains("without the proof")), "said");
+        play_out_holding(&mut hands, &keys, &mut said);
+        assert!(!said[1].contains(&step), "the lone step is never said");
+        assert!(said[1].iter().any(|f| kind_of(f) == Some(EventType::ShuffleStep)), "a step of this life's");
+        assert!(hands[0].over() && hands[1].over(), "and the hand goes on");
+        assert_eq!(hands[0].terminal(), hands[1].terminal());
     }
 
     /// What the survivor says again to a seat back from a restart: the frames

@@ -4666,15 +4666,34 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         ($t:ident, $mode:expr) => {{
             if $t.journal.as_ref().is_none_or(|j| j.is_refusing()) && !crate::table::hand::control("g11r") {
                 if let Some(key) = $t.table.as_ref().map(|f| f.table_id()) {
+                    let first_try = $t.journal_tried_ms == 0;
                     $t.journal_tried_ms = super::node::now_unix_ms();
+                    let mode = $mode;
                     match crate::storage::journal::Handle::open_with(
                         &profile_dir,
                         key,
                         app_key.verifying_key().to_bytes(),
-                        $mode,
+                        mode,
                         JOURNAL_OPEN,
                     ) {
-                        Ok(j) => $t.journal = Some(j),
+                        Ok(j) => {
+                            // `G11-R` phase C: back from a restart, what the previous
+                            // life recorded of the hands up to the record's goes out
+                            // again.
+                            if let crate::storage::journal::Mode::Resume { newest_seen } = mode {
+                                // The first open only: the minute retry's hand is
+                                // this life's own.
+                                if first_try && !crate::table::hand::control("g11c") {
+                                    if let Some(frame) = settlement_to_say_again(&j, newest_seen) {
+                                        $t.cert_lane.feed(newest_seen, vec![vec![frame]], super::node::now_unix_ms());
+                                        j.note(format!(
+                                            "hand #{newest_seen}: this seat's own settlement, from its signing journal, said again after the restart (G11-R)"
+                                        ));
+                                    }
+                                }
+                            }
+                            $t.journal = Some(j);
+                        }
                         Err(e) => {
                             // Fails closed: no frame of a hand's chain leaves without
                             // its record, so this seat sits the hands out until the
@@ -12942,11 +12961,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     })
                                                 } else if !member && !exact {
                                                     Err(crate::table::hand::Failed::NotYet)
-                                                } else if signed_before {
-                                                    crate::table::hand::Hand::open_restoring(o, &app_key, now, deadline, kept.as_ref())
-                                                        .map(|h| (h, Vec::new()))
                                                 } else {
-                                                    crate::table::hand::Hand::open(o, &app_key, now, deadline)
+                                                    // `G11-R` phase C: with what the journal holds of it.
+                                                    crate::table::hand::Hand::open_journaled(
+                                                        o,
+                                                        &app_key,
+                                                        now,
+                                                        deadline,
+                                                        crate::table::hand::Voice::Speak,
+                                                        signed_before.then_some(kept),
+                                                        journal_view(t.journal.as_ref(), hid),
+                                                    )
                                                 };
                                                 match opened {
                                                     Ok((mut h, opening_sends)) => {
@@ -19036,7 +19061,9 @@ async fn reopen_hand(
     let now = super::node::now_unix_ms();
     let deadline = opening.crypto_step_timeout_ms;
     let (genesis, required) = (opening.genesis, opening.required.clone());
-    match Hand::open_with(opening, app_key, now, deadline, voice) {
+    // `G11-R` phase C: with what the journal holds of it.
+    let view = journal_view(journal, opening.hand_id);
+    match Hand::open_journaled(opening, app_key, now, deadline, voice, None, view) {
         Ok((mut h, sends)) => {
             // `D-066`: the old hand's word, before the held events replay.
             h.note_line_down_recently(old.line_down_recently());
@@ -19126,7 +19153,9 @@ async fn begin_hand_with(
     }
     let now = super::node::now_unix_ms();
     let deadline = opening.crypto_step_timeout_ms;
-    match Hand::open_with(opening, app_key, now, deadline, voice) {
+    // `G11-R` phase C: with what the journal holds of it.
+    let view = journal_view(journal, opening.hand_id);
+    match Hand::open_journaled(opening, app_key, now, deadline, voice, None, view) {
         Ok((mut h, sends)) => {
             // `D-066`: before the early copies replay -- a certificate among
             // them may name this seat.
@@ -19891,6 +19920,9 @@ fn publish_hand(
     }
 }
 
+/// `G11-R` phase C: and, back from a restart, this seat's own settlement of
+/// the session record's hand (`settlement_to_say_again`).
+///
 /// `S1-LF` rule 3: the whole certificate sets this client holds, said again --
 /// every copy at once when the set is whole, then 5 s later and again 10, 20 and
 /// 40 s apart (up to a quarter more, by the set) -- one copy at a time behind the hand's own
@@ -20029,6 +20061,46 @@ fn journal_armed() -> bool {
     }
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| std::env::var("P2P_POKER_JOURNAL_ARMED").is_ok())
+}
+
+/// `G11-R` phase C: what the table's signing journal holds of `hand`, for the
+/// hand opened now: nothing without a journal, in the control build
+/// (`P2P_POKER_CONTROL=g11r`) or in phase C's own (`g11c`: the journal as
+/// phase B and D left it, nothing replayed).
+fn journal_view(j: Option<&crate::storage::journal::Handle>, hand: u64) -> crate::table::hand::JournalView {
+    use crate::table::hand::{JournalView, JournaledFrame};
+    let Some(j) = j.filter(|_| !crate::table::hand::control("g11r") && !crate::table::hand::control("g11c")) else {
+        return JournalView::None;
+    };
+    match j.entries_of(hand) {
+        None => JournalView::Uncovered { armed: journal_armed() },
+        Some(entries) => JournalView::Covered(
+            entries
+                .into_iter()
+                .map(|e| JournaledFrame {
+                    sequence: e.sequence,
+                    parent: e.parent,
+                    secret: e.secret.as_ref().and_then(|s| <[u8; 32]>::try_from(&s[..]).ok()),
+                    frame: e.frame,
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// `G11-R` phase C: on a resume, this seat's own settlement of the session
+/// record's hand as its journal holds it -- one published while the link was
+/// down and never sent, the boundary written: no hand of this life holds it to
+/// say or to answer for, and the table waits on it. Said on the paced lane
+/// ([`CertLane`]); nothing else of a hand (a hand taken up says its own frames
+/// as it takes them), and one settlement alone -- two would be two versions.
+fn settlement_to_say_again(j: &crate::storage::journal::Handle, hand: u64) -> Option<Vec<u8>> {
+    let mut settlements = j
+        .entries_of(hand)?
+        .into_iter()
+        .filter(|e| e.kind == crate::protocol::messages::EventType::HandComplete.code());
+    let one = settlements.next()?;
+    settlements.next().is_none().then_some(one.frame)
 }
 
 /// `G11-R`: the frames of a hand's chain this client signs -- `HAND_INIT` to
@@ -24358,6 +24430,43 @@ mod late_roster_tests {
         let held = j.lookup(3, 1, &[2; 32]).expect("journaled");
         assert_eq!(held.secret.map(|s| s.to_vec()), Some(vec![9u8; 32]), "the secret in its record");
         assert!(j.lookup(3, 9, &[2; 32]).is_some_and(|e| e.secret.is_none()), "none in another's");
+        assert!(j.close(std::time::Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `G11-R` phase C: **back from a restart, this seat's settlement of the
+    /// record's hand goes out again** on the paced lane -- one published while
+    /// the link was down, the boundary written -- and nothing else of the hand;
+    /// never where the journal holds two settlements of it.
+    #[test]
+    fn a_resume_says_the_records_settlement_again() {
+        use crate::protocol::messages::EventType;
+        let dir = std::env::temp_dir().join(format!("p2p-run-journal-refill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let me = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let j = crate::storage::journal::Handle::open(&dir, [1; 32], me.verifying_key().to_bytes(), 1).unwrap();
+        let seal = |kind: EventType, hand_id: u64, sequence: u64, parent: u8| {
+            let slot = crate::net::chained::Slot { table_id: [1; 32], hand_id, sequence, previous_event_hash: [parent; 32] };
+            crate::table::hand::Send::Broadcast(crate::net::chained::seal(kind, &slot, &0u8, &me, 1_000, 30_000, 4096).unwrap())
+        };
+        let settled = seal(EventType::HandComplete, 2, 30, 2);
+        let crate::table::hand::Send::Broadcast(settled_bytes) = &settled;
+        let settled_bytes = settled_bytes.clone();
+        journal_ahead_as(&j, &[seal(EventType::HandInit, 2, 0, 1), settled], true);
+        journal_ahead_as(&j, &[seal(EventType::HandComplete, 3, 30, 3)], true);
+        journal_ahead_as(&j, &[seal(EventType::HandComplete, 3, 30, 4)], true);
+        journal_ahead_as(&j, &[seal(EventType::DeckInit, 4, 1, 5)], true);
+        assert_eq!(settlement_to_say_again(&j, 2), Some(settled_bytes), "its settlement, and nothing else of it");
+        assert_eq!(settlement_to_say_again(&j, 3), None, "two settlements: neither");
+        assert_eq!(settlement_to_say_again(&j, 4), None, "a hand not settled here");
+        assert_eq!(settlement_to_say_again(&j, 0), None, "a hand the journal cannot vouch for");
+        let view = journal_view(Some(&j), 4);
+        assert!(
+            matches!(&view, crate::table::hand::JournalView::Covered(f) if f.len() == 1 && f[0].sequence == 1),
+            "{view:?}"
+        );
+        assert!(matches!(journal_view(Some(&j), 0), crate::table::hand::JournalView::Uncovered { .. }));
+        assert_eq!(journal_view(None, 4), crate::table::hand::JournalView::None);
         assert!(j.close(std::time::Duration::from_secs(5)));
         let _ = std::fs::remove_dir_all(&dir);
     }
