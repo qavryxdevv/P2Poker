@@ -5563,7 +5563,12 @@ references that one.** §4.0 step 10a, §5.3 and §4.11 are annotated accordingl
 >
 > * `previous_event_hash` — a peer that chains one body to two parents at one
 >   `sequence` is forking the chain, and that must remain an equivocation. Putting
->   the parent in the key would excuse it.
+>   the parent in the key would excuse it. **Amended by `D-100` (2026-10-03):** an
+>   honest client signs one hand at two geneses -- `D-039`'s re-adoption,
+>   `S1-BS`'s re-open, `D-038`'s rejoin -- so this key convicts it; the signing
+>   journal keys (hand, sequence, parent), `G11` will prove equivocation by the
+>   same exact slot, and a fork is caught at its root, where one parent carries
+>   two bodies.
 > * `payload` and `emitted_at_unix_ms` and `next_deadline_ms` — the key must have
 >   capacity **one**, so it may contain only fields that legitimately vary. A key
 >   containing the body is a key no two events ever share, and a predicate over it

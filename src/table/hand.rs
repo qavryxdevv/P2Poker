@@ -2926,9 +2926,9 @@ pub struct Hand {
     /// the signed body, which a copy signed again shares.
     transcript_seen: BTreeSet<Hash>,
     /// `S1-KJ`: the event this hand took at each stage from each writer --
-    /// `(sequence, sender key)` to its event hash -- for telling a copy of it
-    /// from another version of it once the stage is left.
-    taken_from: BTreeMap<(u64, [u8; 32]), Hash>,
+    /// `(sequence, sender key)` to its event hash and its parent -- for telling a
+    /// copy of it from another version of it once the stage is left.
+    taken_from: BTreeMap<(u64, [u8; 32]), (Hash, Hash)>,
     /// `S1-KJ`: the stages and writers another version was found of, each said
     /// once.
     versions_said: BTreeSet<(u64, [u8; 32])>,
@@ -3461,8 +3461,8 @@ impl Hand {
             if self.transcript_seen.insert(digest) {
                 self.transcript.push(bytes.to_vec());
                 // `S1-KJ`: what this hand took at this stage from this writer.
-                if let Some(sender) = chained::sender_of(bytes, FRAME_CAP) {
-                    self.taken_from.entry((sequence, sender)).or_insert(digest);
+                if let (Some(sender), Some(parent)) = (chained::sender_of(bytes, FRAME_CAP), chained::parent_of(bytes, FRAME_CAP)) {
+                    self.taken_from.entry((sequence, sender)).or_insert((digest, parent));
                 }
                 // `S1-KB`: another seat's betting action, taken now for the
                 // first time -- verified, in its slot, applied, the hand moved
@@ -3792,14 +3792,16 @@ impl Hand {
         if kind == EventType::TimeoutVote {
             return None;
         }
-        // `G11-R`: an opening at another genesis is another branch, not another
-        // version of the one taken here -- the journal's key and `G11`'s are the
-        // exact slot, the parent in it.
-        if kind == EventType::HandInit && chained::parent_of(bytes, FRAME_CAP) != Some(self.open.genesis) {
+        let sender = chained::sender_of(bytes, FRAME_CAP)?;
+        let (taken, parent) = *self.taken_from.get(&(sequence, sender))?;
+        // `G11-R` (`D-100`): another version is another body at the same parent
+        // -- the exact slot, the journal's key and `G11`'s. A frame at another
+        // parent is another branch: an honest seat signs a hand at two geneses
+        // (`D-039`'s re-adoption, `S1-BS`'s re-open, `D-038`'s rejoin), and a
+        // fork is caught at its root, where one parent carries two bodies.
+        if chained::parent_of(bytes, FRAME_CAP) != Some(parent) {
             return None;
         }
-        let sender = chained::sender_of(bytes, FRAME_CAP)?;
-        let taken = *self.taken_from.get(&(sequence, sender))?;
         if self.versions_said.contains(&(sequence, sender)) || chained::event_hash_of(bytes, FRAME_CAP)? == taken {
             return None;
         }
@@ -8500,7 +8502,7 @@ impl Hand {
             return;
         }
         let digest = chained::event_hash_of(bytes, FRAME_CAP);
-        if digest.is_some() && self.taken_from.get(&(sequence, sender)).copied() == digest {
+        if digest.is_some() && self.taken_from.get(&(sequence, sender)).map(|(d, _)| *d) == digest {
             return;
         }
         let would_prove = match (claimed_action(bytes, kind), self.bet_stages.get(&sequence)) {
@@ -26636,6 +26638,30 @@ mod tests {
         let other = hands[1].open.my_seat;
         hands[1].completed.named.insert((other, hands[1].slot().sequence + 2));
         assert!(hands[1].named_after_giving_up(), "an abort it took");
+    }
+
+    /// `G11-R` (`D-100`): **another version is another body at the same
+    /// parent** -- a seat's frame of a stage left, at another parent than the
+    /// one taken there, is another branch and counts nothing; at the same parent
+    /// it is another version, said once.
+    #[test]
+    fn another_version_is_another_body_at_the_same_parent() {
+        let keys = [key(10), key(11)];
+        let (mut a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
+        let (_, from_b) = Hand::open(heads_up_opening(1), &keys[1], NOW, 30_000).unwrap();
+        let _ = from_a;
+        let _ = deliver(&mut a, &from_b, &keys[0]);
+        assert!(a.slot().sequence >= 1, "stage 0 left");
+        // Seat 1's opening of the hand at another genesis: another branch.
+        let mut elsewhere = heads_up_opening(1);
+        elsewhere.genesis = [7; 32];
+        let (_, other_genesis) = Hand::open(elsewhere, &keys[1], NOW, 30_000).unwrap();
+        assert_eq!(a.on_event(&bytes_of(&other_genesis)[0], &keys[0], NOW), Ok(Vec::new()), "another branch: nothing");
+        // Another body at the same genesis: another version.
+        let mut richer = heads_up_opening(1);
+        richer.seats[1].2 += 1;
+        let (_, other_body) = Hand::open(richer, &keys[1], NOW, 30_000).unwrap();
+        assert_eq!(a.on_event(&bytes_of(&other_body)[0], &keys[0], NOW), Err(Failed::Equivocation { seat: 1 }));
     }
 
     /// What the survivor says again to a seat back from a restart: the frames
