@@ -68,6 +68,32 @@ pub const WRITER_QUEUE: usize = 32;
 /// Bytes before a record's body: its length and its checksum.
 const RECORD_HEAD: usize = 4 + 16;
 
+/// How long a journal left untouched stays in the profile: a table not played
+/// for a week is not resumed, and its journal serves nothing.
+pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// How this client comes to a table's journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The table was just set: a journal made now covers hands from the first
+    /// one this client is dealt in.
+    Fresh { first_hand: u64 },
+    /// Back to a table after a restart, the newest hand of it seen being
+    /// `newest_seen`. A journal made now -- the old one lost -- covers hands
+    /// from `newest_seen + 2`: the previous life may have signed up to the hand
+    /// after the newest one seen, so every slot of those is taken as signed.
+    Resume { newest_seen: u64 },
+}
+
+impl Mode {
+    fn first_covered(self) -> u64 {
+        match self {
+            Mode::Fresh { first_hand } => first_hand,
+            Mode::Resume { newest_seen } => newest_seen.saturating_add(2),
+        }
+    }
+}
+
 /// What the journal says about the table it serves and the key that signs.
 #[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
 pub struct Header {
@@ -129,7 +155,7 @@ pub enum JournalError {
     /// A record over [`RECORD_CAP`], or a segment past [`SEGMENT_CAP`].
     TooLarge,
     /// A slot this journal holds another body at: the second is never written.
-    Conflict,
+    Conflict { hand: u64, sequence: u64, kind: u16 },
     /// A hand this journal does not cover, or one a failed write left broken.
     Uncovered,
     /// The writer's queue is full.
@@ -148,7 +174,10 @@ impl std::fmt::Display for JournalError {
             Self::Locked => f.write_str("another client holds this table's signing journal"),
             Self::Foreign(what) => write!(f, "the signing journal here is another's: {what}"),
             Self::TooLarge => f.write_str("a record or a segment over the journal's cap"),
-            Self::Conflict => f.write_str("the signing journal holds another frame at that slot"),
+            Self::Conflict { hand, sequence, kind } => write!(
+                f,
+                "the signing journal holds another frame at hand #{hand} sequence {sequence} (this one of type {kind:#06x})"
+            ),
             Self::Uncovered => f.write_str("the signing journal does not cover that hand"),
             Self::Full => f.write_str("the signing journal's writer is behind"),
             Self::Timeout => f.write_str("the signing journal did not confirm the write in time"),
@@ -180,6 +209,60 @@ pub fn journal_dir(profile_dir: &Path, table_id: &[u8; 32]) -> PathBuf {
     profile_dir.join("journal").join(hex)
 }
 
+/// Remove the journal of `table_id` -- the table left for good: a signed
+/// leave, or out of it for good. Refused while another holds it; a journal
+/// still open here is to be closed first.
+pub fn remove(profile_dir: &Path, table_id: &[u8; 32]) -> Result<(), JournalError> {
+    remove_dir(&journal_dir(profile_dir, table_id))
+}
+
+/// Remove every journal in `profile_dir` untouched for `older_than` and held by
+/// nobody, and say how many went -- a table not played for a week is not
+/// resumed. Called as the client starts.
+pub fn sweep(profile_dir: &Path, older_than: Duration) -> usize {
+    let Ok(items) = fs::read_dir(profile_dir.join("journal")) else {
+        return 0;
+    };
+    let mut gone = 0;
+    for item in items.flatten() {
+        let dir = item.path();
+        let newest = fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|f| f.metadata().ok()?.modified().ok())
+            .max();
+        let stale = newest.is_none_or(|t| t.elapsed().is_ok_and(|age| age >= older_than));
+        if dir.is_dir() && stale && remove_dir(&dir).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// Everything in a journal's directory, its lock last, and the directory: only
+/// once this client holds the lock.
+fn remove_dir(dir: &Path) -> Result<(), JournalError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let lock = match crate::storage::profile::open_exclusive(&dir.join("lock")) {
+        Ok(Some(file)) => file,
+        Ok(None) | Err(crate::storage::profile::LockError::InUse) => return Err(JournalError::Locked),
+        Err(crate::storage::profile::LockError::Unavailable(e)) => return Err(JournalError::Io(e)),
+    };
+    for item in fs::read_dir(dir)? {
+        let path = item?.path();
+        if path.file_name().is_some_and(|n| n != "lock") {
+            fs::remove_file(&path)?;
+        }
+    }
+    drop(lock);
+    fs::remove_file(dir.join("lock"))?;
+    fs::remove_dir(dir)?;
+    Ok(())
+}
+
 fn segment_path(dir: &Path, hand: u64) -> PathBuf {
     dir.join(format!("{hand}.wal"))
 }
@@ -196,7 +279,7 @@ fn plan(index: &Index, covers_from: u64, entries: &[Entry]) -> Result<(Vec<Entry
         }
         match index.entries.get(&e.key()).or_else(|| fresh.iter().find(|f| f.key() == e.key())) {
             Some(held) if held.frame == e.frame => continue,
-            Some(_) => return Err(JournalError::Conflict),
+            Some(_) => return Err(JournalError::Conflict { hand: e.hand, sequence: e.sequence, kind: e.kind }),
             None => {}
         }
         let body = minicbor::to_vec(e).map_err(|err| JournalError::Io(io::Error::other(err.to_string())))?;
@@ -481,15 +564,20 @@ pub struct Handle {
     finished: Arc<AtomicU64>,
     stuck: AtomicU64,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The application key whose frames this journal records.
+    signer: [u8; 32],
+    /// What the node is to say about the journal at its next tick -- a write
+    /// that failed, a second body refused -- at most `NOTES_CAP`, the oldest
+    /// dropped first.
+    notes: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
 
-impl Handle {
-    /// Open the journal of `table_id` in `profile_dir` for `signer` -- creating
-    /// it where there is none, covering hands from `covers_from` and from past
-    /// any segment already there -- take its lock (held by no other process, or
-    /// the journal is refused), read every segment, and start its writer.
-    pub fn open(profile_dir: &Path, table_id: [u8; 32], signer: [u8; 32], covers_from: u64) -> Result<Handle, JournalError> {
-        let dir = journal_dir(profile_dir, &table_id);
+/// The notes a journal keeps for the node at most.
+const NOTES_CAP: usize = 64;
+
+/// The journal's files and what they hold, as an open finds them.
+fn open_files(dir: PathBuf, table_id: [u8; 32], signer: [u8; 32], mode: Mode) -> Result<(Files, Index), JournalError> {
+    {
         fs::create_dir_all(&dir)?;
         if let Some(parent) = dir.parent() {
             sync_dir(parent)?;
@@ -525,7 +613,7 @@ impl Handle {
                 // A lost header with segments still beside it covers none of
                 // their hands: what they hold is not this header's to vouch for.
                 let past = on_disk.last().map_or(0, |h| h + 1);
-                let h = Header { id, format: JOURNAL_FORMAT, table_id, signer, covers_from: covers_from.max(past) };
+                let h = Header { id, format: JOURNAL_FORMAT, table_id, signer, covers_from: mode.first_covered().max(past) };
                 write_header(&dir, &h)?;
                 h
             }
@@ -543,26 +631,65 @@ impl Handle {
                 index.entries.insert(e.key(), e);
             }
         }
-        let covers_from = Arc::new(AtomicU64::new(header.covers_from));
-        let index = Arc::new(RwLock::new(index));
-        let finished = Arc::new(AtomicU64::new(0));
-        let (tx, rx) = mpsc::sync_channel::<(u64, Job)>(WRITER_QUEUE);
-        let id = header.id;
-        let mut files = Files {
+        let files = Files {
             dir,
             _lock: lock,
+            covers_from: Arc::new(AtomicU64::new(header.covers_from)),
             header,
-            covers_from: Arc::clone(&covers_from),
             segments: BTreeMap::new(),
             #[cfg(test)]
             fail_after: None,
             #[cfg(test)]
             fail_sync: false,
         };
-        let (shared, cover, done) = (Arc::clone(&index), Arc::clone(&covers_from), Arc::clone(&finished));
+        Ok((files, index))
+    }
+}
+
+impl Handle {
+    /// Open the journal of `table_id` in `profile_dir` for `signer` as a fresh
+    /// table's (`Mode::Fresh`, covering from `covers_from`), waiting as long as
+    /// the disk takes -- the tests' and the tools' open.
+    pub fn open(profile_dir: &Path, table_id: [u8; 32], signer: [u8; 32], covers_from: u64) -> Result<Handle, JournalError> {
+        Self::open_with(profile_dir, table_id, signer, Mode::Fresh { first_hand: covers_from }, Duration::from_secs(3600))
+    }
+
+    /// Open the journal of `table_id` in `profile_dir` for `signer` -- creating
+    /// it where there is none, as `mode` says, and from past any segment
+    /// already there -- take its lock (held by no other process, or the journal
+    /// is refused), read every segment, and start its writer, all of it on the
+    /// writer's own thread: a hung disk costs the caller `timeout` and no more.
+    /// An open that times out goes on alone and lets everything go when it
+    /// finds nobody waiting for it.
+    pub fn open_with(
+        profile_dir: &Path,
+        table_id: [u8; 32],
+        signer: [u8; 32],
+        mode: Mode,
+        timeout: Duration,
+    ) -> Result<Handle, JournalError> {
+        let dir = journal_dir(profile_dir, &table_id);
+        let (tx, rx) = mpsc::sync_channel::<(u64, Job)>(WRITER_QUEUE);
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let finished = Arc::new(AtomicU64::new(0));
+        let done = Arc::clone(&finished);
         let thread = std::thread::Builder::new()
             .name("signing-journal".into())
             .spawn(move || {
+                let (mut files, index) = match open_files(dir, table_id, signer, mode) {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        let _ = opened_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let shared = Arc::new(RwLock::new(index));
+                let cover = Arc::clone(&files.covers_from);
+                let id = files.header.id;
+                if opened_tx.send(Ok((id, Arc::clone(&cover), Arc::clone(&shared)))).is_err() {
+                    // Nobody waits: the open timed out. The lock goes with `files`.
+                    return;
+                }
                 for (n, job) in rx {
                     match job {
                         Job::Write(entries, reply) => {
@@ -605,6 +732,12 @@ impl Handle {
                 }
             })
             .map_err(JournalError::Io)?;
+        let (id, covers_from, index) = match opened_rx.recv_timeout(timeout) {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(e)) => return Err(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(JournalError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(JournalError::Gone),
+        };
         Ok(Handle {
             id,
             covers_from,
@@ -614,7 +747,28 @@ impl Handle {
             finished,
             stuck: AtomicU64::new(0),
             thread: Some(thread),
+            signer,
+            notes: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    /// The application key whose frames this journal records.
+    pub fn signer(&self) -> [u8; 32] {
+        self.signer
+    }
+
+    /// Keep `line` for the node to say at its next tick.
+    pub fn note(&self, line: String) {
+        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        if notes.len() >= NOTES_CAP {
+            notes.pop_front();
+        }
+        notes.push_back(line);
+    }
+
+    /// Every note kept since the last call.
+    pub fn take_notes(&self) -> Vec<String> {
+        self.notes.lock().unwrap_or_else(PoisonError::into_inner).drain(..).collect()
     }
 
     /// The journal's random id.
@@ -827,11 +981,11 @@ mod tests {
         j.write(vec![entry(1, 3, 7)], T).unwrap();
         let mut other = entry(1, 3, 7);
         other.frame = vec![1u8; 100];
-        assert!(matches!(j.write(vec![other], T), Err(JournalError::Conflict)));
+        assert!(matches!(j.write(vec![other], T), Err(JournalError::Conflict { .. })));
         j.write(vec![entry(1, 5, 5), entry(1, 5, 5)], T).unwrap();
         let mut twice = entry(1, 6, 6);
         twice.frame = vec![2u8; 100];
-        assert!(matches!(j.write(vec![entry(1, 6, 6), twice], T), Err(JournalError::Conflict)), "two bodies in one batch");
+        assert!(matches!(j.write(vec![entry(1, 6, 6), twice], T), Err(JournalError::Conflict { .. })), "two bodies in one batch");
         assert!(j.lookup(1, 6, &[6; 32]).is_none(), "a refused batch writes nothing");
         assert_eq!(j.lookup(1, 3, &[7; 32]).unwrap().frame, vec![7; 100], "the first stands");
         assert!(j.close(T));
@@ -1028,6 +1182,65 @@ mod tests {
         j.prune(2, T).unwrap();
         assert_eq!(hands_on_disk(&dir).unwrap(), vec![2]);
         assert!(j.close(T));
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// **A resume without a journal covers from the hand after the next**: the
+    /// previous life may have signed up to the hand after the newest one seen;
+    /// a fresh table's covers from its first hand; an existing header stands
+    /// in either.
+    #[test]
+    fn a_resume_without_a_journal_covers_from_two_past_the_newest_seen() {
+        let p = temp_profile("resume");
+        let j = Handle::open_with(&p, [1; 32], [2; 32], Mode::Resume { newest_seen: 7 }, T).unwrap();
+        assert_eq!(j.covers_from(), 9);
+        assert!(j.is_uncovered(8) && !j.is_uncovered(9));
+        assert!(j.close(T));
+        let j = Handle::open_with(&p, [1; 32], [2; 32], Mode::Fresh { first_hand: 1 }, T).unwrap();
+        assert_eq!(j.covers_from(), 9, "the header stands");
+        assert!(j.close(T));
+        let j = Handle::open_with(&p, [5; 32], [2; 32], Mode::Fresh { first_hand: 3 }, T).unwrap();
+        assert_eq!(j.covers_from(), 3);
+        assert!(j.close(T));
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// **An open that times out lets the journal go**: the caller is told at
+    /// once, and the lock is free once the open behind it is done.
+    #[test]
+    fn an_open_that_times_out_lets_the_journal_go() {
+        let p = temp_profile("slowopen");
+        assert!(matches!(
+            Handle::open_with(&p, [1; 32], [2; 32], Mode::Fresh { first_hand: 1 }, Duration::ZERO),
+            Err(JournalError::Timeout)
+        ));
+        let opened = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            Handle::open_with(&p, [1; 32], [2; 32], Mode::Fresh { first_hand: 1 }, T).is_ok_and(|j| j.close(T))
+        });
+        assert!(opened, "free once the abandoned open let go");
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// **A left table's journal is removed, never one held**; the sweep takes
+    /// the stale ones alone.
+    #[test]
+    fn a_left_tables_journal_goes_and_a_held_one_stays() {
+        let p = temp_profile("remove");
+        let j = open(&p, 1);
+        j.write(vec![entry(1, 3, 7)], T).unwrap();
+        assert!(matches!(remove(&p, &[1; 32]), Err(JournalError::Locked)), "held");
+        assert!(j.close(T));
+        remove(&p, &[1; 32]).unwrap();
+        assert!(!journal_dir(&p, &[1; 32]).exists());
+        remove(&p, &[1; 32]).unwrap();
+        let a = open(&p, 1);
+        assert!(a.close(T));
+        let b = Handle::open(&p, [3; 32], [2; 32], 1).unwrap();
+        assert_eq!(sweep(&p, STALE_AFTER), 0, "nothing a week old");
+        assert_eq!(sweep(&p, Duration::ZERO), 1, "the free one goes, the held one stays");
+        assert!(journal_dir(&p, &[3; 32]).exists() && !journal_dir(&p, &[1; 32]).exists());
+        assert!(b.close(T));
         let _ = fs::remove_dir_all(&p);
     }
 

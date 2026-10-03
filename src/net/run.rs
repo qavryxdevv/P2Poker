@@ -1248,6 +1248,14 @@ struct TableRun {
     /// is stuck at 0 and holding everything after it, and only the stage-0 bytes
     /// release it. Capped, because it is a buffer and every buffer here is.
     said: Vec<Vec<u8>>,
+    /// `G11-R`: the table's signing journal -- every own frame of a hand's
+    /// chain recorded before it leaves (phase B: in shadow, `journal_ahead`).
+    /// Opened as the table is set or taken up again; closed, and the table
+    /// left, removed by `leave_the_table!`.
+    journal: Option<crate::storage::journal::Handle>,
+    /// When the journal was last tried, so one that will not open is tried
+    /// again a minute on and not at every tick.
+    journal_tried_ms: u64,
     /// Whether this table has ever dealt a hand.
     ///
     /// The two roads into the first hand fire again on **every later table
@@ -1924,6 +1932,7 @@ impl TableRun {
         rebase(&mut self.ratification_asked_ms, by_ms);
         rebase(&mut self.chat_refused_said_ms, by_ms);
         rebase(&mut self.hand_said_again_ms, by_ms);
+        rebase(&mut self.journal_tried_ms, by_ms);
         rebase(&mut self.stage_waiting.1, by_ms);
         for sat in self.sat_down_ms.values_mut() {
             rebase(sat, by_ms);
@@ -1973,6 +1982,8 @@ impl TableRun {
             finish_said_for: None,
             act_by: None,
             said: Vec::new(),
+            journal: None,
+            journal_tried_ms: 0,
             ever_dealt: false,
             boundaries: crate::table::boundary::Boundaries::new(),
             crossed_for: None,
@@ -2154,6 +2165,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     } = cfg;
     // Advisory events are offered, not waited for. See `Events`.
     let events = Events::new(events);
+    // `G11-R`: the signing journals of tables not played for a week go -- such a
+    // table is not taken up again, and a journal serves its table alone.
+    let _ = crate::storage::journal::sweep(&profile_dir, crate::storage::journal::STALE_AFTER);
     // `D-002` (`S1-FK`): who may hold a reservation on this client's relay --
     // the poker peers `identify` named, kept beside `poker_peers` -- and the
     // player's switch, read from the settings the window keeps: on unless the
@@ -3269,7 +3283,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )))
                                         .await;
                                 }
-                                publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
+                                publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink, $t.journal.as_ref());
                                 // `S1-KB`: and the betting actions of other seats
                                 // the hand took, the held ones too, said again --
                                 // `S1-LE`: after this client's own frames, which a
@@ -3620,12 +3634,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         // certificate, sealed by the
                                                         // retained hand; it still goes out.
                                                         Ok(sends) => {
-                                                            publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
+                                                            publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink, $t.journal.as_ref());
                                                         }
                                                         Err(_) => {}
                                                     }
                                                     let (more, _) = p.replay_early(&app_key, now);
-                                                    publish_hand(more, &mut swarm, &mut $t.said, &$t.tox_sink);
+                                                    publish_hand(more, &mut swarm, &mut $t.said, &$t.tox_sink, $t.journal.as_ref());
                                                     if let Some(n) = p.take_cert_note() {
                                                         let _ = events
                                                             .send(NodeEvent::Warning(format!(
@@ -3914,7 +3928,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 match $h.vote_on_returns(&evidence, &app_key, super::node::now_unix_ms()) {
                     Ok(sends) => {
                         if !sends.is_empty() {
-                            publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
+                            publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink, $t.journal.as_ref());
                         }
                         if let Some(n) = $h.take_cert_note() {
                             let _ = events
@@ -3940,7 +3954,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             match $h.vote_on_cheats(&app_key, super::node::now_unix_ms()) {
                 Ok(sends) => {
                     if !sends.is_empty() {
-                        publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
+                        publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink, $t.journal.as_ref());
                     }
                 }
                 Err(e) => {
@@ -4636,8 +4650,46 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
         }};
     }
+    // `G11-R`, phase B: the table's signing journal, opened as the table is set
+    // or taken up again -- in shadow: a journal that will not open is said, and
+    // nothing else changes.
+    macro_rules! open_journal {
+        ($t:ident, $mode:expr) => {{
+            if $t.journal.is_none() {
+                if let Some(key) = $t.table.as_ref().map(|f| f.table_id()) {
+                    $t.journal_tried_ms = super::node::now_unix_ms();
+                    match crate::storage::journal::Handle::open_with(
+                        &profile_dir,
+                        key,
+                        app_key.verifying_key().to_bytes(),
+                        $mode,
+                        JOURNAL_OPEN,
+                    ) {
+                        Ok(j) => $t.journal = Some(j),
+                        Err(e) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the table's signing journal did not open: {e} (G11-R, shadow: nothing changes)"
+                                )))
+                                .await;
+                        }
+                    }
+                }
+            }
+        }};
+    }
+
     macro_rules! leave_the_table {
         ($t:ident) => {{
+            // `G11-R`: the table's signing journal closed and, the table being
+            // left, removed -- a journal serves the table it was kept at alone.
+            if let Some(j) = $t.journal.take() {
+                let _ = j.close(JOURNAL_CLOSE);
+            }
+            if let Some(key) = $t.table.as_ref().map(|f| f.table_id()) {
+                let _ = crate::storage::journal::remove(&profile_dir, &key);
+            }
+            $t.journal_tried_ms = 0;
             $t.table_closed = false;
             $t.tournament_started = false;
             $t.table_over_at = None;
@@ -6297,6 +6349,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         &mut swarm,
                                                         &events,
                                                         &t.tox_sink,
+                                                        t.journal.as_ref(),
                                                     )
                                                     .await;
                                                 }
@@ -6830,6 +6883,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 &mut swarm,
                                                 &events,
                                                 &t.tox_sink,
+                                                t.journal.as_ref(),
                                             )
                                             .await;
                                         }
@@ -8927,6 +8981,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = subscribe_scored(&mut swarm, &topic);
                                         t.table_topic = Some(topic);
                                         t.table = Some(f);
+                                        open_journal!(t, crate::storage::journal::Mode::Fresh { first_hand: 1 });
                                         // `D-061`: a continuation's advert, for its word.
                                         if let Some(c) = t.continuing.as_mut() {
                                             c.advert = Some(bytes.clone());
@@ -9223,6 +9278,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = subscribe_scored(&mut swarm, &topic);
                                 t.table_topic = Some(topic);
                                 t.table = Some(f);
+                                open_journal!(
+                                    t,
+                                    if t.resuming {
+                                        crate::storage::journal::Mode::Resume {
+                                            newest_seen: t.resume.as_ref().map_or(0, |r| r.hand_id),
+                                        }
+                                    } else {
+                                        crate::storage::journal::Mode::Fresh { first_hand: 1 }
+                                    }
+                                );
                                 // **Ask the DHT for the founder before asking
                                 // the founder for a seat.**
                                 //
@@ -9391,6 +9456,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = subscribe_scored(&mut swarm, &topic);
                                     t.table_topic = Some(topic.clone());
                                     t.table = Some(f);
+                                    open_journal!(
+                                        t,
+                                        crate::storage::journal::Mode::Resume {
+                                            newest_seen: t.resume.as_ref().map_or(0, |r| r.hand_id),
+                                        }
+                                    );
                                     // A table that is set is not advertised again.
                                     t.ever_dealt = true;
                                     t.resuming = true;
@@ -9591,6 +9662,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         t.joined_ad = Some(ad.clone());
                                         t.joined_advert_hash = Some(advert_hash);
                                         t.table = Some(f);
+                                        open_journal!(
+                                            t,
+                                            crate::storage::journal::Mode::Resume {
+                                                newest_seen: t.resume.as_ref().map_or(0, |r| r.hand_id),
+                                            }
+                                        );
                                         // A table in play: nothing to form, and no
                                         // continuation of a forming table to found (`D-062`).
                                         t.ever_dealt = true;
@@ -9744,7 +9821,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let now = super::node::now_unix_ms();
                         match h.act(action, &app_key, now) {
                             Ok(sends) => {
-                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                 let report =
                                     report_hand(h, &events, &mut t.turn_reported, &mut t.acted_said).await;
                                 if let Some(end) = report.ended {
@@ -9795,7 +9872,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         match h.show_held(&app_key, now) {
                             Ok(sends) => {
                                 if !sends.is_empty() {
-                                    publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                    publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                     let _ = events
                                         .send(NodeEvent::Warning("showdown: your hand is shown, as you asked (D-050)".into()))
                                         .await;
@@ -10640,6 +10717,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         &mut swarm,
                                         &events,
                                         &t.tox_sink,
+                                        t.journal.as_ref(),
                                     )
                                     .await;
                                 }
@@ -12506,7 +12584,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     };
                     match folded {
                         Some(Ok(sends)) => {
-                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                             let _ = events
                                 .send(NodeEvent::Warning(
                                     "folded: this seat's card material was lost with the client that stopped, so the hand cannot be played on (D-033)".into(),
@@ -12606,7 +12684,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         match given_up {
                             Some(Ok((current, sends))) => {
-                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
                                         "gave up hand #{current}, in which nothing was dealt: the other seat has opened hand #{next} from that give-up, and this client opens it too"
@@ -12811,7 +12889,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         // carry a certificate naming this seat.
                                                         h.note_line_down_recently(line_down_within(t.line_down_at));
                                                         if member && !signed_before {
-                                                            publish_hand(opening_sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                                            publish_hand(opening_sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                                         }
                                                         for c in &copies {
                                                             match h.on_event(c, &app_key, now) {
@@ -12824,7 +12902,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                                 // through the ordinary road, played on. A restored hand
                                                                 // (D-033) says its part from `restore_done` below.
                                                                 Ok(sends) if member && !signed_before => {
-                                                                    publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                                                    publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                                                 }
                                                                 Ok(_) => {}
                                                                 Err(e) => {
@@ -12844,7 +12922,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             let _ = h.hold(b);
                                                         }
                                                         let (more, failures) = h.replay_early(&app_key, now);
-                                                        publish_hand(more, &mut swarm, &mut t.said, &t.tox_sink);
+                                                        publish_hand(more, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                                         for e in failures {
                                                             // `S1-KT`: evidence of nothing here is no refusal.
                                                             if matches!(e, crate::table::hand::Failed::Ignored) {
@@ -12988,9 +13066,37 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         cheat_out_by_the_word!(t, p);
                     }
+                    // `G11-R`: a table set without its signing journal -- one that
+                    // would not open -- is tried again a minute on, covering only
+                    // the hands after the newest this client has seen; and what the
+                    // journal noted since the last tick is said.
+                    if t.table.is_some()
+                        && t.journal.is_none()
+                        && super::node::now_unix_ms().saturating_sub(t.journal_tried_ms) >= 60_000
+                    {
+                        let newest = t.hand.as_ref().map(|h| h.hand_id()).max(t.resume.as_ref().map(|r| r.hand_id));
+                        open_journal!(t, crate::storage::journal::Mode::Resume { newest_seen: newest.unwrap_or(0) });
+                    }
+                    if let Some(j) = t.journal.as_ref() {
+                        for note in j.take_notes() {
+                            let _ = events.send(NodeEvent::Warning(note)).await;
+                        }
+                    }
                     // Retention ends when the running hand leaves stage 0: from
                     // there its genesis is what the table chained from.
                     if t.hand.as_ref().is_some_and(|h| h.slot().sequence >= 1) {
+                        // `G11-R`: and the journal keeps that hand and the one
+                        // before it -- nothing older is ever signed at.
+                        if let (Some(j), Some(h)) = (t.journal.as_ref(), t.hand.as_ref()) {
+                            let keep_from = h.hand_id().saturating_sub(1);
+                            if keep_from > j.covers_from() {
+                                if let Err(e) = j.prune(keep_from, JOURNAL_WRITE) {
+                                    j.note(format!(
+                                        "the signing journal could not drop the hands before #{keep_from}: {e}"
+                                    ));
+                                }
+                            }
+                        }
                         // `S1-KS`: and the cheat votes and certificates about it,
                         // said again into this hand only while a late bank could
                         // still repair it: a vote of a shuffle frame is 13 KB.
@@ -13028,6 +13134,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 &events,
                                 &t.tox_sink,
                                 &app_key,
+                                t.journal.as_ref(),
                             )
                             .await;
                             if reopened {
@@ -13062,7 +13169,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             h.hand_id()
                                         )))
                                         .await;
-                                    publish_hand(vec![s], &mut swarm, &mut t.said, &t.tox_sink);
+                                    publish_hand(vec![s], &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                 }
                             }
                         }
@@ -13139,7 +13246,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .send(NodeEvent::Warning(format!("a held event: {e}")))
                             .await;
                     }
-                    publish_hand(replayed, &mut swarm, &mut t.said, &t.tox_sink);
+                    publish_hand(replayed, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                     // `S1-CW`: a held certificate replayed here can end the hand too.
                     hand_may_have_ended!(t, h);
                     // `S1-GK`: the seats whose player left by its own word and whose
@@ -13533,7 +13640,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(n) = h.take_cert_note() {
                                 let _ = events.send(NodeEvent::Warning(n)).await;
                             }
-                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                             // `S1-CW`: this vote completed a certificate whose stage a
                             // peer's copy had opened, and the hand ended here -- before
                             // any card was out, at the client that voted last. Said and
@@ -13563,7 +13670,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     "no certificate about the proven cheat came: the hand is given up with the evidence (D-084, PROTOCOL.md 4.10)".into(),
                                 ))
                                 .await;
-                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                             hand_may_have_ended!(t, h);
                         }
                         Ok(_) => {}
@@ -13672,7 +13779,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .await;
                             }
                             if !sends.is_empty() {
-                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                                 hand_may_have_ended!(t, h);
                             }
                         }
@@ -13738,7 +13845,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let budget = h.expired_budget(now);
                     match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                         Ok(sends) => {
-                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                             // **And name the cause when the transport is the cause.**
                             // A player reading "the hand ran out of time" looks for
                             // a slow opponent. Across two networks the opponent was
@@ -13817,7 +13924,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 match said {
                     Ok(sends) => {
                         if !sends.is_empty() {
-                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
                                     "hand #{}: showdown: {} (D-050)",
@@ -13887,7 +13994,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let was_sitting_out = t.sitting_out;
                 match h.act(action, &app_key, now) {
                     Ok(sends) => {
-                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink, t.journal.as_ref());
                         let _ = events
                             .send(NodeEvent::Warning(if lost_material {
                                 "folded: this seat's card material was lost with the client that stopped, so the hand cannot be played on (D-033)".to_string()
@@ -14358,6 +14465,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 &mut swarm,
                                 &mut t.said,
                                 &t.tox_sink,
+                                t.journal.as_ref(),
                             );
                             if let Some(h) = t.hand.as_ref() {
                                 let _ = boundary_event(
@@ -14955,6 +15063,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             &mut swarm,
                             &events,
                             &t.tox_sink,
+                            t.journal.as_ref(),
                         )
                         .await;
                     }
@@ -17943,6 +18052,7 @@ async fn begin_hand(
     swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     events: &Events,
     tox: &super::toxsink::TableSink,
+    journal: Option<&crate::storage::journal::Handle>,
 ) {
     let mut none: Vec<(u8, Vec<u8>)> = Vec::new();
     // **Hand one, which has no boundary behind it and therefore no buffer.**
@@ -17968,6 +18078,7 @@ async fn begin_hand(
         swarm,
         events,
         tox,
+        journal,
     )
     .await;
 }
@@ -18768,6 +18879,7 @@ async fn reopen_hand(
     events: &Events,
     tox: &super::toxsink::TableSink,
     app_key: &ed25519_dalek::SigningKey,
+    journal: Option<&crate::storage::journal::Handle>,
 ) -> bool {
     use crate::table::hand::{Hand, Voice};
     let Some(mut old) = hand.take() else { return false };
@@ -18846,8 +18958,8 @@ async fn reopen_hand(
                     }
                 )))
                 .await;
-            publish_hand(sends, swarm, said, tox);
-            publish_hand(more, swarm, said, tox);
+            publish_hand(sends, swarm, said, tox, journal);
+            publish_hand(more, swarm, said, tox, journal);
             let _ = events
                 .send(NodeEvent::HandWaiting {
                     hand_id: h.hand_id(),
@@ -18889,6 +19001,7 @@ async fn begin_hand_with(
     swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     events: &Events,
     tox: &super::toxsink::TableSink,
+    journal: Option<&crate::storage::journal::Handle>,
 ) {
     use crate::table::hand::{Hand, Voice};
     if hand.is_some() {
@@ -18957,8 +19070,8 @@ async fn begin_hand_with(
                     .send(NodeEvent::Warning(format!("a held event was refused: {e}")))
                     .await;
             }
-            publish_hand(sends, swarm, said, tox);
-            publish_hand(more, swarm, said, tox);
+            publish_hand(sends, swarm, said, tox, journal);
+            publish_hand(more, swarm, said, tox, journal);
             // `S1-LE`: and what the early copies' replay took of a member this
             // client relays -- said now, not at the next tick.
             let again = h.take_said_again();
@@ -19571,8 +19684,15 @@ fn publish_hand(
     swarm: &mut libp2p::Swarm<super::swarm::ShapedBehaviour>,
     said: &mut Vec<Vec<u8>>,
     tox: &super::toxsink::TableSink,
+    journal: Option<&crate::storage::journal::Handle>,
 ) {
     let _ = swarm;
+    // `G11-R`, phase B: the batch's own frames of a hand's chain recorded before
+    // anything of it leaves -- in shadow. Not in the control build
+    // (`P2P_POKER_CONTROL=g11r`), which measures what the journal costs.
+    if let Some(j) = journal.filter(|_| !crate::table::hand::control("g11r")) {
+        journal_ahead(j, &sends);
+    }
     for crate::table::hand::Send::Broadcast(out) in sends {
         // **Arm the on-turn mute before asking whether anything may leave**,
         // so the window starts at the action this client owed rather than at a
@@ -19620,6 +19740,81 @@ fn publish_hand(
             }
             said.push(out);
         }
+    }
+}
+
+/// `G11-R`: how long the node waits on the table's signing journal -- to open
+/// it, to make a batch durable (and to prune it), to close it.
+const JOURNAL_OPEN: std::time::Duration = std::time::Duration::from_millis(2_000);
+const JOURNAL_WRITE: std::time::Duration = std::time::Duration::from_millis(1_500);
+const JOURNAL_CLOSE: std::time::Duration = std::time::Duration::from_millis(2_000);
+
+/// `G11-R`, phase B: the frames of a hand's chain this client signs --
+/// `HAND_INIT` to `HAND_COMPLETE`, one slot a frame of a seat -- recorded in the
+/// table's signing journal before anything of the batch leaves. **In shadow**: a
+/// second body at a slot the journal holds is noted ("would have signed twice")
+/// and the batch still goes, as one the journal could not record does; phase D
+/// sends neither. What happened is said at the node's next tick.
+fn journal_ahead(j: &crate::storage::journal::Handle, sends: &[crate::table::hand::Send]) {
+    use crate::protocol::messages::EventType as E;
+    let mine = j.signer();
+    let entries: Vec<crate::storage::journal::Entry> = sends
+        .iter()
+        .filter_map(|crate::table::hand::Send::Broadcast(b)| {
+            let (kind, hand, sequence) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok()?;
+            let of_the_chain = matches!(
+                kind,
+                E::HandInit
+                    | E::DeckInit
+                    | E::ShuffleStep
+                    | E::ShuffleProof
+                    | E::DeckCommit
+                    | E::DealPrivate
+                    | E::ActionCheck
+                    | E::ActionCall
+                    | E::ActionBet
+                    | E::ActionRaise
+                    | E::ActionFold
+                    | E::BoardReveal
+                    | E::ShowdownReveal
+                    | E::ShowdownMuck
+                    | E::HandComplete
+            );
+            if hand == 0 || !of_the_chain || crate::net::chained::sender_of(b, TABLE_FRAME_PEEK)? != mine {
+                return None;
+            }
+            Some(crate::storage::journal::Entry {
+                hand,
+                sequence,
+                parent: crate::net::chained::parent_of(b, TABLE_FRAME_PEEK)?,
+                kind: kind.code(),
+                frame: b.clone(),
+                secret: None,
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    match j.write(entries.clone(), JOURNAL_WRITE) {
+        Ok(()) => {}
+        Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) => {
+            j.note(format!(
+                "would have signed twice: a frame of type {kind:#06x} at hand #{hand} sequence {sequence} beside the one                  the signing journal holds (G11-R, shadow: sent)"
+            ));
+            // In shadow the rest of the batch is still recorded.
+            let rest: Vec<crate::storage::journal::Entry> =
+                entries.into_iter().filter(|e| j.lookup(e.hand, e.sequence, &e.parent).is_none()).collect();
+            if let Err(e) = j.write(rest, JOURNAL_WRITE) {
+                j.note(format!("the signing journal did not record the rest of a batch: {e} (G11-R, shadow: sent)"));
+            }
+        }
+        Err(e) => j.note(format!("the signing journal did not record a batch: {e} (G11-R, shadow: sent)")),
+    }
+    let took = started.elapsed();
+    if took >= std::time::Duration::from_millis(200) {
+        j.note(format!("the signing journal took {} ms to record a batch (G11-R)", took.as_millis()));
     }
 }
 
@@ -20275,6 +20470,7 @@ async fn publish_and_hear(
             swarm,
             said,
             tox,
+            None,
         );
         if let Some(next) = checkpoint_event(
             &bytes,
@@ -23690,6 +23886,44 @@ mod ad_is_admissible {
 mod late_roster_tests {
     use super::*;
 
+    /// `G11-R` phase B: **the batch's own frames of a hand's chain are recorded
+    /// before anything leaves, and nothing else is** -- a vote, another seat's
+    /// frame and a frame of hand 0 pass by; a second body at a held slot is
+    /// noted and, in shadow, still sent.
+    #[test]
+    fn own_chain_frames_are_journaled_ahead_and_a_second_body_is_noted() {
+        use crate::protocol::messages::EventType;
+        let dir = std::env::temp_dir().join(format!("p2p-journal-ahead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let me = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let j = crate::storage::journal::Handle::open(&dir, [1; 32], me.verifying_key().to_bytes(), 1).unwrap();
+        let seal = |kind: EventType, hand_id: u64, by: &ed25519_dalek::SigningKey, payload: u8| {
+            let slot = crate::net::chained::Slot { table_id: [1; 32], hand_id, sequence: 9, previous_event_hash: [2; 32] };
+            crate::table::hand::Send::Broadcast(
+                crate::net::chained::seal(kind, &slot, &payload, by, 1_000, 30_000, 4096).unwrap(),
+            )
+        };
+        journal_ahead(
+            &j,
+            &[
+                seal(EventType::ActionCall, 3, &me, 0),
+                seal(EventType::TimeoutVote, 4, &me, 0),
+                seal(EventType::ActionCall, 5, &other, 0),
+                seal(EventType::HandInit, 0, &me, 0),
+            ],
+        );
+        assert!(j.lookup(3, 9, &[2; 32]).is_some_and(|e| e.kind == EventType::ActionCall.code()));
+        assert!(j.lookup(4, 9, &[2; 32]).is_none() && j.lookup(5, 9, &[2; 32]).is_none() && j.lookup(0, 9, &[2; 32]).is_none());
+        assert!(j.take_notes().is_empty());
+        journal_ahead(&j, &[seal(EventType::ActionFold, 3, &me, 1), seal(EventType::ActionCheck, 6, &me, 0)]);
+        let notes = j.take_notes();
+        assert!(notes.iter().any(|n| n.contains("would have signed twice")), "{notes:?}");
+        assert!(j.lookup(6, 9, &[2; 32]).is_some(), "the rest of the batch still recorded");
+        assert!(j.close(std::time::Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A re-open must not put this seat's first `HAND_INIT` of the hand beside
     /// its second on the wire: the hand's own events leave the re-send list,
     /// the previous hand's terminal stays.
@@ -23735,7 +23969,7 @@ mod late_roster_tests {
             .find("let (mut more, held_failures) = $h.replay_early(&app_key, now);")
             .expect("the held replayed");
         let own = code[judged..]
-            .find("publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);")
+            .find("publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink, $t.journal.as_ref());")
             .expect("this client's own frames published");
         let said = code[judged + own..].find("say_again!($t, $h);").expect("said again after the replay");
         assert!(said < 400, "right after this client's own frames (S1-LE)");
