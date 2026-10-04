@@ -227,6 +227,9 @@ pub struct Offer<'a> {
     pub signers: &'a [SeatIdx],
     pub dealt_in: &'a [SeatIdx],
     pub stacks: &'a [(SeatIdx, Chips)],
+    /// Batch 4 (`D-102`): the hand the copies open -- the floor a client judges
+    /// them by is that hand's.
+    pub hand_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +510,15 @@ impl Opening {
         Err(first.unwrap_or(Failed::NotYet))
     }
 
+    /// Batch 4 (`D-102`): what the most-signed group of `copies` that `accept`
+    /// takes names for this seat -- the question's number, where the floor
+    /// refused it; `None` for a group without one stack per occupied seat.
+    pub fn offered_to_me(base: &Opening, copies: &[Vec<u8>], accept: impl Fn(&Offer<'_>) -> bool) -> Option<Chips> {
+        let (_, _, body) = Self::accepted_groups(base, copies, &accept).into_iter().next()?;
+        let i = base.seats.iter().position(|(s, _, _)| *s == base.my_seat)?;
+        (body.stacks.len() == base.seats.len()).then(|| body.stacks[i])
+    }
+
     /// `S1-KF` (`D-088`): how many seats other than the adopter signed the
     /// most-signed group of `copies` that `accept` takes -- the pick's measure,
     /// as the adoption's; `None` where it takes none.
@@ -584,7 +596,7 @@ impl Opening {
                 } else {
                     Vec::new()
                 };
-                accept(&Offer { signers: &signed, dealt_in: &body.dealt_in, stacks: &stacks })
+                accept(&Offer { signers: &signed, dealt_in: &body.dealt_in, stacks: &stacks, hand_id: base.hand_id })
             })
             .map(|((genesis, _), (signers, body))| (genesis, signers, body))
             .collect();
@@ -11315,6 +11327,10 @@ impl Hand {
         // the body closes below there is no way back to it. Empty where this
         // client is no longer playing the hand, and then nothing is claimed.
         let stacks_before = self.stacks();
+        // Batch 4 (`D-102`): what this client's own signatures allow it here --
+        // read before `self.late` is borrowed.
+        let floor_here = if control("batch4") { None } else { self.own_floor().or_else(|| self.start_less_dead_blind()) };
+        let me_ix = usize::from(self.open.my_seat);
         if self.late.is_none() {
             let stage = Collective::closed(
                 sequence,
@@ -11420,6 +11436,28 @@ impl Hand {
             // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
             // rejecting an honest peer is how it stops being forwarded.
             Heard::Uninvited => return Err(Failed::NotYet),
+        }
+        // Batch 4 (`D-102`): a borrowed body naming this seat below its own floor
+        // here -- the late stage closes on one only for a seat outside
+        // `required`, whose floor is its start less its dead blind -- is no
+        // settlement this client takes: two seats signing one body could move its
+        // chips with no adoption, and no floor, on the way.
+        let keeps_floor = late.own
+            || floor_here.is_none_or(|fl| late.body.final_stacks.get(me_ix).copied().unwrap_or(0) >= fl);
+        if late.stage.complete() && !keeps_floor {
+            let refused = format!(
+                "the late settlement of hand #{} names this seat at {} chips, below the {} its own signatures \
+                 allow it here, and this client never settled the hand itself, so it adopts none of it: the \
+                 abort's terminal stands here (D-102)",
+                self.open.hand_id,
+                late.body.final_stacks.get(me_ix).copied().unwrap_or(0),
+                floor_here.unwrap_or(0)
+            );
+            self.settle_note = Some(match note {
+                Some(n) => format!("{n}; and {refused}"),
+                None => refused,
+            });
+            return Ok(Vec::new());
         }
         if late.stage.complete() {
             if late.own || !late.disagreed {
@@ -13493,6 +13531,78 @@ impl Hand {
             .into_iter()
             .filter(|s| *s != self.open.my_seat && late.body.deltas.get(usize::from(*s)).is_some_and(|d| *d < 0))
             .collect()
+    }
+
+    /// Batch 4 (`D-102`): the least stack this client's own signatures allow it
+    /// at the end of this hand -- `None` where its stage 0 did not complete here
+    /// (a private opening, a muted or quiet one), which is no evidence:
+    /// - its own settlement (Settling's own body, `late.own`, or the previous
+    ///   life's own `HAND_COMPLETE` the journal holds): that money or the start,
+    ///   whichever is less -- the table may still void the hand (the settlement
+    ///   race on either side) and restore the start;
+    /// - in `required` without one: the start -- the settlement is collective
+    ///   over `required` and never narrowed, and every certificate but a betting
+    ///   one aborts and restores every stack;
+    /// - outside `required`: the start less the dead blind its position posts.
+    pub fn own_floor(&self) -> Option<Chips> {
+        let me = self.open.my_seat;
+        let start = self.start_stack_of(me)?;
+        if let Some(money) = self.own_settlement_money() {
+            return Some(money.min(start));
+        }
+        if self.slot.sequence == 0 {
+            return None;
+        }
+        if self.open.required.contains(&me) {
+            return Some(start);
+        }
+        self.start_less_dead_blind()
+    }
+
+    /// Batch 4: this seat's start less the dead blind its position posts in
+    /// this hand -- what a seat outside `required` can lose here without a frame
+    /// of its own.
+    fn start_less_dead_blind(&self) -> Option<Chips> {
+        let me = self.open.my_seat;
+        let start = self.start_stack_of(me)?;
+        let blind = if me == self.mine.bb_seat {
+            self.mine.big_blind
+        } else if me == self.mine.sb_position {
+            self.mine.small_blind
+        } else {
+            0
+        };
+        Some(start.saturating_sub(blind.min(start)))
+    }
+
+    /// Batch 4: this client's own share of its own settlement of this hand,
+    /// where it holds one -- derived and said at Settling, kept through a
+    /// give-up, or recorded by its previous life.
+    fn own_settlement_money(&self) -> Option<Chips> {
+        let me = usize::from(self.open.my_seat);
+        if let Phase::Playing { play, .. } = &self.phase {
+            match &play.step {
+                Step::Settling { mine, .. } if self.open.required.contains(&self.open.my_seat) => {
+                    return mine.final_stacks.get(me).copied();
+                }
+                Step::Ended if self.open.required.contains(&self.open.my_seat) => {
+                    return play.round.stack.get(me).copied();
+                }
+                _ => {}
+            }
+        }
+        if let Some(late) = self.late.as_ref().filter(|l| l.own) {
+            return late.body.final_stacks.get(me).copied();
+        }
+        let own_key = self.open.seats.iter().find(|(s, _, _)| *s == self.open.my_seat).map(|(_, k, _)| *k)?;
+        self.journal_held.iter().find_map(|b| {
+            let ours = chained::sender_of(b, FRAME_CAP) == Some(own_key)
+                && chained::peek(b, PEEK_CAP).is_ok_and(|(k, h, _)| k == EventType::HandComplete && h == self.open.hand_id);
+            if !ours {
+                return None;
+            }
+            chained::payload_unverified::<HandComplete>(b, FRAME_CAP, HAND_COMPLETE_CAP).and_then(|c| c.final_stacks.get(me).copied())
+        })
     }
 
     /// `G5`, told: what `seat` started this hand with, if it sits in it.
@@ -18149,6 +18259,55 @@ mod tests {
             )),
             "and the settlement wins over the abort, exactly as before"
         );
+    }
+
+    /// Batch 4 (`D-102`), R7: **a borrowed late settlement never takes this
+    /// seat below its own floor** -- the two required peers agreeing on a body
+    /// that names the readmitted seat below its start less its dead blind close
+    /// nothing here, and the abort's terminal stands; at that floor the body
+    /// closes as before.
+    #[test]
+    fn a_borrowed_late_settlement_never_takes_a_seat_below_its_floor() {
+        use crate::table::handwire::HandComplete;
+        let body = |stacks: Vec<u64>| HandComplete {
+            pots: Vec::new(),
+            refunds: Vec::new(),
+            deltas: vec![0, 0, 0],
+            final_stacks: stacks,
+            busted: Vec::new(),
+            state_hash: [0u8; 32],
+        };
+        let sealed = |seat_key: &SigningKey, b: &HandComplete| -> Vec<u8> {
+            let slot = Slot { table_id: [1; 32], hand_id: 1, sequence: 40, previous_event_hash: [5u8; 32] };
+            chained::seal(EventType::HandComplete, &slot, b, seat_key, NOW, 0, HAND_COMPLETE_CAP).expect("a settlement seals")
+        };
+        let fresh = || {
+            let mut o = opening3(2);
+            o.required = vec![0, 1];
+            o.readmitted = vec![2];
+            let (mut h, _) = Hand::open(o, &key(12), NOW, 30_000).unwrap();
+            let _ = h.abort_now(Abort::Deadline, &key(12), NOW + 600_000).unwrap();
+            h
+        };
+        let floor = fresh().start_less_dead_blind().expect("its start, less its dead blind");
+        assert!(floor > 0);
+        let abort_terminal = |h: &Hand| crate::protocol::transcript::abort_terminal(&h.table_id(), h.hand_id(), &h.genesis());
+        // Below the floor: refused.
+        let mut h = fresh();
+        let below = body(vec![12_000, 8_000 + (10_000 - floor) + 1, floor - 1]);
+        assert_eq!(h.on_event(&sealed(&key(10), &below), &key(12), NOW), Ok(Vec::new()));
+        assert_eq!(h.on_event(&sealed(&key(11), &below), &key(12), NOW), Ok(Vec::new()));
+        assert!(h.late.as_ref().is_some_and(|l| l.closed.is_none()), "below the floor: nothing closed");
+        let note = h.take_settle_note().expect("said");
+        assert!(note.contains("below the") && note.contains("D-102"), "{note}");
+        assert_eq!(h.terminal(), Some(abort_terminal(&h)), "the abort's terminal stands");
+        // At the floor: closed, as before.
+        let mut h = fresh();
+        let at = body(vec![12_000, 8_000 + (10_000 - floor), floor]);
+        assert_eq!(h.on_event(&sealed(&key(10), &at), &key(12), NOW), Ok(Vec::new()));
+        assert_eq!(h.on_event(&sealed(&key(11), &at), &key(12), NOW), Ok(Vec::new()));
+        assert!(h.late.as_ref().is_some_and(|l| l.closed.is_some()), "at the floor: closed");
+        assert_ne!(h.terminal(), Some(abort_terminal(&h)), "the settlement wins over the abort");
     }
 
     /// `S1-BP`: a disagreeing settlement that arrives after this client gave
@@ -28694,6 +28853,45 @@ mod tests {
         let key = hands[winner].key_of(loser as u8).expect("its key");
         assert_eq!(hands[winner].start_stack_of_key(&key), Some(start));
         assert_eq!(hands[winner].start_stack_of(9), None, "no such seat");
+    }
+
+    /// Batch 4 (`D-102`): **what a seat's own signatures allow it** -- nothing
+    /// while stage 0 is open; its start at the bet, whatever it has put in (a
+    /// seat in `required` that never settles ends at its start: the table can
+    /// only void the hand without it); at the settlement and after giving it up
+    /// there, the less of its own money and its start.
+    #[test]
+    fn a_seats_own_floor_follows_its_own_signatures() {
+        let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+        let (opening_hand, _) = Hand::open(hashed_opening(opening_n(3, 0)), &keys[0], NOW, 30_000).unwrap();
+        assert_eq!(opening_hand.own_floor(), None, "stage 0 open: no evidence");
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        for (s, h) in hands.iter().enumerate() {
+            let start = h.start_stack_of(s as u8).unwrap();
+            assert_eq!(h.own_floor(), Some(start), "seat {s} at the bet: its start");
+        }
+        let drop_settlements = |_: usize, _: usize, b: &[u8]| -> Option<Vec<u8>> {
+            (!is_kind(b, EventType::HandComplete)).then(|| b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..96 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &drop_settlements, &mut refused);
+        }
+        for s in 0..3usize {
+            let Phase::Playing { play, .. } = &hands[s].phase else { panic!("seat {s} playing") };
+            let Step::Settling { mine, .. } = &play.step else { panic!("seat {s} at the settlement") };
+            let money = mine.final_stacks[s];
+            let start = hands[s].start_stack_of(s as u8).unwrap();
+            assert_eq!(hands[s].own_floor(), Some(money.min(start)), "seat {s} settling");
+            let _ = hands[s].abort_now(Abort::Deadline, &keys[s], NOW + 200_000).unwrap();
+            assert_eq!(hands[s].own_floor(), Some(money.min(start)), "seat {s} after giving the settlement up");
+        }
     }
 
     /// `S1-LP`: **the genesis a missed certificate would re-derive the next

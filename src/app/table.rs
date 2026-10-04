@@ -205,6 +205,7 @@ impl AppState {
             unsafe_note: self.unsafe_note.clone(),
             unsafe_may_show: self.unsafe_may_show(),
             split_note: self.split_note.clone(),
+            floor_offer: self.floor_offer,
             // `S1-IX`: the seats by the names the window shows.
             stopped: self.stopped.as_ref().map(|(s, serial)| crate::gui::table::StoppedView {
                 hand_id: s.hand_id,
@@ -1059,6 +1060,27 @@ mod tests {
         assert!(second > first, "new words, a new question");
         s.apply(NodeEvent::TableSplit { why: None });
         assert_eq!(s.table_view().split_note, None, "the games meet again");
+    }
+
+    /// Batch 4 (`D-102`): **the floor's question reaches the window** -- the
+    /// log says so, the same offer is no new question, a new one is, and the
+    /// node's `None` closes it.
+    #[test]
+    fn the_floor_question_reaches_the_window_and_goes_when_answered() {
+        use crate::net::node::FloorOffer;
+        let mut s = seated(0);
+        let offer = FloorOffer { hand: 12, offered: 1_400, floor: 1_500 };
+        s.apply(NodeEvent::FloorOffer { offer: Some(offer) });
+        let (said, first) = s.table_view().floor_offer.expect("asked");
+        assert_eq!(said, offer);
+        assert!(s.table_view().log.iter().any(|l| l.text.contains("offers your seat back with 1400 chips")), "the log says so");
+        s.apply(NodeEvent::FloorOffer { offer: Some(offer) });
+        assert_eq!(s.table_view().floor_offer.map(|(_, n)| n), Some(first), "the same offer: no new question");
+        s.apply(NodeEvent::FloorOffer { offer: Some(FloorOffer { hand: 13, offered: 1_350, floor: 1_500 }) });
+        let (_, second) = s.table_view().floor_offer.expect("asked again");
+        assert!(second > first, "a new offer, a new question");
+        s.apply(NodeEvent::FloorOffer { offer: None });
+        assert_eq!(s.table_view().floor_offer, None, "answered, or dealt in again");
     }
 
     /// `D-051`: the table not safe reaches the window with a serial the

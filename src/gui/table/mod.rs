@@ -300,6 +300,10 @@ pub struct TableView {
     /// `S1-KF` (`D-088`): the table has split into separate games, with the
     /// serial the window's *Agree* closes it by.
     pub split_note: Option<(String, u64)>,
+    /// Batch 4 (`D-102`): the table dealt on without this client and offers its
+    /// seat back below what its own signatures allow it, with the serial the
+    /// window's answer closes it by.
+    pub floor_offer: Option<(crate::net::node::FloorOffer, u64)>,
     /// `S1-IX`: the table stopped on a disagreement about a hand's result, or
     /// the game ended on it.
     pub stopped: Option<StoppedView>,
@@ -375,6 +379,9 @@ pub enum TableAction {
     Back,
     /// `D-050`: *Show cards* -- the waiting hand is shown instead of mucked.
     ShowCards,
+    /// Batch 4 (`D-102`): take the offer the window showed -- `offered` chips at
+    /// hand `hand`, below this seat's own floor.
+    TakeOffer { hand: u64, offered: u64 },
 }
 
 /// `D-057`: where a step of the way back stands.
@@ -688,6 +695,8 @@ pub struct TableUi {
     /// `S1-KF` (`D-088`): the serial of the *table split* word the player
     /// agreed to play on through.
     pub split_closed: u64,
+    /// Batch 4 (`D-102`): the serial of the floor's question the player answered.
+    pub floor_closed: u64,
     /// `S1-IX`: the serial of the *table stopped* word the player chose to
     /// wait through.
     pub stopped_closed: u64,
@@ -1702,7 +1711,18 @@ fn unsafe_question<'a>(view: &'a TableView, state: &TableUi) -> Option<(&'a Stri
             && view.opponent_gone_s.is_none()
             && !stopped_asked
             && split_question(view, state).is_none()
+            && floor_question(view, state).is_none()
     })
+}
+
+/// Batch 4 (`D-102`): the table dealt on without this client and offers its
+/// seat back below what its own signatures allow it -- not once answered.
+/// Never over a hand being played by the node's own word: it asks only while it
+/// holds no hand of this table, so a hand the window still shows is one the node
+/// dropped (`REVIEW_B4_diff_v7` M1). Before the windows about a table split or
+/// not safe.
+fn floor_question(view: &TableView, state: &TableUi) -> Option<(crate::net::node::FloorOffer, u64)> {
+    view.floor_offer.filter(|(_, n)| *n != state.floor_closed && view.out_for_good.is_none() && view.lost.is_none())
 }
 
 /// `S1-KF` (`D-088`), the owner's word: the table split into separate games
@@ -1718,6 +1738,7 @@ fn split_question<'a>(view: &'a TableView, state: &TableUi) -> Option<(&'a Strin
         .is_some_and(|s| s.ended.is_some() || s.serial != state.stopped_closed);
     view.split_note.as_ref().map(|(why, serial)| (why, serial)).filter(|(_, n)| {
         view.unsafe_may_show
+            && floor_question(view, state).is_none()
             && **n != state.split_closed
             && view.out_for_good.is_none()
             && view.lost.is_none()
@@ -1847,6 +1868,58 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                 ui.label(RichText::new(why.as_str()).color(style::PANEL_MUTED).small());
                 if ui.add(egui::Button::new(RichText::new("Close the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
                     action = Some(TableAction::CloseOut);
+                }
+            });
+    }
+
+    // Batch 4 (`D-102`): the table dealt on without this client and offers its
+    // seat back below what its own signatures allow it. *Take* answers with the
+    // offer shown; at 0 there is nothing to take, and *Wait* closes the window.
+    if let Some((offer, serial)) = floor_question(view, state) {
+        egui::Window::new("Dealt on without you")
+            .id(egui::Id::new("table-floor"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(window_frame(&ctx))
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(&ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
+                if offer.offered == 0 {
+                    window_heading(ui, "The table names your seat at 0 chips", false);
+                    ui.label(format!(
+                        "The other players dealt on without you and name your seat at 0 chips -- the blinds of the hands you missed, or chips taken from you. Your own signatures allow no less than {}, and nothing here can make them deal you in.",
+                        offer.floor
+                    ));
+                    ui.label(RichText::new("You can wait, or leave the table.").strong());
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Wait").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
+                            state.floor_closed = serial;
+                        }
+                        if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                            action = Some(TableAction::LeaveTable);
+                        }
+                    });
+                } else {
+                    window_heading(ui, "The table dealt on without you", false);
+                    ui.label(format!(
+                        "The table offers your seat back with {} chips. By your own signatures you hold no less than {} -- the difference is the blinds of the hands you missed, or chips taken from you.",
+                        offer.offered, offer.floor
+                    ));
+                    ui.label(RichText::new(format!("Take {} chips and play on, or leave the table?", offer.offered)).strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(RichText::new(format!("Take {} chips", offer.offered)).color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A)))
+                            .clicked()
+                        {
+                            state.floor_closed = serial;
+                            action = Some(TableAction::TakeOffer { hand: offer.hand, offered: offer.offered });
+                        }
+                        if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                            action = Some(TableAction::LeaveTable);
+                        }
+                    });
                 }
             });
     }
@@ -2303,6 +2376,7 @@ impl TableView {
             unsafe_note: None,
             unsafe_may_show: false,
             split_note: None,
+            floor_offer: None,
             stopped: None,
             line: None,
             absent: Vec::new(),
@@ -2402,6 +2476,26 @@ mod tests {
         v.opponent_gone_s = None;
         v.lost = Some("gone".into());
         assert!(split_question(&v, &ui(0, 0)).is_none(), "not at the table any more");
+    }
+
+    /// Batch 4 (`D-102`): **the floor's question is asked before the split and
+    /// the not-safe windows**, never over a hand being played, and its answer
+    /// closes it.
+    #[test]
+    fn the_floor_question_is_asked_first_and_its_answer_closes_it() {
+        use crate::net::node::FloorOffer;
+        let mut v = TableView::waiting("Riverside".into(), 6);
+        let ui = |floor: u64, split: u64| TableUi { floor_closed: floor, split_closed: split, ..TableUi::default() };
+        v.floor_offer = Some((FloorOffer { hand: 12, offered: 1_400, floor: 1_500 }, 7));
+        v.split_note = Some(("seat 1 and seat 2 are playing a game of their own".into(), 5));
+        assert_eq!(floor_question(&v, &ui(0, 0)).map(|(_, n)| n), Some(7), "asked over the hand the node dropped");
+        v.unsafe_may_show = true;
+        assert_eq!(floor_question(&v, &ui(0, 0)).map(|(_, n)| n), Some(7), "asked");
+        assert!(split_question(&v, &ui(0, 0)).is_none(), "and the split waits behind it");
+        assert!(floor_question(&v, &ui(7, 0)).is_none(), "the answer closed it");
+        assert_eq!(split_question(&v, &ui(7, 0)).map(|(_, n)| *n), Some(5), "then the other question");
+        v.lost = Some("gone".into());
+        assert!(floor_question(&v, &ui(0, 0)).is_none(), "not at the table any more");
     }
 
     /// A table with nobody at it says what it is waiting for rather than

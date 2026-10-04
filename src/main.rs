@@ -1289,6 +1289,22 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     {
                         join = None;
                     }
+                    // Batch 4 (`D-102`): a headless client has nobody to ask -- it
+                    // takes the offer, unless the harness says to ask (and so take
+                    // nothing).
+                    if let NodeEvent::FloorOffer { offer: Some(o) } = &event {
+                        if o.offered == 0 {
+                            println!("floor: hand #{} names this seat at 0 chips, below the {} of its own signatures: nothing to take", o.hand, o.floor);
+                        } else if std::env::var("P2P_POKER_FLOOR").as_deref() == Ok("ask") {
+                            println!(
+                                "floor: hand #{} offered at {} chips, below the {} this seat's own signatures allow: not taken (P2P_POKER_FLOOR=ask)",
+                                o.hand, o.offered, o.floor
+                            );
+                        } else {
+                            println!("floor: taking hand #{} at {} chips, below the {} of this seat's own signatures", o.hand, o.offered, o.floor);
+                            let _ = commands.send(NodeCommand::TakeOffer { hand: o.hand, offered: o.offered }).await;
+                        }
+                    }
                     // What the log had before, so only new lines are printed.
                     // Most events add none — a re-broadcast this client already
                     // holds, a peer count — and printing `log.back()` after
@@ -2852,6 +2868,11 @@ impl Client {
             }
             Ta::LeaveTable => {
                 self.tell(NodeCommand::LeaveTable);
+                None
+            }
+            // Batch 4 (`D-102`): the offer the window showed, taken.
+            Ta::TakeOffer { hand, offered } => {
+                self.tell(NodeCommand::TakeOffer { hand, offered });
                 None
             }
             // `D-047`: out of the table for good; the player closes it, for good.

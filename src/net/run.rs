@@ -1112,6 +1112,93 @@ pub struct Run {
     pub stay_out: bool,
 }
 
+/// Batch 4 (`D-102`): what this client's own signatures -- or its player's
+/// word, a *Take* -- allow it at the end of hand `hand` of its table: no less
+/// than `stack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnFloor {
+    hand: u64,
+    stack: crate::poker::state::Chips,
+}
+
+/// Batch 4 (`D-102`): the reference moved by what a hand this client holds says
+/// -- to a later hand; within the same hand only down (a hand taken up from the
+/// journal that reads its start does not lift the settlement its previous life
+/// signed); never back to an earlier hand.
+fn floor_moved(cur: Option<OwnFloor>, hand: u64, stack: crate::poker::state::Chips) -> Option<OwnFloor> {
+    match cur {
+        Some(f) if f.hand > hand => Some(f),
+        Some(f) if f.hand == hand => Some(OwnFloor { stack: f.stack.min(stack), ..f }),
+        _ => Some(OwnFloor { hand, stack }),
+    }
+}
+
+/// Batch 4 (`D-102`): the reference a client started again takes -- its
+/// record's (`record`, this table's only), then its signing journal's from the
+/// record's own hand on: the newest hand with an own frame past stage 0 gives
+/// the less of its own settlement's money and its start where it signed one,
+/// and its start where it did not (a seat in `required` that never settles ends
+/// there). A journal that cannot vouch yet -- made new on a resume, which it
+/// stays until the hand it resumes into is taken -- is read all the same: its
+/// own frames are this client's signatures, and a frame it lost can only leave
+/// the floor too high (a question asked, never a stack taken). No journal: the
+/// record's. `my_index`: this seat's place among the occupied seats, which an
+/// opening's stacks are listed by.
+fn floor_after_restart(
+    record: Option<OwnFloor>,
+    journal: Option<&crate::storage::journal::Handle>,
+    me: u8,
+    my_index: Option<usize>,
+) -> Option<OwnFloor> {
+    use crate::protocol::messages::EventType;
+    let Some(j) = journal.filter(|j| !j.is_refusing()) else {
+        return record;
+    };
+    let Some(newest) = j.newest_held() else {
+        return record;
+    };
+    let from = record.map(|r| r.hand).unwrap_or_else(|| j.covers_from()).max(j.covers_from());
+    let mut k = newest;
+    while k >= from && k > 0 {
+        let Some(entries) = j.entries_of(k) else {
+            k -= 1;
+            continue;
+        };
+        if entries.iter().any(|e| e.sequence > 0) {
+            let init = entries
+                .iter()
+                .find(|e| e.sequence == 0 && e.kind == EventType::HandInit.code())
+                .and_then(|e| {
+                    crate::net::chained::payload_unverified::<crate::table::handwire::HandInit>(
+                        &e.frame,
+                        crate::table::hand::FRAME_CAP,
+                        crate::table::hand::HAND_INIT_CAP,
+                    )
+                });
+            let settled = entries.iter().find(|e| e.kind == EventType::HandComplete.code()).and_then(|e| {
+                crate::net::chained::payload_unverified::<crate::table::handwire::HandComplete>(
+                    &e.frame,
+                    crate::table::hand::FRAME_CAP,
+                    crate::table::hand::HAND_COMPLETE_CAP,
+                )
+            });
+            let stack = match settled {
+                Some(c) => (|| {
+                    let money = *c.final_stacks.get(usize::from(me))?;
+                    let delta = *c.deltas.get(usize::from(me))?;
+                    let start = u64::try_from(i128::from(money) - i128::from(delta)).ok()?;
+                    Some(money.min(start))
+                })(),
+                None => init.as_ref().zip(my_index).and_then(|(i, ix)| i.stacks.get(ix).copied()),
+            };
+            // A body this client cannot read gives nothing: the record stands.
+            return stack.map(|stack| OwnFloor { hand: k, stack }).or(record);
+        }
+        k -= 1;
+    }
+    record
+}
+
 /// **One table this client sits at, as the node loop runs it** (`D-043`,
 /// stage 1). Every field was a local of the loop until 2026-09-12; the
 /// comments are the ones those locals carried. The loop reads and writes
@@ -1450,6 +1537,12 @@ struct TableRun {
     /// `G5`, told: vetoes seen and not yet known to have stood -- the hand, the
     /// seat's key and number, and what the seat started that hand with.
     settlement_seen: Vec<(u64, [u8; 32], u8, crate::poker::state::Chips)>,
+    /// Batch 4 (`D-102`): the reference the floor of the table's copies is read
+    /// from (`OwnFloor`).
+    own_floor: Option<OwnFloor>,
+    /// Batch 4 (`D-102`): the question standing -- the newest offer the floor
+    /// refused where the count took it.
+    floor_episode: Option<crate::net::node::FloorOffer>,
     /// `S1-JR`: the seats a hand here was voided over for a proof that does not
     /// hold, by application key -- the seat, the cause, and whether this
     /// client's own check found it.
@@ -1938,6 +2031,16 @@ const REASK_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
 const REASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl TableRun {
+    /// Batch 4 (`D-102`): the reference moved by the hands this client holds,
+    /// the retained one first.
+    fn refresh_own_floor(&mut self) {
+        for h in [self.previous.as_ref(), self.hand.as_ref()].into_iter().flatten() {
+            if let Some(stack) = h.own_floor() {
+                self.own_floor = floor_moved(self.own_floor, h.hand_id(), stack);
+            }
+        }
+    }
+
     /// `S1-JB`: the wall clock jumped by `by_ms`. Every moment this table keeps
     /// on this client's own wall clock moves with it, the running hand's too, so
     /// the time since each stays the time that passed. The timers this table
@@ -2051,6 +2154,8 @@ impl TableRun {
             named_after_give_up: std::collections::BTreeSet::new(),
             settlement_vetoes: std::collections::BTreeMap::new(),
             settlement_seen: Vec::new(),
+            own_floor: None,
+            floor_episode: None,
             cheats: std::collections::BTreeMap::new(),
             equivocators: std::collections::BTreeMap::new(),
             back_from_restart: std::collections::BTreeMap::new(),
@@ -2555,6 +2660,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         stacks: $t.stacks_held.clone(),
                         // `S1-KN`: and the seats it put out for good.
                         out: Some(recorded_out(f, &$t.out_keys)),
+                        // Batch 4 (`D-102`): and what its own signatures allow it.
+                        own_floor: $t.own_floor.map(|o| crate::storage::session::OwnFloorRecord { hand: o.hand, stack: o.stack }),
                     };
                     match crate::storage::session::save(&profile_dir, &record) {
                         Ok(()) => {
@@ -4613,6 +4720,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             $t.rejoin_away = line_down_within($t.line_down_at) || $t.frozen.is_some();
+            // Batch 4 (`D-102`): what the hands it drops say of its own stack.
+            $t.refresh_own_floor();
             $t.previous = None;
             $t.hand = None;
             $t.pending_repair = None;
@@ -4923,6 +5032,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.named_after_give_up.clear();
             $t.settlement_vetoes.clear();
             $t.settlement_seen.clear();
+            $t.own_floor = None;
+            $t.floor_episode = None;
             $t.cheats.clear();
             $t.equivocators.clear();
             $t.back_from_restart.clear();
@@ -9990,6 +10101,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // Batch 4 (`D-102`): the player takes the offer the window showed:
+                    // that, and nothing else, is its word on its stack there.
+                    NodeCommand::TakeOffer { hand, offered } => {
+                        if t.floor_episode.take().is_none() {
+                            continue;
+                        }
+                        // The player's word replaces the reference -- over the hands of
+                        // a branch of its own it held, too: a Take of an earlier hand
+                        // than those would otherwise be asked again for ever.
+                        t.own_floor = Some(OwnFloor { hand: hand.saturating_sub(1), stack: offered });
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "the player takes hand #{hand} with {offered} chips, below its own floor (D-102)"
+                            )))
+                            .await;
+                        let _ = events.send(NodeEvent::FloorOffer { offer: None }).await;
+                    }
+
                     NodeCommand::ShowCards => {
                         let Some(h) = t.hand.as_mut() else {
                             continue;
@@ -12715,7 +12844,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 *hid > current
                                     && crate::table::hand::Opening::from_formation(f, *hid).is_some_and(|base| {
                                         crate::table::hand::Opening::accepted_signers(&base, copies, |o| {
-                                            the_table_offered(o, &table, me, away, Some(held.as_slice()), roster)
+                                            the_table_offered(o, &table, me, away, Some(held.as_slice()), roster, None)
                                         })
                                         .is_some()
                                     })
@@ -12735,6 +12864,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     t.rejoin_stacks = Some(h.stacks_this_client_holds());
                                 }
                                 t.rejoin_floor = t.rejoin_floor.max(Some(current));
+                                t.refresh_own_floor();
                                 t.previous = t.hand.take();
                             }
                         }
@@ -12948,6 +13078,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let own_key = if f.is_founder() { Some(f.table_id()) } else { t.joined_key };
                                 let record = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key);
                                 let floor = adoption_floor(t.rejoin_floor, record);
+                                // Batch 4 (`D-102`): the buy-in this seat's own `TABLE_READY` bound
+                                // (the roster hash), where no reference is held yet -- the hand
+                                // before the first; then the record's reference and the journal's
+                                // own frames, read at every pick -- the reference only moves
+                                // forward, so a newer hand of this life's is never undone by them.
+                                if t.own_floor.is_none() {
+                                    let seed = crate::table::hand::Opening::from_formation(f, 1).and_then(|b| {
+                                        b.seats.iter().find(|(s, _, _)| *s == b.my_seat).map(|(_, _, st)| *st)
+                                    });
+                                    t.own_floor = seed.map(|stack| OwnFloor { hand: 0, stack });
+                                }
+                                {
+                                    let recorded = record.and_then(|r| r.own_floor).map(|o| OwnFloor { hand: o.hand, stack: o.stack });
+                                    let me_now = f.my_seat().unwrap_or(0);
+                                    let my_index = crate::table::hand::Opening::from_formation(f, 1)
+                                        .and_then(|b| b.seats.iter().position(|(s, _, _)| *s == me_now));
+                                    if let Some(read) = floor_after_restart(recorded, t.journal.as_ref(), me_now, my_index) {
+                                        t.own_floor = floor_moved(t.own_floor, read.hand, read.stack);
+                                    }
+                                }
                                 // `S1-KF` (`D-088`): the copies are counted against the table
                                 // as this client last knew it -- the hand it dropped, or its
                                 // record, less the seats it counts long gone -- as `D-066`
@@ -12966,8 +13116,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let known: Option<Vec<Vec<u64>>> =
                                     t.rejoin_stacks.clone().or_else(|| record.and_then(|r| r.stacks.clone()));
                                 let away = t.rejoin_away;
+                                // Batch 4 (`D-102`): the least stack the copies may name for this
+                                // seat without its player's word -- none until the record and the
+                                // journal were read, nor in the control build.
+                                let own = if crate::table::hand::control("batch4") { None } else { t.own_floor };
+                                let floor_of = |_: &crate::table::hand::Offer<'_>| own.map(|fl| fl.stack);
                                 let accept = |o: &crate::table::hand::Offer<'_>| {
-                                    the_table_offered(o, &table, me, away, known.as_deref(), occupied)
+                                    the_table_offered(o, &table, me, away, known.as_deref(), occupied, floor_of(o))
                                 };
                                 // The hand the most seats of the table signed, and of those
                                 // the newest: taken newest first, a copy half the table signed
@@ -12995,6 +13150,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .find(|(_, h)| adopts(*h))
                                     .or(ranked.first())
                                     .map(|(_, h)| (*h, t.resume_inits[h].clone()));
+                                // Batch 4 (`D-102`): nothing the count takes passes the floor
+                                // -- the newest of the most-signed groups it refused is the
+                                // question's offer.
+                                if pick.is_none() {
+                                    if let Some(fl) = own {
+                                        let raw = |o: &crate::table::hand::Offer<'_>| {
+                                            the_table_offered(o, &table, me, away, known.as_deref(), occupied, None)
+                                        };
+                                        let refused = t
+                                            .resume_inits
+                                            .iter()
+                                            .filter(|(h, _)| floor.map_or(true, |f| **h > f))
+                                            .filter_map(|(h, copies)| {
+                                                let base = crate::table::hand::Opening::from_formation(f, *h)?;
+                                                let n = crate::table::hand::Opening::accepted_signers(&base, copies, raw)?;
+                                                let offered = crate::table::hand::Opening::offered_to_me(&base, copies, raw)?;
+                                                Some((*h, n, offered))
+                                            })
+                                            .max();
+                                        if let Some((hand, _, offered)) = refused.filter(|(_, _, o)| *o < fl.stack) {
+                                            let ask = crate::net::node::FloorOffer { hand, offered, floor: fl.stack };
+                                            if t.floor_episode != Some(ask) {
+                                                t.floor_episode = Some(ask);
+                                                let _ = events
+                                                    .send(NodeEvent::Warning(format!(
+                                                        "the table offers this seat hand #{hand} with {offered} chips, below the {} its own signatures allow it: asked (D-102)",
+                                                        fl.stack
+                                                    )))
+                                                    .await;
+                                                let _ = events.send(NodeEvent::FloorOffer { offer: Some(ask) }).await;
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some((hid, copies)) = pick {
                                     // `D-039`: whether the set that signed is exact is asked
                                     // after the adoption, which reads the table's own word on
@@ -13011,6 +13200,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         let now = super::node::now_unix_ms();
                                         match crate::table::hand::Opening::adopt_with_signers_where(base, &copies, accept) {
                                             Ok((mut o, signers)) => {
+                                                // Batch 4 (`D-102`): the adoption is this client's word on
+                                                // its stack at that hand's start -- the reference moves to
+                                                // it (a Take's below the floor, the count's at or above).
+                                                if let Some(start_me) = o.seats.iter().find(|(s, _, _)| *s == o.my_seat).map(|(_, _, st)| *st) {
+                                                    t.own_floor = floor_moved(t.own_floor, hid.saturating_sub(1), start_me);
+                                                }
+                                                if t.floor_episode.take().is_some() {
+                                                    let _ = events.send(NodeEvent::FloorOffer { offer: None }).await;
+                                                }
                                                 // `D-033`: a copy of this seat's own opening among
                                                 // the table's means the previous life signed this
                                                 // hand: it is taken up where it stood, not opened anew.
@@ -13292,6 +13490,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning(note)).await;
                         }
                     }
+                    // Batch 4 (`D-102`): what the hands it holds say of its own stack --
+                    // and a question about a seat dealt in again is over.
+                    t.refresh_own_floor();
+                    if t.hand.is_some() && !t.resuming && t.floor_episode.take().is_some() {
+                        let _ = events.send(NodeEvent::FloorOffer { offer: None }).await;
+                    }
                     // `G5`, told: a loser that kept its settlement back -- seen
                     // here, and counted once the next hand gives its loss back. A
                     // copy that only came late closes the hand, or has this client
@@ -13401,6 +13605,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 )
                             });
                         }
+                        t.refresh_own_floor();
                         t.previous = None;
                     }
                     if let Some(o) = t.pending_repair.take() {
@@ -15106,6 +15311,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(h) = t.hand.as_ref() {
                                 remove_by_the_word!(t, h, true);
                             }
+                            t.refresh_own_floor();
                             t.previous = t.hand.take();
                             continue;
                         }
@@ -15236,6 +15442,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // Retained, not dropped: a certificate about this hand that
                 // arrives during the next one still banks here (`S1-BS`).
+                t.refresh_own_floor();
                 t.previous = t.hand.take();
                 t.hand_reported = false;
                 t.deck_reported = None;
@@ -17792,7 +17999,17 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
                 .to_string(),
         );
     }
-    if t.resuming_since.is_some_and(|since| now.duration_since(since) >= RESUME_LIMIT) {
+    // Batch 4 (`D-102`): the other seats name this seat at 0 chips -- nothing to
+    // take, and nothing here can make them deal it in.
+    if let Some(ep) = t.floor_episode.filter(|ep| ep.offered == 0) {
+        return Some(format!(
+            "the other players dealt on without you and name your seat at 0 chips, below the {} your own signatures allow: nothing here can make them deal you in -- you can leave, or wait in case they do.",
+            ep.floor
+        ));
+    }
+    // Not while the floor's question stands -- the copies come, and are refused
+    // below this seat's own floor; the window asks.
+    if t.floor_episode.is_none() && t.resuming_since.is_some_and(|since| now.duration_since(since) >= RESUME_LIMIT) {
         return Some(format!(
             "this client has waited {} minutes or more to be dealt back into the table's running hand while it hears the other players, and their copies of the hand do not come: a player at the table may be holding it out, or the table has gone on without this seat.",
             RESUME_LIMIT.as_secs() / 60
@@ -21022,7 +21239,18 @@ fn the_table_offered(
     away: bool,
     known: Option<&[Vec<u64>]>,
     roster: usize,
+    floor: Option<u64>,
 ) -> bool {
+    // Batch 4 (`D-102`): a copy naming this seat below what its own signatures
+    // allow it -- the least stack the caller passes -- is not the table's to take
+    // for it without its player's word. Judged for a well-formed copy only: one
+    // without a stack a seat is refused by the adoption anyway.
+    if let Some(least) = floor {
+        let mine = offer.stacks.iter().find(|(s, _)| *s == me).map_or(0, |(_, st)| *st);
+        if !offer.stacks.is_empty() && mine < least {
+            return false;
+        }
+    }
     let held_chips = |s: u8| known.is_some_and(|k| k.iter().any(|v| v.get(usize::from(s)).copied().unwrap_or(0) > 0));
     let mut counted: std::collections::BTreeSet<u8> = table.iter().copied().collect();
     counted.insert(me);
@@ -21118,7 +21346,7 @@ fn catch_up_by_copies(
     inits.iter().rev().filter(|(hid, _)| **hid >= mine.saturating_add(ADRIFT_MARGIN)).find_map(|(hid, copies)| {
         let base = crate::table::hand::Opening::from_formation(f, *hid)?;
         crate::table::hand::Opening::accepted_signers(&base, copies, |o| {
-            the_table_offered(o, &table, me, true, Some(held), roster)
+            the_table_offered(o, &table, me, true, Some(held), roster, None)
         })
         .map(|_| (*hid, mine))
     })
@@ -22483,6 +22711,7 @@ fn for_the_window(command: &NodeCommand) -> bool {
             | NodeCommand::ShowCards
             | NodeCommand::SayAtTable(_)
             | NodeCommand::LeaveTable
+            | NodeCommand::TakeOffer { .. }
     )
 }
 
@@ -24034,19 +24263,19 @@ mod tests {
             code[pick - 400..pick].contains("let record = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key);"),
             "the record only where it is this table's"
         );
-        assert!(code[pick..pick + 3500].contains(".filter(|(h, _)| floor.map_or(true, |f| **h > f))"), "above the floor only");
+        assert!(code[pick..pick + 7000].contains(".filter(|(h, _)| floor.map_or(true, |f| **h > f))"), "above the floor only");
         // `S1-KF` (`D-088`): counted against the table as `D-066` counts it,
         // the most seats of it first.
         assert!(
-            code[pick..pick + 3500].contains("the_table_offered(o, &table, me, away, known.as_deref(), occupied)"),
+            code[pick..pick + 7000].contains("the_table_offered(o, &table, me, away, known.as_deref(), occupied, floor_of(o))"),
             "the others' signatures counted, verified"
         );
         assert!(
-            code[pick..pick + 3500].contains("crate::table::hand::Opening::accepted_signers(&base, copies, accept).map(|n| (n, *h))"),
+            code[pick..pick + 7000].contains("crate::table::hand::Opening::accepted_signers(&base, copies, accept).map(|n| (n, *h))"),
             "by the group the count takes"
         );
         assert!(
-            code.contains("the_table_offered(o, &table, me, away, Some(held.as_slice()), roster)"),
+            code.contains("the_table_offered(o, &table, me, away, Some(held.as_slice()), roster, None)"),
             "and so at the abandon"
         );
         assert!(
@@ -24118,6 +24347,7 @@ mod tests {
             in_game: None,
             stacks: None,
             out: None,
+            own_floor: None,
         };
         assert_eq!(adoption_floor(None, None), None);
         assert_eq!(adoption_floor(None, Some(&record(7, 0))), Some(7), "hand 7 ended: 8 on");
@@ -24260,8 +24490,16 @@ mod tests {
         let known = vec![vec![1_000u64; 4]];
         let known = Some(known.as_slice());
         let at = |signers: &[u8], dealt: &[u8], stacks: &[(u8, u64)], table: &[u8], me: u8, away: bool, known: Option<&[Vec<u64>]>, roster: usize| {
-            the_table_offered(&Offer { signers, dealt_in: dealt, stacks }, table, me, away, known, roster)
+            the_table_offered(&Offer { signers, dealt_in: dealt, stacks, hand_id: 9 }, table, me, away, known, roster, None)
         };
+        // Batch 4 (`D-102`): a copy naming this seat below the floor is refused,
+        // at it taken; a copy without its stacks is left to the adoption.
+        let with_floor = |stacks: &[(u8, u64)], floor: u64| {
+            the_table_offered(&Offer { signers: &[0, 1, 2], dealt_in: &all_in, stacks, hand_id: 9 }, &four, 3, false, None, 4, Some(floor))
+        };
+        assert!(!with_floor(&even, 1_001), "below the floor");
+        assert!(with_floor(&even, 1_000), "at it");
+        assert!(with_floor(&[], 1_001), "no stacks: the adoption refuses it, not the floor");
         // A strict majority, away or not.
         assert!(at(&[0, 1, 2], &all_in, &even, &four, 3, false, None, 4), "three of four");
         // Exactly half holding the lowest seat: only back from away.
@@ -25136,6 +25374,110 @@ mod late_roster_tests {
             "a hand behind belongs to the late-certificate arm, not to this buffer"
         );
         assert_eq!(keep_for_next_hand(None, 8, 7), Keep::No, "unreadable");
+    }
+
+    /// Batch 4 (`D-102`): the reference moves to a later hand, within a hand
+    /// only down, and never back.
+    #[test]
+    fn the_own_floor_moves_forward_and_within_a_hand_only_down() {
+        let f = floor_moved(None, 7, 1_500);
+        assert_eq!(f, Some(OwnFloor { hand: 7, stack: 1_500 }));
+        let lower = floor_moved(f, 7, 900);
+        assert_eq!(lower.map(|o| o.stack), Some(900), "the same hand, lower");
+        assert_eq!(floor_moved(lower, 7, 1_500).map(|o| o.stack), Some(900), "never lifted within the hand");
+        assert_eq!(floor_moved(lower, 6, 2_000), lower, "never back to an earlier hand");
+        assert_eq!(floor_moved(lower, 8, 1_200), Some(OwnFloor { hand: 8, stack: 1_200 }), "a later hand, whatever it says");
+    }
+
+    /// Batch 4 (`D-102`): **a client started again reads its floor from its
+    /// record and its journal** -- the journal's newest hand with an own frame
+    /// past stage 0 gives the less of its own settlement's money and its start,
+    /// or its start where it signed none; a hand with its opening alone gives
+    /// nothing; and a journal that cannot vouch gives no floor at all.
+    #[test]
+    fn a_restart_reads_the_floor_from_the_record_and_the_journal() {
+        use crate::net::chained::{seal, Slot};
+        use crate::protocol::messages::EventType;
+        use crate::storage::journal::{Entry, Handle};
+        use crate::table::handwire::{HandComplete, HandInit};
+        let dir = std::env::temp_dir().join(format!("p2p-floor-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let me_key = key.verifying_key().to_bytes();
+        let t = std::time::Duration::from_secs(5);
+        let slot = |hand: u64, sequence: u64| Slot { table_id: [1; 32], hand_id: hand, sequence, previous_event_hash: [sequence as u8; 32] };
+        let init = |hand: u64| HandInit {
+            hand_id: hand,
+            button_position: 0,
+            sb_position: 1,
+            bb_seat: 2,
+            level: 1,
+            small_blind: 25,
+            big_blind: 50,
+            ante: 0,
+            dealt_in: vec![0, 1, 2],
+            stacks: vec![1_500, 1_500, 1_500],
+            roster_hash: [0; 32],
+            ledger_delta: Vec::new(),
+            engine: [0; 32],
+        };
+        let entry = |hand: u64, sequence: u64, kind: EventType, frame: Vec<u8>| Entry {
+            hand,
+            sequence,
+            parent: [sequence as u8; 32],
+            kind: kind.code(),
+            frame,
+            secret: None,
+        };
+        let opening = |hand: u64| {
+            entry(hand, 0, EventType::HandInit, seal(EventType::HandInit, &slot(hand, 0), &init(hand), &key, 1, 30_000, 512).unwrap())
+        };
+        let later = |hand: u64| entry(hand, 3, EventType::ActionCall, seal(EventType::ActionCall, &slot(hand, 3), &(), &key, 1, 30_000, 64).unwrap());
+        let settled = |hand: u64| {
+            let body = HandComplete {
+                pots: Vec::new(),
+                refunds: Vec::new(),
+                deltas: vec![-600, 600, 0],
+                final_stacks: vec![900, 2_100, 1_500],
+                busted: Vec::new(),
+                state_hash: [0; 32],
+            };
+            entry(hand, 9, EventType::HandComplete, seal(EventType::HandComplete, &slot(hand, 9), &body, &key, 1, 30_000, 4_096).unwrap())
+        };
+        let record = Some(OwnFloor { hand: 4, stack: 1_500 });
+        let j = Handle::open(&dir, [1; 32], me_key, 1).unwrap();
+        j.vouch_from(1, t).unwrap();
+        j.write(vec![opening(5)], t).unwrap();
+        assert_eq!(floor_after_restart(record, Some(&j), 0, Some(0)), record, "an opening alone: the record's");
+        j.write(vec![later(5)], t).unwrap();
+        assert_eq!(
+            floor_after_restart(record, Some(&j), 0, Some(0)),
+            Some(OwnFloor { hand: 5, stack: 1_500 }),
+            "past stage 0 without a settlement: its start"
+        );
+        j.write(vec![settled(5)], t).unwrap();
+        assert_eq!(
+            floor_after_restart(record, Some(&j), 0, Some(0)).map(|o| (o.hand, o.stack)),
+            Some((5, 900)),
+            "its own settlement, lost: the money"
+        );
+        assert_eq!(
+            floor_after_restart(record, Some(&j), 1, Some(1)).map(|o| (o.hand, o.stack)),
+            Some((5, 1_500)),
+            "its own settlement, won: the start"
+        );
+        // A journal that cannot vouch yet -- made new on a resume -- is read all
+        // the same: a frame it lost could only leave the floor too high.
+        j.unvouch(t).unwrap();
+        assert_eq!(
+            floor_after_restart(record, Some(&j), 0, Some(0)).map(|o| (o.hand, o.stack)),
+            Some((5, 900)),
+            "not vouching yet: its own frames all the same"
+        );
+        assert_eq!(floor_after_restart(record, None, 0, Some(0)), record, "no journal: the record's");
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `G5`, told: a veto counts only where the next hand gives the loss back --
@@ -26831,6 +27173,7 @@ mod a_joiner_before_the_first_hand {
             NodeCommand::ShowCards,
             NodeCommand::SayAtTable("hi".into()),
             NodeCommand::LeaveTable,
+            NodeCommand::TakeOffer { hand: 1, offered: 1 },
         ] {
             assert!(for_the_window(&c), "{c:?}");
         }

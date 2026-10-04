@@ -394,6 +394,7 @@ pub struct TableApp {
     pub unsafe_note: Option<(String, u64)>,
     pub unsafe_stuck: Option<PlayMark>,
     pub split_note: Option<(String, u64)>,
+    pub floor_offer: Option<(crate::net::node::FloorOffer, u64)>,
     pub stood_at: Option<PlayMark>,
     pub stopped: Option<(crate::net::node::TableStop, u64)>,
     pub rejoin: Option<Rejoin>,
@@ -580,6 +581,9 @@ pub struct AppState {
     /// last said it, with a serial the window's *Agree* closes it by -- asked
     /// again when the node's words change.
     pub split_note: Option<(String, u64)>,
+    /// Batch 4 (`D-102`): the offer below this seat's own floor the node asks
+    /// about, with a serial the window's answer closes it by.
+    pub floor_offer: Option<(crate::net::node::FloorOffer, u64)>,
     /// `S1-JR`: the hand as it stood when `D-058` last said a stage stands on
     /// seats -- the word holds for the window about the table while the hand
     /// has not moved since.
@@ -1099,6 +1103,7 @@ impl AppState {
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
         std::mem::swap(&mut self.unsafe_stuck, &mut other.unsafe_stuck);
         std::mem::swap(&mut self.split_note, &mut other.split_note);
+        std::mem::swap(&mut self.floor_offer, &mut other.floor_offer);
         std::mem::swap(&mut self.stood_at, &mut other.stood_at);
         std::mem::swap(&mut self.stopped, &mut other.stopped);
         std::mem::swap(&mut self.rejoin, &mut other.rejoin);
@@ -2361,6 +2366,23 @@ impl AppState {
             }
             // `S1-KF` (`D-088`): the table split into separate games, or met again.
             // New words are a new question: a serial that never repeats.
+            // Batch 4 (`D-102`): an offer below this seat's own floor, or the
+            // question over. A new offer is a new question.
+            NodeEvent::FloorOffer { offer } => match offer {
+                None => self.floor_offer = None,
+                Some(o) => {
+                    if self.floor_offer.as_ref().is_none_or(|(said, _)| *said != o) {
+                        self.unsafe_serials = self.unsafe_serials.wrapping_add(1).max(1);
+                        let line = format!(
+                            "The table dealt on without you and offers your seat back with {} chips, below the {} your own signatures allow",
+                            o.offered, o.floor
+                        );
+                        self.floor_offer = Some((o, self.unsafe_serials));
+                        self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
+                        self.note(line);
+                    }
+                }
+            },
             NodeEvent::TableSplit { why } => match why {
                 None => self.split_note = None,
                 Some(w) => {
@@ -2453,6 +2475,7 @@ impl AppState {
                     self.unsafe_note = None;
                     self.unsafe_stuck = None;
                     self.split_note = None;
+                    self.floor_offer = None;
                     let first = self.rejoin.as_ref().is_none_or(|r| r.given_back.is_none());
                     let r = self.rejoin.get_or_insert_with(Rejoin::begin);
                     r.given_back = Some(why.clone());
@@ -2479,6 +2502,7 @@ impl AppState {
                     self.unsafe_note = None;
                     self.unsafe_stuck = None;
                     self.split_note = None;
+                    self.floor_offer = None;
                     let r = self.rejoin.get_or_insert_with(Rejoin::begin);
                     r.given_back = Some(why.clone());
                     r.goes_on = true;
@@ -2614,6 +2638,7 @@ impl AppState {
         self.unsafe_note = None;
         self.unsafe_stuck = None;
         self.split_note = None;
+        self.floor_offer = None;
         self.stood_at = None;
         self.stopped = None;
         self.rejoin = None;

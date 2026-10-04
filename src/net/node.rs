@@ -108,6 +108,9 @@ pub enum NodeCommand {
     /// table window turns to its table first, and the lobby never sends it
     /// (`S1-FG`).
     LeaveTable,
+    /// Batch 4 (`D-102`): the player takes the offer the window showed --
+    /// `offered` chips at hand `hand` -- below the floor its own signatures set.
+    TakeOffer { hand: u64, offered: u64 },
     /// `S1-FG`: give the join to this table up -- the slot holding it, and no
     /// other. The lobby used to send `LeaveTable` for this, which the node
     /// applies to the active table: the one being played, while the join went
@@ -149,6 +152,16 @@ pub struct TableStop {
     /// Why the game at this table is over on it, once it is: no further hand
     /// is dealt here and no winner is named.
     pub ended: Option<String>,
+}
+
+/// Batch 4 (`D-102`): a table's next hand offered to this client below what
+/// its own signatures allow it -- the hand, what the copies name its seat at,
+/// and that floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorOffer {
+    pub hand: u64,
+    pub offered: u64,
+    pub floor: u64,
 }
 
 /// What the loop reports upwards, for the GUI and the log.
@@ -578,6 +591,11 @@ pub enum NodeEvent {
     /// it was here for -- and the words to say so; `None` once they meet again.
     /// The window asks the player to agree and play on, or to leave.
     TableSplit { why: Option<String> },
+    /// Batch 4 (`D-102`): the table dealt on without this client and offers its
+    /// seat back below what its own signatures allow it -- the question, with
+    /// the newest such offer; `None` once it is answered or this client is
+    /// dealt in again. The window asks to take the offer or to leave.
+    FloorOffer { offer: Option<FloorOffer> },
     /// `S1-IX`, `PROTOCOL.md` §6.3 and §6.4: this table has stopped at a
     /// hand's boundary, because other seats finished that hand with a
     /// different result from this client's own -- and, once it has, the game
@@ -801,6 +819,7 @@ impl NodeEvent {
             | Self::SeatFlooded { .. }
             | Self::TableUnsafe { .. }
             | Self::TableSplit { .. }
+            | Self::FloorOffer { .. }
             // `S1-IX`: the table stopped, or the game ended, over the felt.
             | Self::TableStopped { .. }
             // The lobby list and the counters above it.

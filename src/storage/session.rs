@@ -126,6 +126,23 @@ pub struct Record {
     /// it, which reads as `None`.
     #[n(20)]
     pub out: Option<Vec<OutSeat>>,
+    /// Batch 4 (`D-102`): what this client's own signatures allow it at the end
+    /// of a hand of this table -- for the floor a client started again judges
+    /// the table's copies by. Absent from a record written before it, which
+    /// reads as `None`: no floor.
+    #[n(21)]
+    pub own_floor: Option<OwnFloorRecord>,
+}
+
+/// Batch 4 (`D-102`): the hand, and the least stack this client's own
+/// signatures -- or its player's word -- allow it at that hand's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
+pub struct OwnFloorRecord {
+    #[n(0)]
+    pub hand: u64,
+    #[n(1)]
+    pub stack: u64,
 }
 
 /// `S1-KN`: a seat a table put out for good (`D-047`, `D-051`, `D-084`) -- its
@@ -271,7 +288,22 @@ mod tests {
                 OutSeat { app_key: [6; 32], line: Some(vec![9u8; 32].into()) },
                 OutSeat { app_key: [7; 32], line: None },
             ]),
+            own_floor: Some(OwnFloorRecord { hand: 17, stack: 11_900 }),
         }
+    }
+
+    /// Batch 4 (`D-102`): the own floor is kept, and a record written before it
+    /// -- twenty-one fields -- reads with none.
+    #[test]
+    fn the_own_floor_is_kept_and_an_older_record_reads_with_none() {
+        let with = a_record();
+        let back: Record = minicbor::decode(&minicbor::to_vec(&with).expect("encodes")).expect("decodes");
+        assert_eq!(back.own_floor, Some(OwnFloorRecord { hand: 17, stack: 11_900 }));
+        let mut older = a_record();
+        older.own_floor = None;
+        let bytes = minicbor::to_vec(&older).expect("encodes");
+        let back: Record = minicbor::decode(&bytes).expect("decodes");
+        assert_eq!(back.own_floor, None);
     }
 
     /// `S1-KN`: the seats out for good are kept, line or none, and a record
@@ -286,6 +318,7 @@ mod tests {
         assert_eq!(out[1].line_key(), None, "and a seat with none keeps none");
         let mut old = a_record();
         old.out = None;
+        old.own_floor = None;
         let mut e = minicbor::Encoder::new(Vec::new());
         e.array(20).unwrap();
         e.u8(old.version).unwrap();
@@ -324,6 +357,7 @@ mod tests {
         old.in_game = None;
         old.stacks = None;
         old.out = None;
+        old.own_floor = None;
         let bytes = minicbor::to_vec(&old).expect("encodes");
         let back: Record = minicbor::decode(&bytes).expect("decodes");
         assert_eq!(back.in_game, None);
@@ -360,6 +394,7 @@ mod tests {
         let mut first = a_record();
         first.stacks = None;
         first.out = None;
+        first.own_floor = None;
         let mut e = minicbor::Encoder::new(Vec::new());
         e.array(19).unwrap();
         e.u8(first.version).unwrap();
