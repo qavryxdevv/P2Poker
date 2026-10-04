@@ -195,6 +195,20 @@ an older download; and a program that is running is not replaced under a game.
 To remove it, delete that folder and the shortcuts — your player profile is in
 that folder, so make a backup first (Settings, Profile).
 
+#### Playing safely
+
+Your client signs every move it makes and keeps a journal of what it signed, so it
+never signs two different versions of one move — the other players' clients treat
+two versions as cheating and put the seat out of the table for good. Three things
+can make an honest client look like that, and only you can avoid them:
+
+- **Use one profile on one machine at a time.** The same player on two computers at
+  one table signs twice.
+- **Never restore a profile from a backup while you sit at a table.** Restore it
+  between games.
+- **Replace a disk that keeps failing.** The client tells you when its journal
+  cannot be written; a seat that keeps missing hands is put out as an absent one.
+
 Anything started with arguments — a script, a relay, a test bed — is never
 asked, and neither is a folder that already has a player in it. The About tab
 says where this copy lives, and offers to install a portable one with its

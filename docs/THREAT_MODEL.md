@@ -1158,7 +1158,8 @@ first. What made such a pair unfit before was its *illegality*, not its form: an
 honest client could sign two bodies at a slot across a restart. Since `D-100`'s
 armed journal it cannot, in a hand whose engine names that journal; the residuals
 where it still can (a lost journal, lying storage, a restored profile, one key on
-two machines) are `D-101` point 6's, and the owner's to accept.
+two machines) are `D-101` point 6's, accepted on 2026-10-04 and told to the players
+(README, *Playing safely*).
 
 **The clause that failed it, and it stood in tier 1 in three documents: *the
 event chains to a parent that does not exist*.** It fails question 1 outright and
