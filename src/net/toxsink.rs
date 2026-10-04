@@ -107,6 +107,9 @@ pub enum Seat {
         present: Vec<[u8; 32]>,
         from_hand: bool,
     },
+    /// `S1-KP` (`D-103`): the founder away from the table's hands, and outside
+    /// them; see `tox::table::Command::FounderAway`.
+    FounderAway { away: bool, outside: bool },
     /// `D-051`: a whole message from this group member was not a signed
     /// event, or did not verify under the key inside it.
     ///
@@ -1029,6 +1032,7 @@ impl TableSink {
                     },
                     Seat::Seats { apps, lines, fixed } => Command::Seats { apps, lines, fixed },
                     Seat::InGame { apps, present, from_hand } => Command::InGame { apps, present, from_hand },
+                    Seat::FounderAway { away, outside } => Command::FounderAway { away, outside },
                     Seat::Noise { member_key, points } => Command::Noise { member_key, points },
                 });
             }

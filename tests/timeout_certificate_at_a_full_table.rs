@@ -220,7 +220,7 @@ fn a_settlement_at_max_seats_fits_its_cap() {
     );
 }
 
-/// `HAND_INIT` carries four per-seat vectors and its cap is `PROTOCOL.md`
+/// `HAND_INIT` carries five per-seat vectors and its cap is `PROTOCOL.md`
 /// §9.3's, so it is not free to change if it turns out to be tight. Measured at
 /// `MAX_SEATS` with every number at its widest.
 #[test]
@@ -240,6 +240,9 @@ fn a_hand_init_at_max_seats_fits_its_cap() {
         ledger_delta: (0..MAX_SEATS).map(|s| (s, i64::MIN)).collect(),
         // `S1-KT`: the engine's digest, 32 bytes on every copy.
         engine: [0xff; 32],
+        // `S1-KM` (`D-104`): one count of returns per seat -- one byte each at
+        // most (`MAX_RETURNS` is 3); the widest a `u8` encodes to is two.
+        returns: vec![u8::MAX; usize::from(MAX_SEATS)],
     };
     let encoded = canonical(&body).len();
     assert!(
@@ -355,6 +358,7 @@ fn opening_at_max_seats(my_seat: u8) -> Opening {
         grace: vec![GRACE_HANDS; n],
         present_run: vec![0; n],
         returns: vec![0; n],
+        returns_seen: vec![0; n],
         out: Vec::new(),
         button: None,
         blinds: None,

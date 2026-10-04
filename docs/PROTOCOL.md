@@ -204,22 +204,22 @@ There are two version numbers and they do different jobs.
 | `PROTOCOL_MAJOR` | compile-time constant, `2` | libp2p protocol name strings, GossipSub topic strings, the DHT keys | wire-format epoch. Two peers with different majors cannot negotiate anything; they never meet, because the protocol strings differ. |
 | `protocol_version` | `u16`, currently `2` | every signed envelope, every table advertisement | the exact rule set and encoding in force for this session. Must equal the value pinned by the table advertisement for every event of that table. |
 
-For `PROTOCOL_MAJOR = 3` there are **eight** strings, exactly:
+For `PROTOCOL_MAJOR = 4` there are **eight** strings, exactly:
 
 ```
-identify protocol             /p2p-poker/3
-GossipSub lobby topic         /p2p-poker/lobby/3        (IdentTopic, not Sha256Topic)
-GossipSub lobby slice topic   /p2p-poker/lobby/3/<slice> (S1-EX; see below)
-GossipSub lobby chat topic    /p2p-poker/lobby-chat/3   (IdentTopic; see §7.7)
-GossipSub search-queue topic  /p2p-poker/search-queue/3 (IdentTopic, and /<slice>
+identify protocol             /p2p-poker/4
+GossipSub lobby topic         /p2p-poker/lobby/4        (IdentTopic, not Sha256Topic)
+GossipSub lobby slice topic   /p2p-poker/lobby/4/<slice> (S1-EX; see below)
+GossipSub lobby chat topic    /p2p-poker/lobby-chat/4   (IdentTopic; see §7.7)
+GossipSub search-queue topic  /p2p-poker/search-queue/4 (IdentTopic, and /<slice>
                                                          beside each lobby slice; §7.13)
-lobby snapshot RPC            /p2p-poker/lobby-snapshot/3
-join RPC                      /p2p-poker/join/3
-table event stream            /p2p-poker/table/3
+lobby snapshot RPC            /p2p-poker/lobby-snapshot/4
+join RPC                      /p2p-poker/join/4
+table event stream            /p2p-poker/table/4
 ```
 
 A table's own GossipSub topic (§1.4) and the private Kademlia protocol
-(`/p2p-poker/kad/3`, `NETWORK_STACK.md`) carry the major as well, and so do the
+(`/p2p-poker/kad/4`, `NETWORK_STACK.md`) carry the major as well, and so do the
 lobby's DHT keys below.
 
 **Major 2 (`D-089`, 2026-09-30).** Major 1 shipped in releases 0.1.0 to 0.1.5;
@@ -255,13 +255,13 @@ itself, unchanged and unversioned.
   swapped for another every few minutes so that a client holding four slices of
   a large network still walks across it.
 * The peers of a slice find each other under the slice's own DHT provider key
-  (`p2p-poker/main-lobby/v3/<slice>`). This is not optional: a mesh is built
+  (`p2p-poker/main-lobby/v4/<slice>`). This is not optional: a mesh is built
   only out of connected peers that share the topic, so without it a sliced lobby
   cannot hold a mesh at all.
 
 **The lobby's hours (`D-070`).** Beside the lobby's DHT provider key
-(`p2p-poker/main-lobby/v3`) a client provides the key of the current hour,
-`p2p-poker/main-lobby/v3/hour/<n>`, where `n` is the Unix time in seconds divided
+(`p2p-poker/main-lobby/v4`) a client provides the key of the current hour,
+`p2p-poker/main-lobby/v4/hour/<n>`, where `n` is the Unix time in seconds divided
 by 3600, rounded down and written in decimal, and looks it up while it has no
 poker client to talk to. A provider record outlives
 its client by two days; an hour's key names nobody who was not here within the
@@ -270,22 +270,22 @@ hour, so it is where a newcomer finds a client that is running now
 it: a client that knows nothing of the hours meets everybody under the lobby's
 own key, exactly as before.
 
-`/p2p-poker/join/3` is a one-shot request-response RPC, the join exchange,
+`/p2p-poker/join/4` is a one-shot request-response RPC, the join exchange,
 not table-stream traffic (C-7 of `docs/research/PHASE0_FIXPLAN.md`; see §1.4 and
-§4.3). `/p2p-poker/lobby-chat/3` carries `SPEC_CS.md` §22's lobby chat (§7.7).
+§4.3). `/p2p-poker/lobby-chat/4` carries `SPEC_CS.md` §22's lobby chat (§7.7).
 
 `IdentTopic` and `Sha256Topic` both exist in `libp2p-gossipsub` 0.49.5; `IdentTopic`
 sends the topic string in the clear, which is correct here because the string is
 public anyway and debuggable. [LIBP2P §6]
 
 The identify protocol name doubles as the relay-admission discriminator of D-002:
-a peer that advertises `/p2p-poker/3` through `identify` is a poker peer. This is
+a peer that advertises `/p2p-poker/4` through `identify` is a poker peer. This is
 the first of the two candidate admission rules D-002 left open; settling it is
 `NETWORK_STACK.md`'s job, not this document's.
 
 ### 1.2 HELLO / CAPABILITIES
 
-The handshake runs on a freshly opened `/p2p-poker/table/3` stream, immediately
+The handshake runs on a freshly opened `/p2p-poker/table/4` stream, immediately
 after the libp2p security handshake completes, before any other message. It is
 symmetric: each side sends `HELLO`, then each side sends `CAPABILITIES`.
 
@@ -381,11 +381,11 @@ identifier, and the framing, which is ours and survives a change of crate.
 
 | Channel | Protocol string | Framing |
 |---|---|---|
-| **Lobby broadcast** | `/p2p-poker/lobby/3` | one `SignedEvent` per broadcast message, no extra framing |
-| **Lobby chat broadcast** | `/p2p-poker/lobby-chat/3` (§7.7) | one `SignedEvent` per broadcast message |
-| **Search queue broadcast** | `/p2p-poker/search-queue/3` and its slices (§7.13) | one `SignedEvent` per broadcast message |
-| **Lobby RPC** | `/p2p-poker/lobby-snapshot/3` | the RPC codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
-| **Join RPC** | `/p2p-poker/join/3` | the RPC codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
+| **Lobby broadcast** | `/p2p-poker/lobby/4` | one `SignedEvent` per broadcast message, no extra framing |
+| **Lobby chat broadcast** | `/p2p-poker/lobby-chat/4` (§7.7) | one `SignedEvent` per broadcast message |
+| **Search queue broadcast** | `/p2p-poker/search-queue/4` and its slices (§7.13) | one `SignedEvent` per broadcast message |
+| **Lobby RPC** | `/p2p-poker/lobby-snapshot/4` | the RPC codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
+| **Join RPC** | `/p2p-poker/join/4` | the RPC codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
 | **Table mesh** | the table's Tox group (`D-019`), named by the advert's `n(31) tox_chat_id` (§7.2); and the table's own GossipSub topic `/p2p-poker/table/<table_id>/1`, `<table_id>` in 64 lowercase hex digits | on the group, `table::fragment`: an 8-byte header -- `message_id` `u32`, `index` `u16`, `total` `u16`, all big-endian -- then at most 492 bytes of one `SignedEvent`, the message reassembled whole before §4.0 and a claimed `total` above `MAX_FRAGMENTS` refused before anything is allocated; on the topic, one `SignedEvent` per message |
 
 **Which message is legal on which channel.** This is a table rather than prose so
@@ -394,7 +394,7 @@ per message code.
 
 | Message | Channel |
 |---|---|
-| `HELLO`, `CAPABILITIES` | the table stream `/p2p-poker/table/3`, before anything else on it -- **not built in version 1**: the stream has no implementation, and neither message has an emitter or a receiver (`S1-A`) |
+| `HELLO`, `CAPABILITIES` | the table stream `/p2p-poker/table/4`, before anything else on it -- **not built in version 1**: the stream has no implementation, and neither message has an emitter or a receiver (`S1-A`) |
 | `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE` | lobby broadcast |
 | `LOBBY_CHAT` | lobby chat broadcast |
 | `TABLE_CHAT` | table mesh: the table's group, or its topic where there is no group (§7.8) |
@@ -416,7 +416,7 @@ change the wire.
 
 **Amended 2026-09-28 (`S1-A`, the owner's word): the table mesh is what `D-019`
 built, and this section now says so.** The rows above described a length-prefixed
-`/p2p-poker/table/3` stream between every pair of seats, which was specified and
+`/p2p-poker/table/4` stream between every pair of seats, which was specified and
 never built: `TABLE_PROTOCOL` is declared and read nowhere, and `NETWORK_STACK.md`
 §8 carries the same correction. `D-019`, an accepted decision -- and a numbered
 decision beats a specification document (`CONTRIBUTING.md`) -- put a formed table's
@@ -437,7 +437,7 @@ transport already authenticated the sender has accepted a forged action.
 
 ### 1.5 The table is a full mesh; forwarding is allowed
 
-Every seated participant holds a `/p2p-poker/table/3` stream to every other
+Every seated participant holds a `/p2p-poker/table/4` stream to every other
 seated participant. There is no forwarding node, no host, and no star topology.
 For 10 seats that is 45 connections, which is unremarkable.
 
@@ -2298,7 +2298,7 @@ Codes `0x0000`–`0x00FF`.
 
 **`0x0001 HELLO`**
 
-*Direction:* each side of a newly opened `/p2p-poker/table/3` stream → the other.
+*Direction:* each side of a newly opened `/p2p-poker/table/4` stream → the other.
 *Legal:* exactly once per stream, as the first message, from each side.
 *Envelope:* **unchained** — `chain_scope = 0`, `event_class = 0`,
 `table_id = ZERO32`, `hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `sequence = 0`,
@@ -2349,7 +2349,7 @@ Codes `0x0200`–`0x02FF`. Group 1 (lobby) is specified in §7 because it has it
 transport, TTL and anti-spam rules.
 
 `JOIN_REQUEST`, `JOIN_ACCEPT` and `JOIN_REJECT` run over
-`request_response::cbor::Behaviour` on `/p2p-poker/join/3` (§1.4). Join is a
+`request_response::cbor::Behaviour` on `/p2p-poker/join/4` (§1.4). Join is a
 one-shot RPC with a natural timeout and free size caps, and it avoids opening a
 table stream to a peer that has not been admitted. `PLAYER_LIST` stays on the
 table mesh, because it is a broadcast to already-admitted peers, and
@@ -2961,10 +2961,14 @@ requires the next hand to start automatically and deterministically, not to be
 | `n(10) roster_hash` | `bytes[32]` | `roster_hash(k)` |
 | `n(11) ledger_delta` | `Vec<(u8, i64)>` | ≤ `MAX_SEATS`, ascending by seat, unique; the per-seat ledger change applied at this hand boundary — positive for a buy-in, negative for a departing stack |
 | `n(12) engine` | `bytes[32]` | `blake3("p2p-poker engine" ‖ ENGINE_DIGEST ‖ ENGINE_SOURCE)` (§13): what the sender's betting engine decides over the pinned corpus (D-093), and the code it, the hand's judge and the settlement decide by (D-097), and the deck's code, the vendored shuffle verifier and the lock's entries of its crates (D-098). Two clients that differ in either never complete stage 0 together, so neither ever judges the other's betting action against a round of its own (`S1-KT`, D-094): a split, never a framing |
+| `n(13) returns` | `Vec<u8>` | one per occupied seat, ascending by seat, each `≤ MAX_RETURNS`; D-032's count of each seat's returns at this hand's start -- `#{ j < k : s ∈ R(j+1) \ R(j) }`, capped -- which every seat that played the chain holds alike, and a seat that adopts the hand takes from the copies (`S1-KM`, D-104) |
 
 **`HAND_INIT` announces nothing and decides nothing.** Every field is a pure
 function of `TERMINAL(k-1)` and the table parameters, so every receiver
-recomputes all of them and rejects a copy in which any field differs. This is
+recomputes all of them and rejects a copy in which any field differs.
+(`n(9) stacks` and `n(13) returns` are folds over the chain of hands that
+`GENESIS(k)` commits rather than functions of `TERMINAL(k-1)` alone; a client
+that did not play that chain, and adopts the hand, takes both from the copies.) This is
 exactly why the stage is collective and not single-writer (§3.2's stage-kind
 principle): a body with no choices in it must not give one seat a veto over the
 hand-to-hand transition that `SPEC_CS.md` §4 requires to be automatic. A seat
@@ -5384,8 +5388,8 @@ means it does not and never can be.
 | `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; the one type a seat outside `P(k)` may emit |
 | `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; counts into no `P` (§3.2) |
 
-45 message types. Lobby chat is on `/p2p-poker/lobby-chat/3` and not on the lobby
-topic, and the search queue's presence is on `/p2p-poker/search-queue/3` (§7.13),
+45 message types. Lobby chat is on `/p2p-poker/lobby-chat/4` and not on the lobby
+topic, and the search queue's presence is on `/p2p-poker/search-queue/4` (§7.13),
 so §1.4's "a message on the wrong channel is dropped" rule covers them like any
 other.
 
@@ -6920,7 +6924,7 @@ messages are unchained; that section was corrected to say so.
 
 ### 7.1 Topic and transport
 
-* GossipSub topic: `IdentTopic::new("/p2p-poker/lobby/3")`. [LIBP2P §6]
+* GossipSub topic: `IdentTopic::new("/p2p-poker/lobby/4")`. [LIBP2P §6]
 * `MessageAuthenticity::Signed(libp2p_keypair)` and
   `ValidationMode::Strict` — transport hygiene, not the application signature.
 * `validate_messages()` on, so nothing is forwarded until the application has
@@ -6950,7 +6954,7 @@ messages are unchained; that section was corrected to say so.
   tighter still. Conflating the two is what produced the earlier
   `LOBBY_MAX_MESSAGE = 16 384`, which is deleted.
 
-The lobby chat topic `/p2p-poker/lobby-chat/3` (§7.7) is a second `IdentTopic`
+The lobby chat topic `/p2p-poker/lobby-chat/4` (§7.7) is a second `IdentTopic`
 with the same settings; it is separate so that a client can subscribe to tables
 without subscribing to chat.
 
@@ -7118,7 +7122,7 @@ port materially helps everyone else (D-003).
 
 `SPEC_CS.md` §3 requires a new client to request a snapshot of existing tables from
 several peers before relying on live GossipSub. This runs as a request-response
-RPC on `/p2p-poker/lobby-snapshot/3` with the RPC codec's own framing -- a
+RPC on `/p2p-poker/lobby-snapshot/4` with the RPC codec's own framing -- a
 length-prefixed signed event each way, as the join RPC (§4.3), never a second
 encoding around a signature -- and **not** over GossipSub, because a lobby with
 hundreds of tables would blow past any sane gossip frame, and because the mesh is
@@ -7241,7 +7245,7 @@ should not come away thinking the lobby is private.
 here rather than only in the transport document.
 
 *Channel:* lobby chat broadcast — GossipSub on
-`LOBBY_CHAT_TOPIC = /p2p-poker/lobby-chat/3`, not the lobby topic.
+`LOBBY_CHAT_TOPIC = /p2p-poker/lobby-chat/4`, not the lobby topic.
 *Signed by:* the sender's application key.
 *Envelope:* unchained, per the rule at the head of §7 (`chain_scope = 0`).
 
@@ -7530,9 +7534,9 @@ can count who is looking and a searching client can say how many others are, and
 how long they have waited. It is the queue's mirror of `LOBBY_PLAYER_PRESENCE`
 (§7.4): the same kind of message, on a topic of its own, judged the same way.
 
-*Channel:* the search-queue topic `/p2p-poker/search-queue/3`, an `IdentTopic`
+*Channel:* the search-queue topic `/p2p-poker/search-queue/4`, an `IdentTopic`
 with the lobby topic's settings -- and, wherever the lobby is sliced (`S1-EX`), the
-slice topic `/p2p-poker/search-queue/3/<slice>`, the slice named by the speaker's
+slice topic `/p2p-poker/search-queue/4/<slice>`, the slice named by the speaker's
 own application key at every depth, exactly as a founder names an advert's slice by
 its table key. A client listens to the queue's slices that match the lobby's slices
 it holds, so a sliced lobby and a sliced queue are one decision.
@@ -8492,11 +8496,11 @@ Names and values are §13's; this table is the per-channel view of them.
 |---|---|---|
 | `GOSSIP_MAX_TRANSMIT` | 65 536 B | GossipSub `max_transmit_size`; two-sided. The crate default, pinned there for interoperability |
 | `LOBBY_MSG_MAX` | 8 192 B | application ceiling for any lobby message of any type; the transport limit above is a backstop, never the operative limit |
-| `SNAPSHOT_REQ_MAX` | 1 024 B | `set_request_size_maximum` on `/p2p-poker/lobby-snapshot/3` |
+| `SNAPSHOT_REQ_MAX` | 1 024 B | `set_request_size_maximum` on `/p2p-poker/lobby-snapshot/4` |
 | `SNAPSHOT_RESP_MAX` | 262 144 B | `set_response_size_maximum`; fits `128 × 1 536 = 196 608` plus overhead |
-| `JOIN_REQ_MAX` | 4 096 B | `set_request_size_maximum` on `/p2p-poker/join/3`; `JOIN_REQUEST`'s own payload cap is 512 B, so this is envelope headroom only |
+| `JOIN_REQ_MAX` | 4 096 B | `set_request_size_maximum` on `/p2p-poker/join/4`; `JOIN_REQUEST`'s own payload cap is 512 B, so this is envelope headroom only |
 | `JOIN_RESP_MAX` | 16 384 B | `set_response_size_maximum`; `JOIN_ACCEPT` embeds a whole advert (≤ 1 536 B) plus a ten-entry roster |
-| `TABLE_FRAME_MAX` | 262 144 B | `u32` length prefix on `/p2p-poker/table/3` |
+| `TABLE_FRAME_MAX` | 262 144 B | `u32` length prefix on `/p2p-poker/table/4` |
 | `MAX_EMBEDDED_EVENT` | 32 768 B | per-element cap for an embedded `SignedEvent` in `DISPUTE` and `HAND_ABORT` |
 | `TABLE_AD_SIGNED_MAX` | 1 536 B | a complete `SignedEvent` of an advert, wherever one is embedded or forwarded |
 | `MAX_BODY` | frame − 128 B | `EventBody` bytes |
@@ -9040,17 +9044,17 @@ protocol-version change. Everything else is two-sided, and changing it is a
 major-version change (§10.2).
 
 ```
-PROTOCOL_VERSION                = 3
-PROTOCOL_MAJOR                  = 3
+PROTOCOL_VERSION                = 4
+PROTOCOL_MAJOR                  = 4
 
-IDENTIFY_PROTOCOL               = "/p2p-poker/3"
-LOBBY_TOPIC                     = "/p2p-poker/lobby/3"
-LOBBY_CHAT_TOPIC                = "/p2p-poker/lobby-chat/3"
-SNAPSHOT_PROTOCOL               = "/p2p-poker/lobby-snapshot/3"
-JOIN_PROTOCOL                   = "/p2p-poker/join/3"
-TABLE_PROTOCOL                  = "/p2p-poker/table/3"
+IDENTIFY_PROTOCOL               = "/p2p-poker/4"
+LOBBY_TOPIC                     = "/p2p-poker/lobby/4"
+LOBBY_CHAT_TOPIC                = "/p2p-poker/lobby-chat/4"
+SNAPSHOT_PROTOCOL               = "/p2p-poker/lobby-snapshot/4"
+JOIN_PROTOCOL                   = "/p2p-poker/join/4"
+TABLE_PROTOCOL                  = "/p2p-poker/table/4"
 
-LOBBY_DERIVATION_STRING         = "p2p-poker/main-lobby/v3"
+LOBBY_DERIVATION_STRING         = "p2p-poker/main-lobby/v4"
 LOBBY_NAMESPACE_KEY             = 122010ff86e6a7b7c62abd79a9c00a863630417d412bc0c5f1f124185730057de280
 RELAY_DERIVATION_STRING         = "/libp2p/relay"
 RELAY_NAMESPACE_KEY             = 1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f3ef52c452a369e6ef7b610

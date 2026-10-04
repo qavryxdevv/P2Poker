@@ -36,8 +36,12 @@ use crate::poker::state::Chips;
 /// `0x0605`/`0x0606` and the deck tag in every reveal body), and a client of
 /// version 2 cannot read it; the owner's rule of `D-089` is that an old
 /// client and a new one never see each other.
-pub const PROTOCOL_VERSION: u16 = 3;
-pub const PROTOCOL_MAJOR: u16 = 3;
+///
+/// `D-104`: 4 since 0.4.0 -- the wire changed again (`S1-KM`: `HAND_INIT`
+/// carries the seats' return counts, `n(13) returns`), and a client of
+/// version 3 cannot read it.
+pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_MAJOR: u16 = 4;
 
 /// `S1-KT`, `D-093`: the digest of what the betting engine decides over the
 /// seeded corpus of `tests/random_hands.rs` (`the_engine_is_the_protocol_majors`,
@@ -92,15 +96,15 @@ pub fn engine_id() -> [u8; 32] {
 /// Held here and used from `net::swarm`, which defined its own copy of this
 /// string under the name `PROTOCOL_VERSION` — a third meaning for a name that
 /// already had two.
-pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/3";
-pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/3";
-pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/3";
+pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/4";
+pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/4";
+pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/4";
 /// `D-064`: the queue of clients searching for a game, beside the lobby and
 /// sliced like it (`PROTOCOL.md` §7.13).
-pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/3";
-pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/3";
-pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/3";
-pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/3";
+pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/4";
+pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/4";
+pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/4";
+pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/4";
 
 // **The two Mainline infohashes and their derivation strings are gone.**
 // `56b0b50` took BitTorrent out of the binary and the lobby became a libp2p

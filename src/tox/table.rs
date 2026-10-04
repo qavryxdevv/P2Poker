@@ -550,6 +550,14 @@ pub enum Command {
         present: Vec<[u8; 32]>,
         from_hand: bool,
     },
+    /// `S1-KP` (`D-103`): the founder is away from the table's hands, as the
+    /// node reads them -- certified out of them with chips for three hands or
+    /// three minutes, or gone by its own signed word, until a hand has it back
+    /// in the required set (`away`); `outside`: from the first such hand, for
+    /// a copy held empty to take a counted seat's invitation. A seat back from
+    /// a restart through the other seats is told both while it holds no hand.
+    /// Never a bar: the founder's line stays, and its invitation is taken.
+    FounderAway { away: bool, outside: bool },
     /// `D-051`: a whole message from this member was not a signed event, or
     /// did not verify under the key inside it -- which no client of this
     /// build sends.
@@ -1211,6 +1219,14 @@ const LONE_OFFERS_AFTER: Duration = Duration::from_secs(60);
 /// and a table every copy of which waits on a dead seat would never deal again.
 const LONE_OFFERS_ANYWAY_AFTER: Duration = Duration::from_secs(180);
 
+/// `S1-KP` (`D-103`): how long every confirmed entry of a seat may be quiet before
+/// a member whose founder is away offers that seat the group as missing -- the
+/// sweep's own `S1-DT` reading, well inside the 58 s the library takes to time a
+/// dead entry out, and past a live member's longest gap (its status is said every
+/// `AWAY_RESAY`, 20 s). A live seat read missing is offered the group its copy
+/// already holds, and the library swallows the offer.
+const QUIET_MISSING_AFTER: Duration = Duration::from_secs(30);
+
 /// `D-049`: how often a member says its sitting-out status in the group again,
 /// changed or not. The library broadcasts a status losslessly and exchanges it
 /// with every peer a member connects to; this bounds what any gap in that
@@ -1407,6 +1423,13 @@ struct TableState {
     /// copy offered itself to it in answer (once) and when its last offer came;
     /// one whose offers paused for `OFFER_FORGOTTEN_AFTER` is forgotten.
     waiting_on: HashMap<[u8; 32], (Instant, Instant)>,
+    /// `S1-KP` (`D-103`): the node's reading that the founder is away from the
+    /// table's hands (`Command::FounderAway`) -- the members take its part in
+    /// the group as for a founder out for good, without barring it.
+    founder_away_by_hands: bool,
+    /// `S1-KP` (`D-103`): and outside them since the first such hand -- a copy
+    /// held empty takes a counted seat's invitation.
+    founder_outside: bool,
     out: tokio::sync::mpsc::Receiver<Vec<u8>>,
     inbox: tokio::sync::mpsc::Sender<FromTable>,
     chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
@@ -1983,7 +2006,13 @@ fn sweep_table(
     // founder's TOX key against APPLICATION keys, found nothing ever, and so
     // offered while the founder sat in the group. A founder out of the roster
     // for good (`D-047`) is offered nothing.
-    if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
+    // `S1-KP` (`D-103`, `REFUTE_S1KP_v2_groups` V5): not from a copy held empty
+    // while the founder is away by the node's reading -- a founder apart from the
+    // table whose own copy emptied keeps the newest member offer and takes it
+    // `FOUNDER_YIELDS_AFTER` on, and a lone copy's offer would take it out of the
+    // table's reach with that member; the copies holding seats offer it.
+    let lone_and_away = t.founder_away_by_hands && held_empty(t);
+    if let (Role::Joiner { founder, .. }, Some(g), false) = (&t.setup.role, t.group, lone_and_away) {
         if t.self_joined && t.roster.contains(founder) && !t.barred_lines.contains(founder) {
             if let Some(n) = friend_number(friends, founder) {
                 let here = t.peer_lines.iter().any(|(p, l)| l == founder && t.confirmed.contains(p));
@@ -2023,18 +2052,24 @@ fn sweep_table(
         t.empty_since = None;
         t.waiting_on.clear();
     }
-    if let (true, Some(g)) = (founder_out(t), t.group) {
+    // `S1-KP` (`D-103`): and so for a founder away from the table's hands by the
+    // node's reading, which bars nothing.
+    if let (true, Some(g)) = (founder_away(t), t.group) {
         if let (true, Some(mine)) = (t.self_joined && t.settled, t.setup.binder.as_ref().map(|k| k.verifying_key().to_bytes())) {
-            let present = seats_present(&t.confirmed, &t.peer_keys, &t.cut, &t.bound, &t.seat_apps);
+            // `S1-KP` (`REFUTE_S1KP_v2_groups` V1, fix A): a seat whose entries here
+            // are all quiet counts as missing -- one back from a restart is offered
+            // from this copy before its dead entry times out.
+            let present = seats_heard(tox, g, t);
             let offers = member_offers(t, &mine, friends, connected);
             // Not again to a member this lone copy has answered once: it waits on
             // that member's next offer (`LONE_YIELDS_AFTER`). Of the seats due, the
             // one offered longest ago -- round the missing seats in turn: the first
             // due in seat order took every sweep from a third seat for as long as
-            // two before it stayed missing.
+            // two before it stayed missing. `S1-KP`: never the founder away by the
+            // node's reading -- `S1-FE` offers it the group already.
             let due = missing_lines(&t.seat_lines, &mine, &t.in_game, &present, &t.barred, &t.barred_lines, &t.roster)
                 .into_iter()
-                .filter(|line| offers && !t.waiting_on.contains_key(line))
+                .filter(|line| offers && !t.waiting_on.contains_key(line) && !founder_line_away(t, line))
                 .filter_map(|line| friend_number(friends, &line).map(|n| (line, n)))
                 .filter(|(line, n)| {
                     connected.contains(n) && t.seat_offered.get(line).is_none_or(|at| at.elapsed() >= REINVITE_EVERY)
@@ -2054,7 +2089,7 @@ fn sweep_table(
     t.trouble.founder_link.store(
         match &t.setup.role {
             Role::Host => 3,
-            Role::Joiner { founder, .. } if !founder_out(t) => friend_number(friends, founder)
+            Role::Joiner { founder, .. } if !founder_away(t) => friend_number(friends, founder)
                 .map(|n| tox.friend_connection(n).max(0) as u64)
                 .unwrap_or(0),
             // `D-037`: no founder to reach; the best member link stands in.
@@ -2291,6 +2326,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             empty_since: None,
                             reachable_since: None,
                             waiting_on: HashMap::new(),
+                            founder_away_by_hands: false,
+                            founder_outside: false,
                             out,
                             inbox,
                             chat,
@@ -2509,6 +2546,10 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             t.in_game_present = present;
                             t.in_game_from_hand = from_hand;
                         }
+                        Command::FounderAway { away, outside } => {
+                            t.founder_away_by_hands = away;
+                            t.founder_outside = outside || away;
+                        }
                         Command::Seats { apps, lines, fixed } => {
                             t.seat_apps = apps;
                             t.seat_lines = lines;
@@ -2634,6 +2675,9 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
             }
         }
         // --- one turn of toxcore's own loop --------------------------------
+        // `S1-KP` (`REFUTE_S1KP_v1_groups` G7): the tables that left an emptied
+        // copy in this turn -- every later invitation for one of them waits a turn.
+        let mut left_this_turn: std::collections::HashSet<TableId> = std::collections::HashSet::new();
         for e in tox.iterate() {
             match e {
                 Event::FriendConnection { friend, status } if status != 0 => {
@@ -2651,7 +2695,14 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         // in the group refuses the offer.
                         if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
                             // `S1-KL`: never a founder the table's word removed for good.
-                            if t.self_joined && friends.get(&friend) == Some(founder) && !t.barred_lines.contains(founder) {
+                            // `S1-KP` (`REFUTE_S1KP_v2_groups` V5): nor from a copy held empty
+                            // while the founder is away by the node's reading.
+                            let lone_and_away = t.founder_away_by_hands && held_empty(t);
+                            if t.self_joined
+                                && friends.get(&friend) == Some(founder)
+                                && !t.barred_lines.contains(founder)
+                                && !lone_and_away
+                            {
                                 t.invited.retain(|f| *f != friend);
                                 if tox.invite(g, friend).is_ok() {
                                     t.invited.push(friend);
@@ -2668,8 +2719,13 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         // than the sweep's `REINVITE_EVERY` -- a link that flaps would
                         // otherwise fill the library's ring of invitations -- and only
                         // while this member offers its copy at all (`member_offers`).
-                        if let (true, Some(g)) = (founder_out(t), t.group) {
-                            let line = friends.get(&friend).copied().filter(|k| in_game_line(t, k) && !t.waiting_on.contains_key(k));
+                        // `S1-KP` (`D-103`): and for a founder away by the node's reading
+                        // -- never to that founder itself (`S1-FE` offers it, just above).
+                        if let (true, Some(g)) = (founder_away(t), t.group) {
+                            let line = friends
+                                .get(&friend)
+                                .copied()
+                                .filter(|k| in_game_line(t, k) && !t.waiting_on.contains_key(k) && !founder_line_away(t, k));
                             let mine = t.setup.binder.as_ref().map(|k| k.verifying_key().to_bytes());
                             if let (true, Some(k), Some(mine)) = (t.self_joined && t.settled, line, mine) {
                                 let due = t.seat_offered.get(&k).is_none_or(|at| at.elapsed() >= REINVITE_EVERY);
@@ -2703,7 +2759,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                     // seat whose old address no longer answered had no way back.
                     let from = friends.get(&friend).copied();
                     let mut left_one = false;
-                    for t in tables.values_mut() {
+                    for (id, t) in tables.iter_mut() {
                         // `S1-EK`: and settled once -- a copy whose founder is a round
                         // trip from confirmed is not an emptied one; leaving it said
                         // goodbye, the founder freed the seat before the first hand,
@@ -2752,7 +2808,14 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         // left for the other would be no copy at all. Nothing is kept for
                         // later -- an offer is taken as it comes, and a kept one could
                         // outlive the copy it was made from.
-                        if let (true, Some(k), Some(g)) = (founder_out(t), from.filter(|k| *k > me), t.group) {
+                        // `S1-KP` (`D-103`): and so while the founder is away by the node's
+                        // reading, the founder's own line ordered above every member's
+                        // (`REFUTE_S1KP_v1_groups` G3): its first offer is not taken, a later
+                        // one `LONE_YIELDS_AFTER` on is -- a founder apart from the table no
+                        // longer takes a lone member at once.
+                        if let (true, Some(k), Some(g)) =
+                            (founder_away(t), from.filter(|k| *k > me || founder_line_away(t, k)), t.group)
+                        {
                             let now = Instant::now();
                             match t.waiting_on.get_mut(&k) {
                                 Some((answered, last)) => {
@@ -2762,7 +2825,14 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                     }
                                 }
                                 None => {
-                                    if tox.invite(g, friend).is_ok() {
+                                    // `S1-KP`: answered with this copy only by a seat its own
+                                    // hand counts in the game (`REFUTE_S1KP_v1_groups` G6: one
+                                    // back from a restart holds none yet), and never to the
+                                    // founder away by the node's reading -- whose kept offer
+                                    // would take this lone copy apart from the table
+                                    // (`REFUTE_S1KP_v2_groups` V5). Recorded all the same: the
+                                    // other copy's own offer is taken `LONE_YIELDS_AFTER` on.
+                                    if t.in_game_from_hand && !founder_line_away(t, &k) && tox.invite(g, friend).is_ok() {
                                         t.seat_offered.insert(k, now);
                                         t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -2784,9 +2854,17 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                 "the table's group held nobody else here and it is offered again: left the old copy, taking the invitation (S1-EB)"
                             );
                             left_one = true;
+                            left_this_turn.insert(*id);
                         }
                     }
-                    if left_one {
+                    // `S1-KP` (`D-103`, `REFUTE_S1KP_v1_groups` G7): and so for a second
+                    // invitation in this same turn for a table that left its copy in it --
+                    // found with no group, it was taken at once, while the library still
+                    // held the copy just left.
+                    let deferred_table = tables
+                        .iter()
+                        .any(|(id, t)| left_this_turn.contains(id) && t.group.is_none() && invitation_fits(t, from));
+                    if left_one || deferred_table {
                         invites_deferred.push((friend, invite));
                     } else {
                         take_invitation(&mut tox, &mut tables, &friends, friend, &invite);
@@ -3464,8 +3542,19 @@ fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {
     }
     match (&t.setup.role, from) {
         // `S1-KO`: and once the founder is out for good, any seat still in the
-        // game -- the members take the founder's part in the group.
-        (Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => k == *founder || (founder_out(t) && in_game_line(t, &k)),
+        // game -- the members take the founder's part in the group. `S1-KP`
+        // (`D-103`): and while it is away from the table's hands by the node's
+        // reading; or, at a copy held empty, once the founder was outside them at
+        // the last hand this client held (`REFUTE_S1KP_v1_groups` G4) -- and only
+        // from a seat this client's hand, or its record, counts as playing (G1).
+        // `REFUTE_S1KP_impl_groups` I1: and with no copy at all -- the copy held
+        // empty is left for the invitation one turn, and taken without it the next.
+        (Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => {
+            k == *founder
+                || ((founder_away(t) || (t.founder_outside && (held_empty(t) || t.group.is_none())))
+                    && in_game_line(t, &k)
+                    && counted_line(t, &k))
+        }
         (Role::Back { chat_id: Some(_) }, Some(k)) => t.roster.contains(&k),
         // `S1-FE`: a founder, from a member of its roster -- only ever taken
         // into the group it created (`wanted_chat`), and only once its own copy
@@ -3643,6 +3732,61 @@ fn founder_out(t: &TableState) -> bool {
     matches!(&t.setup.role, Role::Joiner { founder, .. } if t.out_lines.contains(founder))
 }
 
+/// `S1-KP` (`D-103`): whether this member's founder is away -- out for good by
+/// the table's word (`founder_out`), or away from the table's hands by the
+/// node's reading (`Command::FounderAway`): certified out of them with chips
+/// for three hands or three minutes, or gone by its own signed word, until a
+/// hand has it back. Either way the members take its part in the group; only
+/// the first bars it.
+fn founder_away(t: &TableState) -> bool {
+    founder_out(t) || (matches!(&t.setup.role, Role::Joiner { .. }) && t.founder_away_by_hands)
+}
+
+/// `S1-KP` (`D-103`): whether `line` is this member's founder's while the founder
+/// is away by the node's reading -- a line the members' own offers leave to
+/// `S1-FE`'s (`REFUTE_S1KP_v2_groups` V6), `heads_up` reads without, and a copy
+/// held empty orders above every member's (`REFUTE_S1KP_v1_groups` G3).
+fn founder_line_away(t: &TableState, line: &[u8; 32]) -> bool {
+    t.founder_away_by_hands && matches!(&t.setup.role, Role::Joiner { founder, .. } if founder == line)
+}
+
+/// `S1-KP` (`D-103`): the founder's application key while it is away by the
+/// node's reading, read through the seats' lines.
+fn founder_app_away(t: &TableState) -> Option<[u8; 32]> {
+    match &t.setup.role {
+        Role::Joiner { founder, .. } if t.founder_away_by_hands => {
+            t.seat_lines.iter().find(|(_, l)| l == founder).map(|(a, _)| *a)
+        }
+        _ => None,
+    }
+}
+
+/// `S1-KP` (`D-103`, `REFUTE_S1KP_v1_groups` G1): whether `line` is the line of a
+/// seat this client's own hand -- or, back from a restart, its record -- counts
+/// as playing (`in_game_present`). A member's invitation is taken from no other:
+/// a copy cut off from the table, whose seats this client's last hand had
+/// certified out, offers itself all the same.
+fn counted_line(t: &TableState, line: &[u8; 32]) -> bool {
+    t.seat_lines.iter().any(|(app, l)| l == line && t.in_game_present.contains(app))
+}
+
+/// `S1-KP` (`D-103`, `REFUTE_S1KP_v2_groups` V1, fix A): `seats_present`, less
+/// the seats whose every confirmed entry here has been quiet for
+/// `QUIET_MISSING_AFTER` -- a seat back from a restart, whose dead entry the
+/// library times out only after 58 s, is offered the group from the copy the
+/// table plays in at once. An offer to a seat that still holds a copy is
+/// swallowed by that copy.
+fn seats_heard(tox: &Tox, g: u32, t: &TableState) -> std::collections::HashSet<[u8; 32]> {
+    t.peer_keys
+        .iter()
+        .filter(|(p, k)| t.confirmed.contains(*p) && !t.cut.contains(*k))
+        .filter(|(_, k)| tox.peer_quiet_secs(g, k).is_none_or(|q| q < QUIET_MISSING_AFTER.as_secs()))
+        .filter_map(|(_, k)| t.bound.get(k))
+        .filter(|app| t.seat_apps.contains(*app))
+        .copied()
+        .collect()
+}
+
 /// `S1-KO`: whether `line` is the line of a seat still in the game -- the line
 /// its join declared, of a seat this client's own hand counts in the game
 /// (`in_game`), barred here neither by key nor by line, and on this table's
@@ -3710,7 +3854,12 @@ fn member_offers(
         && quiet_since.is_some_and(|at| {
             at.elapsed() >= LONE_OFFERS_AFTER && (all_reached || at.elapsed() >= LONE_OFFERS_ANYWAY_AFTER)
         });
-    offers_its_copy(held_empty(t), heads_up(&t.in_game, mine), quiet_long)
+    // `S1-KP` (`D-103`, `REFUTE_S1KP_v1_groups` G5): a founder away from the hands
+    // by the node's reading holds chips as a dead seat, and no game of two
+    // counts it -- its copy is not one of the two to meet.
+    let founder = founder_app_away(t);
+    let in_game: Vec<[u8; 32]> = t.in_game.iter().copied().filter(|a| Some(*a) != founder).collect();
+    offers_its_copy(held_empty(t), heads_up(&in_game, mine), quiet_long)
 }
 
 /// `S1-KO`: the lines to offer the group to -- of each seat still in the game
@@ -4236,7 +4385,7 @@ mod tests {
             "a member's offer to its founder, on the sweep"
         );
         assert!(
-            code.contains("if t.self_joined && friends.get(&friend) == Some(founder) && !t.barred_lines.contains(founder) {"),
+            code.contains("if t.self_joined && friends.get(&friend) == Some(founder) && !t.barred_lines.contains(founder) && !lone_and_away {"),
             "and on the founder's friendship coming up"
         );
         assert!(
@@ -4339,12 +4488,14 @@ mod tests {
             "a founder out by the table's word"
         );
         assert_eq!(code.matches("t.out_lines.insert(").count(), 1, "and by nothing else");
+        // `S1-KP` (`D-103`): or away from the hands by the node's reading -- and from
+        // a seat counted as playing only.
         assert!(
-            code.contains("Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => k == *founder || (founder_out(t) && in_game_line(t, &k)),"),
-            "any seat of the game's invitation, once the founder is out"
+            code.contains("Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => { k == *founder || ((founder_away(t) || (t.founder_outside && (held_empty(t) || t.group.is_none()))) && in_game_line(t, &k) && counted_line(t, &k)) }"),
+            "a seat of the game's invitation, once the founder is out or away"
         );
         let sweep = code.find("fn sweep_table(").expect("the sweep");
-        let offers = sweep + code[sweep..].find("if let (true, Some(g)) = (founder_out(t), t.group) {").expect("a member's offer");
+        let offers = sweep + code[sweep..].find("if let (true, Some(g)) = (founder_away(t), t.group) {").expect("a member's offer");
         assert!(code[offers..].contains("let offers = member_offers(t, &mine, friends, connected);"), "by the rule");
         assert!(
             code[offers..]
@@ -4352,17 +4503,20 @@ mod tests {
             "to a missing seat of the game, by its line"
         );
         assert!(
-            code.contains("let line = friends.get(&friend).copied().filter(|k| in_game_line(t, k) && !t.waiting_on.contains_key(k));"),
-            "and on a seat of the game's friendship coming up -- not one this lone copy waits on"
+            code.contains("let line = friends .get(&friend) .copied() .filter(|k| in_game_line(t, k) && !t.waiting_on.contains_key(k) && !founder_line_away(t, k));"),
+            "and on a seat of the game's friendship coming up -- not one this lone copy waits on, nor the founder away"
         );
         assert!(code.contains("let offers = due && member_offers(t, &mine, &friends, &connected);"), "throttled, by the same rule");
-        assert!(code.contains(".filter(|line| offers && !t.waiting_on.contains_key(line))"), "the sweep, the same");
+        assert!(
+            code.contains(".filter(|line| offers && !t.waiting_on.contains_key(line) && !founder_line_away(t, line))"),
+            "the sweep, the same"
+        );
         // A member offers only by its own hand, its own seat in the game, and a
         // lone copy at a larger game only once alone, on the line, unoffered for
         // `LONE_OFFERS_AFTER` and within reach of every seat its hand counts as
         // playing.
         let rule = code.find("fn member_offers(").expect("the rule");
-        let body = &code[rule..rule + code[rule..].find("offers_its_copy(held_empty(t), heads_up(&t.in_game, mine), quiet_long)").expect("its end")];
+        let body = &code[rule..rule + code[rule..].find("offers_its_copy(held_empty(t), heads_up(&in_game, mine), quiet_long)").expect("its end")];
         assert!(body.contains("if !t.in_game_from_hand || !t.in_game.contains(mine) { return false; }"));
         assert!(body.contains("let all_reached = t.in_game_present.iter().filter(|app| *app != mine).all(|app| {"));
         assert!(body.contains(
@@ -4385,16 +4539,16 @@ mod tests {
         let named = invite + code[invite..].find("if !invite_names(&invite, wanted_chat(t)) { continue; }").expect("its group");
         let higher = invite
             + code[invite..]
-                .find("if let (true, Some(k), Some(g)) = (founder_out(t), from.filter(|k| *k > me), t.group) {")
-                .expect("a higher line's offer");
+                .find("if let (true, Some(k), Some(g)) = (founder_away(t), from.filter(|k| *k > me || founder_line_away(t, k)), t.group) {")
+                .expect("a higher line's offer -- the founder away ordered above all");
         let waited = higher
             + code[higher..]
                 .find("Some((answered, last)) => { *last = now; if answered.elapsed() < LONE_YIELDS_AFTER { continue; } }")
                 .expect("taken only after this copy's own answer");
         let answered = higher
             + code[higher..]
-                .find("None => { if tox.invite(g, friend).is_ok() {")
-                .expect("the first answered with one offer of this copy");
+                .find("if t.in_game_from_hand && !founder_line_away(t, &k) && tox.invite(g, friend).is_ok() {")
+                .expect("the first answered with one offer of this copy -- by a seat in the game, never to the founder away");
         let left = invite + code[invite..].find("if let Some(g) = t.group.take() {").expect("the copy left");
         assert!(named < higher && waited < left && answered < left, "before any copy is left for it");
         assert_eq!(code.matches("t.held_offer = Some(").count(), 2, "an offer kept by a founder alone (S1-FE)");
@@ -4402,6 +4556,42 @@ mod tests {
         // holds somebody again.
         assert!(code.contains("t.waiting_on.retain(|_, (_, last)| last.elapsed() < OFFER_FORGOTTEN_AFTER);"));
         assert!(code.contains("} else { t.empty_since = None; t.waiting_on.clear(); }"));
+    }
+
+    /// `S1-KP` (`D-103`): a founder away from the table's hands by the node's
+    /// reading -- certified out of them with chips for three hands or three
+    /// minutes, or gone by its own word -- is a founder whose part the members
+    /// take, as one out for good, and it is barred by nothing: no line of its is
+    /// barred, its invitation is still taken (ordered above every member's at a
+    /// copy held empty), and `S1-FE` still offers it the group from a copy holding
+    /// seats. A seat whose entries here are all quiet counts as missing, so the
+    /// table's copy reaches one back from a restart before its dead entry times
+    /// out; and a second invitation in one turn for a table that left its copy
+    /// waits a turn, as the first did.
+    #[test]
+    fn a_founder_away_from_the_hands_has_its_part_taken_and_is_barred_by_nothing() {
+        let src = include_str!("table.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(code.contains(
+            "fn founder_away(t: &TableState) -> bool { founder_out(t) || (matches!(&t.setup.role, Role::Joiner { .. }) && t.founder_away_by_hands) }"
+        ));
+        assert!(code.contains("Command::FounderAway { away, outside } => { t.founder_away_by_hands = away; t.founder_outside = outside || away; }"));
+        assert_eq!(code.matches("t.founder_away_by_hands = ").count(), 1, "set by the node's word alone");
+        assert!(!code.contains("t.out_lines.insert(founder") && !code.contains("barred_lines.insert(founder"), "nothing barred by it");
+        // The members' sweep counts quiet seats missing, and leaves the founder to S1-FE.
+        let sweep = code.find("fn sweep_table(").expect("the sweep");
+        assert!(code[sweep..].contains("let present = seats_heard(tox, g, t);"));
+        assert!(code.contains(".filter(|(_, k)| tox.peer_quiet_secs(g, k).is_none_or(|q| q < QUIET_MISSING_AFTER.as_secs()))"));
+        assert!(QUIET_MISSING_AFTER > AWAY_RESAY && QUIET_MISSING_AFTER < Duration::from_secs(58), "past a live member's gap, inside the library's timeout");
+        // A copy held empty offers the founder away nothing, answers it nothing.
+        assert_eq!(code.matches("let lone_and_away = t.founder_away_by_hands && held_empty(t);").count(), 2, "the sweep's offer and the up-edge's");
+        assert!(code.contains("if let (Role::Joiner { founder, .. }, Some(g), false) = (&t.setup.role, t.group, lone_and_away) {"));
+        // No game of two counts the founder away.
+        assert!(code.contains("let founder = founder_app_away(t); let in_game: Vec<[u8; 32]> = t.in_game.iter().copied().filter(|a| Some(*a) != founder).collect();"));
+        // A second invitation in one turn waits a turn.
+        assert!(code.contains("left_one = true; left_this_turn.insert(*id);"));
+        assert!(code.contains("if left_one || deferred_table { invites_deferred.push((friend, invite)); } else { take_invitation(&mut tox, &mut tables, &friends, friend, &invite); }"));
     }
 
     /// `S1-KL`: the node's own count of this client's returns belongs to one

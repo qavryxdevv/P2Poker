@@ -44,7 +44,8 @@ use crate::protocol::constants::{RESUME_GIVE_UP_MS, RESUME_RECORD_MAX_AGE_MS};
 /// signing journal armed -- an older binary resumes nothing an armed one played:
 /// it would sign again what the journal recorded (`REFUTE_JOURNAL_D2b` S3); nor
 /// an armed one a table an unarmed one played (`REFUTE_G11_v2` M1).
-pub const RECORD_VERSION: u8 = 7;
+/// `D-104`: 8 with protocol major 4, for `D-089`'s reason.
+pub const RECORD_VERSION: u8 = 8;
 
 /// An unfinished session, as the node last knew it.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -132,6 +133,14 @@ pub struct Record {
     /// reads as `None`: no floor.
     #[n(21)]
     pub own_floor: Option<OwnFloorRecord>,
+    /// `S1-KM` (`D-104`, `REFUTE_S1KM_impl_v2` I-2): how many times this client's
+    /// own seat came back to this table by a return certificate it banked -- its
+    /// own count (`Opening::returns_seen`), which an adoption after a restart
+    /// starts from (never above the table's count) instead of zero, so that the
+    /// table's word on its fourth absence is this client's too. Absent from a
+    /// record written before it, which reads as `None`: zero.
+    #[n(22)]
+    pub own_returns: Option<u8>,
 }
 
 /// Batch 4 (`D-102`): the hand, and the least stack this client's own
@@ -289,6 +298,7 @@ mod tests {
                 OutSeat { app_key: [7; 32], line: None },
             ]),
             own_floor: Some(OwnFloorRecord { hand: 17, stack: 11_900 }),
+            own_returns: Some(2),
         }
     }
 
@@ -301,9 +311,23 @@ mod tests {
         assert_eq!(back.own_floor, Some(OwnFloorRecord { hand: 17, stack: 11_900 }));
         let mut older = a_record();
         older.own_floor = None;
+        older.own_returns = None;
         let bytes = minicbor::to_vec(&older).expect("encodes");
         let back: Record = minicbor::decode(&bytes).expect("decodes");
         assert_eq!(back.own_floor, None);
+    }
+
+    /// `S1-KM` (`D-104`): this client's own count of its returns is kept, and a
+    /// record without it reads as none -- zero.
+    #[test]
+    fn the_own_count_of_returns_is_kept_and_a_record_without_it_reads_with_none() {
+        let with = a_record();
+        let back: Record = minicbor::decode(&minicbor::to_vec(&with).expect("encodes")).expect("decodes");
+        assert_eq!(back.own_returns, Some(2));
+        let mut older = a_record();
+        older.own_returns = None;
+        let back: Record = minicbor::decode(&minicbor::to_vec(&older).expect("encodes")).expect("decodes");
+        assert_eq!(back.own_returns, None);
     }
 
     /// `S1-KN`: the seats out for good are kept, line or none, and a record
@@ -319,6 +343,7 @@ mod tests {
         let mut old = a_record();
         old.out = None;
         old.own_floor = None;
+        old.own_returns = None;
         let mut e = minicbor::Encoder::new(Vec::new());
         e.array(20).unwrap();
         e.u8(old.version).unwrap();
@@ -358,6 +383,7 @@ mod tests {
         old.stacks = None;
         old.out = None;
         old.own_floor = None;
+        old.own_returns = None;
         let bytes = minicbor::to_vec(&old).expect("encodes");
         let back: Record = minicbor::decode(&bytes).expect("decodes");
         assert_eq!(back.in_game, None);
@@ -395,6 +421,7 @@ mod tests {
         first.stacks = None;
         first.out = None;
         first.own_floor = None;
+        first.own_returns = None;
         let mut e = minicbor::Encoder::new(Vec::new());
         e.array(19).unwrap();
         e.u8(first.version).unwrap();

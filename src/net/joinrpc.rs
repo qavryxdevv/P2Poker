@@ -133,7 +133,7 @@ pub fn table_topic(table_id: &[u8; 32]) -> libp2p::gossipsub::IdentTopic {
         name.push_str(&format!("{b:02x}"));
     }
     // The major (`PROTOCOL_MAJOR`, `D-089`), like every protocol string.
-    name.push_str("/3");
+    name.push_str("/4");
     libp2p::gossipsub::IdentTopic::new(name)
 }
 
@@ -216,7 +216,7 @@ mod tests {
         assert_ne!(a.to_string(), b.to_string());
         assert_eq!(table_topic(&[1u8; 32]).to_string(), a.to_string());
         assert!(a.to_string().starts_with("/p2p-poker/table/"));
-        assert!(a.to_string().ends_with("/3"));
+        assert!(a.to_string().ends_with("/4"));
     }
 
     /// The protocol name is the one in the constants table, so the string in the

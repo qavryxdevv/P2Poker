@@ -422,8 +422,12 @@ fn tiny_stacks_exercise_the_all_in_paths() {
 /// for -- one per major. A change to what the engine decides is a rule change,
 /// and a rule change is a new major (`D-089`): two builds of one major never
 /// decide differently, so no seat is judged by a round another build would not
-/// make. Edited in place only while its major is unreleased (3: 0.3.0 is not).
-const PINNED: &[(u16, &str)] = &[(3, "83021f6e91984aaa1b796cf43427bd5c83bf49b10616b829ac0539f381bc71e8")];
+/// make. Edited in place only while its major is unreleased (4: 0.4.0 is not;
+/// 3 went out with 0.3.0, and `D-104` decides nothing new, so 4 pins the same).
+const PINNED: &[(u16, &str)] = &[
+    (3, "83021f6e91984aaa1b796cf43427bd5c83bf49b10616b829ac0539f381bc71e8"),
+    (4, "83021f6e91984aaa1b796cf43427bd5c83bf49b10616b829ac0539f381bc71e8"),
+];
 
 /// `S1-KT`: the functions of `src/table/hand.rs` a betting stage's round and
 /// its judgement stand on -- the round built at the deal, the turns, the

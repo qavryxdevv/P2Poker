@@ -309,10 +309,27 @@ pub struct Opening {
     /// [`REPLENISH_AFTER`].
     pub present_run: Vec<u8>,
     /// `D-032`: how many times each seat has come back to the table by a
-    /// return certificate (`S1-BM`), indexed by seat. Carried like `grace`,
-    /// this receiver's own; at `MAX_RETURNS` this client votes for no further
-    /// return of that seat, and a certificate needs every voter.
+    /// return certificate (`S1-BM`), indexed by seat -- **the table's count**.
+    /// `S1-KM` (`D-104`): every seat that played the chain since the formation
+    /// holds the same one (a return moves `R` with it, and the genesis commits
+    /// `R`), so it is carried in `HAND_INIT` (`n(13)`), compared at stage 0 and
+    /// taken by a client that adopts the hand -- which counted every seat from
+    /// zero and parted from the table at another seat's fourth absence. At
+    /// `MAX_RETURNS` this client votes for no further return of that seat (a
+    /// certificate needs every voter), and another seat certified absent is out
+    /// of the table for good (`D-047`). Capped at `MAX_RETURNS` where folded.
     pub returns: Vec<u8>,
+    /// `S1-KM` (`D-104`): **this client's own count** -- the returns it banked
+    /// itself, folded as `returns` is but from zero at an adoption (its own
+    /// seat's from what the node noted itself and its session record kept, never
+    /// above the table's): what `returns` was before the table's count was
+    /// carried. What this client does
+    /// on a count and cannot take back reads this one: its own seat put out of the
+    /// table at a fourth absence (an adopted count would let half the counted
+    /// table, through the copies it adopted from, zero this seat's stack past
+    /// `D-102`'s floor), another seat barred from the group for good, and
+    /// `S1-JT`'s lobby word.
+    pub returns_seen: Vec<u8>,
     /// `D-047`: the seats out of the table for good -- certified absent with
     /// `MAX_RETURNS` returns behind them. Their chips left the table at the
     /// boundary that put them here, so every rule treats them as busted:
@@ -425,6 +442,7 @@ impl Opening {
             grace: vec![GRACE_HANDS; usize::from(ad.max_players)],
             present_run: vec![0; usize::from(ad.max_players)],
             returns: vec![0; usize::from(ad.max_players)],
+            returns_seen: vec![0; usize::from(ad.max_players)],
             out: Vec::new(),
             // The first hand of a table: nothing has decided the button yet.
             button: None,
@@ -453,8 +471,9 @@ impl Opening {
     /// in the group, and the checkpoint at the end of the hand says whether it
     /// was (a different set is a different stage-0 hash, and a different
     /// checkpoint earns no return; the client adopts again at the next
-    /// boundary). `readmitted`, `grace` and `present_run` are this receiver's
-    /// own and start fresh.
+    /// boundary). `readmitted`, `grace`, `present_run` and `returns_seen` are
+    /// this receiver's own and start fresh; `S1-KM` (`D-104`): `returns`, the
+    /// table's count, is the copies' (`n(13)`).
     ///
     /// `base` carries what the copies do not: the table, the session, the
     /// roster's keys, this client's seat, and the advertised parameters.
@@ -467,19 +486,21 @@ impl Opening {
     /// it stood) from one the table deals in without a copy of its own (D-039:
     /// opened anew and said) by this, since both are in `required`.
     ///
-    /// **`D-039`: the required set is the body's `dealt_in` joined with the
-    /// signers.** `dealt_in` is the table's own word on who plays this hand,
-    /// signed by a strict majority of the other seats, and `dealt_in ⊆ R(k)`
-    /// (§4.4); the signers are in `R(k)` by having signed. So the union is a
-    /// subset of `R(k)` that is exact whenever every required seat is dealt in,
-    /// which is every hand this client can open (a required seat outside
-    /// `dealt_in` is one with no chips or no grace, and nothing here emits a
-    /// sit-out). Before this the set was the signers alone, so a seat the table
-    /// was waiting for at stage 0 -- back from a restart, still required, its
-    /// copy the one thing missing -- adopted as a bystander that could not sign,
-    /// and at a table where half the seats had restarted together nobody could
-    /// certify anybody, no stage 0 ever closed, and the hands aborted on their
-    /// budget for the rest of the run (`run175510-4`).
+    /// **`D-039`: the required set is the body's `dealt_in`.** `dealt_in` is
+    /// the table's own word on who plays this hand, signed by a strict majority
+    /// of the other seats, and it is `R(k)` exactly: `R(k)` filtered by chips
+    /// and grace (§4.4), and every required seat has both (`S1-CF`). Before
+    /// D-039 the set was the signers alone, so a seat the table was waiting for
+    /// at stage 0 -- back from a restart, still required, its copy the one thing
+    /// missing -- adopted as a bystander that could not sign, and at a table
+    /// where half the seats had restarted together nobody could certify anybody,
+    /// no stage 0 ever closed, and the hands aborted on their budget for the rest
+    /// of the run (`run175510-4`). `S1-KM` (`D-104`, `REFUTE_S1KM_v1` F3): and
+    /// not `dealt_in` joined with the signers, as it was since -- a seat of
+    /// §4.9's readmission set `A` signs a byte-identical copy without being in
+    /// `R(k)`, and in an adopter's `required` it made every copy of the table's
+    /// differ in `dealt_in` there (the adopter stalled), and would have made the
+    /// table's count of returns and the adopter's part where it did not.
     pub fn adopt_with_signers(base: Opening, copies: &[Vec<u8>]) -> Result<(Opening, Vec<SeatIdx>), Failed> {
         let my_seat = base.my_seat;
         let others = base.seats.iter().filter(|(s, _, _)| *s != my_seat).count();
@@ -663,10 +684,37 @@ impl Opening {
                 what: "the copies' blinds were the schedule's for this hand",
             });
         }
+        // `S1-KM` (`D-104`): the table's count of returns, one per occupied seat
+        // -- the body's own `self_consistent` held it to the stacks' length and to
+        // the limit; a copy without it offers no count.
+        if body.returns.len() != base.seats.len() {
+            return Err(Failed::Elsewhere {
+                seat: base.my_seat,
+                what: "the copies carried one count of returns per occupied seat",
+            });
+        }
+        let mut returns = vec![0u8; usize::from(base.max_players)];
+        for ((seat, _, _), count) in base.seats.iter().zip(body.returns.iter()) {
+            if let Some(r) = returns.get_mut(usize::from(*seat)) {
+                *r = (*count).min(crate::protocol::constants::MAX_RETURNS);
+            }
+        }
+        // `S1-KM` (`D-104`, `REFUTE_S1KM_impl_v2` I-2): this client's own count
+        // starts at zero for every seat but its own, which keeps what `base`
+        // brings -- the node's own noting and its session record -- never above
+        // the table's count: so the table's word on this seat's fourth absence is
+        // this client's own too where it witnessed the returns, and a count the
+        // copies named never is.
+        let mut returns_seen = vec![0u8; usize::from(base.max_players)];
+        let me = usize::from(base.my_seat);
+        if let (Some(seen), Some(own), Some(table)) = (returns_seen.get_mut(me), base.returns_seen.get(me), returns.get(me)) {
+            *seen = (*own).min(*table);
+        }
         let signers: Vec<SeatIdx> = signers.into_iter().collect();
-        let mut required: Vec<SeatIdx> = body.dealt_in.iter().copied().chain(signers.iter().copied()).collect();
-        required.sort_unstable();
-        required.dedup();
+        // `D-039`, `S1-KM` (`REFUTE_S1KM_v1` F3): `R(k)` is the body's `dealt_in`
+        // -- not joined with the signers, among whom a readmitted seat of §4.9's
+        // `A` signs a byte-identical copy from outside `R(k)`.
+        let required: Vec<SeatIdx> = body.dealt_in.clone();
         let opening = Opening {
             genesis,
             required,
@@ -680,7 +728,8 @@ impl Opening {
             roster_hash: body.roster_hash,
             grace: vec![GRACE_HANDS; usize::from(base.max_players)],
             present_run: vec![0; usize::from(base.max_players)],
-            returns: vec![0; usize::from(base.max_players)],
+            returns,
+            returns_seen,
             out: Vec::new(),
             ..base
         };
@@ -1478,6 +1527,12 @@ fn derive_init(o: &Opening) -> Result<HandInit, Failed> {
                 d
             },
             stacks: o.seats.iter().map(|(_, _, stack)| *stack).collect(),
+            // `S1-KM` (`D-104`): the table's count of returns, by occupied seat.
+            returns: o
+                .seats
+                .iter()
+                .map(|(seat, _, _)| o.returns.get(usize::from(*seat)).copied().unwrap_or(0))
+                .collect(),
             roster_hash: o.roster_hash,
             // A buy-in enters the ledger here and nowhere earlier, which is
             // what makes an abandoned formation move no chips (§4.3).
@@ -2796,6 +2851,9 @@ pub struct Hand {
     /// test, so every copy reaches it. The test caught this the moment it
     /// delivered a second copy.
     dealt_said: bool,
+    /// `S1-KM` (`D-104`, `REFUTE_S1KM_impl_v2` I-6): the same for a count of
+    /// returns that differs -- its own flag, so neither note silences the other.
+    returns_said: bool,
     /// Diagnostic: what the certificate path last decided.
     cert_note: Vec<String>,
     /// Whether the player has been told, this hand, that D-036's floor is
@@ -3390,6 +3448,7 @@ impl Hand {
                 settle_note: None,
                 dealt_note: None,
                 dealt_said: false,
+                returns_said: false,
                 cert_note: Vec::new(),
                 floor_said: false,
                 last_stamp_ms: opened_at_ms,
@@ -4186,6 +4245,22 @@ impl Hand {
                     short(&self.open.genesis),
                     theirs.dealt_in,
                     self.mine.dealt_in
+                ));
+            }
+            // `S1-KM` (`D-104`, `REFUTE_S1KM_v1` F4): the table's count of returns
+            // has `S1-CF`'s shape -- compared here, committed by no genesis -- and
+            // two seats that play the chain alike never differ in it (a return
+            // moves `R` too). Said once a hand, with both counts, where it does.
+            if what == NotOurs::Differs(Field::Returns)
+                && opened.envelope.previous_event_hash == self.open.genesis
+                && !self.returns_said
+            {
+                self.returns_said = true;
+                self.dealt_note = Some(format!(
+                    "seat {seat} opened hand #{} at THIS client's own genesis with another count of returns: {:?} \
+                     against this client's {:?}. Two seats that played the same hands count alike, so one of the \
+                     two took its count from copies the other did not: stage 0 will not complete (S1-KM)",
+                    self.open.hand_id, theirs.returns, self.mine.returns
                 ));
             }
             // `S1-KT`: a seat whose client decides the betting by another
@@ -14465,6 +14540,8 @@ impl Hand {
         present_run.resize(n, 0);
         let mut returns = self.open.returns.clone();
         returns.resize(n, 0);
+        let mut returns_seen = self.open.returns_seen.clone();
+        returns_seen.resize(n, 0);
         // **What counts as having taken part must be agreed, not observed.**
         // `signed` is this client's own record of whose events it accepted, and
         // two honest peers legitimately differ in it: a hand ended by a
@@ -14600,9 +14677,26 @@ impl Hand {
         }
         for seat in &self.returned {
             let s = usize::from(*seat);
+            // `S1-KM` (`D-104`, `REFUTE_S1KM_v1` F5): the two premises the table's
+            // count rests on -- a seat comes back from outside `R(k)` (the vote,
+            // the certificate's reception and `on_return_cert` each refuse one
+            // inside it), and with chips after the out-for-good zeroing above (a
+            // certificate's subject is a seat dealt in; `open.out` holds none) --
+            // so the count moves with `R(k+1)`, which the genesis commits.
+            debug_assert!(
+                !self.open.required.contains(seat) && alive.get(s).copied().unwrap_or(false),
+                "S1-KM: a returned seat comes back from outside R(k), with chips; seat {seat}"
+            );
             // `D-032`: a return is counted whether or not it changes the roster.
+            // `S1-KM` (`REFUTE_S1KM_v1` F2): capped at the limit -- every reader
+            // compares `>=`, and a count past it (a return every voter of which
+            // was a rogue, banked by an honest seat that did not vote) would fail
+            // this client's own `HAND_INIT` every hand from then on.
             if let Some(r) = returns.get_mut(s) {
-                *r = r.saturating_add(1);
+                *r = r.saturating_add(1).min(crate::protocol::constants::MAX_RETURNS);
+            }
+            if let Some(r) = returns_seen.get_mut(s) {
+                *r = r.saturating_add(1).min(crate::protocol::constants::MAX_RETURNS);
             }
             if alive.get(s).copied().unwrap_or(false) && !required.contains(seat) {
                 required.push(*seat);
@@ -14713,6 +14807,7 @@ impl Hand {
             grace,
             present_run,
             returns,
+            returns_seen,
             out,
             button: Some(positions.button),
             blinds: Some((positions.small_blind, positions.big_blind)),
@@ -15490,9 +15585,16 @@ impl Hand {
 
     /// `IN(k)`: the subjects of complete return certificates banked at this
     /// boundary, ascending.
-    /// `D-032`: how many times each seat has come back, indexed by seat.
+    /// `D-032`: how many times each seat has come back, indexed by seat -- the
+    /// table's count (`S1-KM`).
     pub fn returns(&self) -> &[u8] {
         &self.open.returns
+    }
+
+    /// `S1-KM` (`D-104`): the returns this client banked itself, indexed by
+    /// seat -- from zero at an adoption.
+    pub fn returns_seen(&self) -> &[u8] {
+        &self.open.returns_seen
     }
 
     /// `D-047`: the seats out of the table for good -- certified absent with
@@ -15610,9 +15712,32 @@ impl Hand {
     /// absence, is out of the table for good -- in a hand a majority of the
     /// seats with chips still carries as it ends. Short of that it is certified
     /// out of the hand, and D-032's limit keeps it out: a dead seat that drains.
+    ///
+    /// `S1-KM` (`D-104`): another seat by the table's count (`returns`), which
+    /// every seat at one genesis holds alike, an adopter too; this client's own
+    /// seat by its own count (`returns_seen`) -- a count it took from the copies
+    /// does not take its own chips off the table. Its own count survives an
+    /// adoption where it was kept (the node's noting, the session record), so
+    /// the table's word and its own agree there; where it was lost, the client
+    /// parts from a table that puts it out, and the seats that witnessed its
+    /// returns bar it from the group (`REFUTE_S1KM_impl_v2` I-2).
     pub fn out_after_absences(&self, seat: SeatIdx) -> bool {
+        let count = if seat == self.open.my_seat { &self.open.returns_seen } else { &self.open.returns };
         self.certified_here(seat)
-            && self.open.returns.get(usize::from(seat)).copied().unwrap_or(0) >= crate::protocol::constants::MAX_RETURNS
+            && count.get(usize::from(seat)).copied().unwrap_or(0) >= crate::protocol::constants::MAX_RETURNS
+            && self.carried_by_majority()
+    }
+
+    /// `S1-KM` (`D-104`): [`Hand::out_after_absences`] by this client's own count
+    /// for every seat -- what the node bars a seat from the table's group for
+    /// good by: an act no later hand takes back, and so never on a count the
+    /// copies of an adopted hand named. Short of it, a seat the table's count
+    /// puts out loses its chips alike at every seat and is barred by the seats
+    /// that witnessed its returns (exclusion is theirs, `S1-KL`).
+    pub fn out_after_absences_seen(&self, seat: SeatIdx) -> bool {
+        self.certified_here(seat)
+            && self.open.returns_seen.get(usize::from(seat)).copied().unwrap_or(0)
+                >= crate::protocol::constants::MAX_RETURNS
             && self.carried_by_majority()
     }
 
@@ -17339,6 +17464,7 @@ mod tests {
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
             returns: vec![0; 3],
+            returns_seen: vec![0; 3],
             out: Vec::new(),
             button: None,
             blinds: None,
@@ -17384,6 +17510,7 @@ mod tests {
             grace: vec![GRACE_HANDS; 5],
             present_run: vec![0; 5],
             returns: vec![0; 5],
+            returns_seen: vec![0; 5],
             out: Vec::new(),
             button: None,
             blinds: None,
@@ -17482,6 +17609,7 @@ mod tests {
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
             returns: vec![0; 3],
+            returns_seen: vec![0; 3],
             out: Vec::new(),
             button: None,
             blinds: None,
@@ -24293,6 +24421,8 @@ mod tests {
         o.max_players = 4;
         o.grace = vec![GRACE_HANDS; 4];
         o.present_run = vec![0; 4];
+        o.returns = vec![0; 4];
+        o.returns_seen = vec![0; 4];
         o
     }
 
@@ -24826,6 +24956,116 @@ mod tests {
         assert!(adopted.readmitted.is_empty());
         assert_eq!(adopted.required, vec![0, 1, 2]);
         assert_eq!(adopted.grace, vec![GRACE_HANDS; 4], "per-receiver accumulators start fresh");
+    }
+
+    /// `S1-KM` (`D-104`): the table's count of returns comes with the copies --
+    /// an adopter used to count every seat from zero and part from the table at
+    /// another seat's fourth absence -- and it is the control's, the count of a
+    /// seat that followed; this client's own count starts at zero.
+    #[test]
+    fn an_adopted_opening_takes_the_tables_count_of_returns() {
+        let (mut hands, keys) = a_table_after_hand_one();
+        for h in hands.iter_mut() {
+            h.open.returns[1] = 2;
+            h.open.returns_seen[1] = 2;
+        }
+        let control = hands[3].next_hand().expect("the control derives hand 2");
+        assert_eq!(control.returns[1], 2);
+        let (copies, opened) = hand_two_copies(&hands, &keys);
+        assert_eq!(opened[0].init().returns, vec![0, 2, 0, 0], "carried in the body, by occupied seat");
+        let adopted = Opening::adopt(adopter_base(), &copies).expect("three of four occupied seats agree");
+        assert_eq!(adopted.returns, control.returns, "the table's count");
+        assert_eq!(adopted.returns_seen, vec![0; 4], "its own starts at zero");
+        // A copy without one count per occupied seat offers none.
+        let mut short = adopter_base();
+        short.seats.truncate(3);
+        assert!(Opening::adopt(short, &copies).is_err());
+    }
+
+    /// `S1-KM` (`D-104`, `REFUTE_S1KM_impl_v2` I-2): an adopter's own count of
+    /// its own returns is what the node brings in `base` -- its own noting, its
+    /// session record -- never above the table's count; every other seat's own
+    /// count starts at zero.
+    #[test]
+    fn an_adopters_own_count_of_its_own_returns_is_kept_never_above_the_tables() {
+        let (mut hands, keys) = a_table_after_hand_one();
+        for h in hands.iter_mut() {
+            h.open.returns[3] = 2;
+            h.open.returns_seen[3] = 2;
+            h.open.returns[1] = 1;
+            h.open.returns_seen[1] = 1;
+        }
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        let mut base = adopter_base();
+        base.returns_seen[3] = 2;
+        base.returns_seen[1] = 1;
+        let kept = Opening::adopt(base, &copies).expect("adopted");
+        assert_eq!(kept.returns_seen, vec![0, 0, 0, 2], "its own seat's kept; another's not");
+        let mut over = adopter_base();
+        over.returns_seen[3] = 3;
+        let capped = Opening::adopt(over, &copies).expect("adopted");
+        assert_eq!(capped.returns_seen[3], 2, "never above the table's count");
+    }
+
+    /// `S1-KM` (`D-104`, `REFUTE_S1KM_v1` F3): an adopter's `required` is the
+    /// body's `dealt_in` -- `R(k)` by `S1-CF` -- and not joined with the signers:
+    /// a seat outside `R(k)` that signed a byte-identical copy (a readmitted seat
+    /// of §4.9's `A`, or the adopter's own previous life signing as one) stays a
+    /// bystander. Broken deliberately: with the union, seat 3 is required.
+    #[test]
+    fn an_adopters_required_set_is_the_tables_dealt_in() {
+        let (hands, keys) = a_table_after_hand_one();
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        let table_id = hands[0].table_id();
+        let o = chained::open_in_hand(&copies[0], FRAME_CAP, EventType::HandInit, &table_id, 2).unwrap();
+        let body: HandInit = chained::payload(&o, HAND_INIT_CAP).unwrap();
+        assert_eq!(body.dealt_in, vec![0, 1, 2]);
+        let signers: BTreeSet<SeatIdx> = [0u8, 1, 2, 3].into_iter().collect();
+        let (adopted, signed) =
+            Opening::adopt_group(adopter_base(), o.envelope.previous_event_hash, signers, body).expect("a well-formed body");
+        assert_eq!(signed, vec![0, 1, 2, 3], "the signers are still said");
+        assert_eq!(adopted.required, vec![0, 1, 2], "R(k) is the table's dealt_in");
+    }
+
+    /// `S1-KM` (`D-104`, `REFUTE_S1KM_v1` F2): both counts are capped where they
+    /// are folded -- a return past the limit, banked by a seat that did not vote,
+    /// would otherwise fail this client's own `HAND_INIT` every hand from then on.
+    #[test]
+    fn a_count_of_returns_is_capped_at_the_limit() {
+        use crate::protocol::constants::MAX_RETURNS;
+        let (mut hands, _keys) = a_settled_hand_with_a_bystander();
+        hands[0].open.returns[2] = MAX_RETURNS;
+        hands[0].returned.push(2);
+        let next = hands[0].next_hand().expect("a successor");
+        assert_eq!(next.returns[2], MAX_RETURNS, "the table's count stays at the limit");
+        assert_eq!(next.returns_seen[2], 1, "its own counts the return it banked");
+        let (h, _) = Hand::open(next, &key(10), NOW, 30_000).expect("its own opening holds");
+        assert_eq!(h.init().returns[2], MAX_RETURNS);
+    }
+
+    /// `S1-KM` (`D-104`, `REFUTE_S1KM_v1` F1): what cannot be taken back reads
+    /// this client's own count. A seat whose own count was lost is not taken off
+    /// the table by its own derivation at its fourth absence -- it parts from the
+    /// table -- while every seat that followed puts it out; and the bar for good
+    /// of another seat is read on the own count alone.
+    #[test]
+    fn a_count_taken_from_the_copies_puts_out_no_seat_of_its_own() {
+        use crate::protocol::constants::MAX_RETURNS;
+        let (mut hands, _keys) = a_settled_hand_with_a_bystander();
+        for h in hands.iter_mut() {
+            h.open.returns[2] = MAX_RETURNS;
+            h.certified.push(2);
+        }
+        // Seats 0 and 1 followed every hand; seat 2 (the subject) adopted since.
+        hands[0].open.returns_seen[2] = MAX_RETURNS;
+        hands[1].open.returns_seen[2] = MAX_RETURNS;
+        assert_eq!(hands[0].out_for_good(), vec![2], "the table's count puts seat 2 out at the others");
+        assert!(hands[2].out_for_good().is_empty(), "not by its own derivation, short of its own count");
+        assert!(hands[0].out_after_absences_seen(2), "seat 0 witnessed three returns: it bars");
+        // An adopter among the others takes the chips out with the table and bars nothing.
+        hands[1].open.returns_seen[2] = 0;
+        assert!(hands[1].out_after_absences(2), "the table's count, for the chips");
+        assert!(!hands[1].out_after_absences_seen(2), "its own, for the bar");
     }
 
     /// `D-039`: the table's own word on who is dealt in decides membership.
@@ -27309,7 +27549,10 @@ mod tests {
         use crate::protocol::constants::MAX_RETURNS;
         let (mut hands, _keys) = a_settled_hand_with_a_bystander();
         for h in hands.iter_mut() {
+            // A table that never adopted: the table's count and each seat's own
+            // are one (`S1-KM`).
             h.open.returns[2] = MAX_RETURNS;
+            h.open.returns_seen[2] = MAX_RETURNS;
             h.certified.push(2);
         }
         for (i, h) in hands.iter().enumerate() {

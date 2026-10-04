@@ -362,7 +362,7 @@ fn relay_namespace() -> libp2p::kad::RecordKey {
 /// reachable player and the unreachable one, and that is the difference between
 /// a lobby most people can be seen in and a lobby only a minority can.
 fn lobby_namespace() -> libp2p::kad::RecordKey {
-    namespace(b"p2p-poker/main-lobby/v3")
+    namespace(b"p2p-poker/main-lobby/v4")
 }
 
 /// `S1-EX`: the DHT key the peers of **one slice** of the lobby find each other
@@ -380,7 +380,7 @@ fn lobby_namespace() -> libp2p::kad::RecordKey {
 /// asks who else is there, and its connections stop being arbitrary: ten or
 /// twelve of them per slice, which is what `mesh_n` wants.
 fn shard_namespace(slice: &str) -> libp2p::kad::RecordKey {
-    namespace(format!("p2p-poker/main-lobby/v3/{slice}").as_bytes())
+    namespace(format!("p2p-poker/main-lobby/v4/{slice}").as_bytes())
 }
 
 /// `D-070`: the lobby's key for one hour of the clock -- where the clients that
@@ -413,7 +413,7 @@ fn shard_namespace(slice: &str) -> libp2p::kad::RecordKey {
 /// cannot answer. A clock an hour wrong announces where nobody looks, and that
 /// client is met under the lobby's own key as it always was.
 fn hour_namespace(hour: u64) -> libp2p::kad::RecordKey {
-    namespace(format!("p2p-poker/main-lobby/v3/hour/{hour}").as_bytes())
+    namespace(format!("p2p-poker/main-lobby/v4/hour/{hour}").as_bytes())
 }
 
 /// `S1-IY`: the failed dials whose own words are sent to the window. The window
@@ -1618,6 +1618,32 @@ struct TableRun {
     /// only before it ever has; a rejoin from the table's copies later (`D-038`)
     /// drops the hands it holds, not its seat.
     hand_since_resume: bool,
+    /// `S1-KM` (`D-104`, `REFUTE_S1KM_impl_v2` I-2): the most the hands this
+    /// client held at its table counted of its own seat's returns by its own
+    /// count (`Hand::returns_seen`) -- read on the tick, kept in the session
+    /// record with the node's own noting (`S1-KL`).
+    own_returns_seen: u8,
+    /// `S1-KP` (`D-103`): the founder away from the table's hands, as the hands
+    /// this client holds read it -- see [`FounderAbsence`].
+    founder_absence: FounderAbsence,
+    /// `S1-KP` (`D-103`): `(away, outside)` as last told to the carrier.
+    founder_absence_told: Option<(bool, bool)>,
+    /// `S1-KP` (`D-103`): this slot took its table back from the session record
+    /// through the other seats because its founder did not answer the rejoin --
+    /// the record road; its founder is asked again every `REASK_AGAIN` until a
+    /// hand is held, and every answer to the slot is only said.
+    back_by_record: bool,
+    /// `S1-KP` (`D-103`): when the record road last asked the founder.
+    record_road_asked: Option<tokio::time::Instant>,
+    /// `S1-KP` (`D-103`): the founder answered the record road's ask -- it is
+    /// asked no more (`REFUTE_S1KP_impl_node` I3).
+    record_road_answered: bool,
+    /// `S1-KP` (`D-103`): this client's Tox key on the record road, for its asks.
+    record_road_tox: Option<[u8; 32]>,
+    /// `S1-KP` (`D-103`): the lines of the seats the record counted as the table,
+    /// this client's own excepted -- a friendship with one up holds the record
+    /// road's clock open (`REFUTE_S1KP_v1_node` N2).
+    record_counted_lines: Vec<[u8; 32]>,
     /// `S1-KF` (`D-088`): the stacks the hand this client holds, and the one
     /// retained before it, hold by its own derivation, on the last stall tick
     /// -- what the session record keeps for a client started again.
@@ -2175,6 +2201,14 @@ impl TableRun {
             table_counted: None,
             in_game_told: None,
             hand_since_resume: false,
+            own_returns_seen: 0,
+            founder_absence: FounderAbsence::default(),
+            founder_absence_told: None,
+            back_by_record: false,
+            record_road_asked: None,
+            record_road_answered: false,
+            record_road_tox: None,
+            record_counted_lines: Vec::new(),
             stacks_held: None,
             rejoin_away: false,
             split_said_hand: 0,
@@ -2662,6 +2696,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         out: Some(recorded_out(f, &$t.out_keys)),
                         // Batch 4 (`D-102`): and what its own signatures allow it.
                         own_floor: $t.own_floor.map(|o| crate::storage::session::OwnFloorRecord { hand: o.hand, stack: o.stack }),
+                        // `S1-KM` (`D-104`): and its own count of its returns -- the
+                        // hand's own (`returns_seen`) or the node's (`S1-KL`), whichever
+                        // holds more, for an adoption after a restart to start from.
+                        own_returns: Some(own_count_of_returns($t.own_returns_seen, &$t.own_returns, $t.own_returns_of, f)),
                     };
                     match crate::storage::session::save(&profile_dir, &record) {
                         Ok(()) => {
@@ -4616,7 +4654,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // and so out of its group too: a founder gone so is a founder
                     // whose part the members take, as one put out.
                     let resigned = $h.named_by_its_own_word(seat);
-                    let at_the_limit = flooded || cheated || resigned || $h.out_after_absences(seat);
+                    let at_the_limit = flooded || cheated || resigned || $h.out_after_absences_seen(seat);
+                    // `S1-KM` (`D-104`): the fourth absence by this client's own count
+                    // of the seat's returns -- the bar is for good, and a count taken
+                    // from an adopted hand's copies bars nobody; the chips leave by
+                    // the table's count all the same, at every seat alike.
                     if !at_the_limit {
                         continue;
                     }
@@ -4918,6 +4960,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(j) = $t.journal.take() {
                 let _ = j.close(JOURNAL_CLOSE);
             }
+            // `S1-KP` (`REFUTE_S1KP_impl_node` I2): and the joins this slot asked
+            // and was not answered -- the record road's ask among them: answered
+            // or failed late, it would reach the slot's next table.
+            join_pending.retain(|_, slot| *slot != $t.slot);
             $t.journal_tried_ms = 0;
             $t.newest_own_seen = 0;
             $t.cert_lane = CertLane::default();
@@ -5053,6 +5099,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.table_counted = None;
             $t.in_game_told = None;
             $t.hand_since_resume = false;
+            $t.own_returns_seen = 0;
+            $t.founder_absence = FounderAbsence::default();
+            $t.founder_absence_told = None;
+            $t.back_by_record = false;
+            $t.record_road_asked = None;
+            $t.record_road_answered = false;
+            $t.record_road_tox = None;
+            $t.record_counted_lines.clear();
             $t.stacks_held = None;
             $t.rejoin_away = false;
             $t.split_said_hand = 0;
@@ -5637,6 +5691,171 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 offered.matters(peer);
             }
+        }};
+    }
+    // `S1-KP` (`D-103`): the record road. A seat back from a restart whose founder
+    // did not answer its rejoin -- gone without a word, its client closed or its
+    // machine off -- had nobody to take it back: the founder road failed, and ten
+    // minutes later the record was given up. Where its record is a joiner's of
+    // this table, keeps the roster it was admitted by, does not name the founder
+    // out for good (`S1-KO`'s arm takes that one) and counts more than two seats
+    // as the table (heads-up the one other seat is the founder), the slot takes
+    // the table back from the record as `S1-KO`'s arm does -- but the founder is
+    // not barred: its invitation is taken, it is asked again every `REASK_AGAIN`
+    // (its driver re-offers the group on the ask, `Seat::Back`), and the members
+    // that read it away take its part. True where the road was taken; false
+    // leaves the founder road's failure to the caller, the record kept.
+    macro_rules! back_by_record {
+        ($t:ident, $why:expr) => {{
+            let why: String = $why;
+            let mut taken = false;
+            let record = $t.resume.clone().filter(|r| $t.resuming && r.founder_seed == [0u8; 32] && !r.roster_list.is_empty());
+            let ad = record.as_ref().and_then(|r| super::advert::from_body_bytes(&r.advert).ok());
+            if let (Some(r), Some(ad)) = (record, ad) {
+                let me = app_key.verifying_key().to_bytes();
+                let out_apps: Vec<[u8; 32]> = r.out.iter().flatten().map(|s| s.app_key).collect();
+                let counted: Vec<u8> = r.in_game.clone().unwrap_or_default();
+                let seats = joinwire::receive_player_list_at(&r.roster_list).map(|(l, _, _)| l.roster).unwrap_or_default();
+                let chips: Option<Vec<u64>> = r.stacks.as_ref().and_then(|s| s.first().cloned());
+                let in_game: Vec<[u8; 32]> = seats
+                    .iter()
+                    .filter(|e| !out_apps.contains(&e.app_public_key))
+                    .filter(|e| {
+                        e.app_public_key == me
+                            || chips.as_ref().is_none_or(|c| c.get(usize::from(e.seat)).copied().unwrap_or(0) > 0)
+                    })
+                    .map(|e| e.app_public_key)
+                    .collect();
+                // The seats the record counted as the table -- the only ones whose
+                // invitation is taken (`REFUTE_S1KP_v1_groups` G1); every seat in the
+                // game where the record counted none (written before a hand,
+                // `REFUTE_S1KP_impl_groups` I6).
+                let present: Vec<[u8; 32]> = seats
+                    .iter()
+                    .filter(|e| (counted.is_empty() || counted.contains(&e.seat)) && in_game.contains(&e.app_public_key))
+                    .map(|e| e.app_public_key)
+                    .collect();
+                // The friendships an invitation rides on -- the founder's comes with
+                // the joiner's role.
+                let members: Vec<[u8; 32]> = seats
+                    .iter()
+                    .filter(|e| e.app_public_key != me && e.app_public_key != ad.founder_app_key && in_game.contains(&e.app_public_key))
+                    .filter_map(|e| e.tox_key)
+                    .collect();
+                let counted_lines: Vec<[u8; 32]> = seats
+                    .iter()
+                    .filter(|e| e.app_public_key != me && (counted.is_empty() || counted.contains(&e.seat)))
+                    .filter_map(|e| e.tox_key)
+                    .collect();
+                // Another seat of the game than the founder must be left to take it
+                // back (heads-up with the founder there is none); the count of the
+                // table is no bar -- a founder certified out is in no count, and at
+                // three seats that left two (`REFUTE_S1KP_impl_groups` I2).
+                let founder_out = out_apps.contains(&ad.founder_app_key);
+                // `REFUTE_S1KP_impl_node` I1: and one the record counted, whose
+                // invitation this seat takes.
+                let counted_other = present.iter().any(|a| *a != me && *a != ad.founder_app_key);
+                if !founder_out && !out_apps.contains(&me) && !members.is_empty() && counted_other {
+                    let table_key = r.table_key;
+                    let now = super::node::now_unix_ms();
+                    // What the founder road built goes; the record stays.
+                    $t.tox_sink.clear();
+                    $t.tox_group_said = false;
+                    $t.table_announces = 0;
+                    join_pending.retain(|_, slot| *slot != $t.slot);
+                    let started = ad.founder_tox_key.map(|founder_tox| {
+                        $t.tox_sink.start(
+                            &profile_dir,
+                            super::toxsink::Role::Joiner { founder: founder_tox, chat_id: ad.tox_chat_id },
+                            &ad.table_name,
+                            &nickname,
+                            members.clone(),
+                            Some(app_key.clone()),
+                        )
+                    });
+                    $t.record_road_tox = match &started {
+                        Some(Ok(k)) => *k,
+                        _ => None,
+                    };
+                    $t.out_keys.clear();
+                    $t.tox_sink.tell(super::toxsink::Seat::InGame { apps: in_game.clone(), present: present.clone(), from_hand: false });
+                    $t.in_game_told = Some(((in_game, present), false));
+                    // Away and outside until a hand of its own reads it again.
+                    $t.founder_absence = FounderAbsence { since: None, outside: true, away: true, seeded: true };
+                    $t.tox_sink.tell(super::toxsink::Seat::FounderAway { away: true, outside: true });
+                    $t.founder_absence_told = Some((true, true));
+                    restore_recorded_out!($t, table_key);
+                    match Formation::joined_back(
+                        app_key.clone(),
+                        ad.clone(),
+                        r.advert_hash,
+                        table_key,
+                        &r.roster_list,
+                        (!r.ratification.is_empty()).then(|| r.ratification.clone()),
+                        now,
+                    ) {
+                        Ok((f, sends)) => {
+                            let topic = joinrpc::table_topic(&table_key);
+                            let _ = subscribe_scored(&mut swarm, &topic);
+                            $t.table_topic = Some(topic.clone());
+                            $t.joined_key = Some(table_key);
+                            $t.joined_ad = Some(ad.clone());
+                            $t.joined_advert_hash = Some(r.advert_hash);
+                            $t.table = Some(f);
+                            if $t.journal.is_none() {
+                                open_journal!($t, crate::storage::journal::Mode::Resume { newest_seen: r.hand_id });
+                            }
+                            $t.ever_dealt = true;
+                            $t.resuming = true;
+                            $t.resume_since_ms = now;
+                            $t.hand_since_resume = false;
+                            $t.line_down_at = Some(tokio::time::Instant::now());
+                            $t.rejoin_away = true;
+                            $t.resume_last_peer_ms = None;
+                            $t.back_by_record = true;
+                            $t.record_road_asked = Some(tokio::time::Instant::now());
+                            $t.record_counted_lines = counted_lines;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "rejoining {} (seat {}, stack {}, last at hand #{}) from the session record, through the other seats: {why}; it is asked again every {} s, and the seats that read it away take its part in the table's group (S1-KP)",
+                                    ad.table_name,
+                                    r.my_seat,
+                                    r.my_stack,
+                                    r.hand_id,
+                                    REASK_AGAIN.as_secs()
+                                )))
+                                .await;
+                            if let Some(f) = $t.table.as_ref() {
+                                report_roster(&events, f).await;
+                                seat_on_tox(f, &$t.tox_sink);
+                            }
+                            for send in sends {
+                                if let Send::Broadcast(bytes) = send {
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes.clone());
+                                    $t.tox_sink.try_broadcast(&bytes);
+                                }
+                            }
+                            taken = true;
+                        }
+                        Err(e) => {
+                            // The record does not rebuild: the founder road's failure
+                            // stands, as before.
+                            $t.tox_sink.clear();
+                            $t.tox_group_said = false;
+                            $t.table_announces = 0;
+                            $t.in_game_told = None;
+                            $t.founder_absence = FounderAbsence::default();
+                            $t.founder_absence_told = None;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the founder did not answer, and the seat's record does not rebuild the table ({e:?}): no road through the other seats (S1-KP)"
+                                )))
+                                .await;
+                        }
+                    }
+                }
+            }
+            taken
         }};
     }
 
@@ -6604,6 +6823,37 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             request_response::Message::Response { request_id, response } => {
                                 join_pending.remove(&request_id);
+                                // `S1-KP` (`D-103`): the founder answering the record road's
+                                // ask -- its driver offered the group again on the ask itself;
+                                // the slot's table is the record's. *Already seated* ends the
+                                // asking (`REFUTE_S1KP_impl_node` I3: each ask re-made a live
+                                // founder's friendship still coming up); a refusal for any other
+                                // reason, signed by the table key, ends the road as it ends the
+                                // founder road: the seat put out for good, or the session gone
+                                // (`REFUTE_S1KP_impl_node` I8).
+                                if t.back_by_record {
+                                    let key = t.table.as_ref().map(|f| f.table_id());
+                                    match joinwire::receive_join_reject(&response) {
+                                        Ok((_, reason, _, sender)) if Some(sender) == key => {
+                                            if reason == crate::table::join::RejectReason::AlreadySeated.code() {
+                                                t.record_road_answered = true;
+                                            } else {
+                                                let why = if reason == crate::table::join::RejectReason::OutForGood.code() {
+                                                    "the founder answers that the table put this seat out of it for good (S1-KP)".to_string()
+                                                } else {
+                                                    format!("the founder refused the rejoin (reason {reason}): the session this seat's record names is over (S1-KP)")
+                                                };
+                                                let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                                forget_the_resumed_record(&profile_dir, t.resume.as_ref());
+                                                t.resume = None;
+                                                leave_table_now!(t, why);
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(_) => t.record_road_answered = true,
+                                    }
+                                    continue;
+                                }
                                 let Some(f) = t.table.as_mut() else { continue };
                                 match f.on_join_answer(&response, now) {
                                     Ok(_) => {
@@ -6829,10 +7079,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // have done nothing. `S1-FG`: at the slot that asked --
                         // `table_for_event` sends it nowhere else.
                         join_pending.remove(&request_id);
+                        // `S1-KP` (`D-103`): an ask of the record road's that went
+                        // unanswered -- the slot holds the record's table; nothing goes.
+                        if t.back_by_record {
+                            continue;
+                        }
+                        // `S1-KP` (`D-103`): a seat back from a restart whose founder does
+                        // not answer is taken back through the other seats, where its
+                        // record allows (`back_by_record!`).
+                        let why = format!("the founder did not answer: {error}");
+                        if back_by_record!(t, why.clone()) {
+                            continue;
+                        }
                         // The Tox group goes with the table (`join_failed!`): dropping
                         // the handle tells the driver to leave and joins its thread,
                         // which flushes what it still holds.
-                        join_failed!(t, format!("the founder did not answer: {error}"));
+                        join_failed!(t, why);
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message {
@@ -9592,7 +9854,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 join_pending.insert(asked, t.slot);
                             }
                             Err(e) => {
-                                join_failed!(t, format!("cannot ask to join: {e:?}"));
+                                // `S1-KP` (`D-103`, `REFUTE_S1KP_v2_node` V6): a rejoin that
+                                // cannot even be asked -- a password table's, whose password
+                                // the record does not keep -- is taken back through the other
+                                // seats, where the record allows.
+                                let why = format!("cannot ask to join: {e:?}");
+                                if !back_by_record!(t, why.clone()) {
+                                    join_failed!(t, why);
+                                }
                             }
                         }
                     }
@@ -9793,6 +10062,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     })
                                     .map(|e| e.app_public_key)
                                     .collect();
+                                // `S1-KP` (`D-103`, `REFUTE_S1KP_v1_groups` G1): and of them the
+                                // seats the record counted as the table -- the only ones whose
+                                // invitation a member takes now.
+                                let counted: Vec<u8> = r.in_game.clone().unwrap_or_default();
+                                let present: Vec<[u8; 32]> = seats
+                                    .iter()
+                                    .filter(|e| (counted.is_empty() || counted.contains(&e.seat)) && in_game.contains(&e.app_public_key))
+                                    .map(|e| e.app_public_key)
+                                    .collect();
                                 // Their Tox keys -- the friendships an invitation rides on.
                                 let members: Vec<[u8; 32]> = seats
                                     .iter()
@@ -9862,8 +10140,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     for_good: true,
                                 });
                                 // From the record, not a hand: taken from, offered nothing.
-                                t.tox_sink.tell(super::toxsink::Seat::InGame { apps: in_game.clone(), present: Vec::new(), from_hand: false });
-                                t.in_game_told = Some(((in_game, Vec::new()), false));
+                                t.tox_sink.tell(super::toxsink::Seat::InGame { apps: in_game.clone(), present: present.clone(), from_hand: false });
+                                t.in_game_told = Some(((in_game, present), false));
                                 restore_recorded_out!(t, table_key);
                                 match started {
                                     Some(Ok(_)) => {
@@ -12769,11 +13047,90 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if t.tox_sink.group_seen().0 > 0 {
                             t.resume_last_peer_ms = Some(now);
                         }
+                        // `S1-KP` (`D-103`, `REFUTE_S1KP_v1_node` N2): on the record road,
+                        // and while a seat the record counted can be reached -- a member
+                        // reads the founder away only after three hands or three minutes
+                        // of a hand that may wait out its whole deadline -- never past the
+                        // age a record is offered at from the resume.
+                        if t.back_by_record
+                            && now.saturating_sub(t.resume_since_ms) < crate::protocol::constants::RESUME_RECORD_MAX_AGE_MS
+                            && t.record_counted_lines.iter().any(|l| t.tox_sink.friend_up(l))
+                        {
+                            t.resume_last_peer_ms = Some(now);
+                        }
                         let since = t.resume_last_peer_ms.map_or(t.resume_since_ms, |p| p.max(t.resume_since_ms));
                         if now.saturating_sub(since) >= crate::protocol::constants::RESUME_GIVE_UP_MS {
-                            let why = "no seat of the game took this seat back in ten minutes: its founder is out of the table for good, and no hand of the table came (S1-KO)".to_string();
+                            let why = if t.back_by_record {
+                                "no seat of the game took this seat back in ten minutes, and its founder did not answer (S1-KP)".to_string()
+                            } else {
+                                "no seat of the game took this seat back in ten minutes: its founder is out of the table for good, and no hand of the table came (S1-KO)".to_string()
+                            };
                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
                             leave_table_now!(t, why);
+                        }
+                    }
+                    // `S1-KP` (`D-103`): the record road asks its founder again, every
+                    // `REASK_AGAIN` until the slot holds a hand -- a live founder answers
+                    // *already seated* and its driver offers the group again at once
+                    // (`Seat::Back`); the answer itself is only said. A password table's
+                    // ask cannot be made: its founder offers the group on the friendship's
+                    // own cycle.
+                    // `REFUTE_S1KP_impl_node` I3: no more once the founder answered, and
+                    // a quarter as often while its friendship is down -- each ask makes a
+                    // live founder's driver re-make a friendship still coming up.
+                    let founder_up = t
+                        .joined_ad
+                        .as_ref()
+                        .and_then(|ad| ad.founder_tox_key)
+                        .is_some_and(|k| t.tox_sink.friend_up(&k));
+                    let ask_every = if founder_up { REASK_AGAIN } else { REASK_AGAIN * 4 };
+                    if t.back_by_record
+                        && !t.record_road_answered
+                        && !t.hand_since_resume
+                        && t.hand.is_none()
+                        && t.record_road_asked.is_none_or(|at| at.elapsed() >= ask_every)
+                    {
+                        t.record_road_asked = Some(tokio::time::Instant::now());
+                        let ask = match (t.joined_ad.as_ref(), t.joined_advert_hash, t.table.as_ref()) {
+                            (Some(ad), Some(advert_hash), Some(f)) if !ad.password_required => {
+                                let mine = f.my_seat();
+                                let buyin = f.roster().seats().iter().find(|e| Some(e.seat) == mine).map_or(0, |e| e.buyin);
+                                let founder = PeerId::from_bytes(&ad.founder_peer_id).ok();
+                                let nonce = crate::security::rng::secret_32().ok();
+                                founder.zip(nonce).and_then(|(founder, nonce)| {
+                                    let request = crate::table::join::JoinRequest {
+                                        advert_hash,
+                                        app_public_key: app_key.verifying_key().to_bytes(),
+                                        peer_id: my_peer_bytes.clone(),
+                                        display_name: nickname.clone(),
+                                        requested_seat: mine,
+                                        password_proof: None,
+                                        buyin,
+                                        join_nonce: nonce,
+                                        table_id: f.table_id(),
+                                        tox_key: t.record_road_tox,
+                                    };
+                                    joinwire::publish_join_request(&request, &app_key, super::node::now_unix_ms())
+                                        .ok()
+                                        .map(|bytes| (founder, bytes))
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some((founder, bytes)) = ask {
+                            if !swarm.is_connected(&founder) {
+                                swarm.behaviour_mut().ipfs_kad.get_closest_peers(founder);
+                                let_through!(founder);
+                                let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(founder)
+                                    .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                    .build();
+                                if built_to_be_measured() {
+                                    in_flight.ours(opts.connection_id(), super::dialbook::Source::Founder);
+                                }
+                                let _ = swarm.dial(opts);
+                            }
+                            let asked = swarm.behaviour_mut().join.send_request(&founder, bytes);
+                            join_pending.insert(asked, t.slot);
                         }
                     }
                     // `S1-CR`: the record's first write, once the table is set, and
@@ -13078,6 +13435,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let own_key = if f.is_founder() { Some(f.table_id()) } else { t.joined_key };
                                 let record = t.resume.as_ref().filter(|r| Some(r.table_key) == own_key);
                                 let floor = adoption_floor(t.rejoin_floor, record);
+                                // `S1-KM` (`D-104`, `REFUTE_S1KM_impl_v2` I-2): this seat's own
+                                // count of its returns, which the adopted opening starts from
+                                // (never above the table's): its record's, or the node's own
+                                // (`S1-KL`, which a rejoin from the copies does not drop).
+                                let own_seen = record
+                                    .and_then(|r| r.own_returns)
+                                    .unwrap_or(0)
+                                    .max(if t.own_returns_of == Some((f.table_id(), f.session())) {
+                                        u8::try_from(t.own_returns.len()).unwrap_or(u8::MAX)
+                                    } else {
+                                        0
+                                    })
+                                    // `REFUTE_S1KP_impl_node` I5: and what the hands held since
+                                    // counted -- a rejoin after a restart and later returns.
+                                    .max(t.own_returns_seen);
                                 // Batch 4 (`D-102`): the buy-in this seat's own `TABLE_READY` bound
                                 // (the roster hash), where no reference is held yet -- the hand
                                 // before the first; then the record's reference and the journal's
@@ -13196,8 +13568,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     let exact = heads_up
                                         || copies.len() >= occupied
                                         || t.resume_early.iter().any(|(h, _)| *h == hid);
-                                    if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
+                                    if let Some(mut base) = crate::table::hand::Opening::from_formation(f, hid) {
                                         let now = super::node::now_unix_ms();
+                                        if let Some(r) = base.returns_seen.get_mut(usize::from(base.my_seat)) {
+                                            *r = own_seen.min(crate::protocol::constants::MAX_RETURNS);
+                                        }
                                         match crate::table::hand::Opening::adopt_with_signers_where(base, &copies, accept) {
                                             Ok((mut o, signers)) => {
                                                 // Batch 4 (`D-102`): the adoption is this client's word on
@@ -13672,6 +14047,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let Some(h) = t.hand.as_mut() else { continue };
                     // `S1-KO`: a hand held since the resume, whatever comes of it.
                     t.hand_since_resume = true;
+                    // `S1-KM` (`D-104`): and its own count of this seat's returns, for
+                    // the session record.
+                    t.own_returns_seen = t.own_returns_seen.max(h.returns_seen().get(usize::from(h.my_seat())).copied().unwrap_or(0));
                     // `S1-KF` (`D-088`): the table this hand counts, less the seats
                     // this client counts long gone, and the stacks it holds -- for
                     // the record.
@@ -13706,6 +14084,48 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 from_hand: true,
                             });
                             t.in_game_told = Some((told, true));
+                        }
+                        // `S1-KP` (`D-103`): and the founder away from the table's hands --
+                        // certified out with chips for three hands or three minutes, or
+                        // gone by its own word -- until a hand has it back: the members
+                        // then take its part in the group, as for a founder put out, and
+                        // bar nothing. Read on every tick of a held hand (a re-open of the
+                        // same hand counts); with no hand held the last reading stands.
+                        let founder_seat = (!f.is_founder())
+                            .then(|| f.roster().seats().iter().find(|e| e.app_public_key == f.ad().founder_app_key).map(|e| e.seat))
+                            .flatten();
+                        if let Some(fs) = founder_seat {
+                            let before = t.founder_absence;
+                            // Its own word with its client out of the group -- or put out for
+                            // good by the table's count, which a client that adopted after the
+                            // founder's returns bars nothing for (`REFUTE_S1KP_impl_node` I4).
+                            let gone = t.left_by_word.get(&fs).is_some_and(|(_, out, _)| *out) || h.out_for_good_decided().contains(&fs);
+                            t.founder_absence = founder_absence_at(
+                                before,
+                                h.hand_id(),
+                                h.required().contains(&fs),
+                                h.start_stack_of(fs).unwrap_or(0) > 0,
+                                gone,
+                                tokio::time::Instant::now(),
+                            );
+                            let told = (t.founder_absence.away, t.founder_absence.outside);
+                            if t.founder_absence_told != Some(told) {
+                                t.tox_sink.tell(super::toxsink::Seat::FounderAway { away: told.0, outside: told.1 });
+                                t.founder_absence_told = Some(told);
+                                let line = if told.0 && !before.away {
+                                    Some(format!(
+                                        "the founder (seat {fs}) is away from the table's hands since hand #{}: the seats of the game take its part in the table's group, offering it to a seat missing from it and taking such a seat's invitation, and bar nothing (S1-KP)",
+                                        t.founder_absence.since.map_or(h.hand_id(), |(s, _)| s)
+                                    ))
+                                } else if !told.1 && before.outside {
+                                    Some(format!("the founder (seat {fs}) is back in the table's hands: its part in the group is its own again (S1-KP)"))
+                                } else {
+                                    None
+                                };
+                                if let Some(line) = line {
+                                    let _ = events.send(NodeEvent::Warning(line)).await;
+                                }
+                            }
                         }
                     }
 
@@ -15247,6 +15667,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // `S1-KL`: this client's own returns, the hand seen whole -- before
+                // the record of the boundary, which keeps their count (`S1-KM`,
+                // `REFUTE_S1KP_impl_node` I7).
+                note_own_returns(t);
                 // `S1-CR`: the boundary reached, on record; a busted seat has
                 // nothing to come back to.
                 if let Some(h) = t.hand.as_ref() {
@@ -15327,8 +15751,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let next = t.hand.as_ref().and_then(|h| h.next_hand());
-                // `S1-KL`: this client's own returns, the hand seen whole.
-                note_own_returns(t);
                 // `S1-JR`: the hands voided one after another, and the
                 // boundaries at which this client asked to be dealt in again
                 // and was not -- each counted once per hand, and read by
@@ -16716,10 +17138,78 @@ fn back_through_the_seats(t: &TableRun) -> bool {
                 && !f.is_founder()
                 && r.founder_seed == [0u8; 32]
                 && !r.roster_list.is_empty()
-                && r.out.iter().flatten().any(|s| s.app_key == f.ad().founder_app_key)
+                // `S1-KP` (`D-103`): or on the record road, its founder silent.
+                && (r.out.iter().flatten().any(|s| s.app_key == f.ad().founder_app_key) || t.back_by_record)
         }
         _ => false,
     }
+}
+
+/// `S1-KP` (`D-103`): how many hands the founder is certified out of with chips
+/// before the members take its part in the table's group.
+const FOUNDER_AWAY_HANDS: u64 = 3;
+
+/// `S1-KP` (`D-103`, `REFUTE_S1KP_v1_node` N2): or for how long by this
+/// client's clock -- a hand that cannot certify the seat missing from it at a
+/// game of two waits out its whole deadline, and that is longer than the ten
+/// minutes a seat back from a restart waits to be taken back.
+const FOUNDER_AWAY_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// `S1-KP` (`D-103`): the node's reading of a founder away from the table's
+/// hands -- a client gone without a word, which the table certifies out and
+/// never puts out (`D-047` counts an absence toward the fourth only behind a
+/// return), so its members never took its part in the group (`S1-KO`) and a
+/// seat back from a restart had nobody to take it back. Read from the hands
+/// this client holds: their required set is in every genesis, so every seat
+/// holding a hand reads it alike, if not at the same moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FounderAbsence {
+    /// The first hand this client held with the founder certified out of it
+    /// with chips (or gone by its own word), and when, by this client's clock.
+    since: Option<(u64, tokio::time::Instant)>,
+    /// From that hand on, until a hand has the founder back in its required set.
+    outside: bool,
+    /// `FOUNDER_AWAY_HANDS` hands or `FOUNDER_AWAY_AFTER` past `since` -- at
+    /// once by the founder's own word -- until a hand has it back.
+    away: bool,
+    /// Told by the record road before this client holds a hand, not read from
+    /// one: the first hand it holds reads the founder afresh
+    /// (`REFUTE_S1KP_impl_groups` I4).
+    seeded: bool,
+}
+
+/// `S1-KP` (`D-103`): [`FounderAbsence`] after a hand this client holds.
+///
+/// - The founder in the hand's required set ends the reading: it is back.
+/// - Outside it holding chips -- certified out, a dead seat -- starts it (and
+///   so does its player's own signed word with its client out of the group).
+/// - Outside it without chips and not read yet: a founder that busted in the
+///   hands -- still watching as the founder, or gone without a word -- is not
+///   read (`REFUTE_S1KP_v1_groups` G1: its copy is the table's).
+/// - A founder read away whose dead seat then drains to nothing stays read
+///   (`REFUTE_S1KP_v2_groups` V2, `REFUTE_S1KP_v2_node` V1): a dead seat pays
+///   its blinds until it busts.
+fn founder_absence_at(
+    prev: FounderAbsence,
+    hand: u64,
+    in_required: bool,
+    chips: bool,
+    by_word: bool,
+    now: tokio::time::Instant,
+) -> FounderAbsence {
+    let prev = if prev.seeded { FounderAbsence::default() } else { prev };
+    if in_required {
+        return FounderAbsence::default();
+    }
+    if !(chips || by_word || prev.outside) {
+        return prev;
+    }
+    let (h0, t0) = prev.since.unwrap_or((hand, now));
+    let away = prev.away
+        || by_word
+        || hand.saturating_sub(h0).saturating_add(1) >= FOUNDER_AWAY_HANDS
+        || now.saturating_duration_since(t0) >= FOUNDER_AWAY_AFTER;
+    FounderAbsence { since: Some((h0, t0)), outside: true, away, seeded: false }
 }
 
 /// `S1-GS`, `S1-GX`: whether this client's own line is the likelier reading of a
@@ -17451,6 +17941,26 @@ fn note_own_returns(t: &mut TableRun) {
     }
 }
 
+/// `S1-KM` (`D-104`, `REFUTE_S1KM_impl_v2` I-2): this client's own count of its
+/// returns at its table -- what the hand it holds counts itself
+/// (`returns_seen`), or what the node noted of the return certificates about its
+/// seat it banked at this table and game (`S1-KL`), whichever holds more; at
+/// most `MAX_RETURNS`. Kept in the session record, so that an adoption after a
+/// restart starts this seat's own count from it rather than from zero.
+fn own_count_of_returns(
+    seen: u8,
+    own_returns: &std::collections::BTreeMap<u64, usize>,
+    own_returns_of: Option<([u8; 32], Option<[u8; 32]>)>,
+    f: &Formation,
+) -> u8 {
+    let by_node = if own_returns_of == Some((f.table_id(), f.session())) {
+        u8::try_from(own_returns.len()).unwrap_or(u8::MAX)
+    } else {
+        0
+    };
+    seen.max(by_node).min(crate::protocol::constants::MAX_RETURNS)
+}
+
 /// `S1-KL`: the hand from which an absence the table certifies about this
 /// client is its fourth -- the one its `MAX_RETURNS`-th return took it back in
 /// at, by its own count (`TableRun::own_returns`) -- and how many seats had
@@ -17783,7 +18293,9 @@ fn watch_progress(t: &mut TableRun) {
         // goes meanwhile.
         if let Some(h) = t.hand.as_ref() {
             let me = h.my_seat();
-            t.alone_hand = Some((h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0), h.seats_with_chips()));
+            t.alone_hand = Some((h.hand_id(), h.returns_seen().get(usize::from(me)).copied().unwrap_or(0), h.seats_with_chips()));
+            // `S1-KM` (`D-104`): its own count -- a hand adopted from the others'
+            // copies carries the table's, and takes no absence of this seat's.
         }
     }
     if !alone {
@@ -23407,8 +23919,8 @@ mod tests {
     fn the_lobby_rendezvous_key_is_the_published_one() {
         assert_eq!(
             hex(lobby_namespace().to_vec().as_slice()),
-            "12205ef24262c85e4c5278bec607397ecca577e01c34edb205981817acbcdc370c3a",
-            "sha2-256 of \"p2p-poker/main-lobby/v3\" under the 0x12 0x20 multihash prefix (protocol major 3, `D-091`)"
+            "1220ada731844c6847600249b6d33b3e522c1e439254442ac43bdb40ff245546f2ff",
+            "sha2-256 of \"p2p-poker/main-lobby/v4\" under the 0x12 0x20 multihash prefix (protocol major 4, `D-104`)"
         );
         assert_eq!(
             hex(relay_namespace().to_vec().as_slice()),
@@ -23514,12 +24026,12 @@ mod tests {
     fn an_hours_lobby_key_is_the_published_one() {
         assert_eq!(
             hex(hour_namespace(494_000).to_vec().as_slice()),
-            "1220bb93b3ce480e56d71ef773301d264c7a4bbcc837b2c5131152bd0a2cbb9c6242",
-            "sha2-256 of \"p2p-poker/main-lobby/v3/hour/494000\" under the 0x12 0x20 multihash prefix"
+            "1220e5697382a64cfc896b61999ffa662a9e3af5702838e4f342e2fd0c50dc06a428",
+            "sha2-256 of \"p2p-poker/main-lobby/v4/hour/494000\" under the 0x12 0x20 multihash prefix"
         );
         assert_eq!(
             hex(hour_namespace(494_001).to_vec().as_slice()),
-            "12206cec2f5273d88348d94496a8b8302e1f0e31be754233c3ce0de1e9b4a8e71ea0",
+            "12205be9bb8e8f07073100bc41048dd0258e3a8cdad926c9f88311abab5ee071bf9f",
             "and the hour after it is another key altogether"
         );
         assert_eq!(lobby_hour(494_000 * 3_600), 494_000);
@@ -24348,6 +24860,7 @@ mod tests {
             stacks: None,
             out: None,
             own_floor: None,
+            own_returns: None,
         };
         assert_eq!(adoption_floor(None, None), None);
         assert_eq!(adoption_floor(None, Some(&record(7, 0))), Some(7), "hand 7 ended: 8 on");
@@ -25421,6 +25934,7 @@ mod late_roster_tests {
             roster_hash: [0; 32],
             ledger_delta: Vec::new(),
             engine: [0; 32],
+            returns: vec![0, 0, 0],
         };
         let entry = |hand: u64, sequence: u64, kind: EventType, frame: Vec<u8>| Entry {
             hand,
@@ -26015,9 +26529,9 @@ mod a_joiner_before_the_first_hand {
     /// What `the_closest_nodes_to_a_key_say_how_big_the_dht_is` derives from its
     /// fixed five thousand. Written out rather than recomputed: a test that
     /// recomputes the thing it checks passes whatever the code does. The key
-    /// is the lobby's of protocol major 3 (`D-091`); under major 2's it was
-    /// 3 920, under major 1's 6 234.
-    const THE_ESTIMATE_OF_THIS_DRAW: u64 = 3_225;
+    /// is the lobby's of protocol major 4 (`D-104`); under major 3's it was
+    /// 3 225, under major 2's 3 920, under major 1's 6 234.
+    const THE_ESTIMATE_OF_THIS_DRAW: u64 = 5_532;
 
     /// `S1-HZ`: a founder's lobby answer keeps it alive through its silence in the
     /// group only when it came after the silence began -- within one gap between
@@ -26586,7 +27100,7 @@ mod a_joiner_before_the_first_hand {
         assert!(code[fallback..fallback + 900].contains("hand_may_have_ended!(t, h);"), "and the end said");
         assert_eq!(code.matches("note_cheaters(&cheaters);").count(), 2, "noted at both vote sites");
         // `S1-KO`: and a seat gone by its own word (`D-063`) the same way.
-        assert!(code.contains("let at_the_limit = flooded || cheated || resigned || $h.out_after_absences(seat);"), "out for good");
+        assert!(code.contains("let at_the_limit = flooded || cheated || resigned || $h.out_after_absences_seen(seat);"), "out for good");
         // `S1-KA`: once the hand is over, for every seat it certified.
         assert!(
             code.contains("if $h.over() && ($at_the_deal || !$h.late_close_open()) { for seat in $h.certified_seats().to_vec() { let flooded = $h.named_for_flooding(seat); let cheated = $h.named_for_cheating(seat);"),
@@ -26663,8 +27177,8 @@ mod a_joiner_before_the_first_hand {
             .expect("a majority of the seats with chips");
         assert!(majority < alone, "before the word is taken");
         assert!(
-            code.contains("t.alone_hand = Some((h.hand_id(), h.returns().get(usize::from(me)).copied().unwrap_or(0), h.seats_with_chips()));"),
-            "the count kept with the hand"
+            code.contains("t.alone_hand = Some((h.hand_id(), h.returns_seen().get(usize::from(me)).copied().unwrap_or(0), h.seats_with_chips()));"),
+            "the count kept with the hand -- its own (S1-KM)"
         );
         let told = code.find("NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded, cheated }").expect("the word said");
         assert!(alone < told);
@@ -26715,7 +27229,8 @@ mod a_joiner_before_the_first_hand {
         assert!(restored < found, "before the roster is said again, and whether or not the group came up");
         // The seat back from a restart: barred behind its driver's opening,
         // before its request is sealed, whether or not the group came up.
-        let joiner = code.find("super::toxsink::Role::Joiner { founder: founder_tox,").expect("the joiner's driver");
+        let join_table = code.find("NodeCommand::JoinTable { key, buyin, seat, password } => {").expect("the join");
+        let joiner = join_table + code[join_table..].find("super::toxsink::Role::Joiner { founder: founder_tox,").expect("the joiner's driver");
         let barred = joiner + code[joiner..].find("restore_recorded_out!(t, key); match Formation::join(").expect("barred");
         assert!(barred - joiner < 3000, "right behind the opening");
         assert!(
@@ -26792,8 +27307,10 @@ mod a_joiner_before_the_first_hand {
         let barred = body
             .find("t.out_keys.clear(); t.tox_sink.tell(super::toxsink::Seat::Remove { app_key: Some(ad.founder_app_key), tox_key: ad.founder_tox_key, for_good: true, });")
             .expect("the founder barred by its advertised line");
+        // `S1-KP` (`D-103`): with the seats the record counted as the table as
+        // `present` -- the only ones a member's invitation is taken from.
         let told = body
-            .find("t.tox_sink.tell(super::toxsink::Seat::InGame { apps: in_game.clone(), present: Vec::new(), from_hand: false }); t.in_game_told = Some(((in_game, Vec::new()), false)); restore_recorded_out!(t, table_key);")
+            .find("t.tox_sink.tell(super::toxsink::Seat::InGame { apps: in_game.clone(), present: present.clone(), from_hand: false }); t.in_game_told = Some(((in_game, present), false)); restore_recorded_out!(t, table_key);")
             .expect("the seats of the game told, from the record");
         let awaited = opened + body[opened..].find(".await").expect("the first wait");
         let rebuilt = body.find("match Formation::joined_back(").expect("rebuilt from the record");
@@ -26814,7 +27331,8 @@ mod a_joiner_before_the_first_hand {
         // It gives up as a rejoin does: ten minutes with no hand of the table taken
         // up and no other seat of its group seen.
         assert!(code.contains("if t.resuming && back_through_the_seats(t) && !t.hand_since_resume && t.hand.is_none() {"));
-        assert!(code.contains("if t.tox_sink.group_seen().0 > 0 { t.resume_last_peer_ms = Some(now); } let since = t.resume_last_peer_ms.map_or(t.resume_since_ms, |p| p.max(t.resume_since_ms)); if now.saturating_sub(since) >= crate::protocol::constants::RESUME_GIVE_UP_MS {"));
+        assert!(code.contains("if t.tox_sink.group_seen().0 > 0 { t.resume_last_peer_ms = Some(now); }"));
+        assert!(code.contains("let since = t.resume_last_peer_ms.map_or(t.resume_since_ms, |p| p.max(t.resume_since_ms)); if now.saturating_sub(since) >= crate::protocol::constants::RESUME_GIVE_UP_MS {"));
         // A seat out for good has no word: neither a leave nor, the founder, a list;
         // and a seat leaving says nothing to such a founder.
         let left = code.find("macro_rules! a_seat_left_before_the_start {").expect("a leave word");
@@ -26828,7 +27346,7 @@ mod a_joiner_before_the_first_hand {
         ));
         // A seat gone by its player's own word is out of the table's group for good
         // like one put out -- a founder so gone is out for its members.
-        assert!(code.contains("let at_the_limit = flooded || cheated || resigned || $h.out_after_absences(seat);"));
+        assert!(code.contains("let at_the_limit = flooded || cheated || resigned || $h.out_after_absences_seen(seat);"));
         // The seats still in the game, from the hand, told when they change or were
         // told from a record.
         assert!(code.contains(
@@ -27499,7 +28017,10 @@ mod back_at_the_table {
                 &code[line_start..(at + 40).min(code.len())]
             );
         }
-        assert_eq!(sites, 5, "the entry points twice, the lobby's providers, a neighbour found by multicast, a founder");
+        assert_eq!(
+            sites, 6,
+            "the entry points twice, the lobby's providers, a neighbour found by multicast, a founder -- and a founder asked again from the record road (S1-KP)"
+        );
         let dialing = code.find("SwarmEvent::Dialing { peer_id, connection_id } => {").expect("the dial's arm");
         assert!(code[dialing..dialing + 1_200].contains("in_flight.start(connection_id,"), "every dial started is told its source");
         assert!(code[dialing..dialing + 1_600].contains("dialbook.dialing_from(source);"), "and entered under it");
@@ -27569,7 +28090,7 @@ mod back_at_the_table {
         assert!(!code.contains("&& !have_reservation"), "one way in is not enough to stop asking");
         assert!(code.contains("if ways_in.short_of() {"), "and the relays' key is looked up for as long");
         // The two dials that matter, and the relays they go through.
-        assert_eq!(code.matches("let_through!(").count(), 2, "the lobby's dial and the ask");
+        assert_eq!(code.matches("let_through!(").count(), 3, "the lobby's dial and the ask -- and the record road's ask again (S1-KP)");
         assert!(code.contains("if charge.is_some() {\n                                    let_through!(peer);"));
         assert!(code.contains("let_through!(founder);"));
         assert!(code.contains("for relay in offered.take_relays_that_matter() {"), "their relays, once a turn of the loop");
@@ -27697,5 +28218,103 @@ mod answer_rotation_tests {
         assert_eq!(relay_members(&r, 6), vec![2, 3, 4]);
         assert!(add_relay(&mut r, 9, 1, 2), "the hand-5 relays forgotten four hands on");
         assert_eq!(relay_members(&r, 9), vec![2, 3]);
+    }
+
+    /// `S1-KP` (`D-103`): the founder away from the table's hands -- certified out
+    /// of them with chips for three hands or three minutes, or gone by its own
+    /// signed word -- until a hand has it back in the required set; a dead seat
+    /// draining to nothing stays away (`REFUTE_S1KP_v2_groups` V2), and a founder
+    /// that busted in the hands -- still watching as the founder -- is never read
+    /// (`REFUTE_S1KP_v1_groups` G1).
+    #[test]
+    fn the_founder_is_read_away_from_the_hands_it_is_certified_out_of() {
+        let t0 = tokio::time::Instant::now();
+        let none = FounderAbsence::default();
+        // Certified out with chips: outside at once, away from the third hand.
+        let a = founder_absence_at(none, 10, false, true, false, t0);
+        assert!(a.outside && !a.away, "outside from the first hand");
+        let a = founder_absence_at(a, 11, false, true, false, t0);
+        assert!(!a.away, "two hands");
+        let a = founder_absence_at(a, 12, false, true, false, t0);
+        assert!(a.away, "three hands");
+        // Hand ids skipped by an adoption count by distance.
+        let b = founder_absence_at(founder_absence_at(none, 10, false, true, false, t0), 15, false, true, false, t0);
+        assert!(b.away, "a gap counts");
+        // Or three minutes of a hand that does not end.
+        let c = founder_absence_at(none, 20, false, true, false, t0);
+        let c = founder_absence_at(c, 20, false, true, false, t0 + FOUNDER_AWAY_AFTER);
+        assert!(c.away, "a hand that waits out its deadline");
+        // Draining to nothing while away: still away.
+        let d = founder_absence_at(a, 13, false, false, false, t0);
+        assert!(d.away && d.outside, "a dead seat busts, and stays away");
+        // Back in the required set: the reading ends.
+        let e = founder_absence_at(d, 14, true, true, false, t0);
+        assert_eq!(e, FounderAbsence::default(), "a return ends it");
+        // A founder that busted in the hands is not read -- nor by a word it never said.
+        let f = founder_absence_at(none, 30, false, false, false, t0);
+        assert_eq!(f, none, "busted, still watching: its copy is the table's");
+        // Gone by its own word, busted or not: away at once.
+        let g = founder_absence_at(none, 31, false, false, true, t0);
+        assert!(g.away && g.outside, "its own word");
+        // The record road's word stands only until a hand is held: the first reads
+        // afresh (`REFUTE_S1KP_impl_groups` I4).
+        let seeded = FounderAbsence { since: None, outside: true, away: true, seeded: true };
+        assert_eq!(founder_absence_at(seeded, 40, false, false, false, t0), none, "a busted founder watching: not read");
+        let h = founder_absence_at(seeded, 40, false, true, false, t0);
+        assert!(h.outside && !h.away && !h.seeded, "certified out with chips: outside, away only in time");
+    }
+
+    /// `S1-KP` (`D-103`): the record road. A founder road that fails for a seat
+    /// back from a restart takes the table back from its record through the other
+    /// seats -- where the record is a joiner's of this table, keeps a roster, names
+    /// the founder out for good nowhere (`S1-KO`'s arm takes that one), counts
+    /// more than two seats and leaves another seat in the game -- without barring
+    /// the founder: it is asked again every `REASK_AGAIN` (its driver re-offers the
+    /// group on the ask), its answers are only said, and the seats the record
+    /// counted are the ones a member's invitation is taken from.
+    #[test]
+    fn a_founder_that_does_not_answer_a_rejoin_leaves_the_road_through_the_seats() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let road = code.find("macro_rules! back_by_record {").expect("the record road");
+        let end = road + code[road..].find("taken }}; }").expect("its end");
+        let body = &code[road..end];
+        assert!(body.contains("r.founder_seed == [0u8; 32] && !r.roster_list.is_empty()"), "a joiner's record with its roster");
+        assert!(
+            body.contains("if !founder_out && !out_apps.contains(&me) && !members.is_empty() && counted_other {"),
+            "the founder not out, this seat not out, another seat than the founder left, and one the record counted"
+        );
+        assert!(!body.contains("counted.len() > 2"), "a founder certified out is in no count (REFUTE_S1KP_impl_groups I2)");
+        assert!(!body.contains("Seat::Remove { app_key: Some(ad.founder_app_key)"), "the founder is not barred");
+        assert!(body.contains("$t.tox_sink.tell(super::toxsink::Seat::FounderAway { away: true, outside: true });"));
+        assert!(body.contains("present: present.clone(), from_hand: false"), "the counted seats");
+        assert!(body.contains("$t.tox_sink.clear();"), "a running sink starts nothing");
+        assert!(!body.contains("no_return"), "no lobby word against a founder that may come back");
+        // At the founder road's failure, before the table is lost; and its own asks
+        // never tear the road down.
+        let failed = code.find("let why = format!(\"the founder did not answer: {error}\"); if back_by_record!(t, why.clone()) { continue; }").expect("at the failure");
+        let skip = code.find("if t.back_by_record { continue; } // `S1-KP` (`D-103`): a seat back from a restart whose founder does").expect("its own asks");
+        assert!(skip < failed);
+        // An answer is read for its refusal alone: *already seated* ends the asking,
+        // any other refusal of the table's ends the road.
+        let answer = code
+            .find("if t.back_by_record { let key = t.table.as_ref().map(|f| f.table_id()); match joinwire::receive_join_reject(&response) {")
+            .expect("an answer on the record road");
+        let answer_end = answer + code[answer..].find("let Some(f) = t.table.as_mut() else { continue };").expect("before the founder road's reading");
+        let arm = &code[answer..answer_end];
+        assert!(arm.contains("if reason == crate::table::join::RejectReason::AlreadySeated.code() { t.record_road_answered = true; }"));
+        assert!(arm.contains("forget_the_resumed_record(&profile_dir, t.resume.as_ref()); t.resume = None; leave_table_now!(t, why);"));
+        assert!(arm.contains("continue; }"), "and nothing of the founder road's");
+        assert!(code.contains("if !back_by_record!(t, why.clone()) { join_failed!(t, why); }"), "a rejoin that cannot be asked");
+        // Asked again, and the clock held open by a counted seat within reach.
+        assert!(code.contains(
+            "if t.back_by_record && !t.record_road_answered && !t.hand_since_resume && t.hand.is_none() && t.record_road_asked.is_none_or(|at| at.elapsed() >= ask_every) {"
+        ));
+        assert!(code.contains("let ask_every = if founder_up { REASK_AGAIN } else { REASK_AGAIN * 4 };"), "a quarter as often while it cannot be reached");
+        assert!(code.contains("&& t.record_counted_lines.iter().any(|l| t.tox_sink.friend_up(l)) { t.resume_last_peer_ms = Some(now); }"));
+        // Forgotten with the table.
+        let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
+        assert!(code[leave..].contains("$t.founder_absence = FounderAbsence::default(); $t.founder_absence_told = None; $t.back_by_record = false;"));
     }
 }

@@ -1,12 +1,16 @@
 //! `HAND_INIT` on the wire, and how to check one.
 //!
-//! `PROTOCOL.md` §4.3's thirteen fields, in its own numbering, and the sentence
+//! `PROTOCOL.md` §4.4's fourteen fields, in its own numbering, and the sentence
 //! that governs all of them:
 //!
 //! > **`HAND_INIT` announces nothing and decides nothing.** Every field is a
 //! > pure function of `TERMINAL(k-1)` and the table parameters, so every
 //! > receiver recomputes all of them and rejects a copy in which any field
 //! > differs.
+//!
+//! (`n(9) stacks` and `n(13) returns` are folds over the chain of hands the
+//! genesis commits rather than of `TERMINAL(k-1)` alone; a client that did not
+//! play that chain -- one that adopts the hand -- takes both from the copies.)
 //!
 //! That is why the stage is collective rather than single-writer: a body with no
 //! choices in it must not give one seat a veto over a hand-to-hand transition
@@ -26,7 +30,7 @@
 use crate::poker::state::{Hash, SeatIdx, Street};
 use crate::protocol::constants::ABORT_EVIDENCE_MAX;
 
-/// The body of a `HAND_INIT`, in `PROTOCOL.md` §4.3's field order.
+/// The body of a `HAND_INIT`, in `PROTOCOL.md` §4.4's field order.
 ///
 /// `#[cbor(array)]` like every other body in this project: a map would encode
 /// the field names on every copy of every hand, and canonical CBOR over an
@@ -77,13 +81,22 @@ pub struct HandInit {
     /// split, never a framing (`D-094`).
     #[cbor(n(12), with = "minicbor::bytes")]
     pub engine: Hash,
+    /// `S1-KM` (`D-104`): `D-032`'s count at this hand's start -- how many times
+    /// each seat has come back by a return certificate -- one per occupied seat,
+    /// ascending by seat, each at most `MAX_RETURNS`. Every seat that played the
+    /// chain since the formation holds the same count (a return moves `R` too,
+    /// and the genesis commits `R`); a seat that adopts the hand takes it from
+    /// here, where it used to count every seat from zero and part from the table
+    /// at another seat's fourth absence.
+    #[n(13)]
+    pub returns: Vec<u8>,
 }
 
 /// Which field two copies disagree about.
 ///
 /// Named rather than numbered so a log line reads as a sentence. The first
 /// difference is enough: two peers that disagree about the button will disagree
-/// about everything downstream of it, and listing all twelve would bury the one
+/// about everything downstream of it, and listing all fourteen would bury the one
 /// that matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -100,6 +113,8 @@ pub enum Field {
     RosterHash,
     LedgerDelta,
     Engine,
+    /// `S1-KM` (`D-104`).
+    Returns,
 }
 
 impl std::fmt::Display for Field {
@@ -118,6 +133,7 @@ impl std::fmt::Display for Field {
             Self::RosterHash => "roster_hash",
             Self::LedgerDelta => "ledger_delta",
             Self::Engine => "engine",
+            Self::Returns => "returns",
         };
         f.write_str(name)
     }
@@ -175,6 +191,15 @@ impl HandInit {
                 "ledger_delta is not ascending and unique",
             ));
         }
+        // `S1-KM` (`D-104`): one count per occupied seat, as there is one stack,
+        // and none past the limit -- a count is capped where it is folded, and a
+        // return past it is refused by every honest voter (`D-032`).
+        if self.returns.len() != self.stacks.len() {
+            return Err(NotOurs::Malformed("returns is not one count per occupied seat"));
+        }
+        if self.returns.iter().any(|r| *r > crate::protocol::constants::MAX_RETURNS) {
+            return Err(NotOurs::Malformed("returns holds a count past MAX_RETURNS"));
+        }
         Ok(())
     }
 
@@ -203,6 +228,7 @@ impl HandInit {
         same!(ante, Ante);
         same!(dealt_in, DealtIn);
         same!(stacks, Stacks);
+        same!(returns, Returns);
         same!(roster_hash, RosterHash);
         same!(ledger_delta, LedgerDelta);
         Ok(())
@@ -1439,6 +1465,7 @@ mod tests {
             roster_hash: [3; 32],
             ledger_delta: vec![(0, 10_000), (1, 10_000)],
             engine: [5; 32],
+            returns: vec![0, 2],
         }
     }
 
@@ -1496,6 +1523,7 @@ mod tests {
                 Field::LedgerDelta,
             ),
             (HandInit { engine: [6; 32], ..body() }, Field::Engine),
+            (HandInit { returns: vec![0, 3], ..body() }, Field::Returns),
         ];
         for (theirs, expected) in cases {
             assert_eq!(
@@ -1522,9 +1550,17 @@ mod tests {
                 HandInit { ledger_delta: vec![(1, 1), (0, 1)], ..body() },
                 "ledger order",
             ),
+            // `S1-KM` (`D-104`): one count per occupied seat, none past the limit.
+            (HandInit { returns: vec![0], ..body() }, "returns short"),
+            (HandInit { returns: vec![0, 0, 0], ..body() }, "returns long"),
+            (HandInit { returns: vec![0, crate::protocol::constants::MAX_RETURNS + 1], ..body() }, "returns past the limit"),
         ] {
             assert!(b.self_consistent(2).is_err(), "{why}");
         }
+        assert!(
+            HandInit { returns: vec![crate::protocol::constants::MAX_RETURNS, 0], ..body() }.self_consistent(2).is_ok(),
+            "the limit itself is a count"
+        );
     }
 
     /// A seat number outside the table is refused, and the table size is the
