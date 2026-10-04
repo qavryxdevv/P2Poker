@@ -13308,19 +13308,41 @@ impl Hand {
             .max_by_key(|(_, seats)| seats.len())
     }
 
-    /// `G5`, told: the seats a certificate voided this hand at its settlement
-    /// for, where this client's own settlement has them lose -- a loser that kept
-    /// its copy back had the hand called off and its losses given back. Read by
-    /// the node, which says it at the second such hand (the window).
+    /// `G5`, told: the seats that may have kept their settlement back in a hand
+    /// they lost by this client's own settlement -- named by the certificate that
+    /// voided the hand there, or still owing their copy when this client gave the
+    /// hand up there. The node counts one only where the next hand gives the loss
+    /// back ([`Hand::start_stack_of_key`]), and says it at the second (the window).
     pub fn settlement_vetoed_by(&self) -> Vec<SeatIdx> {
-        let Some(late) = self.late.as_ref().filter(|l| l.own) else {
+        let Some(late) = self.late.as_ref().filter(|l| l.own && l.closed.is_none()) else {
             return Vec::new();
         };
-        self.settlement_named
-            .iter()
-            .copied()
+        // Named by the certificate that voided the hand, or -- heads-up, or a round
+        // that could not certify -- still owing its copy when this client gave the
+        // hand up at the settlement.
+        let mut seats: Vec<SeatIdx> = self.settlement_named.clone();
+        for s in late.stage.waiting_for() {
+            if !seats.contains(&s) {
+                seats.push(s);
+            }
+        }
+        seats
+            .into_iter()
             .filter(|s| *s != self.open.my_seat && late.body.deltas.get(usize::from(*s)).is_some_and(|d| *d < 0))
             .collect()
+    }
+
+    /// `G5`, told: what `seat` started this hand with, if it sits in it.
+    pub fn start_stack_of(&self, seat: SeatIdx) -> Option<Chips> {
+        if !self.occupies_a_seat(seat) {
+            return None;
+        }
+        self.start_stacks_by_seat().get(usize::from(seat)).copied()
+    }
+
+    /// `G5`, told: what the seat holding `key` started this hand with.
+    pub fn start_stack_of_key(&self, key: &[u8; 32]) -> Option<Chips> {
+        self.start_stack_of(self.seat_of_key(key)?)
     }
 
     /// `S1-LP`: how many seats of the roster signed this hand's opening at
@@ -28184,7 +28206,7 @@ mod tests {
 
     /// `G5`, told: **a loser that keeps its settlement back is named** -- the
     /// three others vote it at the settlement, their certificate voids the hand
-    /// as before, and each names the seat its own settlement has lose.
+    /// as before, and each names the seat that loses by its own settlement.
     #[test]
     fn a_loser_that_keeps_its_settlement_back_is_named() {
         let (mut hands, keys, copies, _bad) = four_at_the_settlement();
@@ -28212,6 +28234,45 @@ mod tests {
             assert!(hands[s].over(), "seat {s}: the hand voided as before: {refused:?}");
             assert_eq!(hands[s].settlement_vetoed_by(), vec![loser as u8], "seat {s} names the withholder");
         }
+    }
+
+    /// `G5`, told, heads-up: **the winner names a loser whose settlement never
+    /// came** -- no certificate at two seats, the winner gives the hand up at
+    /// the settlement's budget and names the seat that loses by its own
+    /// settlement.
+    #[test]
+    fn heads_up_a_loser_that_keeps_its_settlement_back_is_named() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(2);
+        let drop_settlements = |_: usize, _: usize, b: &[u8]| -> Option<Vec<u8>> {
+            (!is_kind(b, EventType::HandComplete)).then(|| b.to_vec())
+        };
+        let mut refused = Vec::new();
+        for _ in 0..64 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            pump_cheat(&mut hands, &keys, vec![(s, sends)], &drop_settlements, &mut refused);
+        }
+        let Phase::Playing { play, .. } = &hands[0].phase else { panic!("playing: {refused:?}") };
+        let Step::Settling { mine, .. } = &play.step else { panic!("at the settlement") };
+        let deltas = mine.deltas.clone();
+        let final_stacks = mine.final_stacks.clone();
+        if deltas[0] == 0 {
+            return; // a split pot: nobody lost, nothing to name
+        }
+        let (winner, loser) = if deltas[0] > 0 { (0usize, 1usize) } else { (1, 0) };
+        let _ = hands[winner].abort_now(Abort::Deadline, &keys[winner], NOW + 200_000).unwrap();
+        assert_eq!(hands[winner].settlement_vetoed_by(), vec![loser as u8]);
+        assert!(hands[loser].settlement_vetoed_by().is_empty(), "the loser names nobody");
+        // What the node compares the next hand's start with: the seat's own start.
+        let start = hands[winner].start_stack_of(loser as u8).expect("the loser sits in the hand");
+        assert_eq!(i128::from(start) + i128::from(deltas[loser]), i128::from(final_stacks[loser]));
+        let key = hands[winner].key_of(loser as u8).expect("its key");
+        assert_eq!(hands[winner].start_stack_of_key(&key), Some(start));
+        assert_eq!(hands[winner].start_stack_of(9), None, "no such seat");
     }
 
     /// `S1-LP`: **the genesis a missed certificate would re-derive the next

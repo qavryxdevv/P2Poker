@@ -1447,6 +1447,9 @@ struct TableRun {
     /// `G5`, told: by seat key, the hands a certificate voided at their
     /// settlement for that seat while this client's own settlement had it lose.
     settlement_vetoes: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
+    /// `G5`, told: vetoes seen and not yet known to have stood -- the hand, the
+    /// seat's key and number, and what the seat started that hand with.
+    settlement_seen: Vec<(u64, [u8; 32], u8, crate::poker::state::Chips)>,
     /// `S1-JR`: the seats a hand here was voided over for a proof that does not
     /// hold, by application key -- the seat, the cause, and whether this
     /// client's own check found it.
@@ -2047,6 +2050,7 @@ impl TableRun {
             voided_recent: (0, None),
             named_after_give_up: std::collections::BTreeSet::new(),
             settlement_vetoes: std::collections::BTreeMap::new(),
+            settlement_seen: Vec::new(),
             cheats: std::collections::BTreeMap::new(),
             equivocators: std::collections::BTreeMap::new(),
             back_from_restart: std::collections::BTreeMap::new(),
@@ -4918,6 +4922,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.voided_recent = (0, None);
             $t.named_after_give_up.clear();
             $t.settlement_vetoes.clear();
+            $t.settlement_seen.clear();
             $t.cheats.clear();
             $t.equivocators.clear();
             $t.back_from_restart.clear();
@@ -13287,22 +13292,50 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning(note)).await;
                         }
                     }
-                    // `G5`, told: a loser that kept its settlement back.
+                    // `G5`, told: a loser that kept its settlement back -- seen
+                    // here, and counted once the next hand gives its loss back. A
+                    // copy that only came late closes the hand, or has this client
+                    // take a next hand dealt on the settled money: never counted.
                     for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
                         for seat in h.settlement_vetoed_by() {
-                            let Some(key) = h.key_of(seat) else { continue };
+                            let (Some(key), Some(start)) = (h.key_of(seat), h.start_stack_of(seat)) else { continue };
+                            if !t.settlement_seen.iter().any(|(k, s, ..)| *k == h.hand_id() && *s == key) {
+                                t.settlement_seen.push((h.hand_id(), key, seat, start));
+                            }
+                        }
+                    }
+                    for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
+                        // Stage 0 left: every seat of the next hand signed its start.
+                        if h.slot().sequence == 0 {
+                            continue;
+                        }
+                        let next = h.hand_id();
+                        let stood: Vec<(u64, [u8; 32], u8)> = t
+                            .settlement_seen
+                            .iter()
+                            .filter(|(k, key, _, start)| {
+                                k.saturating_add(1) == next && settlement_veto_stood(*start, h.start_stack_of_key(key))
+                            })
+                            .map(|(k, key, seat, _)| (*k, *key, *seat))
+                            .collect();
+                        t.settlement_seen.retain(|(k, ..)| k.saturating_add(1) != next);
+                        for (k, key, seat) in stood {
                             let entry = t.settlement_vetoes.entry(key).or_insert_with(|| (seat, Default::default()));
-                            if entry.1.insert(h.hand_id()) {
-                                let floor = h.hand_id().saturating_sub(16);
-                                entry.1.retain(|k| *k >= floor);
+                            if entry.1.insert(k) {
+                                let floor = k.saturating_sub(16);
+                                entry.1.retain(|x| *x >= floor);
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
-                                        "hand #{}: seat {seat} lost it and kept its settlement back -- the table called the hand off and gave its losses back (G5)",
-                                        h.hand_id()
+                                        "hand #{k}: seat {seat} lost it and kept its settlement back -- the table called the hand off and gave its losses back (G5)"
                                     )))
                                     .await;
                             }
                         }
+                    }
+                    // The table past the next hand without it leaving stage 0
+                    // here: not known to have stood.
+                    if let Some(now_hand) = t.hand.as_ref().map(|h| h.hand_id()) {
+                        t.settlement_seen.retain(|(k, ..)| k.saturating_add(1) >= now_hand);
                     }
                     // `S1-LN`: a hand given up for want of a frame and then named
                     // for a later stage of it -- the running one or the retained.
@@ -17140,6 +17173,14 @@ fn group_locked_words(peer_limit: Option<u16>, password: bool) -> String {
 /// an abort at a stage the table went on from, then named for a later stage of,
 /// make the table not safe.
 const NAMED_AFTER_GIVE_UP_LIMIT: usize = 2;
+
+/// `G5`, told: whether a settlement veto seen at hand `k` stood -- hand `k+1`,
+/// past its stage 0, has the seat start at what it started `k` with: the loss
+/// given back. A late copy that closed `k` has it start `k+1` with the settled
+/// stack instead; a seat not in `k+1` is not counted.
+fn settlement_veto_stood(start_at_veto: crate::poker::state::Chips, start_next: Option<crate::poker::state::Chips>) -> bool {
+    start_next == Some(start_at_veto)
+}
 
 /// `G5`, told: a seat whose settlement vetoes hold two hands within the last
 /// ten -- the first such seat, if any.
@@ -25095,6 +25136,16 @@ mod late_roster_tests {
             "a hand behind belongs to the late-certificate arm, not to this buffer"
         );
         assert_eq!(keep_for_next_hand(None, 8, 7), Keep::No, "unreadable");
+    }
+
+    /// `G5`, told: a veto counts only where the next hand gives the loss back --
+    /// not where a late copy closed the hand and the next one starts on the
+    /// settled money.
+    #[test]
+    fn a_settlement_veto_counts_where_the_next_hand_gives_the_loss_back() {
+        assert!(settlement_veto_stood(1_500, Some(1_500)), "the loss given back");
+        assert!(!settlement_veto_stood(1_500, Some(900)), "a late copy closed the hand");
+        assert!(!settlement_veto_stood(1_500, None), "the seat is not in the next hand");
     }
 
     /// `G5`, told: two vetoes within ten hands name the seat; one, or two far
