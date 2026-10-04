@@ -1903,10 +1903,18 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                     });
                 } else {
                     window_heading(ui, "The table dealt on without you", false);
-                    ui.label(format!(
-                        "The table offers your seat back with {} chips. By your own signatures you hold no less than {} -- the difference is the blinds of the hands you missed, or chips taken from you.",
-                        offer.offered, offer.floor
-                    ));
+                    let missed = offer.hands_missed();
+                    ui.label(if missed > 0 {
+                        format!(
+                            "While you were away the table played {missed} hand(s) without you. It offers your seat back with {} chips; by your own signatures you hold no less than {} -- the difference is the blinds of the hands you missed, or chips taken from you.",
+                            offer.offered, offer.floor
+                        )
+                    } else {
+                        format!(
+                            "The table offers your seat back with {} chips, though by your own signatures you hold no less than {}: no hand was played without you, so the difference is chips taken from you.",
+                            offer.offered, offer.floor
+                        )
+                    });
                     ui.label(RichText::new(format!("Take {} chips and play on, or leave the table?", offer.offered)).strong());
                     ui.horizontal(|ui| {
                         if ui
@@ -2486,7 +2494,8 @@ mod tests {
         use crate::net::node::FloorOffer;
         let mut v = TableView::waiting("Riverside".into(), 6);
         let ui = |floor: u64, split: u64| TableUi { floor_closed: floor, split_closed: split, ..TableUi::default() };
-        v.floor_offer = Some((FloorOffer { hand: 12, offered: 1_400, floor: 1_500 }, 7));
+        v.floor_offer = Some((FloorOffer { hand: 12, offered: 1_400, floor: 1_500, since: 9 }, 7));
+        assert_eq!(FloorOffer { hand: 12, offered: 1_400, floor: 1_500, since: 9 }.hands_missed(), 2, "hands 10 and 11");
         v.split_note = Some(("seat 1 and seat 2 are playing a game of their own".into(), 5));
         assert_eq!(floor_question(&v, &ui(0, 0)).map(|(_, n)| n), Some(7), "asked over the hand the node dropped");
         v.unsafe_may_show = true;

@@ -2374,8 +2374,10 @@ impl AppState {
                     if self.floor_offer.as_ref().is_none_or(|(said, _)| *said != o) {
                         self.unsafe_serials = self.unsafe_serials.wrapping_add(1).max(1);
                         let line = format!(
-                            "The table dealt on without you and offers your seat back with {} chips, below the {} your own signatures allow",
-                            o.offered, o.floor
+                            "The table played {} hand(s) without you and offers your seat back with {} chips, below the {} your own signatures allow",
+                            o.hands_missed(),
+                            o.offered,
+                            o.floor
                         );
                         self.floor_offer = Some((o, self.unsafe_serials));
                         self.log_table(crate::gui::table::LogKind::SitOut, line.clone());

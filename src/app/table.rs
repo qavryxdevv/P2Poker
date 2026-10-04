@@ -1069,14 +1069,14 @@ mod tests {
     fn the_floor_question_reaches_the_window_and_goes_when_answered() {
         use crate::net::node::FloorOffer;
         let mut s = seated(0);
-        let offer = FloorOffer { hand: 12, offered: 1_400, floor: 1_500 };
+        let offer = FloorOffer { hand: 12, offered: 1_400, floor: 1_500, since: 9 };
         s.apply(NodeEvent::FloorOffer { offer: Some(offer) });
         let (said, first) = s.table_view().floor_offer.expect("asked");
         assert_eq!(said, offer);
-        assert!(s.table_view().log.iter().any(|l| l.text.contains("offers your seat back with 1400 chips")), "the log says so");
+        assert!(s.table_view().log.iter().any(|l| l.text.contains("played 2 hand(s) without you and offers your seat back with 1400 chips")), "the log says so");
         s.apply(NodeEvent::FloorOffer { offer: Some(offer) });
         assert_eq!(s.table_view().floor_offer.map(|(_, n)| n), Some(first), "the same offer: no new question");
-        s.apply(NodeEvent::FloorOffer { offer: Some(FloorOffer { hand: 13, offered: 1_350, floor: 1_500 }) });
+        s.apply(NodeEvent::FloorOffer { offer: Some(FloorOffer { hand: 13, offered: 1_350, floor: 1_500, since: 9 }) });
         let (_, second) = s.table_view().floor_offer.expect("asked again");
         assert!(second > first, "a new offer, a new question");
         s.apply(NodeEvent::FloorOffer { offer: None });

@@ -13170,7 +13170,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             })
                                             .max();
                                         if let Some((hand, _, offered)) = refused.filter(|(_, _, o)| *o < fl.stack) {
-                                            let ask = crate::net::node::FloorOffer { hand, offered, floor: fl.stack };
+                                            let ask = crate::net::node::FloorOffer { hand, offered, floor: fl.stack, since: fl.hand };
                                             if t.floor_episode != Some(ask) {
                                                 t.floor_episode = Some(ask);
                                                 let _ = events

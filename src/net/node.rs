@@ -156,12 +156,21 @@ pub struct TableStop {
 
 /// Batch 4 (`D-102`): a table's next hand offered to this client below what
 /// its own signatures allow it -- the hand, what the copies name its seat at,
-/// and that floor.
+/// that floor, and the hand it was read at (`since`): the table played the
+/// hands between without this seat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloorOffer {
     pub hand: u64,
     pub offered: u64,
     pub floor: u64,
+    pub since: u64,
+}
+
+impl FloorOffer {
+    /// The hands the table played between the floor's hand and the one offered.
+    pub fn hands_missed(&self) -> u64 {
+        self.hand.saturating_sub(self.since.saturating_add(1))
+    }
 }
 
 /// What the loop reports upwards, for the GUI and the log.
