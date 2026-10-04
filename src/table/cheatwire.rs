@@ -47,12 +47,14 @@ pub struct CheatVote {
     #[cbor(n(1), with = "minicbor::bytes")]
     pub anchor: Hash,
     /// What the frames prove: [`CAUSE_REVEAL`], [`CAUSE_SHUFFLE`],
-    /// [`CAUSE_KEY`], [`CAUSE_ACTION`] or [`CAUSE_MONEY`].
+    /// [`CAUSE_KEY`], [`CAUSE_ACTION`], [`CAUSE_MONEY`] or
+    /// [`CAUSE_EQUIVOCATION`].
     #[n(2)]
     pub cause: u16,
     /// Frames of the subject's own signing that this voter holds it proven by:
     /// one reveal; one deck key; one shuffle step, or a step and the proof
-    /// bound to it; one betting action; one settlement. Not in the digest: two judges may hold two broken frames.
+    /// bound to it; one betting action; one settlement; two frames at one slot.
+    /// Not in the digest: two judges may hold two broken frames.
     #[n(3)]
     pub evidence: Vec<minicbor::bytes::ByteVec>,
 }
@@ -79,9 +81,17 @@ pub const CAUSE_ACTION: u16 = 8;
 /// judge's own derivation and nothing borrowed (`G9`). Not a cause of §4.10's.
 pub const CAUSE_MONEY: u16 = 9;
 
+/// Two frames of the hand's chain (`HAND_INIT` to `HAND_COMPLETE`) the seat
+/// signed at one slot -- one sequence, one parent -- with different event
+/// hashes (`G11`, `D-100`): an honest client signs one body a slot, through
+/// its armed signing journal, across any crash or restart, and replays the
+/// bytes it recorded. Judged by the pair alone, at any position. Not a cause
+/// of §4.10's.
+pub const CAUSE_EQUIVOCATION: u16 = 10;
+
 /// The causes the band knows.
 pub fn cause_known(cause: u16) -> bool {
-    matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY | CAUSE_ACTION | CAUSE_MONEY)
+    matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY | CAUSE_ACTION | CAUSE_MONEY | CAUSE_EQUIVOCATION)
 }
 
 impl CheatVote {
@@ -116,6 +126,16 @@ pub struct CheatCert {
 /// A vote is three fixed fields and its frames: at most a shuffle step and the
 /// proof bound to it, each at its cap under the largest envelope.
 pub const CHEAT_VOTE_CAP: usize = 13_312;
+/// `G11` (`REFUTE_G11_v2` M4): a vote about two versions of one stage carries
+/// both -- at most two frames of the largest kind of the hand's chain, a
+/// `SHUFFLE_PROOF` at its cap under the largest envelope, and the fixed fields.
+/// Above `FRAME_CAP`: such a vote has a ceiling of its own on every road
+/// (`hand::frame_ceiling`). A certificate carries two such votes where they fit
+/// its cap -- two small pairs do -- and two that do not bank as two votes,
+/// carried apart (`S1-KS`). Every other cause's vote stays within
+/// [`CHEAT_VOTE_CAP`].
+pub const CHEAT_PAIR_VOTE_CAP: usize =
+    2 * (crate::table::hand::SHUFFLE_PROOF_CAP + crate::table::hand::ENVELOPE_MAX) + 512;
 /// Two signed votes about a card share or a deck key, with room to spare, under
 /// the frame cap the certificate itself is sealed in. Two votes about a shuffle
 /// do not fit one frame: those bank as two votes, carried apart.
@@ -213,12 +233,47 @@ mod tests {
         assert!(CHEAT_CERT_CAP + ENVELOPE_MAX <= FRAME_CAP);
     }
 
+    /// `G11` (`REFUTE_G11_v2` M4): two frames of the largest kind of the hand's
+    /// chain fit a pair vote, and a pair vote fits the transport -- a Tox
+    /// message (`fragment::MAX_MESSAGE`) and a GossipSub one.
     #[test]
-    fn the_band_knows_five_causes() {
-        for c in [CAUSE_REVEAL, CAUSE_SHUFFLE, CAUSE_KEY, CAUSE_ACTION, CAUSE_MONEY] {
+    fn a_pair_vote_fits_two_frames_of_the_largest_kind_and_the_transport() {
+        use crate::table::hand::{frame_ceiling, ENVELOPE_MAX, FRAME_OPEN_MAX, SHUFFLE_PROOF_CAP};
+        use crate::protocol::messages::EventType;
+        let biggest = [
+            EventType::HandInit,
+            EventType::DeckInit,
+            EventType::ShuffleStep,
+            EventType::ShuffleProof,
+            EventType::DeckCommit,
+            EventType::DealPrivate,
+            EventType::ActionRaise,
+            EventType::BoardReveal,
+            EventType::ShowdownReveal,
+            EventType::ShowdownMuck,
+            EventType::HandComplete,
+        ]
+        .into_iter()
+        .map(frame_ceiling)
+        .max()
+        .unwrap();
+        assert_eq!(biggest, SHUFFLE_PROOF_CAP + ENVELOPE_MAX, "the largest chain frame is a shuffle proof");
+        let pair = frames(&[biggest, biggest]);
+        let v = CheatVote { subject_seat: 7, anchor: [1; 32], cause: CAUSE_EQUIVOCATION, evidence: pair };
+        let bytes = crate::protocol::serialization::to_canonical(&v).expect("encodes");
+        assert!(bytes.len() <= CHEAT_PAIR_VOTE_CAP, "{} bytes", bytes.len());
+        assert_eq!(frame_ceiling(EventType::CheatVote), CHEAT_PAIR_VOTE_CAP + ENVELOPE_MAX);
+        assert!(FRAME_OPEN_MAX >= frame_ceiling(EventType::CheatVote));
+        assert!(CHEAT_PAIR_VOTE_CAP + ENVELOPE_MAX <= crate::table::fragment::MAX_MESSAGE);
+        assert!(CHEAT_PAIR_VOTE_CAP + ENVELOPE_MAX <= crate::protocol::constants::GOSSIP_MAX_TRANSMIT);
+    }
+
+    #[test]
+    fn the_band_knows_six_causes() {
+        for c in [CAUSE_REVEAL, CAUSE_SHUFFLE, CAUSE_KEY, CAUSE_ACTION, CAUSE_MONEY, CAUSE_EQUIVOCATION] {
             assert!(cause_known(c));
         }
-        for c in [0u16, 1, 4, 5, 6, 10] {
+        for c in [0u16, 1, 4, 5, 6, 11] {
             assert!(!cause_known(c), "{c}");
         }
     }

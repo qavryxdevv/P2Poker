@@ -1149,6 +1149,17 @@ points at it rather than restating it.**
 > signed fixes the state it is judged against — or out of the removal path
 > altogether.
 
+**Amended 2026-10-04 (`D-101`, `G11`): the third question and the accused's own
+second message.** Two frames of one stage, both signed by the accused at one slot
+-- one sequence, one parent -- answer it *no* where they travel together: the
+verdict is a function of the two frames' own bytes, which every vote carries, so
+no receiver's store, delivery or count decides it -- only who holds the pair
+first. What made such a pair unfit before was its *illegality*, not its form: an
+honest client could sign two bodies at a slot across a restart. Since `D-100`'s
+armed journal it cannot, in a hand whose engine names that journal; the residuals
+where it still can (a lost journal, lying storage, a restored profile, one key on
+two machines) are `D-101` point 6's, and the owner's to accept.
+
 **The clause that failed it, and it stood in tier 1 in three documents: *the
 event chains to a parent that does not exist*.** It fails question 1 outright and
 question 2 with it. Whether a parent exists is decidable **only against the

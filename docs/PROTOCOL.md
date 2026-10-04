@@ -6026,6 +6026,11 @@ to be inferred.**
    was named in, and a seat named in two of the last ten hands is `S1-JR`'s question
    whether the table is safe to stay at. It still ends no hand, moves no chip and
    evicts nobody (`D-014`: no removal on an equivocation).
+   **Amended 2026-10-04 (`G11`, `D-101`).** The pair now proves its writer -- two
+   chain frames of one seat's at one sequence and one parent, with different event
+   hashes, judged alike at any position -- and the cheat band (`S1-KR`, cause 10)
+   puts it out for good from the next hand; a client holding the pair votes about
+   no honest seat in that hand, and a split it made ends on the abort terminal.
 
 **Prerequisites a future wire-in of §5.2.1 must satisfy, all of them findings
 against the tree rather than opinions:**

@@ -18999,7 +18999,9 @@ fn stash_for_resume(
     if hand_id == 0 {
         return false;
     }
-    let signer_of = |b: &[u8]| crate::net::chained::sender_of(b, crate::table::hand::FRAME_CAP);
+    // `G11` (`REVIEW_G11_v4` S3): read at the peek's cap -- a pair vote is above
+    // `FRAME_CAP`, and its kind's ceiling is held where it is opened.
+    let signer_of = |b: &[u8]| crate::net::chained::sender_of(b, TABLE_FRAME_PEEK);
     let Some(signer) = signer_of(bytes) else {
         return false;
     };
@@ -20386,7 +20388,7 @@ fn journal_ahead_as(j: &crate::storage::journal::Handle, sends: &[crate::table::
     match written {
         Ok(()) => {}
         Err(crate::storage::journal::JournalError::Conflict { hand, .. })
-            if crate::table::hand::rogue("bad-action", hand) => {}
+            if crate::table::hand::rogue("bad-action", hand) || crate::table::hand::rogue("equivocate-action", hand) => {}
         // `REFUTE_JOURNAL_D2` N1: the whole batch was refused -- every hand of
         // it sits out, as for any other refusal.
         Err(crate::storage::journal::JournalError::Conflict { hand, sequence, kind }) if armed => {
@@ -20460,7 +20462,7 @@ fn journal_check_own_as(j: &crate::storage::journal::Handle, bytes: &[u8], armed
     if j.lookup(hand, sequence, &parent).is_some_and(|e| e.frame == bytes) {
         return;
     }
-    if crate::table::hand::rogue("bad-action", hand) {
+    if crate::table::hand::rogue("bad-action", hand) || crate::table::hand::rogue("equivocate-action", hand) {
         return;
     }
     let why = format!(
@@ -20493,25 +20495,7 @@ fn sat_out(j: &crate::storage::journal::Handle, bytes: &[u8]) -> bool {
 /// `G11-R`: the frames of a hand's chain -- one slot a frame of a seat, from
 /// `HAND_INIT` to `HAND_COMPLETE`.
 fn of_the_chain(kind: crate::protocol::messages::EventType) -> bool {
-    use crate::protocol::messages::EventType as E;
-    matches!(
-        kind,
-        E::HandInit
-            | E::DeckInit
-            | E::ShuffleStep
-            | E::ShuffleProof
-            | E::DeckCommit
-            | E::DealPrivate
-            | E::ActionCheck
-            | E::ActionCall
-            | E::ActionBet
-            | E::ActionRaise
-            | E::ActionFold
-            | E::BoardReveal
-            | E::ShowdownReveal
-            | E::ShowdownMuck
-            | E::HandComplete
-    )
+    crate::table::hand::of_the_chain(kind)
 }
 
 /// Take one frame of the next hand into the pre-open buffer, evicting the
@@ -20847,7 +20831,9 @@ fn a_seats_own_frame(bytes: &[u8], f: &Formation) -> bool {
     let Ok((kind, hand_id, _)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
         return false;
     };
-    crate::net::chained::open_in_hand(bytes, crate::table::hand::FRAME_CAP, kind, &f.table_id(), hand_id)
+    // `G11` (`REFUTE_G11_v2` M4): at its kind's own ceiling -- a pair vote's is
+    // above `FRAME_CAP`.
+    crate::net::chained::open_in_hand(bytes, crate::table::hand::frame_ceiling(kind), kind, &f.table_id(), hand_id)
         .ok()
         .is_some_and(|o| f.roster().seat_of(&o.sender).is_some())
 }

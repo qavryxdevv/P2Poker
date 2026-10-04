@@ -67,8 +67,9 @@ use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, B
 use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 use crate::table::cheatwire::{
-    cause_known, cheat_sequence, subject_digest as cheat_digest, CheatCert, CheatVote, CAUSE_ACTION, CAUSE_KEY,
-    CAUSE_MONEY, CAUSE_REVEAL, CAUSE_SHUFFLE, CHEAT_CERT_CAP, CHEAT_VOTE_CAP,
+    cause_known, cheat_sequence, subject_digest as cheat_digest, CheatCert, CheatVote, CAUSE_ACTION,
+    CAUSE_EQUIVOCATION, CAUSE_KEY, CAUSE_MONEY, CAUSE_REVEAL, CAUSE_SHUFFLE, CHEAT_CERT_CAP, CHEAT_PAIR_VOTE_CAP,
+    CHEAT_VOTE_CAP,
 };
 
 /// What a step wants sent.
@@ -852,6 +853,52 @@ pub(crate) fn hand_engine() -> Hash {
     *blake3::hash(&parts).as_bytes()
 }
 
+/// `G11-R`, `G11`: the frames of a hand's chain -- one slot a frame of a seat,
+/// from `HAND_INIT` to `HAND_COMPLETE`: what the signing journal records, and
+/// the only kinds two versions of which prove anything (`D-100`). Votes,
+/// certificates, aborts, returns, the cheat band and checkpoints are never
+/// versions: each references a stage, or sits in a band of its own.
+pub(crate) fn of_the_chain(kind: EventType) -> bool {
+    matches!(
+        kind,
+        EventType::HandInit
+            | EventType::DeckInit
+            | EventType::ShuffleStep
+            | EventType::ShuffleProof
+            | EventType::DeckCommit
+            | EventType::DealPrivate
+            | EventType::ActionCheck
+            | EventType::ActionCall
+            | EventType::ActionBet
+            | EventType::ActionRaise
+            | EventType::ActionFold
+            | EventType::BoardReveal
+            | EventType::ShowdownReveal
+            | EventType::ShowdownMuck
+            | EventType::HandComplete
+    )
+}
+
+/// `G11` (`D-100`): whether this client proves a seat by two versions of one
+/// stage -- every build that signs through its armed journal (`hand_engine`
+/// says so, so every seat of its hand does too); not a control of the harness
+/// (`g11d`, `g11r`: it could sign twice itself; `g11`: the judge off).
+pub(crate) fn proves_by_two() -> bool {
+    signs_through_the_journal() && !control("g11")
+}
+
+/// `G11`: two frames in event-hash order -- two judges holding one pair carry
+/// it alike, and its verdict is kept once (`evidence_memo`).
+fn ordered_pair(a: Vec<u8>, b: Vec<u8>) -> Vec<Vec<u8>> {
+    let ha = chained::event_hash_of(&a, PEEK_CAP);
+    let hb = chained::event_hash_of(&b, PEEK_CAP);
+    if ha <= hb {
+        vec![a, b]
+    } else {
+        vec![b, a]
+    }
+}
+
 /// `S1-LL`: whether `frame` is a `TIMEOUT_VOTE` that asks a question
 /// (`CAUSE_QUESTION`, `D-065`'s early question) rather than votes.
 pub fn is_question(frame: &[u8]) -> bool {
@@ -1030,8 +1077,11 @@ pub fn frame_ceiling(kind: EventType) -> usize {
         // `S1-BM`: the return pair, sealed in the boundary band.
         EventType::ReturnVote => crate::table::returnwire::RETURN_VOTE_CAP,
         EventType::ReturnCert => crate::table::returnwire::RETURN_CERT_CAP,
-        // `S1-KR`: the cheat pair, in its own band.
-        EventType::CheatVote => crate::table::cheatwire::CHEAT_VOTE_CAP,
+        // `S1-KR`: the cheat pair, in its own band. `G11` (`REFUTE_G11_v2` M4):
+        // a vote may carry two frames of the largest kind -- above `FRAME_CAP`,
+        // so not clamped to it below; its payload is held to `CHEAT_VOTE_CAP`
+        // for any other cause where it is read (`on_cheat_vote`).
+        EventType::CheatVote => return crate::table::cheatwire::CHEAT_PAIR_VOTE_CAP + ENVELOPE_MAX,
         EventType::CheatCert => crate::table::cheatwire::CHEAT_CERT_CAP,
         EventType::HandComplete => HAND_COMPLETE_CAP,
         EventType::HandAbort => HAND_ABORT_CAP,
@@ -1096,6 +1146,14 @@ const STATE_HASH_CAP: usize = 512;
 /// every `open` still uses its own type's cap.
 const PEEK_CAP: usize = HAND_ABORT_CAP;
 const _: () = assert!(PEEK_CAP >= FRAME_CAP);
+
+/// `G11` (`REFUTE_G11_v2` M4): the cap a frame is opened at before its kind's
+/// own ceiling is known -- a pair vote's, the largest [`frame_ceiling`] but the
+/// abort's (whose road is its own). Each road then holds the frame to its
+/// kind's ceiling.
+pub const FRAME_OPEN_MAX: usize = crate::table::cheatwire::CHEAT_PAIR_VOTE_CAP + ENVELOPE_MAX;
+const _: () = assert!(FRAME_OPEN_MAX >= FRAME_CAP);
+const _: () = assert!(PEEK_CAP >= FRAME_OPEN_MAX);
 
 /// Where the first button sits: **the rule of version 1** (`D-083`).
 ///
@@ -2961,8 +3019,26 @@ pub struct Hand {
     /// copy of it from another version of it once the stage is left.
     taken_from: BTreeMap<(u64, [u8; 32]), (Hash, Hash)>,
     /// `S1-KJ`: the stages and writers another version was found of, each said
-    /// once.
+    /// once. `G11`: marked only where the judge took the pair.
     versions_said: BTreeSet<(u64, [u8; 32])>,
+    /// `G11` (`REFUTE_G11_v2` S3): the first frame of the hand's chain heard from
+    /// each writer at each sequence, its signature checked -- whether or not the
+    /// stage then took it -- for the pair a second version makes with it.
+    /// Bounded: one a writer a sequence of this hand, each within its kind's
+    /// ceiling.
+    first_frames: BTreeMap<(u64, [u8; 32]), Vec<u8>>,
+    /// `G11` (`REFUTE_G11_v3` M1): the seats this client holds a pair of -- two
+    /// versions of one stage, judged -- with the pair, whatever else it holds
+    /// them proven by. A client holding one abstains (`abstains_about`).
+    pairs: BTreeMap<SeatIdx, Vec<Vec<u8>>>,
+    /// `G11` (`REVIEW_G11_v4` S1): the (voter, subject) cause-10 votes whose pair
+    /// this client judged for the record -- once each, whatever else it holds.
+    pair_judged: BTreeSet<(SeatIdx, SeatIdx)>,
+    /// `G11` (`REVIEW_G11_v4` S1): the seats whose pair this client said as a
+    /// cause-10 vote after a vote of another cause about them had gone.
+    pair_said: BTreeSet<SeatIdx>,
+    /// `G11` (`REVIEW_G11_v4` N1): the abstention said once a hand.
+    abstain_said: bool,
     /// `S1-KB`: another seat's betting actions this hand took, each the first
     /// time it took it, for the node to say again once (`take_said_again`).
     said_again: Vec<Vec<u8>>,
@@ -3291,6 +3367,11 @@ impl Hand {
                 transcript_seen: BTreeSet::new(),
                 taken_from: BTreeMap::new(),
                 versions_said: BTreeSet::new(),
+                first_frames: BTreeMap::new(),
+                pairs: BTreeMap::new(),
+                pair_judged: BTreeSet::new(),
+                pair_said: BTreeSet::new(),
+                abstain_said: false,
                 said_again: Vec::new(),
                 relay_for: BTreeSet::new(),
                 shuffle_judge: None,
@@ -3403,7 +3484,18 @@ impl Hand {
         // A settlement arriving after this client gave the hand up. §4.10:
         // `HAND_COMPLETE` wins, because it is collective.
         if kind == EventType::HandComplete && matches!(self.phase, Phase::Aborted(_)) {
-            return self.on_late_settlement(bytes);
+            // `G11`: a second settlement of one seat's at the late stage's own
+            // slot is a pair as well (`REFUTE_G11_v2` S2).
+            // `REVIEW_G11_v4` S2: read after the call -- the first copy at a seat
+            // that gave up before settling builds the late stage.
+            let out = self.on_late_settlement(bytes);
+            let late_slot = self.late.as_ref().map(|l| self.slot().at(l.stage.sequence(), l.parent));
+            if let Some(slot) = late_slot.filter(|s| s.sequence == sequence) {
+                if !matches!(out, Err(Failed::Wire(_)) | Err(Failed::NotYet)) {
+                    self.check_second_version(bytes, kind, &slot);
+                }
+            }
+            return out;
         }
         // An abort is answered from **any** phase and from any position: it is
         // §3.2's witness-independent terminal, it has no required emitter set,
@@ -3469,6 +3561,7 @@ impl Hand {
         if matches!(self.phase, Phase::Aborted(_)) {
             self.judge_left(bytes, kind, sequence);
         }
+        let slot_before = self.slot;
         let out = self.dispatch(bytes, kind, key, now_ms);
         self.mark_stage(now_ms);
         // `D-033`: kept once, for a seat back from a restart -- keyed by the
@@ -3494,6 +3587,11 @@ impl Hand {
                 // `S1-KJ`: what this hand took at this stage from this writer.
                 if let (Some(sender), Some(parent)) = (chained::sender_of(bytes, FRAME_CAP), chained::parent_of(bytes, FRAME_CAP)) {
                     self.taken_from.entry((sequence, sender)).or_insert((digest, parent));
+                    // `G11`: and its bytes, where nothing of this writer's was
+                    // kept here yet.
+                    if of_the_chain(kind) && bytes.len() <= frame_ceiling(kind) {
+                        self.keep_first(sequence, sender, bytes);
+                    }
                 }
                 // `S1-KB`: another seat's betting action, taken now for the
                 // first time -- verified, in its slot, applied, the hand moved
@@ -3506,6 +3604,12 @@ impl Hand {
                     self.said_again.push(bytes.to_vec());
                 }
             }
+        }
+        // `G11`: a frame of the chain this hand answered at its stage -- taken or
+        // refused, but signed for that very slot -- against its writer's first
+        // there. Not one that never opened, nor one of a later stage.
+        if !matches!(out, Err(Failed::Wire(_)) | Err(Failed::NotYet)) {
+            self.check_second_version(bytes, kind, &slot_before);
         }
         // **Caught here, because here is where the frame still exists.** A
         // reveal share proved wrong is `PROTOCOL.md` §4.10's `cause = 3`, whose
@@ -3807,12 +3911,14 @@ impl Hand {
     /// some seats and the other to the rest parts the table in two, and every
     /// seat moves on with the version it had -- so each saw the other only
     /// after, as another seat's say-again (`S1-KB`) or answer (`D-065`) of a
-    /// stage it had left. Nothing in the hand is changed by the finding and
-    /// nobody is removed for it (`D-014`: no removal on an equivocation); the
-    /// node counts it towards `S1-JR`'s question to the player. A copy of the
-    /// same event -- the same bytes, or the same body signed again -- is read
-    /// as a copy without checking a signature; only a different body is
-    /// opened, and one that does not verify is nothing.
+    /// stage it had left. Nothing in the hand is changed by the finding; since
+    /// `G11` (`D-100`) the pair proves its writer here (`CAUSE_EQUIVOCATION`)
+    /// and the band puts it out, and the node still counts it towards `S1-JR`'s
+    /// question to the player. A copy of the same event -- the same bytes, or
+    /// the same body signed again -- is read as a copy without checking a
+    /// signature; only a different body is judged, and one the judge does not
+    /// take is nothing -- and marks nothing (`REFUTE_G11_v2` M2: one frame over
+    /// its kind's ceiling, marked, kept the true second version unjudged).
     fn another_version(&mut self, bytes: &[u8], kind: EventType, sequence: u64) -> Option<SeatIdx> {
         // A vote **references** the stage it is about rather than occupying
         // it (`PROTOCOL.md` §4.8), so its sequence is that stage's, beside the
@@ -3823,8 +3929,21 @@ impl Hand {
         if kind == EventType::TimeoutVote {
             return None;
         }
+        // `G11`: a frame of the chain, within its kind's ceiling, before
+        // anything else is read of it.
+        if !of_the_chain(kind) || bytes.len() > frame_ceiling(kind) {
+            return None;
+        }
         let sender = chained::sender_of(bytes, FRAME_CAP)?;
-        let (taken, parent) = *self.taken_from.get(&(sequence, sender))?;
+        // `REVIEW_G11_v4b` N3': a frame taken and then failed on never entered
+        // `taken_from`; the writer's first frame there stands for it.
+        let (taken, parent) = match self.taken_from.get(&(sequence, sender)) {
+            Some(t) => *t,
+            None => {
+                let first = self.first_frames.get(&(sequence, sender))?;
+                (chained::event_hash_of(first, PEEK_CAP)?, chained::parent_of(first, PEEK_CAP)?)
+            }
+        };
         // `G11-R` (`D-100`): another version is another body at the same parent
         // -- the exact slot, the journal's key and `G11`'s. A frame at another
         // parent is another branch: an honest seat signs a hand at two geneses
@@ -3836,12 +3955,19 @@ impl Hand {
         if self.versions_said.contains(&(sequence, sender)) || chained::event_hash_of(bytes, FRAME_CAP)? == taken {
             return None;
         }
-        let opened = chained::open_in_hand(bytes, FRAME_CAP, kind, &self.open.table_id, self.open.hand_id).ok()?;
-        if opened.event_hash == taken || opened.envelope.sequence != sequence {
+        let seat = self.seat_of(&sender).ok()?;
+        // `REVIEW_G11_v4` M3: with the writer's first frame here, whatever the
+        // stage took -- a frame of the chain at that very slot.
+        let first = self.first_frame(sequence, &sender)?;
+        if chained::event_hash_of(&first, PEEK_CAP) == chained::event_hash_of(bytes, FRAME_CAP) {
             return None;
         }
-        let seat = self.seat_of(&sender).ok()?;
+        // `G11`: said, and marked, only where the judge takes the pair.
+        if self.judge_evidence(CAUSE_EQUIVOCATION, &ordered_pair(first.clone(), bytes.to_vec()), seat) != Judged::Proven {
+            return None;
+        }
         self.versions_said.insert((sequence, sender));
+        self.prove_equivocation(seat, first, bytes.to_vec());
         Some(seat)
     }
 
@@ -5509,10 +5635,18 @@ impl Hand {
             Body::Amount(a) => self.say(kind, a, ACTION_CAP, key, now_ms)?,
         };
         let hash = self.opened(&bytes, kind)?.event_hash;
+        // `G11` harness: a rogue signs a second version of its turn at the same
+        // slot and says it after its own (`equivocate-action`).
+        let second = if rogue("equivocate-action", self.open.hand_id) {
+            self.rogue_second_version(kind, key, now_ms)
+        } else {
+            None
+        };
         // `D-034`: this client's own action gives the next seat its turn now.
         self.last_stamp_ms = now_ms;
         let mut out: Vec<Send> = refused.into_iter().map(Send::Broadcast).collect();
         out.push(Send::Broadcast(bytes));
+        out.extend(second.map(Send::Broadcast));
         match self.apply_action(me, action, kind, hash, key, now_ms) {
             Ok(mut more) => out.append(&mut more),
             // Refused by the engine: nothing moved, and the bytes are dropped --
@@ -7678,7 +7812,9 @@ impl Hand {
                 let admitted = hand_budget_spent
                     || (self.long_past_stage(now_ms)
                         && (!self.crypto_stage() || self.round_has_had_air(now_ms)))
-                    || (self.past_deadline(now_ms) && !self.party_to_vote());
+                    || (self.past_deadline(now_ms) && !self.party_to_vote())
+                    // `G11` (`REVIEW_G11_v4` M2): a split's halves leave together.
+                    || self.split_abort_from(seat);
                 // `D-084`: the proven seat's own bare abort is nothing while its
                 // evidence is held -- taken once admitted, it ended the hand with
                 // the evidence never sent.
@@ -7862,7 +7998,7 @@ impl Hand {
                     // as a bare abort would, at the bare abort's admission, naming
                     // nobody here: held for ever, it kept the subject that refused
                     // the half in a hand every other seat had ended.
-                    if !control("s1lf") && self.bare_abort_admitted(now_ms) {
+                    if !control("s1lf") && (self.bare_abort_admitted(now_ms) || self.split_abort_from(seat)) {
                         // `D-084`, as on the bare abort's road: the proven seat's own
                         // is nothing while its evidence is held, another's waits for
                         // the evidence to go first.
@@ -8332,8 +8468,29 @@ impl Hand {
     fn note_proven(&mut self, seat: SeatIdx, cause: u16, frames: Vec<Vec<u8>>) {
         // `G9`: a seat not dealt in signs nothing of the deck -- but a seat of the
         // hand's stages signs its settlement.
-        let signs_it = self.mine.dealt_in.contains(&seat) || (cause == CAUSE_MONEY && self.open.required.contains(&seat));
-        if seat == self.open.my_seat || !signs_it || self.proven.contains_key(&seat) {
+        // `G11` (`REFUTE_G11_v2` S3 b): and its opening.
+        let signs_it = self.mine.dealt_in.contains(&seat)
+            || (matches!(cause, CAUSE_MONEY | CAUSE_EQUIVOCATION) && self.open.required.contains(&seat));
+        if seat == self.open.my_seat || !signs_it {
+            return;
+        }
+        // `G11` (`REFUTE_G11_v2` N1): two frames at one slot are judged alike at
+        // any position, the other causes at the judge's own stage or deck -- so
+        // the pair replaces another proof while no vote about the seat went.
+        if let Some(p) = self.proven.get(&seat) {
+            if !(cause == CAUSE_EQUIVOCATION && p.cause != CAUSE_EQUIVOCATION && !self.cheat_voted.contains(&seat)) {
+                return;
+            }
+        }
+        // `G11`, `D-100`: a client that could sign two bodies at one slot itself
+        // -- a control of the harness -- proves nobody by two; it never shares a
+        // hand with one that does (`hand_engine`).
+        if cause == CAUSE_EQUIVOCATION && !proves_by_two() {
+            if !self.proven.contains_key(&seat) {
+                self.cert_note.push(format!(
+                    "seat {seat} would be proven here to have signed two versions of one stage (G11, a control)"
+                ));
+            }
             return;
         }
         // `G9`'s control build (`P2P_POKER_CONTROL=g9`) proves no settlement.
@@ -8352,12 +8509,199 @@ impl Hand {
             CAUSE_SHUFFLE => "a shuffle step or proof that does not hold",
             CAUSE_ACTION => "a betting action the rules refuse",
             CAUSE_MONEY => "a settlement that pays what the cards do not",
+            CAUSE_EQUIVOCATION => "two versions of one stage of the hand",
             _ => "a card share that does not hold",
         };
         self.cert_note.push(format!(
             "seat {seat} is proven here to have signed {what}; the table is asked to put it out (S1-KR)"
         ));
         self.proven.insert(seat, Proven { cause, frames });
+    }
+
+    /// `G11` (`D-100`): what two frames say about `accused` -- proven where both
+    /// are of the hand's chain, both within their kind's ceiling (looked at
+    /// before any signature is checked), both signed by `accused` for this table
+    /// and hand, at one sequence and one parent, with different event hashes: two
+    /// bodies at one slot, which an honest client never signs -- its armed
+    /// journal replays the bytes it recorded. Reads nothing of this client's own
+    /// position: any seat on any branch judges a pair alike.
+    fn judge_equivocation(&self, frames: &[Vec<u8>], accused: SeatIdx) -> Judged {
+        let [a, b] = frames else {
+            return Judged::NotEvidence("the evidence were two frames");
+        };
+        let Some(accused_key) = self.key_of(accused) else {
+            return Judged::NotEvidence("the seat it accuses were at this table");
+        };
+        // `REVIEW_G11_v4` M1: about a seat of this hand alone -- `open.seats`
+        // keeps every seat the table ever sat, busted and out for good among them.
+        if !self.open.required.contains(&accused) && !self.mine.dealt_in.contains(&accused) {
+            return Judged::NotEvidence("the seat it accuses were one of this hand's");
+        }
+        let mut slots: Vec<(u64, Hash, Hash)> = Vec::with_capacity(2);
+        let mut openings = 0;
+        let mut unarmed_opening = false;
+        for frame in [a, b] {
+            let Ok((kind, _, _)) = chained::peek(frame, PEEK_CAP) else {
+                return Judged::NotEvidence("the evidence were frames");
+            };
+            if !of_the_chain(kind) {
+                return Judged::NotEvidence("the frames were of the hand's chain");
+            }
+            if frame.len() > frame_ceiling(kind) {
+                return Judged::NotEvidence("the frames were within their caps");
+            }
+            let Ok(opened) =
+                chained::open_in_hand(frame, frame_ceiling(kind), kind, &self.open.table_id, self.open.hand_id)
+            else {
+                return Judged::NotEvidence("the frames opened in this hand");
+            };
+            if opened.sender != accused_key {
+                return Judged::NotEvidence("the frames were signed by the seat it accuses");
+            }
+            // `REFUTE_G11_v3` S1: two openings prove only where both name the
+            // armed engine -- a mixed table's unarmed seat may sign its opening
+            // twice across a restart, and is no armed signer. Read below, for two
+            // openings alone (`REVIEW_G11_v4` M3: a frame of the opening's kind at
+            // any other slot is a frame of the seat's like any other).
+            if kind == EventType::HandInit {
+                openings += 1;
+                let armed = opened.envelope.sequence == 0
+                    && chained::payload::<HandInit>(&opened, HAND_INIT_CAP).is_ok_and(|b| b.engine == hand_engine());
+                unarmed_opening |= !armed;
+            }
+            slots.push((opened.envelope.sequence, opened.envelope.previous_event_hash, opened.event_hash));
+        }
+        let (first, second) = (slots[0], slots[1]);
+        if first.0 != second.0 || first.1 != second.1 {
+            return Judged::NotEvidence("the frames sat at one slot -- one sequence, one parent");
+        }
+        if first.2 == second.2 {
+            return Judged::NotEvidence("the frames were two events, not one event twice");
+        }
+        if openings == 2 {
+            if unarmed_opening {
+                return Judged::NotEvidence("the openings named the armed engine");
+            }
+            return Judged::Proven;
+        }
+        // `REFUTE_G11_v3` S1: any other pair only after this client's own stage 0
+        // completed -- it took the accused's armed opening, as every seat of that
+        // stage 0 did alike.
+        if !self.stage_zero_done {
+            return if self.over() {
+                Judged::NotEvidence("this client's stage 0 had completed")
+            } else {
+                Judged::Unjudgeable
+            };
+        }
+        Judged::Proven
+    }
+
+    /// `G11`: `seat` proven here by `first` and `second`, two frames of its own,
+    /// where the judge takes the pair -- and only there (`REFUTE_G11_v2` M2).
+    fn prove_equivocation(&mut self, seat: SeatIdx, first: Vec<u8>, second: Vec<u8>) -> bool {
+        let pair = ordered_pair(first, second);
+        if self.judge_evidence(CAUSE_EQUIVOCATION, &pair, seat) != Judged::Proven {
+            return false;
+        }
+        self.keep_pair(seat, &pair);
+        self.note_proven(seat, CAUSE_EQUIVOCATION, pair);
+        true
+    }
+
+    /// `G11` (`REFUTE_G11_v3` M1): a pair the judge took, recorded on its own --
+    /// whatever this client already holds the seat proven by: a rogue that has a
+    /// seat prove it of another cause first (an illegal second version seen
+    /// before the legal one) still leaves the pair, and with it the seat's
+    /// abstention ([`Hand::abstains_about`]). Not where a client proves nobody by
+    /// two (a control).
+    fn keep_pair(&mut self, seat: SeatIdx, pair: &[Vec<u8>]) {
+        // `REVIEW_G11_v4` M1: a seat of this hand alone, as `note_proven` asks.
+        let of_the_hand = self.mine.dealt_in.contains(&seat) || self.open.required.contains(&seat);
+        if seat != self.open.my_seat && of_the_hand && proves_by_two() {
+            self.pairs.entry(seat).or_insert_with(|| pair.to_vec());
+        }
+    }
+
+    /// `G11` (`REVIEW_G11_v4` M1): whether this client holds a pair about a seat
+    /// it also holds proven -- what its abstention and its give-up at a turn rest
+    /// on; never a pair `note_proven` would not take.
+    fn holds_a_proven_pair(&self) -> bool {
+        self.pairs.keys().any(|s| self.proven.contains_key(s))
+    }
+
+    /// `G11` (`REVIEW_G11_v4` M2, `REVIEW_G11_v4b` M2'): whether a bare abort
+    /// from `seat` is taken at once -- in a hand where this client holds a proven
+    /// pair, from any seat of the hand it holds unpaired. Waiting for no round of
+    /// its own: a stage that waits on the proven seat alone looks certifiable here
+    /// while the round can complete nowhere (its voters stand on the other branch,
+    /// or left), and held to its own clock this half opened the next hand last,
+    /// to be certified absent there by the half that left first. The attacked
+    /// hand is void anyway (`D-014` point 1): every half now leaves it within a
+    /// round trip of the first to give up. Never a key outside the hand -- §4.10
+    /// gives such a seat no abort -- and the sender is read by the hand's own sets
+    /// and the pairs, not by `proven`, which differs from seat to seat.
+    fn split_abort_from(&self, seat: SeatIdx) -> bool {
+        self.holds_a_proven_pair() && self.open.required.contains(&seat) && !self.pairs.contains_key(&seat)
+    }
+
+    /// `G11`: the first frame of `sender`'s at `sequence` this hand heard -- kept
+    /// as it was checked, or the one the hand took there.
+    fn first_frame(&self, sequence: u64, sender: &[u8; 32]) -> Option<Vec<u8>> {
+        self.first_frames.get(&(sequence, *sender)).cloned()
+    }
+
+    /// `G11`: keep `bytes` as `sender`'s first frame at `sequence`, its signature
+    /// and its slot already checked by the caller, where none is kept yet.
+    fn keep_first(&mut self, sequence: u64, sender: [u8; 32], bytes: &[u8]) {
+        self.first_frames.entry((sequence, sender)).or_insert_with(|| bytes.to_vec());
+    }
+
+    /// `G11` (`REFUTE_G11_v2` S2, S3 a): `bytes`, a frame of the chain this hand
+    /// answered at `slot` -- the stage it was at -- against the writer's first
+    /// frame there: another body at that very slot is the pair, judged and, where
+    /// the judge takes it, noted; else it is kept as the writer's first, its
+    /// signature and slot checked here. Whatever the stage's own handler did with
+    /// it: three of them refuse a second body before the stage hears it (a
+    /// `HAND_INIT` or a `DECK_COMMIT` that disagrees, a deck key already seated),
+    /// and a frame taken and then failed on is still the first of a pair.
+    fn check_second_version(&mut self, bytes: &[u8], kind: EventType, slot: &Slot) {
+        if !of_the_chain(kind) || bytes.len() > frame_ceiling(kind) {
+            return;
+        }
+        let Some(sender) = chained::sender_of(bytes, FRAME_CAP) else {
+            return;
+        };
+        let Ok(seat) = self.seat_of(&sender) else {
+            return;
+        };
+        // `REVIEW_G11_v4` S4: a seat already paired here costs nothing more.
+        if seat == self.open.my_seat || self.pairs.contains_key(&seat) {
+            return;
+        }
+        let hash = chained::event_hash_of(bytes, FRAME_CAP);
+        match self.first_frame(slot.sequence, &sender) {
+            Some(first) if chained::event_hash_of(&first, PEEK_CAP) == hash => {}
+            Some(first) => {
+                self.prove_equivocation(seat, first, bytes.to_vec());
+            }
+            None => {
+                // `REVIEW_G11_v4` M3: kept only as a frame that can be half of a
+                // proven pair -- an opening at the hand's first slot under the
+                // armed engine, or a frame of any other kind of the chain.
+                let Ok(opened) = chained::open(bytes, frame_ceiling(kind), kind, slot) else {
+                    return;
+                };
+                if kind == EventType::HandInit {
+                    let armed = slot.sequence == 0
+                        && chained::payload::<HandInit>(&opened, HAND_INIT_CAP).is_ok_and(|b| b.engine == hand_engine());
+                    if !armed {
+                        return;
+                    }
+                }
+                self.keep_first(slot.sequence, sender, bytes);
+            }
+        }
     }
 
     /// `S1-KS`: what a vote's or a certificate's frames say about `accused`, by
@@ -8377,6 +8721,7 @@ impl Hand {
             (CAUSE_SHUFFLE, [_] | [_, _]) => self.judge_shuffle_evidence(frames, accused),
             (CAUSE_ACTION, [frame]) => self.judge_action(frame, accused),
             (CAUSE_MONEY, [frame]) => self.judge_money(frame, accused),
+            (CAUSE_EQUIVOCATION, [_, _]) => self.judge_equivocation(frames, accused),
             _ => Judged::NotEvidence("the evidence were the frames its cause names"),
         };
         // Kept only where the frames are the accused's own and were judged:
@@ -8656,6 +9001,29 @@ impl Hand {
             EventType::ActionCall
         };
         self.say(kind, &head, ACTION_CAP, key, now_ms).ok()
+    }
+
+    /// `G11` harness (`equivocate-action`): another legal version of this
+    /// seat's turn, at the slot `kind` is about to be signed at -- a fold beside
+    /// any other action, a check (or, facing a bet, a call) beside a fold.
+    fn rogue_second_version(&self, kind: EventType, key: &SigningKey, now_ms: u64) -> Option<Vec<u8>> {
+        let Phase::Playing { play, .. } = &self.phase else {
+            return None;
+        };
+        let me = self.open.my_seat;
+        let head = ActionHead {
+            street: street_code(play.street),
+            seat: me,
+            action_index: play.actions,
+        };
+        let other = if kind != EventType::ActionFold {
+            EventType::ActionFold
+        } else if play.round.to_call(me) > 0 {
+            EventType::ActionCall
+        } else {
+            EventType::ActionCheck
+        };
+        self.say(other, &head, ACTION_CAP, key, now_ms).ok()
     }
 
     /// `S1-KS`: what a `DECK_INIT` of `accused`'s own signing says about it,
@@ -8965,8 +9333,18 @@ impl Hand {
         // A **betting** stage is not bounded here. A player thinking is
         // legitimate, and it is bounded instead by that seat's own client
         // acting for it at `action_timeout_ms + action_grace_ms`.
+        //
+        // `G11` (`REFUTE_G11_v3` M2, `REVIEW_G11_v4b` M2'): except in a hand
+        // where this client holds a proven pair -- a hand split, or able to be, by
+        // two versions of one stage -- given up long past the stage, twice the
+        // turn's own deadline, as a cryptographic stage is, whatever round looks
+        // possible here: the abort terminal is a function of the hand's genesis,
+        // the one end every half reaches, and the other seats take it at once
+        // (`split_abort_from`). A certificate about the proven seat that completes
+        // in time still goes first (`may_abandon`'s guard). Before, a split at a
+        // turn stood to the hand's whole budget: 24.5 minutes at three seats.
         if !self.crypto_stage() {
-            return false;
+            return self.holds_a_proven_pair() && self.long_past_stage(now_ms);
         }
         // `S1-CX`: heads-up, a hand both seats have signed keeps the longer
         // budget -- nobody can vote at two seats, so this budget's only effect
@@ -9133,7 +9511,22 @@ impl Hand {
             .into_iter()
             .filter(|s| *s != self.open.my_seat && self.mine.dealt_in.contains(s))
             .collect();
-        !quiet.is_empty() && self.admissible_for(&self.voters_of(&quiet), &quiet, &[])
+        // `G11`: and not one this client abstains from.
+        !quiet.is_empty() && !self.abstains_about(&quiet) && self.admissible_for(&self.voters_of(&quiet), &quiet, &[])
+    }
+
+    /// `G11` (`REFUTE_G11_v3` M1): whether this client abstains from a round
+    /// about `quiet` -- it holds a pair of some seat's (two versions of one
+    /// stage, judged) and the round names a seat it holds neither proven nor
+    /// paired. It casts no counting vote there and seals no copy, and no
+    /// certificate is possible for it there. A certificate needs every voter of
+    /// its set, so one honest abstainer blocks a certificate about an honest seat
+    /// on every branch of a split; one completed before the pair stands
+    /// everywhere, as before; and no stage's members move on a fact of this
+    /// client's own -- the voter sets stay what every seat derives. A whole
+    /// certificate others sealed is still taken.
+    fn abstains_about(&self, quiet: &[SeatIdx]) -> bool {
+        self.holds_a_proven_pair() && quiet.iter().any(|s| !self.proven.contains_key(s) && !self.pairs.contains_key(s))
     }
 
     /// D-036: how many votes a subject needs, for the tally's denominator --
@@ -9929,6 +10322,15 @@ impl Hand {
             // D-036: the floor is the joint one -- the seats outside the
             // quiet set are two at least, and more than the quiet.
             if !self.certificate_possible() {
+                // `G11` (`REVIEW_G11_v4` N1): said once a hand where this client
+                // abstains.
+                if !self.abstain_said && self.holds_a_proven_pair() {
+                    self.abstain_said = true;
+                    let paired: Vec<SeatIdx> = self.pairs.keys().copied().collect();
+                    self.cert_note.push(format!(
+                        "this client holds two versions of one stage signed by seat(s) {paired:?}, and votes about no other seat in this hand: a stage that waits on one ends with the hand given up, nobody named (G11)"
+                    ));
+                }
                 self.say_floor_once(now_ms);
                 continue;
             }
@@ -10071,6 +10473,10 @@ impl Hand {
             .filter(|s| waiting.contains(s))
             .collect();
         if round.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `G11` (`REFUTE_G11_v3` M1): none in a round this client abstains from.
+        if self.abstains_about(&round) {
             return Ok(Vec::new());
         }
         // `D-084`: none in a round about a proven cheat -- a voter that says
@@ -10397,6 +10803,11 @@ impl Hand {
             }
             return Ok(Vec::new());
         };
+        // `G11` (`REFUTE_G11_v3` M1): no copy sealed in a round this client
+        // abstains from -- every honest copy is owed, so none completes.
+        if self.abstains_about(&subject.quiet_seats()) {
+            return Ok(Vec::new());
+        }
         // A stage already open about exactly this set takes this client's
         // copy. One about another set is replaced: the sealable set only
         // grows, and the peers that opened the smaller one move to this one
@@ -12630,8 +13041,10 @@ impl Hand {
         // table identity and the signature doing all the work — that is what a
         // relay decision may rest on, and a `hand_id` this client is not
         // playing is not a fault in the sender.
+        // `G11` (`REFUTE_G11_v2` M4): at the largest ceiling there is -- a pair
+        // vote's -- and to the kind's own at the door below.
         let Ok(opened) =
-            chained::open_in_hand(&bytes, FRAME_CAP, kind, &self.open.table_id, hand_id)
+            chained::open_in_hand(&bytes, FRAME_OPEN_MAX, kind, &self.open.table_id, hand_id)
         else {
             return Holding::Malformed;
         };
@@ -15717,8 +16130,19 @@ impl Hand {
         self.proven
             .iter()
             .filter(|(s, _)| !self.cheat_out.contains(s))
-            .map(|(s, p)| (*s, p.cause))
+            .map(|(s, p)| (*s, self.cause_said(*s, p.cause)))
             .collect()
+    }
+
+    /// `G11` (`REFUTE_G11_v3` N5): the cause a proven seat is told by -- two
+    /// versions of one stage where this client holds the pair, whatever proved it
+    /// first here.
+    fn cause_said(&self, seat: SeatIdx, cause: u16) -> u16 {
+        if self.pairs.contains_key(&seat) {
+            CAUSE_EQUIVOCATION
+        } else {
+            cause
+        }
     }
 
     /// `S1-KR`: every seat proven here, put out or not, with the cause -- what
@@ -15726,7 +16150,7 @@ impl Hand {
     /// and told should it ever be dealt in here again (a table this client
     /// adopts after banking, `D-038`).
     pub fn proven_seats(&self) -> Vec<(SeatIdx, u16)> {
-        self.proven.iter().map(|(s, p)| (*s, p.cause)).collect()
+        self.proven.iter().map(|(s, p)| (*s, self.cause_said(*s, p.cause))).collect()
     }
 
     /// `S1-KR`: the seats proven here that a certificate can still put out,
@@ -15793,6 +16217,8 @@ impl Hand {
                 evidence: frames.into_iter().map(minicbor::bytes::ByteVec::from).collect(),
             };
             let slot = self.slot().at(sequence, anchor);
+            // `G11` (`REFUTE_G11_v2` M4): a pair rides under its own cap.
+            let cap = if cause == CAUSE_EQUIVOCATION { CHEAT_PAIR_VOTE_CAP } else { CHEAT_VOTE_CAP };
             let bytes = match chained::seal(
                 EventType::CheatVote,
                 &slot,
@@ -15800,7 +16226,7 @@ impl Hand {
                 key,
                 now_ms,
                 self.next_deadline_for(EventType::CheatVote),
-                CHEAT_VOTE_CAP,
+                cap,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -15812,6 +16238,44 @@ impl Hand {
             let held = self.cheat_votes.get(&seat).map_or(0, |m| m.len());
             self.cert_note.push(format!("cheat: vote {held} about seat {seat} (mine), proven here (S1-KR)"));
             out.push(Send::Broadcast(bytes));
+        }
+        // `G11` (`REVIEW_G11_v4` S1): a pair recorded after this client's vote of
+        // another cause went is said once as a cause-10 vote -- not counted again,
+        // carried so that every seat holds the pair and abstains alike.
+        let late_pairs: Vec<(SeatIdx, Vec<Vec<u8>>)> = self
+            .pairs
+            .iter()
+            .filter(|(s, _)| {
+                self.cheat_voted.contains(*s)
+                    && !self.pair_said.contains(*s)
+                    && self.proven.get(*s).is_some_and(|p| p.cause != CAUSE_EQUIVOCATION)
+            })
+            .map(|(s, p)| (*s, p.clone()))
+            .collect();
+        for (seat, pair) in late_pairs {
+            self.pair_said.insert(seat);
+            let Some(sequence) = cheat_sequence(seat) else {
+                continue;
+            };
+            let vote = CheatVote {
+                subject_seat: seat,
+                anchor,
+                cause: CAUSE_EQUIVOCATION,
+                evidence: pair.into_iter().map(minicbor::bytes::ByteVec::from).collect(),
+            };
+            let slot = self.slot().at(sequence, anchor);
+            match chained::seal(
+                EventType::CheatVote,
+                &slot,
+                &vote,
+                key,
+                now_ms,
+                self.next_deadline_for(EventType::CheatVote),
+                CHEAT_PAIR_VOTE_CAP,
+            ) {
+                Ok(bytes) => out.push(Send::Broadcast(bytes)),
+                Err(e) => self.cert_note.push(format!("cheat: the pair about seat {seat} would not seal: {e:?} (G11)")),
+            }
         }
         match self.certify_cheats(key, now_ms) {
             Ok(mut c) => out.append(&mut c),
@@ -15832,10 +16296,24 @@ impl Hand {
     /// votes or not -- a seat not dealt in, or two votes about a shuffle, which
     /// no certificate carries.
     fn on_cheat_vote(&mut self, bytes: &[u8], key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
-        let opened = chained::open_in_hand(bytes, FRAME_CAP, EventType::CheatVote, &self.open.table_id, self.open.hand_id)
-            .map_err(Failed::Wire)?;
+        let opened = chained::open_in_hand(
+            bytes,
+            frame_ceiling(EventType::CheatVote),
+            EventType::CheatVote,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .map_err(Failed::Wire)?;
         let voter = self.seat_of(&opened.sender)?;
-        let body: CheatVote = chained::payload(&opened, CHEAT_VOTE_CAP).map_err(Failed::Wire)?;
+        let body: CheatVote = chained::payload(&opened, CHEAT_PAIR_VOTE_CAP).map_err(Failed::Wire)?;
+        // `G11` (`REFUTE_G11_v2` M4): only a vote about two versions carries two
+        // frames of the largest kind; every other cause's stays within its cap.
+        if body.cause != CAUSE_EQUIVOCATION && opened.envelope.payload.len() > CHEAT_VOTE_CAP {
+            return Err(Failed::Elsewhere {
+                seat: voter,
+                what: "a cheat vote were within its cause's cap",
+            });
+        }
         if body.subject_seat == voter {
             return Err(Failed::Elsewhere {
                 seat: voter,
@@ -15872,10 +16350,33 @@ impl Hand {
         // client then votes about itself; the vote itself is never counted.
         let counted = self.cheat_voters(body.subject_seat).contains(&voter);
         let subject = body.subject_seat;
-        if self.cheat_votes.get(&subject).is_some_and(|m| m.contains_key(&voter)) {
+        if control("s1kr") {
             return Ok(Vec::new());
         }
-        if control("s1kr") {
+        // `G11` (`REFUTE_G11_v3` M1, `REVIEW_G11_v4` S1): a pair is recorded on
+        // its own, whatever this client already holds the subject proven by --
+        // judged once a voter, and before a vote of the voter's already held: a
+        // seat that voted another cause first sends its pair after, as one.
+        if body.cause == CAUSE_EQUIVOCATION && !self.pairs.contains_key(&subject) && !self.pair_judged.contains(&(voter, subject)) {
+            let frames: Vec<Vec<u8>> = body.evidence.iter().map(|b| b.to_vec()).collect();
+            match self.judge_evidence(CAUSE_EQUIVOCATION, &frames, subject) {
+                Judged::Proven => {
+                    self.pair_judged.insert((voter, subject));
+                    self.keep_pair(subject, &frames);
+                    if !self.proven.contains_key(&subject) {
+                        self.judged_from.insert((voter, subject));
+                        self.note_proven(subject, CAUSE_EQUIVOCATION, frames);
+                    }
+                }
+                // `REVIEW_G11_v4b` N2': judged again on a later copy -- this
+                // client's stage 0 may yet complete.
+                Judged::Unjudgeable => {}
+                _ => {
+                    self.pair_judged.insert((voter, subject));
+                }
+            }
+        }
+        if self.cheat_votes.get(&subject).is_some_and(|m| m.contains_key(&voter)) {
             return Ok(Vec::new());
         }
         if !self.proven.contains_key(&subject) {
@@ -15887,7 +16388,12 @@ impl Hand {
             }
             let frames: Vec<Vec<u8>> = body.evidence.iter().map(|b| b.to_vec()).collect();
             match self.judge_evidence(body.cause, &frames, subject) {
-                Judged::Proven => self.note_proven(subject, body.cause, frames),
+                Judged::Proven => {
+                    if body.cause == CAUSE_EQUIVOCATION {
+                        self.keep_pair(subject, &frames);
+                    }
+                    self.note_proven(subject, body.cause, frames)
+                }
                 Judged::Holds => {
                     return Err(Failed::Elsewhere {
                         seat: voter,
@@ -16138,6 +16644,22 @@ impl Hand {
         if control("s1kr") {
             return Ok(Vec::new());
         }
+        // `G11` (`REVIEW_G11_v4` S1): a carried cause-10 vote's pair is recorded
+        // here too, once a voter, whatever this client holds the subject by.
+        for (voter, _, cause, frames) in &carried {
+            if *cause == CAUSE_EQUIVOCATION && !self.pairs.contains_key(&subject) && !self.pair_judged.contains(&(*voter, subject)) {
+                match self.judge_evidence(CAUSE_EQUIVOCATION, frames, subject) {
+                    Judged::Proven => {
+                        self.pair_judged.insert((*voter, subject));
+                        self.keep_pair(subject, frames);
+                    }
+                    Judged::Unjudgeable => {}
+                    _ => {
+                        self.pair_judged.insert((*voter, subject));
+                    }
+                }
+            }
+        }
         // **Judged here, or nothing.** Not on the voters' word: two rogues can
         // sign a certificate about anybody, and only frames prove. One set that
         // proves the subject here is enough; one that cannot be judged yet holds
@@ -16160,6 +16682,9 @@ impl Hand {
                 }
                 match self.judge_evidence(*cause, frames, subject) {
                     Judged::Proven => {
+                        if *cause == CAUSE_EQUIVOCATION {
+                            self.keep_pair(subject, frames);
+                        }
                         self.note_proven(subject, *cause, frames.clone());
                         unjudgeable = false;
                         refused = None;
@@ -21473,7 +21998,8 @@ mod tests {
 
     /// `S1-KT`: **a seat the illegal action never reached judges it from the
     /// vote** -- at its own record of a stage it has left, the rogue's legal
-    /// action having moved the hand on -- and banks.
+    /// action having moved the hand on -- and banks. (`G11`: the seat that saw
+    /// the check sees no call, which beside it would be two versions.)
     #[test]
     fn a_seat_the_illegal_action_never_reached_judges_it_from_the_vote() {
         let (mut hands, keys, _) = n_seats_to_the_bet(3);
@@ -21483,10 +22009,8 @@ mod tests {
         let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
         let _ = hands[a].on_event(&check, &keys[a], NOW);
         assert!(hands[a].proven.contains_key(&(rogue as u8)), "seat {a} proves it");
-        for s in [a, b] {
-            hands[s].on_event(&call, &keys[s], NOW).expect("the rogue's legal call");
-            assert_ne!(seat_to_act(std::slice::from_ref(&hands[s])), rogue, "seat {s}: the hand moved on");
-        }
+        hands[b].on_event(&call, &keys[b], NOW).expect("the rogue's legal call");
+        assert_ne!(seat_to_act(std::slice::from_ref(&hands[b])), rogue, "seat {b}: the hand moved on");
         assert!(hands[b].proven.is_empty(), "seat {b} never saw the check");
         let mut refused = Vec::new();
         tick_votes(&mut hands, &keys, &mut refused);
@@ -21512,10 +22036,9 @@ mod tests {
         let fold = action_frame(&hands[actor], &keys[actor], EventType::ActionFold);
         hands[judge].on_event(&call, &keys[judge], NOW).expect("a legal call");
         let _ = hands[judge].on_event(&call, &keys[judge], NOW);
-        let _ = hands[judge].on_event(&fold, &keys[judge], NOW);
         assert_eq!(hands[judge].judge_action(&fold, actor as u8), Judged::Holds, "a fold is legal at the seat's turn");
         assert_eq!(hands[judge].judge_action(&call, actor as u8), Judged::Holds);
-        assert!(hands[judge].proven.is_empty(), "nothing proven");
+        assert!(hands[judge].proven.is_empty(), "nothing proven: a copy is no second version");
         let anchor = hands[judge].anchor();
         let slot = hands[judge].slot().at(cheat_sequence(actor as u8).unwrap(), anchor);
         let v = CheatVote {
@@ -21528,6 +22051,366 @@ mod tests {
         let err = hands[judge].on_event(&vote, &keys[judge], NOW).expect_err("its frame holds here");
         assert!(matches!(&err, Failed::Elsewhere { what, .. } if what.contains("failed at this client")), "{err}");
         assert!(hands[judge].cheat_out().is_empty());
+        // `G11`: the fold beside the call taken at that very slot is another
+        // version -- two versions (`D-100`), whatever the rules say of either.
+        let _ = hands[judge].on_event(&fold, &keys[judge], NOW);
+        assert_eq!(hands[judge].proven.get(&(actor as u8)).map(|p| p.cause), Some(CAUSE_EQUIVOCATION));
+    }
+
+    /// `G11` (`D-100`): **two versions of one betting action -- a call to one
+    /// seat, a fold to the other, both signed at the rogue's own turn -- prove it
+    /// at both**, once each hears the other's version said again (`S1-KB`), and
+    /// the band puts it out of the table for good.
+    #[test]
+    fn two_versions_of_an_action_put_the_writer_out() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let (a, b) = ((rogue + 1) % 3, (rogue + 2) % 3);
+        let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
+        let fold = action_frame(&hands[rogue], &keys[rogue], EventType::ActionFold);
+        hands[a].on_event(&call, &keys[a], NOW).expect("seat a takes the call");
+        hands[b].on_event(&fold, &keys[b], NOW).expect("seat b takes the fold");
+        let err = hands[a].on_event(&fold, &keys[a], NOW).expect_err("another version");
+        assert!(matches!(err, Failed::Equivocation { .. }), "{err}");
+        let err = hands[b].on_event(&call, &keys[b], NOW).expect_err("another version");
+        assert!(matches!(err, Failed::Equivocation { .. }), "{err}");
+        for s in [a, b] {
+            let p = hands[s].proven.get(&(rogue as u8)).expect("proven");
+            assert_eq!(p.cause, CAUSE_EQUIVOCATION, "seat {s}");
+            assert_eq!(p.frames.len(), 2, "seat {s}: the pair");
+        }
+        assert_eq!(hands[a].proven[&(rogue as u8)].frames, hands[b].proven[&(rogue as u8)].frames, "one pair, one order");
+        let mut refused = Vec::new();
+        tick_votes(&mut hands, &keys, &mut refused);
+        for s in [a, b] {
+            assert_eq!(hands[s].cheat_out(), vec![rogue as u8], "seat {s}: out of the table for good: {refused:?}");
+        }
+        assert!(hands[rogue].cheat_out().is_empty(), "the rogue banks nothing about itself");
+    }
+
+    /// `G11`: **a frame twice is no pair** -- the same bytes again, at the stage
+    /// and after it -- and a frame at another parent of the same sequence is
+    /// another branch, never a version.
+    #[test]
+    fn a_copy_or_another_branch_is_no_pair() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let actor = seat_to_act(&hands);
+        let judge = (actor + 1) % 3;
+        let call = action_frame(&hands[actor], &keys[actor], EventType::ActionCall);
+        hands[judge].on_event(&call, &keys[judge], NOW).expect("a legal call");
+        let _ = hands[judge].on_event(&call, &keys[judge], NOW);
+        let mut at = slot_of(&call, EventType::ActionCall);
+        at.previous_event_hash[0] ^= 1;
+        let head = head_of(&hands[actor]);
+        let elsewhere = chained::seal(EventType::ActionFold, &at, &head, &keys[actor], NOW, 30_000, ACTION_CAP).unwrap();
+        let _ = hands[judge].on_event(&elsewhere, &keys[judge], NOW);
+        assert!(hands[judge].proven.is_empty(), "nothing proven");
+        assert!(matches!(
+            hands[judge].judge_equivocation(&[call.clone(), elsewhere.clone()], actor as u8),
+            Judged::NotEvidence(_)
+        ));
+        assert!(matches!(hands[judge].judge_equivocation(&[call.clone(), call.clone()], actor as u8), Judged::NotEvidence(_)));
+        let fold = action_frame(&hands[actor], &keys[actor], EventType::ActionFold);
+        assert_eq!(hands[judge].judge_equivocation(&[call.clone(), fold.clone()], actor as u8), Judged::Proven, "a pair");
+        assert!(
+            matches!(hands[judge].judge_equivocation(&[call.clone(), fold], judge as u8), Judged::NotEvidence(_)),
+            "not the signer"
+        );
+        let _ = elsewhere;
+    }
+
+    /// `G11` (`REFUTE_G11_v2` M2): **a version over its kind's ceiling switches
+    /// nothing off** -- seen first at a stage left, it marks nothing, and the
+    /// true second version still proves its writer.
+    #[test]
+    fn an_over_ceiling_version_switches_nothing_off() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let judge = (rogue + 1) % 3;
+        let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
+        let fold = action_frame(&hands[rogue], &keys[rogue], EventType::ActionFold);
+        let at = slot_of(&call, EventType::ActionCall);
+        let fat: Vec<u8> = vec![7; 900];
+        let over = chained::seal(EventType::ActionCall, &at, &minicbor::bytes::ByteVec::from(fat), &keys[rogue], NOW, 30_000, 2_048)
+            .unwrap();
+        assert!(over.len() > frame_ceiling(EventType::ActionCall), "{} bytes", over.len());
+        hands[judge].on_event(&call, &keys[judge], NOW).expect("the call");
+        let _ = hands[judge].on_event(&over, &keys[judge], NOW);
+        assert!(hands[judge].proven.is_empty(), "an over-ceiling frame proves nothing");
+        let err = hands[judge].on_event(&fold, &keys[judge], NOW).expect_err("the true second version");
+        assert!(matches!(err, Failed::Equivocation { .. }), "{err}");
+        assert_eq!(hands[judge].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_EQUIVOCATION));
+    }
+
+    /// `G11` (`REFUTE_G11_v2` S2): **a deck key signed twice is a pair** -- the
+    /// second copy of seat 0's `DECK_INIT`, the same key stamped anew, which the
+    /// deck stage refuses as a key already seated before it hears it.
+    #[test]
+    fn a_deck_key_signed_twice_is_a_pair() {
+        let (mut hands, keys, pending) = cheat_table(3);
+        let first: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+        // Seat 2's key never reaches seat 1, whose deck stage stays open: the
+        // second copy meets the live site, a key already seated.
+        let route = |from: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if from == 0 && to == 1 && is_kind(b, EventType::DeckInit) && first.borrow().is_none() {
+                *first.borrow_mut() = Some(b.to_vec());
+            }
+            if from == 2 && to == 1 && is_kind(b, EventType::DeckInit) {
+                return None;
+            }
+            Some(b.to_vec())
+        };
+        let mut refused = Vec::new();
+        pump_cheat(&mut hands, &keys, pending, &route, &mut refused);
+        let deck0 = first.borrow().clone().expect("seat 0's deck key");
+        let at = slot_of(&deck0, EventType::DeckInit);
+        let opened = chained::open(&deck0, FRAME_CAP, EventType::DeckInit, &at).unwrap();
+        let body: DeckInit = chained::payload(&opened, DECK_INIT_CAP).unwrap();
+        let again = chained::seal(EventType::DeckInit, &at, &body, &keys[0], NOW + 1, 30_000, DECK_INIT_CAP).unwrap();
+        assert_ne!(chained::event_hash_of(&again, FRAME_CAP), chained::event_hash_of(&deck0, FRAME_CAP));
+        assert!(matches!(hands[1].phase, Phase::Deck { .. }), "seat 1's deck stage is open");
+        let err = hands[1].on_event(&again, &keys[1], NOW + 2).expect_err("a key already seated");
+        assert!(matches!(err, Failed::BadKey { .. }), "{err}");
+        assert_eq!(hands[1].proven.get(&0).map(|p| p.cause), Some(CAUSE_EQUIVOCATION), "{refused:?}");
+    }
+
+    /// `G11` (`REFUTE_G11_v3` M1, M2): **a turn split by two versions ends at
+    /// both halves on the abort terminal, nobody certified** -- each half holds
+    /// the pair (`S1-KB` says each version to the other), abstains from every
+    /// round about the other honest seat, and gives the hand up long past the
+    /// turn -- never before, and not at the hand's whole budget.
+    #[test]
+    fn a_split_turn_ends_with_nobody_certified() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
+        let fold = action_frame(&hands[rogue], &keys[rogue], EventType::ActionFold);
+        let honest: Vec<usize> = (0..3).filter(|s| *s != rogue).collect();
+        let (a, b) = (honest[0], honest[1]);
+        hands[a].on_event(&call, &keys[a], NOW).expect("a takes the call");
+        hands[b].on_event(&fold, &keys[b], NOW).expect("b takes the fold");
+        let _ = hands[a].on_event(&fold, &keys[a], NOW);
+        let _ = hands[b].on_event(&call, &keys[b], NOW);
+        // Whoever's turn it is on its own half plays it: the halves then wait on
+        // each other.
+        for s in [a, b] {
+            if let Some(turn) = hands[s].turn().filter(|t| usize::from(t.seat) == s) {
+                let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+                hands[s].act(action, &keys[s], NOW + 1_000).expect("its own turn");
+            }
+        }
+        for s in [a, b] {
+            let other = if s == a { b } else { a };
+            assert!(hands[s].pairs.contains_key(&(rogue as u8)), "seat {s} holds the pair");
+            assert!(hands[s].abstains_about(&[other as u8]), "seat {s} abstains about seat {other}");
+            assert!(!hands[s].abstains_about(&[rogue as u8]), "seat {s} still votes about the rogue");
+            assert!(!hands[s].certificate_possible(), "seat {s}: no certificate about the other half");
+        }
+        for s in [a, b] {
+            let other = if s == a { b } else { a };
+            let owed = hands[s].owed_type().expect("a stage owed");
+            let past = 2 * u64::from(hands[s].next_deadline_for(owed)) + 1_000;
+            assert!(past < u64::from(hands[s].open.hand_deadline_ms), "long past the turn comes before the hand's budget");
+            for at in [NOW + 30_000, NOW + past - 2_000] {
+                let _ = hands[s].vote_on_timeouts(&keys[s], at, 0).unwrap();
+                assert!(!hands[s].voted_about.contains(&(other as u8)), "seat {s}: no vote about seat {other}");
+                assert!(!hands[s].may_abandon(at), "seat {s}: not given up at {} s", (at - NOW) / 1000);
+            }
+            assert!(hands[s].may_abandon(NOW + past + 1_000), "seat {s}: given up long past the turn");
+        }
+        // `REVIEW_G11_v4` M2: one half gives up -- here early, as a half waiting
+        // at a cryptographic stage does at its budget -- and the other takes that
+        // abort at once, long before its own give-up at the turn: neither opens the
+        // next hand while the other still stands in this one.
+        let sends = hands[a].abort_now(Abort::Told { cause: 1 }, &keys[a], NOW + 2_000).expect("given up");
+        for bytes in bytes_of(&sends) {
+            let _ = hands[b].on_event(&bytes, &keys[b], NOW + 2_100);
+        }
+        for s in [a, b] {
+            assert!(hands[s].over(), "seat {s}: the hand is over");
+            assert!(hands[s].certified.is_empty(), "seat {s}: nobody certified");
+        }
+        assert!(hands[a].terminal().is_some());
+        assert_eq!(hands[a].terminal(), hands[b].terminal(), "one terminal at both halves");
+    }
+
+    /// `G11` (`REFUTE_G11_v3` M1): **a seat steered to another cause first
+    /// still holds the pair and abstains** -- the rogue's illegal check facing
+    /// the bet, then its legal call: the pair is recorded whatever proved the
+    /// rogue first here.
+    #[test]
+    fn a_steered_cause_still_holds_the_pair() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        assert!(hands[rogue].turn().unwrap().to_call > 0, "facing the big blind");
+        let judge = (rogue + 1) % 3;
+        let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
+        let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
+        let _ = hands[judge].on_event(&check, &keys[judge], NOW);
+        assert_eq!(hands[judge].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_ACTION), "proven of the check first");
+        // Its vote of that cause goes before the call: the cause stays.
+        let first_votes = hands[judge].vote_on_cheats(&keys[judge], NOW).unwrap();
+        assert!(!first_votes.is_empty(), "the vote about the check went");
+        let _ = hands[judge].on_event(&call, &keys[judge], NOW);
+        assert_eq!(hands[judge].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_ACTION), "the voted cause stays");
+        assert!(hands[judge].pairs.contains_key(&(rogue as u8)), "and the pair recorded beside it");
+        let third = (rogue + 2) % 3;
+        assert!(hands[judge].abstains_about(&[third as u8]));
+        assert_eq!(hands[judge].proven_seats(), vec![(rogue as u8, CAUSE_EQUIVOCATION)], "told as two versions");
+        // `REVIEW_G11_v4` S1: and the pair is said once, as a cause-10 vote, which
+        // the third seat records though it holds this voter's first vote already.
+        let mut held = Vec::new();
+        for b in bytes_of(&first_votes) {
+            let _ = hands[third].on_event(&b, &keys[third], NOW);
+            held.push(b);
+        }
+        let pair_votes = hands[judge].vote_on_cheats(&keys[judge], NOW + 1_000).unwrap();
+        let pair_vote = bytes_of(&pair_votes).into_iter().find(|b| is_kind(b, EventType::CheatVote)).expect("the pair as a vote");
+        assert!(!held.contains(&pair_vote), "another vote than the first");
+        let _ = hands[third].on_event(&pair_vote, &keys[third], NOW + 1_000);
+        assert!(hands[third].pairs.contains_key(&(rogue as u8)), "the third seat holds the pair");
+        assert!(bytes_of(&hands[judge].vote_on_cheats(&keys[judge], NOW + 2_000).unwrap()).iter().all(|b| b != &pair_vote), "said once");
+    }
+
+    /// `G11` (`REFUTE_G11_v3` S1): **an opening proves only where it names the
+    /// armed engine** -- two openings of another engine's at one genesis prove
+    /// nothing (a mixed table's unarmed seat may sign its opening twice across a
+    /// restart); two of the armed engine's do.
+    #[test]
+    fn an_opening_pair_proves_only_under_the_armed_engine() {
+        let (hands, keys, _) = n_seats_to_the_bet(3);
+        let at = hands[0].slot().at(0, hands[0].open.genesis);
+        let mut theirs = hands[1].mine.clone();
+        let armed = |n: u64| chained::seal(EventType::HandInit, &at, &theirs, &keys[1], NOW + n, 30_000, HAND_INIT_CAP).unwrap();
+        let pair = [armed(1), armed(2)];
+        assert_eq!(hands[0].judge_equivocation(&pair, 1), Judged::Proven, "two armed openings at one genesis");
+        theirs.engine = [9; 32];
+        let other = |n: u64| chained::seal(EventType::HandInit, &at, &theirs, &keys[1], NOW + n, 30_000, HAND_INIT_CAP).unwrap();
+        assert!(matches!(hands[0].judge_equivocation(&[other(1), other(2)], 1), Judged::NotEvidence(_)));
+    }
+
+    /// `G11` (`REVIEW_G11_v4` M1): **a pair about a seat outside the hand moves
+    /// nothing** -- not proven, not recorded, and no abstention or give-up rests
+    /// on it (a busted seat's key stays in the roster).
+    #[test]
+    fn a_pair_about_a_seat_outside_the_hand_moves_nothing() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let at = hands[0].slot().at(0, hands[0].open.genesis);
+        let body = hands[2].mine.clone();
+        let opening = |n: u64| chained::seal(EventType::HandInit, &at, &body, &keys[2], NOW + n, 30_000, HAND_INIT_CAP).unwrap();
+        let pair = vec![opening(1), opening(2)];
+        hands[0].open.required.retain(|s| *s != 2);
+        hands[0].mine.dealt_in.retain(|s| *s != 2);
+        assert!(matches!(hands[0].judge_equivocation(&pair, 2), Judged::NotEvidence(_)));
+        hands[0].keep_pair(2, &pair);
+        assert!(hands[0].pairs.is_empty(), "no pair recorded");
+        assert!(!hands[0].holds_a_proven_pair());
+        assert!(!hands[0].abstains_about(&[1]));
+    }
+
+    /// `G11` (`REVIEW_G11_v4b` M2'): **a pair-holder waits for no round** --
+    /// its turn waiting on the proven seat alone, where a certificate about it
+    /// looks possible here, it still takes an honest seat's bare abort at once and
+    /// gives the turn up long past the stage; never an abort from the rogue or
+    /// from a key outside the hand.
+    #[test]
+    fn a_pair_holder_waits_for_no_round() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let (a, b) = ((rogue + 1) % 3, (rogue + 2) % 3);
+        let at = hands[a].slot().at(0, hands[a].open.genesis);
+        let body = hands[rogue].mine.clone();
+        let opening = |n: u64| chained::seal(EventType::HandInit, &at, &body, &keys[rogue], NOW + n, 30_000, HAND_INIT_CAP).unwrap();
+        for s in [a, b] {
+            assert!(hands[s].prove_equivocation(rogue as u8, opening(1), opening(2)), "seat {s} pairs the rogue's openings");
+            assert!(hands[s].holds_a_proven_pair());
+        }
+        assert!(hands[a].certificate_possible(), "the turn waits on the rogue alone: a certificate looks possible here");
+        assert!(hands[a].split_abort_from(b as u8), "an honest seat's bare abort is taken at once all the same");
+        assert!(!hands[a].split_abort_from(rogue as u8), "never the rogue's");
+        let required = hands[a].open.required.clone();
+        hands[a].open.required.retain(|s| *s != b as u8);
+        assert!(!hands[a].split_abort_from(b as u8), "never a key outside the hand");
+        hands[a].open.required = required;
+        let owed = hands[a].owed_type().unwrap();
+        let past = 2 * u64::from(hands[a].next_deadline_for(owed));
+        assert!(hands[a].may_abandon(NOW + past + 1_000), "the turn given up long past the stage");
+        let sends = hands[b].abort_now(Abort::Told { cause: 1 }, &keys[b], NOW + 1_000).unwrap();
+        for bytes in bytes_of(&sends) {
+            let _ = hands[a].on_event(&bytes, &keys[a], NOW + 1_100);
+        }
+        assert!(hands[a].over(), "seat {a} took seat {b}'s abort at once");
+    }
+
+    /// `G11` (`REVIEW_G11_v4` M3): **a junk frame first switches nothing off**
+    /// -- a frame of the opening's kind signed at the rogue's turn, refused by the
+    /// betting stage, is kept as nobody's first: the two versions after it still
+    /// prove the rogue.
+    #[test]
+    fn a_junk_frame_first_switches_nothing_off() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let rogue = seat_to_act(&hands);
+        let judge = (rogue + 1) % 3;
+        let call = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCall);
+        let fold = action_frame(&hands[rogue], &keys[rogue], EventType::ActionFold);
+        let at = slot_of(&call, EventType::ActionCall);
+        let junk = chained::seal(EventType::HandInit, &at, &head_of(&hands[rogue]), &keys[rogue], NOW, 30_000, HAND_INIT_CAP).unwrap();
+        let _ = hands[judge].on_event(&junk, &keys[judge], NOW);
+        assert!(hands[judge].proven.is_empty(), "junk proves nothing alone");
+        hands[judge].on_event(&call, &keys[judge], NOW).expect("the call");
+        let _ = hands[judge].on_event(&fold, &keys[judge], NOW);
+        assert_eq!(hands[judge].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_EQUIVOCATION), "the pair proves it");
+        assert!(hands[judge].pairs.contains_key(&(rogue as u8)));
+    }
+
+    /// `G11` (`REVIEW_G11_v4` M3): **an opening of another engine first switches
+    /// nothing off at stage 0** -- kept as nobody's first; the armed opening and a
+    /// second armed one prove the seat.
+    #[test]
+    fn an_opening_of_another_engine_first_switches_nothing_off() {
+        let (mut hands, keys, _pending) = cheat_table(3);
+        let at = hands[0].slot().at(0, hands[0].open.genesis);
+        let mut wrong = hands[1].mine.clone();
+        wrong.engine = [9; 32];
+        let junk = chained::seal(EventType::HandInit, &at, &wrong, &keys[1], NOW, 30_000, HAND_INIT_CAP).unwrap();
+        let _ = hands[0].on_event(&junk, &keys[0], NOW);
+        assert!(hands[0].first_frames.is_empty(), "an opening of another engine is nobody's first");
+        let real = hands[1].mine.clone();
+        let one = chained::seal(EventType::HandInit, &at, &real, &keys[1], NOW + 1, 30_000, HAND_INIT_CAP).unwrap();
+        let two = chained::seal(EventType::HandInit, &at, &real, &keys[1], NOW + 2, 30_000, HAND_INIT_CAP).unwrap();
+        let _ = hands[0].on_event(&one, &keys[0], NOW + 1);
+        let _ = hands[0].on_event(&two, &keys[0], NOW + 2);
+        assert!(hands[0].pairs.contains_key(&1), "two armed openings at one genesis: the pair");
+    }
+
+    /// `G11` (`REFUTE_G11_v2` M4): **a vote carrying two frames of the largest
+    /// kind reaches the band** -- above `FRAME_CAP`, opened at its own ceiling,
+    /// held early at its own ceiling: judged (here: nothing), never refused as
+    /// a malformed frame.
+    #[test]
+    fn a_pair_vote_above_the_frame_cap_reaches_the_band() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        let anchor = hands[0].anchor();
+        let subject: SeatIdx = 1;
+        let slot = hands[0].slot().at(cheat_sequence(subject).unwrap(), anchor);
+        let big = SHUFFLE_PROOF_CAP + ENVELOPE_MAX;
+        let v = CheatVote {
+            subject_seat: subject,
+            anchor,
+            cause: CAUSE_EQUIVOCATION,
+            evidence: vec![vec![7u8; big].into(), vec![8u8; big].into()],
+        };
+        let vote = chained::seal(EventType::CheatVote, &slot, &v, &keys[2], NOW, 30_000, CHEAT_PAIR_VOTE_CAP).unwrap();
+        assert!(vote.len() > FRAME_CAP, "{} bytes", vote.len());
+        assert!(vote.len() <= frame_ceiling(EventType::CheatVote));
+        let r = hands[0].on_event(&vote, &keys[0], NOW);
+        assert!(!matches!(r, Err(Failed::Wire(_))), "judged, not refused as a frame: {r:?}");
+        assert!(hands[0].pair_judged.contains(&(2, subject)), "its pair judged");
+        assert!(hands[0].pairs.is_empty(), "junk frames prove nothing");
+        // A vote of another cause over its own cap is refused.
+        let fat = CheatVote { cause: CAUSE_ACTION, ..v };
+        let fat = chained::seal(EventType::CheatVote, &slot, &fat, &keys[2], NOW, 30_000, CHEAT_PAIR_VOTE_CAP).unwrap();
+        assert!(matches!(hands[0].on_event(&fat, &keys[0], NOW), Err(Failed::Elsewhere { .. })));
     }
 
     /// `S1-KT`: an action signed at another parent -- another branch of the
@@ -21653,7 +22536,9 @@ mod tests {
         assert!(hands[3].proven.is_empty(), "the state hash alone proves nothing");
         assert!(hands[3].over(), "seat 3 closed on it");
         let _ = hands[3].on_event(&bad, &keys[3], NOW);
-        assert_eq!(hands[3].proven.get(&2).map(|p| p.cause), Some(CAUSE_MONEY), "proven at the stage left");
+        // `G11`: beside the copy it took, two versions at one slot.
+        assert_eq!(hands[3].proven.get(&2).map(|p| p.cause), Some(CAUSE_EQUIVOCATION), "proven at the stage left");
+        assert_eq!(hands[3].judge_money(&bad, 2), Judged::Proven, "and its money is false");
         assert_eq!(hands[0].stacks(), hands[1].stacks(), "one money");
         assert_eq!(hands[0].stacks(), hands[3].stacks(), "one money");
         for to in [0usize, 1, 3] {
@@ -21738,7 +22623,11 @@ mod tests {
         let _ = hands[0].on_event(&honest, &keys[0], NOW);
         assert!(hands[0].proven.is_empty(), "its honest copy proves nothing");
         let _ = hands[0].on_event(&bad, &keys[0], NOW);
-        assert_eq!(hands[0].proven.get(&2).map(|p| p.cause), Some(CAUSE_MONEY), "the second version is proven");
+        // `G11`: two versions at one slot -- preferred while no vote went -- and
+        // a false settlement besides.
+        assert_eq!(hands[0].proven.get(&2).map(|p| p.cause), Some(CAUSE_EQUIVOCATION), "the second version is proven");
+        assert!(hands[0].pairs.contains_key(&2));
+        assert_eq!(hands[0].judge_money(&bad, 2), Judged::Proven, "and its money is false");
     }
 
     /// `G9`: **the late road is judged, against this client's own body only**
@@ -21964,13 +22853,10 @@ mod tests {
         let check = action_frame(&hands[rogue], &keys[rogue], EventType::ActionCheck);
         hands[judge].on_event(&call, &keys[judge], NOW).expect("the call");
         let _ = hands[judge].on_event(&fold, &keys[judge], NOW);
-        assert!(hands[judge].proven.is_empty(), "a legal version proves nothing");
+        // `G11`: a legal second version is two versions at one slot.
+        assert_eq!(hands[judge].proven.get(&(rogue as u8)).map(|p| p.cause), Some(CAUSE_EQUIVOCATION));
         let _ = hands[judge].on_event(&check, &keys[judge], NOW);
-        assert_eq!(
-            hands[judge].proven.get(&(rogue as u8)).map(|p| p.cause),
-            Some(CAUSE_ACTION),
-            "and the check after it is proven all the same"
-        );
+        assert_eq!(hands[judge].judge_action(&check, rogue as u8), Judged::Proven, "and the check after it is illegal all the same");
     }
 
     /// `S1-KT`: **a betting stage takes a betting action and nothing else** --
