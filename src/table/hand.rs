@@ -10158,12 +10158,44 @@ impl Hand {
         self.late.as_ref().is_some_and(|l| l.closed.is_some())
     }
 
+    /// `S1-LA` (`REVIEW_S1LA_S1LN` A-H1; `S1-LF` v7 rule 12): whether this hand
+    /// closed late on a settlement this client did not settle itself -- a body
+    /// borrowed from the required seats' copies. Its own chain stopped where it
+    /// gave the hand up, so the sets the table applied after (or one it applied
+    /// that the table's chain did not) are not the settlement's: its `R(k+1)`
+    /// is no reading of the table's, and the node takes the table's next hand
+    /// from its copies instead of deriving one.
+    pub fn closed_on_a_borrowed_settlement(&self) -> bool {
+        self.late.as_ref().is_some_and(|l| l.closed.is_some() && !l.own)
+    }
+
+    /// `S1-LA` (`REVIEW_S1LA_S1LN` v2): whether fewer than two seats hold chips
+    /// at this hand's terminal -- the settled stacks, a borrowed body's too,
+    /// before a word for good takes any seat's. No reading of the certificates
+    /// then gives a next hand at any seat: the tournament is over by the table's
+    /// own figures, and a client that derives nothing need wait for no copies.
+    pub fn fewer_than_two_hold_chips(&self) -> bool {
+        self.boundary_stacks().iter().filter(|c| **c > 0).count() < 2
+    }
+
     /// `S1-LF`: whether this hand, given up while it was settling, may still be
     /// closed by a late settlement -- its terminal is not final until the deal:
     /// a word for good given now could speak for an abort the late close takes
     /// back (`S1-LF` rule 7). Never in the control build.
+    ///
+    /// `S1-LA` (`REVIEW_S1LA_S1LN` v3): and a hand a seat outside `required`
+    /// gave up before any settlement copy came -- the table's settlement closes
+    /// it late on the required seats alone (`on_late_settlement`), so the first
+    /// copy may still come and take the abort back. A seat of `required` that
+    /// gave up before settling closes on no borrowed body but its own earlier
+    /// life's, which opens the late stage as it comes.
     pub fn late_close_open(&self) -> bool {
-        !control("s1lf") && self.aborted().is_some() && self.late.as_ref().is_some_and(|l| l.closed.is_none())
+        !control("s1lf")
+            && self.aborted().is_some()
+            && match self.late.as_ref() {
+                Some(l) => l.closed.is_none(),
+                None => !self.open.required.contains(&self.open.my_seat),
+            }
     }
 
     /// `S1-JR`: whether a certificate ended this hand -- the table settled it.
@@ -12029,6 +12061,24 @@ impl Hand {
     /// [`MAX_CONSECUTIVE_AUTO_ACTIONS`] — which decides when a seat sits out.
     fn commit_certificate(&mut self, subject: &CertSubject, raw: Option<Vec<u8>>) {
         self.certifying = None;
+        // `S1-LA` (`REVIEW_S1LA_S1LN` A-H2): the leave words the set's own copies
+        // carry -- one copy a voter, the same copies at every seat whose stage they
+        // completed -- and not the words this client happens to hold just now. The
+        // stage's voters' copies alone (v2): a copy of the set from a seat outside
+        // them is no part of what the stage heard.
+        let set: SetKey = (subject.subject_sequence, subject.parent_event_hash, subject.digest());
+        let stage_voters: Vec<SeatIdx> = self.voters_of(&subject.subject_seats);
+        let carried_leave: BTreeSet<SeatIdx> = self
+            .store
+            .get(&set)
+            .map(|s| {
+                s.copies
+                    .values()
+                    .filter(|c| stage_voters.contains(&c.emitter))
+                    .flat_map(|c| c.resignations.iter().map(|(seat, _)| *seat))
+                    .collect()
+            })
+            .unwrap_or_default();
         for seat in &subject.subject_seats {
             // `D-065`: a silent voter is not heard by being named, and is not
             // struck: its veto goes, and nothing else.
@@ -12049,7 +12099,12 @@ impl Hand {
             if let Some(raw) = raw.as_ref() {
                 self.words.insert(*seat, raw.clone());
             }
-            if self.leave_words.contains_key(seat) {
+            // Out for good by its player's own word only as the set carries it: a
+            // seat holding the word put the leaver out for good where another, the
+            // same certificate applied, marked it absent -- two rosters at one
+            // terminal. The control reads the words held, as before.
+            let left = if control("s1lf") { self.leave_words.contains_key(seat) } else { carried_leave.contains(seat) };
+            if left {
                 self.resigned.insert(*seat);
             }
             match subject.cause_of(*seat) {
@@ -12488,6 +12543,17 @@ impl Hand {
             self.proof = Some((c.event_hash, c.raw.clone()));
         }
         let stage = c.subject.subject_sequence;
+        // `S1-LA` (`REVIEW_S1LA_S1LN` v2, A-H2 at the abort terminal): out by its
+        // player's own word only as the copies of this client's voter set carry the
+        // word -- every seat that holds the set whole holds those -- and not on the
+        // words this client happens to hold, which another may not: the leaver's
+        // chips leave the table where the word is read, and stay where it is not.
+        let v = self.voters_off_position(&c.subject);
+        let carried_leave: BTreeSet<SeatIdx> = copies
+            .iter()
+            .filter(|copy| v.contains(&copy.emitter))
+            .flat_map(|copy| copy.resignations.iter().map(|(seat, _)| *seat))
+            .collect();
         for seat in &c.subject.subject_seats {
             if c.subject.names_silent(*seat) {
                 self.completed.silent.insert((*seat, stage));
@@ -12495,7 +12561,7 @@ impl Hand {
             }
             self.completed.named.insert((*seat, stage));
             self.completed.words.entry(*seat).or_insert_with(|| c.raw.clone());
-            if self.leave_words.contains_key(seat) {
+            if carried_leave.contains(seat) {
                 self.completed.resigned.insert(*seat);
             }
             match c.subject.cause_of(*seat) {
@@ -13166,6 +13232,14 @@ impl Hand {
     /// fixed for a hand; this is what a certificate moves.
     pub fn certified_seats(&self) -> Vec<SeatIdx> {
         self.certified_list()
+    }
+
+    /// `S1-LA` (`REVIEW_S1LA_S1LN` A-M1): the seats the sets the chain applied
+    /// certified out -- what stands whatever ends the hand; the whole sets held
+    /// off position count only at an abort terminal a late settlement may still
+    /// take back.
+    pub fn certified_applied(&self) -> &[SeatIdx] {
+        &self.certified
     }
 
     /// Every input the next hand's roster is derived from, in one line.
@@ -15700,8 +15774,10 @@ impl Hand {
     /// the majority from is kept out all the same, by D-032's limit, the flood
     /// meters or the proof checks of the seats that named it.
     pub fn out_for_good_decided(&self) -> Vec<SeatIdx> {
-        // `S1-LF`: not while a late settlement may still close the hand.
-        if self.over() && !self.late_close_open() {
+        // `S1-LF`: not while a late settlement may still close the hand -- and
+        // `S1-LA`: never on a borrowed settlement's own sets, which decide
+        // nothing (`S1-LF` v7 rule 12): the table's next hand says it.
+        if self.over() && !self.late_close_open() && !self.closed_on_a_borrowed_settlement() {
             self.out_for_good()
         } else {
             self.open.out.clone()
@@ -18369,6 +18445,9 @@ mod tests {
 
         // (ii) The peers AGREE: the same body twice, and the seat follows it.
         let mut h = fresh();
+        // `S1-LA` (`REVIEW_S1LA_S1LN` v3): before the first copy, the table's
+        // settlement may still close it -- no word for good meanwhile.
+        assert!(h.late_close_open(), "a seat outside required that gave the hand up, no copy yet");
         assert_eq!(h.on_event(&sealed(&key(10), &a), &key(12), NOW), Ok(Vec::new()));
         assert_eq!(h.on_event(&sealed(&key(11), &a), &key(12), NOW), Ok(Vec::new()));
         let late = h.late.as_ref().expect("held");
@@ -18392,6 +18471,10 @@ mod tests {
             )),
             "and the settlement wins over the abort, exactly as before"
         );
+        // `S1-LA`: closed on a body it did not settle -- its own sets decide
+        // nobody out for good; the table's next hand says it.
+        assert!(!h.late_close_open() && h.closed_on_a_borrowed_settlement());
+        assert_eq!(h.out_for_good_decided(), h.open.out);
     }
 
     /// Batch 4 (`D-102`), R7: **a borrowed late settlement never takes this
@@ -18847,6 +18930,163 @@ mod tests {
         let ob2 = hands[1].next_hand().expect("re-derived");
         assert_eq!(ob2.required, vec![0, 1, 2, 3]);
         assert_eq!(ob2.genesis, oa.genesis, "the table's genesis, from the whole set");
+    }
+
+    /// `S1-LA` (`REVIEW_S1LA_S1LN` v2, A-L1), at a betting stage. Four seats at
+    /// the first bet, the seat to act quiet past its turn; the other three vote
+    /// about it, and every copy they seal is held back. The seat acts after all
+    /// and its action is taken everywhere; then the copies come -- the set is
+    /// whole at every seat, off position, while the hand goes on -- and the hand
+    /// is played to its settlement. A set whole off position counts only at an
+    /// abort terminal (`D-099` point 2): every seat opens hand 2 with that seat
+    /// in it, at one genesis, with no strike. Before `S1-LF` each voter banked
+    /// its own copy as it sealed it and dealt hand 2 without the seat (the
+    /// control `s1lf` keeps that road, and fails here).
+    #[test]
+    fn a_whole_set_about_a_seat_that_acted_moves_no_roster_at_the_settlement() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(4);
+        let quiet = hands.iter().find_map(|h| h.turn()).map(|t| usize::from(t.seat)).expect("a seat to act");
+        let voters: Vec<usize> = (0..4).filter(|s| *s != quiet).collect();
+        let t1 = NOW + 300_000;
+        let held = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        let hold_certs = |_: usize, _: usize, b: &[u8]| -> Option<Vec<u8>> {
+            if is_kind(b, EventType::TimeoutCert) {
+                held.borrow_mut().push(b.to_vec());
+                None
+            } else {
+                Some(b.to_vec())
+            }
+        };
+        let mut refused = Vec::new();
+        let votes: Vec<(usize, Vec<Send>)> =
+            voters.iter().map(|&s| (s, hands[s].vote_on_timeouts(&keys[s], t1, 0).unwrap())).collect();
+        assert!(votes.iter().all(|(_, v)| !v.is_empty()), "every voter votes about seat {quiet}");
+        pump_cheat_at(&mut hands, &keys, votes, &hold_certs, &mut refused, t1);
+        assert!(!held.borrow().is_empty(), "the voters sealed");
+        for (i, h) in hands.iter().enumerate() {
+            assert!(h.took_part(quiet as SeatIdx), "seat {i}: seat {quiet} still in the hand -- no voter took it out on its own copy");
+        }
+        // The quiet seat acts after all, and its action is taken everywhere.
+        let turn = hands[quiet].turn().expect("still its turn");
+        let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+        let sends = hands[quiet].act(action, &keys[quiet], t1).unwrap();
+        pump_cheat_at(&mut hands, &keys, vec![(quiet, sends)], &hold_certs, &mut refused, t1);
+        // Then the copies: the set is whole at every seat, off position.
+        let copies: Vec<Vec<u8>> = std::mem::take(&mut *held.borrow_mut());
+        for (to, h) in hands.iter_mut().enumerate() {
+            for c in &copies {
+                let _ = h.on_event(c, &keys[to], t1 + 1_000);
+            }
+            let _ = h.replay_early(&keys[to], t1 + 1_000);
+            assert!(!h.take_newly_whole().is_empty(), "seat {to}: the set is whole here");
+            assert!(h.aborted().is_none(), "seat {to}: and the hand goes on");
+        }
+        // And the hand is played to its settlement.
+        for _ in 0..64 {
+            if hands.iter().all(|h| h.betting_over()) {
+                break;
+            }
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], t1).unwrap();
+            pump_cheat_at(&mut hands, &keys, vec![(s, sends)], &hold_certs, &mut refused, t1);
+        }
+        for (i, h) in hands.iter().enumerate() {
+            assert!(h.betting_over() && h.checkpoint8().is_some(), "seat {i} settled: {refused:?}");
+            assert!(h.took_part(quiet as SeatIdx), "seat {i}: seat {quiet} played the hand");
+        }
+        let next: Vec<Opening> = hands.iter().map(|h| h.next_hand().expect("a successor")).collect();
+        for (i, o) in next.iter().enumerate() {
+            assert_eq!(o.required, vec![0, 1, 2, 3], "seat {i}: seat {quiet} stays in R(k+1)");
+            assert_eq!(o.genesis, next[0].genesis, "seat {i}: one genesis");
+            assert_eq!(hands[i].strikes_against(quiet as SeatIdx), 0, "seat {i}: no strike");
+        }
+    }
+
+    /// `S1-LA`, closed by `D-099`: a certificate a voter sealed before its
+    /// subject's late frame was taken -- the stage took the frame, so the chain
+    /// never applied the certificate -- moves no roster at the settled terminal.
+    /// Four seats; seat 3's opening reaches the others late; seats 0 to 2 vote
+    /// about it and seat 0 seals; its copy reaches seats 1 and 3, never seat 2;
+    /// then seat 3's opening comes, the hand is played to its settlement, and
+    /// every seat opens hand 2 with seat 3 in it, at one genesis, with no strike.
+    /// Before `S1-LF` every seat that held a copy banked it and dealt hand 2
+    /// without seat 3 while seat 2 dealt with it: one terminal, two rosters (the
+    /// control `s1lf` keeps that road, and fails here).
+    #[test]
+    fn a_certificate_sealed_before_its_subjects_late_frame_moves_no_roster_at_the_settlement() {
+        let keys: Vec<SigningKey> = (10..14).map(key).collect();
+        let mut hands = Vec::new();
+        let mut inits = Vec::new();
+        for seat in 0..4u8 {
+            let mut o = opening4(seat);
+            o.required = vec![0, 1, 2, 3];
+            let (h, sends) = Hand::open(o, &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(sends);
+        }
+        // Seats 0 to 2 hear one another's openings, not seat 3's.
+        for to in 0..3usize {
+            for from in 0..3usize {
+                if from != to {
+                    let _ = deliver(&mut hands[to], &inits[from], &keys[to]);
+                }
+            }
+            assert_eq!(hands[to].waiting_for(), vec![3], "seat {to} waits for seat 3");
+        }
+        // They vote about seat 3; seat 0 alone holds every vote, and seals.
+        let t1 = NOW + 30_000;
+        let table_id = hands[0].slot().table_id;
+        let votes: Vec<Vec<Send>> = (0..3usize).map(|s| hands[s].vote_on_timeouts(&keys[s], t1, 0).unwrap()).collect();
+        let mut sealed: Vec<Vec<u8>> = Vec::new();
+        for s in 1..3usize {
+            for Send::Broadcast(b) in &votes[s] {
+                for Send::Broadcast(out) in hands[0].on_event(b, &keys[0], t1).unwrap() {
+                    if chained::open_in_hand(&out, FRAME_CAP, EventType::TimeoutCert, &table_id, 1).is_ok() {
+                        sealed.push(out);
+                    }
+                }
+            }
+        }
+        assert_eq!(sealed.len(), 1, "seat 0 sealed its copy on the third vote");
+        assert!(!hands[0].took_part(3) || hands[0].waiting_for() == vec![3], "the certificate stage is not whole: seat 0 still waits");
+        // Its copy reaches seats 1 and 3 -- which take the votes it carries and
+        // seal copies of their own, never delivered: after seat 3's opening, at
+        // this cryptographic stage, they would make the set whole off position
+        // and give hand 1 up -- and not seat 2: the copy lost before the roster
+        // freezes that `S1-LA` needs (`REVIEW_S1LA_S1LN` A-L1). Before `S1-LF`
+        // seats 0, 1 and 3 banked it and dealt hand 2 without seat 3 while seat 2
+        // dealt with it: two rosters at one terminal.
+        for to in [1usize, 3] {
+            let _ = hands[to].on_event(&sealed[0], &keys[to], t1);
+        }
+        // Seat 3's opening comes after all, and the others' reach seat 3.
+        let mut first: Vec<(usize, Vec<Send>)> = Vec::new();
+        for to in 0..3usize {
+            let out = deliver(&mut hands[to], &inits[3], &keys[to]);
+            first.push((to, out));
+        }
+        for from in 0..3usize {
+            let out = deliver(&mut hands[3], &inits[from], &keys[3]);
+            first.push((3, out));
+        }
+        for h in &hands {
+            assert!(h.dealt(), "stage 0 closed with seat 3 everywhere: {:?}", h.waiting_for());
+        }
+        play_out(&mut hands, &keys, &[0, 1, 2, 3], first);
+        for (i, h) in hands.iter().enumerate() {
+            assert!(h.betting_over() && h.checkpoint8().is_some(), "seat {i} settled");
+            assert!(h.took_part(3), "seat {i}: the certificate was never applied on the chain");
+        }
+        let next: Vec<Opening> = hands.iter().map(|h| h.next_hand().expect("a successor")).collect();
+        for (i, o) in next.iter().enumerate() {
+            assert_eq!(o.required, vec![0, 1, 2, 3], "seat {i}: seat 3 stays in R(k+1)");
+            assert_eq!(o.genesis, next[0].genesis, "seat {i}: one genesis");
+        }
+        assert_eq!(hands[0].strikes_of(3), 0, "and seat 3 took no strike");
     }
 
     /// A quiet hand hears itself, counts the table's copies, and speaks once
@@ -24594,6 +24834,11 @@ mod tests {
         }
         assert_eq!(late.terminal(), Some(terminal), "the settlement won over the abort");
         assert!(late.checkpoint8().is_none(), "and it holds no checkpoint of its own");
+        // `S1-LA` (`S1-LF` v7 rule 12): closed on a body it did not settle itself --
+        // the node takes the table's next hand from its copies; a seat that settled
+        // derives its own.
+        assert!(late.closed_on_a_borrowed_settlement());
+        assert!(!hands[0].closed_on_a_borrowed_settlement());
         assert!(late.on_event(&cert, &keys[1], NOW).is_ok(), "accepted on the voters' word");
         assert_eq!(late.returned(), &[2]);
         assert_eq!(late.next_hand().unwrap().required, vec![0, 1, 2]);

@@ -1531,6 +1531,15 @@ struct TableRun {
     /// table went on from, and was then named for a later stage of
     /// (`Hand::named_after_giving_up`), its own line up -- the last few.
     named_after_give_up: std::collections::BTreeSet<u64>,
+    /// `S1-LN` (`REVIEW_S1LN_v2`, pacing): how many such hands in the game.
+    named_after_give_up_total: usize,
+    /// `S1-LN` (`REVIEW_S1LN_v2` B1): the last hand this client ended by an
+    /// abort, kept read-only past the hand's retention for `S1-LN`'s count alone
+    /// -- the whole set naming this seat at a later stage of it may come after
+    /// the running hand left stage 0, when the hand it is about was dropped and
+    /// the set went nowhere. Fed that hand's `TIMEOUT_CERT` copies; nothing it
+    /// says is sent, and nothing else reads it. Gone `S1LN_WATCH_HANDS` hands on.
+    gave_up_watch: Option<crate::table::hand::Hand>,
     /// `G5`, told: by seat key, the hands a certificate voided at their
     /// settlement for that seat while this client's own settlement had it lose.
     settlement_vetoes: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
@@ -2178,6 +2187,8 @@ impl TableRun {
             overlong: Vec::new(),
             voided_recent: (0, None),
             named_after_give_up: std::collections::BTreeSet::new(),
+            named_after_give_up_total: 0,
+            gave_up_watch: None,
             settlement_vetoes: std::collections::BTreeMap::new(),
             settlement_seen: Vec::new(),
             own_floor: None,
@@ -3773,6 +3784,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             Some(crate::protocol::messages::EventType::CheatVote) => "CHEAT_VOTE",
                                             _ => "certificate",
                                         };
+                                        // `S1-LN` (`REVIEW_S1LN_v2` B1): a copy about the hand this client
+                                        // ended by an abort and has let go -- read into the kept hand for
+                                        // the count alone; nothing it says is sent.
+                                        if kind == Some(crate::protocol::messages::EventType::TimeoutCert)
+                                            && $t.previous.as_ref().is_none_or(|p| p.hand_id() != hand_id)
+                                        {
+                                            if let Some(w) = $t.gave_up_watch.as_mut().filter(|w| w.hand_id() == hand_id) {
+                                                let now = super::node::now_unix_ms();
+                                                if let Err(Failed::NotYet) = w.on_event($bytes, &app_key, now) {
+                                                    let _ = w.hold($bytes.to_vec());
+                                                }
+                                                let _ = w.replay_early(&app_key, now);
+                                            }
+                                        }
                                         if hand_id.saturating_add(1) == $h.hand_id()
                                             && matches!(
                                                 kind,
@@ -3818,7 +3843,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             )))
                                                             .await;
                                                     }
-                                                    if p.take_late_roster() {
+                                                    // `S1-LA` (v2): spent either way; no repair
+                                                    // from a borrowed settlement's own sets.
+                                                    if p.take_late_roster() && !p.closed_on_a_borrowed_settlement() {
                                                         $t.late_banked_for = Some(p.hand_id());
                                                         $t.pending_repair = p.next_hand();
                                                     }
@@ -4571,7 +4598,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         };
         ($t:ident, $h:expr, $at_the_deal:expr) => {{
             let id = $h.hand_id();
-            let cert: Vec<u8> = $h.certified_seats().to_vec();
+            // `S1-LA` (`REVIEW_S1LA_S1LN` A-M1): while a late settlement may still
+            // close the hand -- and take the abort's whole sets back -- only the
+            // sets its chain applied are acted on here (the window, the group);
+            // the rest wait for the deal, as the word for good does (`S1-LF` rule 7).
+            let cert: Vec<u8> = if $h.late_close_open() && !$at_the_deal {
+                $h.certified_applied().to_vec()
+            } else {
+                $h.certified_seats().to_vec()
+            };
             if $t.required_seen.0 != id {
                 $t.required_seen = (id, Vec::new());
             }
@@ -4645,7 +4680,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // `S1-LF` (rule 7): a hand given up while it was settling may still be
             // closed late, which takes its abort back: its words for good wait for
             // the deal, which reads the terminal the next hand is derived from.
-            if $h.over() && ($at_the_deal || !$h.late_close_open()) {
+            // `S1-LA` (`REVIEW_S1LA_S1LN` v3): and never on the sets of a hand
+            // closed on a borrowed settlement, on any road -- they decide nothing
+            // (`S1-LF` v7 rule 12).
+            if $h.over() && ($at_the_deal || !$h.late_close_open()) && !$h.closed_on_a_borrowed_settlement() {
                 for seat in $h.certified_seats().to_vec() {
                     let flooded = $h.named_for_flooding(seat);
                     let cheated = $h.named_for_cheating(seat);
@@ -4764,6 +4802,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.rejoin_away = line_down_within($t.line_down_at) || $t.frozen.is_some();
             // Batch 4 (`D-102`): what the hands it drops say of its own stack.
             $t.refresh_own_floor();
+            // `S1-LN` (`REVIEW_S1LN_v2` B1): either, kept for the count where it
+            // ended by an abort -- the newer wins.
+            keep_for_the_count(&mut $t.gave_up_watch, $t.previous.take(), &$t.named_after_give_up);
+            keep_for_the_count(&mut $t.gave_up_watch, $t.hand.take(), &$t.named_after_give_up);
             $t.previous = None;
             $t.hand = None;
             $t.pending_repair = None;
@@ -5076,6 +5118,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.overlong.clear();
             $t.voided_recent = (0, None);
             $t.named_after_give_up.clear();
+            $t.named_after_give_up_total = 0;
+            $t.gave_up_watch = None;
             $t.settlement_vetoes.clear();
             $t.settlement_seen.clear();
             $t.own_floor = None;
@@ -13222,6 +13266,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 t.rejoin_floor = t.rejoin_floor.max(Some(current));
                                 t.refresh_own_floor();
+                                // `S1-LN` (`REVIEW_S1LN_v2` B1): the hand let go, kept for the count where it ended by an abort.
+                                keep_for_the_count(&mut t.gave_up_watch, t.previous.take(), &t.named_after_give_up);
                                 t.previous = t.hand.take();
                             }
                         }
@@ -13843,7 +13889,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .send(NodeEvent::Warning(format!("hand #{} (over): {n}", p.hand_id())))
                                 .await;
                         }
-                        if p.take_late_roster() {
+                        // `S1-LA` (`REVIEW_S1LA_S1LN` v2): spent either way, and no
+                        // repair from a hand closed on a borrowed settlement -- its
+                        // derivation is the one rule 12 refused, and a re-open at it
+                        // would move the client off the table's hand it adopted.
+                        if p.take_late_roster() && !p.closed_on_a_borrowed_settlement() {
                             t.late_banked_for = Some(p.hand_id());
                             t.pending_repair = p.next_hand();
                         }
@@ -13917,8 +13967,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         t.settlement_seen.retain(|(k, ..)| k.saturating_add(1) >= now_hand);
                     }
                     // `S1-LN`: a hand given up for want of a frame and then named
-                    // for a later stage of it -- the running one or the retained.
-                    for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
+                    // for a later stage of it -- the running one or the retained, or
+                    // the one kept for the count once let go (`REVIEW_S1LN_v2` B1).
+                    for h in [t.hand.as_ref(), t.previous.as_ref(), t.gave_up_watch.as_ref()].into_iter().flatten() {
                         // Not while this client's own line was down -- the hand's
                         // word, frozen at its end, or the node's own verdict since.
                         if h.named_after_giving_up()
@@ -13926,6 +13977,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             && !line_down_within(t.line_down_at)
                             && t.named_after_give_up.insert(h.hand_id())
                         {
+                            t.named_after_give_up_total = t.named_after_give_up_total.saturating_add(1);
                             let floor = h.hand_id().saturating_sub(8);
                             t.named_after_give_up.retain(|k| *k >= floor);
                             let _ = events
@@ -13935,6 +13987,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 )))
                                 .await;
                         }
+                    }
+                    // `S1-LN` (`REVIEW_S1LN_v2` B1): the kept hand goes once counted, or
+                    // `S1LN_WATCH_HANDS` hands on.
+                    let running = t.hand.as_ref().map(|h| h.hand_id());
+                    if t.gave_up_watch.as_ref().is_some_and(|w| {
+                        t.named_after_give_up.contains(&w.hand_id())
+                            || running.is_some_and(|r| r >= w.hand_id().saturating_add(S1LN_WATCH_HANDS))
+                    }) {
+                        t.gave_up_watch = None;
                     }
                     // `G11-R` phase C: what the hand took from the journal -- the
                     // running one, or the retained one it moved to before the tick.
@@ -13981,6 +14042,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             });
                         }
                         t.refresh_own_floor();
+                        // `S1-LN` (`REVIEW_S1LN_v2` B1): kept for the count where it
+                        // ended by an abort -- the set about a later stage of it may
+                        // come yet.
+                        keep_for_the_count(&mut t.gave_up_watch, t.previous.take(), &t.named_after_give_up);
                         t.previous = None;
                     }
                     if let Some(o) = t.pending_repair.take() {
@@ -15731,11 +15796,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     h.hand_id()
                                 )))
                                 .await;
-                            // `S1-KA`: and its word for good, before it goes.
-                            if let Some(h) = t.hand.as_ref() {
+                            // `S1-KA`: and its word for good, before it goes -- never on a
+                            // borrowed settlement's own sets (`S1-LA`, `REVIEW_S1LA_S1LN` v2).
+                            if let Some(h) = t.hand.as_ref().filter(|h| !h.closed_on_a_borrowed_settlement()) {
                                 remove_by_the_word!(t, h, true);
                             }
+                            // §4.9's set was this boundary's, and the opening it was for
+                            // is the table's: it reaches no later one (v2).
+                            t.readmitted.clear();
                             t.refresh_own_floor();
+                            // `S1-LN` (`REVIEW_S1LN_v2` B1): the hand let go, kept for the count where it ended by an abort.
+                            keep_for_the_count(&mut t.gave_up_watch, t.previous.take(), &t.named_after_give_up);
                             t.previous = t.hand.take();
                             continue;
                         }
@@ -15750,7 +15821,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                     }
                 }
-                let next = t.hand.as_ref().and_then(|h| h.next_hand());
+                // `S1-LA` (`REVIEW_S1LA_S1LN` A-H1; `S1-LF` v7 rule 12): a hand this
+                // client closed late on a settlement it did not settle itself derives
+                // nothing either. Its chain stopped where it gave the hand up, so the
+                // sets the table applied after -- or one it applied that the table's
+                // chain did not -- are not the settlement's, and an `R(k+1)` read from
+                // it is a genesis nobody holds. The table's next hand is taken from its
+                // copies, as a client back from a restart takes it (`S1-CR`): dealt in
+                // by the table's word, it signs it as a member (`D-039`). Nothing is
+                // decided here on its own sets -- no word for good from them; the rest
+                // of the boundary is any hand's (v2: the counts, the late-roster flag,
+                // the re-send list, the readmission set).
+                let borrowed = t.hand.as_ref().is_some_and(|h| h.closed_on_a_borrowed_settlement());
+                let next = if borrowed { None } else { t.hand.as_ref().and_then(|h| h.next_hand()) };
                 // `S1-JR`: the hands voided one after another, and the
                 // boundaries at which this client asked to be dealt in again
                 // and was not -- each counted once per hand, and read by
@@ -15858,13 +15941,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // `S1-KA`: the word for good about the hand going behind, before it
                 // goes -- a hand this client gave up on its own budget is dealt on
-                // 800 ms later, before any tick has read it over.
-                if let Some(h) = t.hand.as_ref() {
+                // 800 ms later, before any tick has read it over. `S1-LA`: never on
+                // a borrowed settlement's own sets.
+                if let Some(h) = t.hand.as_ref().filter(|_| !borrowed) {
                     remove_by_the_word!(t, h, true);
                 }
+                // `S1-LA`: where a borrowed settlement's client goes on from -- the
+                // table's next hand, from its copies, never one at or below this one,
+                // counted against the table as this hand counted it, with the stacks
+                // it holds; none where fewer than two seats hold chips by the
+                // settlement itself, which no derivation at any seat goes on from.
+                let adopt = t.hand.as_ref().filter(|h| borrowed && !h.fewer_than_two_hold_chips()).map(|h| {
+                    let me = h.my_seat();
+                    let counted: Vec<u8> =
+                        h.table_for_the_count().into_iter().filter(|s| *s == me || !t.long_gone_said.contains(s)).collect();
+                    let held: Vec<Vec<u64>> = stacks_held_by(std::iter::once(h).chain(t.previous.iter()));
+                    (h.hand_id(), counted, held)
+                });
                 // Retained, not dropped: a certificate about this hand that
                 // arrives during the next one still banks here (`S1-BS`).
                 t.refresh_own_floor();
+                // `S1-LN` (`REVIEW_S1LN_v2` B1): the hand let go, kept for the count where it ended by an abort.
+                keep_for_the_count(&mut t.gave_up_watch, t.previous.take(), &t.named_after_give_up);
                 t.previous = t.hand.take();
                 t.hand_reported = false;
                 t.deck_reported = None;
@@ -15929,6 +16027,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     t.said.extend(terminal);
                     t.said.extend(checkpoint);
+                }
+                if let Some((id, counted, held)) = adopt {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "hand #{id}: closed late on a settlement this client did not settle itself; the next hand is adopted from the table's copies, not derived (S1-LA)"
+                        )))
+                        .await;
+                    t.rejoin_floor = t.rejoin_floor.max(Some(id));
+                    t.rejoin_table = Some(counted);
+                    if !held.is_empty() {
+                        t.rejoin_stacks = Some(held);
+                    }
+                    // And whether it comes back from away, as a rejoin from the
+                    // copies reads it (`S1-KF`, v3).
+                    t.rejoin_away = line_down_within(t.line_down_at) || t.frozen.is_some();
+                    // §4.9's set was this boundary's, and the opening it was for is
+                    // the table's: it reaches no later one (v2).
+                    t.readmitted.clear();
+                    t.resuming = true;
+                    t.resume_since_ms = super::node::now_unix_ms();
+                    continue;
                 }
                 match next {
                     Some(mut opening) => {
@@ -17901,6 +18020,46 @@ fn named_twice_lately(named: &std::collections::BTreeSet<u64>, hand_now: u64) ->
     hand_now != 0 && named.iter().filter(|k| **k <= hand_now && hand_now - **k < 5).count() >= NAMED_AFTER_GIVE_UP_LIMIT
 }
 
+/// `S1-LN` (`REVIEW_S1LN_v2` B1): how many hands past it the last hand this
+/// client ended by an abort is kept for the count -- the window counts within
+/// five.
+const S1LN_WATCH_HANDS: u64 = 5;
+
+/// `S1-LN` (`REVIEW_S1LN_v2`, pacing): this many in the game, the last within
+/// the last five hands, make the table not safe -- one short of `D-047`'s
+/// fourth absence.
+const NAMED_IN_THE_GAME_LIMIT: usize = 3;
+
+/// `S1-LN`: whether this client was named after ending a hand
+/// `NAMED_IN_THE_GAME_LIMIT` times in the game (`total`), the last within the
+/// last five hands of the running one -- nothing without a running hand.
+fn named_often_in_the_game(total: usize, named: &std::collections::BTreeSet<u64>, hand_now: u64) -> bool {
+    hand_now != 0
+        && total >= NAMED_IN_THE_GAME_LIMIT
+        && named.iter().filter(|k| **k <= hand_now).max().is_some_and(|k| hand_now - *k < 5)
+}
+
+/// `S1-LN` (`REVIEW_S1LN_v2` B1): a held hand this client is letting go, kept
+/// read-only for `S1-LN`'s count where it ended by an abort not closed late and
+/// is not counted yet -- a set naming this seat at a later stage of it held back
+/// past the hand's retention still reaches it. One at a time, the newest of the
+/// table's: a hand no other seat signed the opening of -- this client's own
+/// derivation alone, called off at stage 0 -- never takes the place of one
+/// (`REVIEW_S1LA_S1LN` B-M1: on B1's own road it pushed the hand out a minute on).
+fn keep_for_the_count(
+    watch: &mut Option<crate::table::hand::Hand>,
+    letting_go: Option<crate::table::hand::Hand>,
+    counted: &std::collections::BTreeSet<u64>,
+) {
+    if let Some(h) = letting_go {
+        let newer = watch.as_ref().is_none_or(|w| h.hand_id() >= w.hand_id());
+        let the_tables = !h.counted_at_stage_zero().is_empty();
+        if newer && the_tables && h.aborted().is_some() && !h.late_settled() && !counted.contains(&h.hand_id()) {
+            *watch = Some(h);
+        }
+    }
+}
+
 /// `S1-JR`: this many of the last five hands called off before they were
 /// played out make the table not safe -- a rate and not a run, so a rogue that
 /// lets a hand through now and then is still counted.
@@ -18475,6 +18634,15 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
     if named_twice_lately(&t.named_after_give_up, hand_now) {
         return Some(
             "twice in the last five hands your client ended a hand at a step the other players went on from, and was then counted absent for a later step: a player may be keeping frames from your client, or sending it a version the others did not get, to have it put out of the game -- or your line keeps failing."
+                .to_string(),
+        );
+    }
+    // `S1-LN` (`REVIEW_S1LN_v2`, pacing): or three times in the game, the last
+    // lately -- spaced five hands apart the count above never fires, and a
+    // fourth absence puts a seat out of the table for good.
+    if named_often_in_the_game(t.named_after_give_up_total, &t.named_after_give_up, hand_now) {
+        return Some(
+            "three times in this game your client ended a hand at a step the other players went on from, and was then counted absent for a later step -- a fourth absence puts a seat out of the table for good: a player may be keeping frames from your client, or sending it a version the others did not get, to have it put out of the game -- or your line keeps failing."
                 .to_string(),
         );
     }
@@ -26859,6 +27027,16 @@ mod a_joiner_before_the_first_hand {
         // And the window's words carry it.
         let src = include_str!("run.rs");
         assert!(src.contains("if named_twice_lately(&t.named_after_give_up, hand_now) {"));
+        // `REVIEW_S1LN_v2`, pacing: three in the game, the last lately -- spaced
+        // six hands apart the count above never fires.
+        let named: std::collections::BTreeSet<u64> = [9u64, 15].into_iter().collect();
+        assert!(!named_twice_lately(&named, 15), "six apart");
+        assert!(!named_often_in_the_game(2, &named, 15), "two in the game");
+        assert!(named_often_in_the_game(3, &named, 15), "three in the game, the last now");
+        assert!(named_often_in_the_game(3, &named, 19) && !named_often_in_the_game(3, &named, 20), "the last within five");
+        assert!(!named_often_in_the_game(3, &named, 0), "no running hand: nothing");
+        assert!(src.contains("if named_often_in_the_game(t.named_after_give_up_total, &t.named_after_give_up, hand_now) {"));
+        assert!(src.contains("t.named_after_give_up_total = t.named_after_give_up_total.saturating_add(1);"), "counted as it is said");
     }
 
     /// `S1-GX`: a founder whose own line was cut gave every seat back once its
@@ -27103,14 +27281,17 @@ mod a_joiner_before_the_first_hand {
         assert!(code.contains("let at_the_limit = flooded || cheated || resigned || $h.out_after_absences_seen(seat);"), "out for good");
         // `S1-KA`: once the hand is over, for every seat it certified.
         assert!(
-            code.contains("if $h.over() && ($at_the_deal || !$h.late_close_open()) { for seat in $h.certified_seats().to_vec() { let flooded = $h.named_for_flooding(seat); let cheated = $h.named_for_cheating(seat);"),
-            "the group's word for good, once the hand is over"
+            code.contains("if $h.over() && ($at_the_deal || !$h.late_close_open()) && !$h.closed_on_a_borrowed_settlement() { for seat in $h.certified_seats().to_vec() { let flooded = $h.named_for_flooding(seat); let cheated = $h.named_for_cheating(seat);"),
+            "the group's word for good, once the hand is over -- never a borrowed settlement's (S1-LA)"
         );
         assert!(code.contains("let resigned = $h.named_by_its_own_word(seat); let at_the_limit ="), "the word, the cheat and the flood alike");
         assert!(code.contains("h.out_for_good_decided().contains(&me).then_some((me, flooded, cheated))"), "this client, once decided");
         assert!(code.contains("let why = if h.over() { Some(h) } else { t.previous.as_ref() };"), "and why, from the hand that decided it");
         let behind = code.find("// Retained, not dropped: a certificate about this hand that").expect("the deal");
-        assert!(code[behind - 400..behind].contains("if let Some(h) = t.hand.as_ref() { remove_by_the_word!(t, h, true); }"), "the word before the deal puts the hand behind");
+        assert!(
+            code[behind - 1_500..behind].contains("if let Some(h) = t.hand.as_ref().filter(|_| !borrowed) { remove_by_the_word!(t, h, true); }"),
+            "the word before the deal puts the hand behind -- a borrowed settlement's none (S1-LA)"
+        );
         assert!(code.contains("if !alone || !(flooded || cheated || absent) { return None; }"), "the lobby word");
     }
 
@@ -28316,5 +28497,95 @@ mod answer_rotation_tests {
         // Forgotten with the table.
         let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
         assert!(code[leave..].contains("$t.founder_absence = FounderAbsence::default(); $t.founder_absence_told = None; $t.back_by_record = false;"));
+    }
+
+    /// `S1-LN` (`REVIEW_S1LN_v2` B1): the hand this client ended by an abort is
+    /// kept for the count past its retention -- let go at the retention's end, at
+    /// each replacement of the retained hand and at a rejoin from the copies --
+    /// the copies of that hand's certificates are read into it with nothing said,
+    /// the count reads it, and it goes once counted or `S1LN_WATCH_HANDS` hands on.
+    #[test]
+    fn a_hand_ended_by_an_abort_is_kept_for_the_count_past_its_retention() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            code.matches("keep_for_the_count(&mut t.gave_up_watch, t.previous.take(), &t.named_after_give_up);").count(),
+            4,
+            "the retention's end and the three replacements of the retained hand (a borrowed settlement's boundary is the deal's)"
+        );
+        assert!(
+            code.contains(
+                "keep_for_the_count(&mut $t.gave_up_watch, $t.previous.take(), &$t.named_after_give_up); keep_for_the_count(&mut $t.gave_up_watch, $t.hand.take(), &$t.named_after_give_up);"
+            ),
+            "a rejoin from the copies"
+        );
+        let feed = code
+            .find("if let Some(w) = $t.gave_up_watch.as_mut().filter(|w| w.hand_id() == hand_id) {")
+            .expect("its copies read into it");
+        let block = &code[feed..feed + code[feed..].find("let _ = w.replay_early(&app_key, now); }").expect("its end")];
+        assert!(!block.contains("publish_hand") && !block.contains("try_broadcast"), "nothing it says is sent");
+        assert!(code.contains("for h in [t.hand.as_ref(), t.previous.as_ref(), t.gave_up_watch.as_ref()].into_iter().flatten() {"), "counted");
+        assert!(code.contains("running.is_some_and(|r| r >= w.hand_id().saturating_add(S1LN_WATCH_HANDS))"), "gone hands on");
+        let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
+        assert!(code[leave..].contains("$t.gave_up_watch = None;"), "forgotten with the table");
+        assert_eq!(S1LN_WATCH_HANDS, 5, "the window counts within five hands");
+        let keep = code.find("fn keep_for_the_count(").expect("the keeping");
+        assert!(
+            code[keep..keep + 1_500].contains("if newer && the_tables && h.aborted().is_some() && !h.late_settled() && !counted.contains(&h.hand_id()) {"),
+            "a hand of the table's ended by an abort not closed late, not counted yet, the newest"
+        );
+        assert!(code[keep..keep + 1_500].contains("let the_tables = !h.counted_at_stage_zero().is_empty();"), "another seat signed it");
+    }
+
+    /// `S1-LA` (`REVIEW_S1LA_S1LN` A-H1, A-M1 and v2; `S1-LF` v7 rule 12): a hand
+    /// closed late on a settlement this client did not settle itself derives
+    /// nothing at its boundary -- the table's next hand is adopted from its
+    /// copies, nothing decided on this client's own sets, and no later repair
+    /// derived from them either -- while the rest of the boundary is any hand's;
+    /// and while a late settlement may still close a hand, only the sets its
+    /// chain applied are acted on.
+    #[test]
+    fn a_hand_closed_on_a_borrowed_settlement_takes_the_tables_next_hand() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let derive = code
+            .find("let borrowed = t.hand.as_ref().is_some_and(|h| h.closed_on_a_borrowed_settlement()); let next = if borrowed { None } else { t.hand.as_ref().and_then(|h| h.next_hand()) };")
+            .expect("nothing derived from a borrowed settlement");
+        let rest = &code[derive..];
+        // The boundary's own steps run as for any hand, the late-roster flag spent.
+        let spent = rest.find("if let Some(h) = t.hand.as_mut() { let _ = h.take_late_roster(); }").expect("the flag spent");
+        let word = rest
+            .find("if let Some(h) = t.hand.as_ref().filter(|_| !borrowed) { remove_by_the_word!(t, h, true); }")
+            .expect("no word for good from its own sets");
+        let adopt = rest.find("let adopt = t.hand.as_ref().filter(|h| borrowed && !h.fewer_than_two_hold_chips()).map(|h| {").expect("the adoption");
+        let taken = rest.find("t.previous = t.hand.take(); t.hand_reported = false;").expect("the hand goes behind");
+        let trimmed = rest.find("for b in t.said.drain(..) {").expect("the re-send list");
+        let go = rest.find("if let Some((id, counted, held)) = adopt {").expect("the way on");
+        let deal = rest.find("match next { Some(mut opening) => {").expect("the deal");
+        assert!(spent < word && word < adopt && adopt < taken && taken < trimmed && trimmed < go && go < deal, "in that order");
+        let body = &rest[go..deal];
+        assert!(body.contains("t.rejoin_floor = t.rejoin_floor.max(Some(id));"), "never back to that hand");
+        assert!(body.contains("t.rejoin_away = line_down_within(t.line_down_at) || t.frozen.is_some();"), "back from away, as a rejoin reads it");
+        assert!(body.contains("t.readmitted.clear(); t.resuming = true;"), "adopted from the copies, §4.9's set spent");
+        assert!(body.ends_with("continue; } "), "and nothing dealt by its own reading");
+        // Nor any word for good from its sets on the event road or the tick.
+        assert!(code.contains("if $h.over() && ($at_the_deal || !$h.late_close_open()) && !$h.closed_on_a_borrowed_settlement() {"));
+        // Fewer than two seats with chips by the settlement: the table's end.
+        assert!(rest[deal..].contains("t.table_over_at = Some(std::time::Instant::now());"));
+        // No repair from it later, on either road; and none of its sets' words
+        // at a resumed client's boundary.
+        assert_eq!(code.matches("if p.take_late_roster() && !p.closed_on_a_borrowed_settlement() {").count(), 2);
+        assert!(!code.contains("if p.take_late_roster() {"));
+        let resumed = code
+            .find("if let Some(h) = t.hand.as_ref().filter(|h| !h.closed_on_a_borrowed_settlement()) { remove_by_the_word!(t, h, true); }")
+            .expect("a resumed client's word, never a borrowed settlement's");
+        assert!(resumed < derive, "at the resumed client's boundary, before");
+        assert!(code[resumed..derive].contains("t.readmitted.clear(); t.refresh_own_floor();"), "§4.9's set spent there too");
+        assert!(
+            code.contains("let cert: Vec<u8> = if $h.late_close_open() && !$at_the_deal { $h.certified_applied().to_vec() } else { $h.certified_seats().to_vec() };"),
+            "while a late close may come, the applied sets alone"
+        );
     }
 }
