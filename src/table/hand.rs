@@ -11441,8 +11441,13 @@ impl Hand {
         // here -- the late stage closes on one only for a seat outside
         // `required`, whose floor is its start less its dead blind -- is no
         // settlement this client takes: two seats signing one body could move its
-        // chips with no adoption, and no floor, on the way.
+        // chips with no adoption, and no floor, on the way. Where this seat's own
+        // settlement is among those heard -- its own key's, signed by a life of
+        // this client's before a restart -- that signature is its word.
+        let own_heard = self.open.required.contains(&self.open.my_seat)
+            && !late.stage.waiting_for().contains(&self.open.my_seat);
         let keeps_floor = late.own
+            || own_heard
             || floor_here.is_none_or(|fl| late.body.final_stacks.get(me_ix).copied().unwrap_or(0) >= fl);
         if late.stage.complete() && !keeps_floor {
             let refused = format!(

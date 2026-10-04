@@ -179,6 +179,19 @@ pub fn gift_page(home: Option<&HomeView>) -> &'static str {
     }
 }
 
+/// `D-080`: what the *Support the project* button says under the pointer --
+/// the page `gift_page` opens for this copy, in its words: a copy from the
+/// Store names GitHub Sponsors and never the donation page's currencies.
+pub fn gift_hover(home: Option<&HomeView>) -> &'static str {
+    if home.is_some_and(|h| h.store) {
+        "No house, no rake, no ads: P2Poker is free, and lives on gifts.\n\
+         Opens the project's GitHub Sponsors page in your browser."
+    } else {
+        "No house, no rake, no ads: P2Poker is free, and lives on gifts.\n\
+         Opens the donation page on GitHub in your browser (Bitcoin, USDT)."
+    }
+}
+
 /// `D-072`: where a player reports a bug -- the repository's issue tracker, with
 /// the form already open.
 ///
@@ -3570,7 +3583,7 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> bo
             egui::pos2(x, row.center().y),
             egui::vec2(widths[form], DONATE_HEIGHT - 2.0),
         );
-        donate = donate_button(ui, rect, DONATE_FORMS[form]).clicked();
+        donate = donate_button(ui, rect, DONATE_FORMS[form], gift_hover(state.home.as_ref())).clicked();
         word_ends = rect.left() - STRIP_GAP;
     }
 
@@ -3705,14 +3718,11 @@ fn donate_place(left: f32, right: f32, centre: f32, widths: &[f32]) -> Option<(u
 /// Nor does it appear at a win, or say what others gave: the lobby asks for
 /// nothing back (`result_words`), and this asks once, quietly, in one place.
 /// Under the pointer it warms and the heart grows -- the pointer's own frames.
-fn donate_button(ui: &mut egui::Ui, rect: egui::Rect, words: &str) -> egui::Response {
+fn donate_button(ui: &mut egui::Ui, rect: egui::Rect, words: &str, hover: &str) -> egui::Response {
     let resp = ui
         .interact(rect, ui.id().with("donate"), egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(
-            "No house, no rake, no ads: P2Poker is free, and lives on gifts.\n\
-             Opens the donation page on GitHub in your browser (Bitcoin, USDT).",
-        );
+        .on_hover_text(hover);
     let hot = resp.hovered();
     let p = ui.painter();
     let r = rect.height() / 2.0;
@@ -4086,6 +4096,14 @@ mod tests {
         assert_eq!(gift_page(Some(&home(false))), DONATION_URL, "GitHub's: the donation page");
         assert_eq!(gift_page(None), DONATION_URL, "a preview's: the donation page");
         assert_eq!(SPONSORS_URL, "https://github.com/sponsors/qavryxdevv");
+        // And the words under the pointer say the page this copy opens: the
+        // Store's names GitHub Sponsors and none of the donation page's
+        // currencies.
+        let store_hover = gift_hover(Some(&home(true)));
+        assert!(store_hover.contains("GitHub Sponsors"), "{store_hover}");
+        assert!(!store_hover.contains("Bitcoin") && !store_hover.contains("USDT"), "{store_hover}");
+        assert!(gift_hover(Some(&home(false))).contains("donation page"), "a copy from GitHub");
+        assert!(gift_hover(None).contains("donation page"), "a preview");
     }
 
     /// `S1-JG`: a table that was not opened is said in the lobby -- the reason,

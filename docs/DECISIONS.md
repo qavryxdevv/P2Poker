@@ -6598,7 +6598,9 @@ project's Sponsors page, <https://github.com/sponsors/qavryxdevv>, approved, whe
 ordinary money and nothing is bought: the button opens it in the player's browser like any page the client opens.
 A copy from the Store draws *Support the project* as every copy does and opens GitHub Sponsors with it, **never the
 donation page** (`render::gift_page`); a copy from GitHub, and a preview, open the donation page as above. It reaches
-the Store with the next package -- the owner: none before the next protocol. **Guard.**
+the Store with the next package -- the owner: none before the next protocol. Its words under the pointer say the
+same (`render::gift_hover`, 2026-10-04): the first build of it told every copy, the Store's included, that the
+button opened the donation page and named its currencies. **Guard.**
 `a_copy_from_the_store_asks_through_github_sponsors` (the strip painted for each copy, and the page each opens);
 `a_copy_from_the_store_opens_no_donation_page` (nothing opens the donation page by name, the one place opens
 `gift_page`'s).
@@ -8388,7 +8390,9 @@ looked at its own stack there -- a majority of the counted table could name any 
    above 0 (`P2P_POKER_FLOOR=ask` makes it refuse, for the beds) and never one of 0.
 5. **The late road too.** A borrowed `HAND_COMPLETE` closes a given-up hand only where it names this client at no less
    than its floor there; below it the abort's terminal stands -- two seats signing one body moved its chips with no
-   adoption, and no floor, on the way (`REFUTE_batch4_v6` M3).
+   adoption, and no floor, on the way (`REFUTE_batch4_v6` M3). Where this seat's own settlement is among those heard --
+   its own key's, signed by a life of this client's before a restart -- that signature is its word, and the stage
+   closes as before (found by a test the deal made fail one time in a few: the seat had lost the hand).
 6. **Why no allowance.** An honest table takes dead blinds from a seat away, so v1-v6 allowed them automatically --
    by the count of hands, by a clock from the seat's last progress, by a tolerance of one block, by an allowance after
    a *Take* -- and every one was refuted (`p2p-poker-local/audit_1002/REFUTE_batch4_v1..v6`): the hand ids are the
