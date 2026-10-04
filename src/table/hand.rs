@@ -2609,6 +2609,9 @@ pub struct Hand {
     /// counting vote about at the stage now open -- never a voter named silent,
     /// whose set takes a veto and no seat out of the roster.
     round_subjects: BTreeSet<SeatIdx>,
+    /// `G5`, told: the seats the certificate that voided this hand at its
+    /// settlement named as waited on.
+    settlement_named: Vec<SeatIdx>,
     /// `D-051`: the seats a banked certificate named with `CAUSE_FLOOD`: every
     /// voter's client cut them off for flooding the group.
     flood_named: BTreeSet<SeatIdx>,
@@ -3370,6 +3373,7 @@ impl Hand {
                 foreign_genesis: BTreeMap::new(),
                 rounds_voted: Vec::new(),
                 round_subjects: BTreeSet::new(),
+                settlement_named: Vec::new(),
                 genesis_note: None,
                 genesis_said: false,
                 late_roster: false,
@@ -12771,6 +12775,10 @@ impl Hand {
             // the stage's own parent -- the slot does not move first, so a late
             // settlement at that parent is still taken (HAND_COMPLETE wins).
             _ if !control("s1lf") => {
+                // `G5`, told: who held the settlement up, for the window.
+                if subject.subject_event_type == EventType::HandComplete.code() {
+                    self.settlement_named = subject.quiet_seats();
+                }
                 self.certifying = None;
                 self.closed_at_stage = true;
                 self.take_whole((subject.subject_sequence, subject.parent_event_hash, subject.digest()));
@@ -13298,6 +13306,21 @@ impl Hand {
             .into_iter()
             .filter(|(_, seats)| seats.len() >= FOREIGN_GENESIS_FLOOR)
             .max_by_key(|(_, seats)| seats.len())
+    }
+
+    /// `G5`, told: the seats a certificate voided this hand at its settlement
+    /// for, where this client's own settlement has them lose -- a loser that kept
+    /// its copy back had the hand called off and its losses given back. Read by
+    /// the node, which says it at the second such hand (the window).
+    pub fn settlement_vetoed_by(&self) -> Vec<SeatIdx> {
+        let Some(late) = self.late.as_ref().filter(|l| l.own) else {
+            return Vec::new();
+        };
+        self.settlement_named
+            .iter()
+            .copied()
+            .filter(|s| *s != self.open.my_seat && late.body.deltas.get(usize::from(*s)).is_some_and(|d| *d < 0))
+            .collect()
     }
 
     /// `S1-LP`: how many seats of the roster signed this hand's opening at
@@ -28157,6 +28180,38 @@ mod tests {
         }
         flood_among(&mut hands, &keys, &mut said, pending);
         (hands, keys, said)
+    }
+
+    /// `G5`, told: **a loser that keeps its settlement back is named** -- the
+    /// three others vote it at the settlement, their certificate voids the hand
+    /// as before, and each names the seat its own settlement has lose.
+    #[test]
+    fn a_loser_that_keeps_its_settlement_back_is_named() {
+        let (mut hands, keys, copies, _bad) = four_at_the_settlement();
+        let loser = {
+            let Phase::Playing { play, .. } = &hands[0].phase else { panic!("playing") };
+            let Step::Settling { mine, .. } = &play.step else { panic!("settling") };
+            (0..4usize).find(|s| mine.deltas[*s] < 0).expect("a seat lost chips")
+        };
+        let honest: Vec<usize> = (0..4).filter(|s| *s != loser).collect();
+        for &to in &honest {
+            for (from, b) in &copies {
+                if *from != to && *from != loser {
+                    let _ = hands[to].on_event(b, &keys[to], NOW);
+                }
+            }
+            assert_eq!(hands[to].waiting_for(), vec![loser as u8], "seat {to} waits on the withholder");
+        }
+        let t1 = NOW + 300_000;
+        let pending: Vec<(usize, Vec<Send>)> =
+            honest.iter().map(|&s| (s, hands[s].vote_on_timeouts(&keys[s], t1, 0).unwrap())).collect();
+        let route = |_: usize, to: usize, b: &[u8]| -> Option<Vec<u8>> { (to != loser).then(|| b.to_vec()) };
+        let mut refused = Vec::new();
+        pump_cheat_at(&mut hands, &keys, pending, &route, &mut refused, t1);
+        for &s in &honest {
+            assert!(hands[s].over(), "seat {s}: the hand voided as before: {refused:?}");
+            assert_eq!(hands[s].settlement_vetoed_by(), vec![loser as u8], "seat {s} names the withholder");
+        }
     }
 
     /// `S1-LP`: **the genesis a missed certificate would re-derive the next

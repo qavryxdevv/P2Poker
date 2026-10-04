@@ -1359,6 +1359,10 @@ struct TableRun {
     pending_repair: Option<crate::table::hand::Opening>,
     /// The hand whose boundary wait has been said.
     genesis_wait_said: Option<u64>,
+    /// `S1-LQ`: the hand whose boundary wait began, and when (this client's
+    /// monotonic clock) -- a wait for a genesis no majority signed ends after
+    /// `WAIT_FOR_REPAIR_MS`.
+    genesis_wait_since: Option<(u64, std::time::Instant)>,
     /// The hand a certificate banked late for, so a redelivery of that
     /// certificate after the hand was dropped is not reported as a repair
     /// missed.
@@ -1440,6 +1444,9 @@ struct TableRun {
     /// table went on from, and was then named for a later stage of
     /// (`Hand::named_after_giving_up`), its own line up -- the last few.
     named_after_give_up: std::collections::BTreeSet<u64>,
+    /// `G5`, told: by seat key, the hands a certificate voided at their
+    /// settlement for that seat while this client's own settlement had it lose.
+    settlement_vetoes: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
     /// `S1-JR`: the seats a hand here was voided over for a proof that does not
     /// hold, by application key -- the seat, the cause, and whether this
     /// client's own check found it.
@@ -2016,6 +2023,7 @@ impl TableRun {
             next_early_lost: (0, 0),
             pending_repair: None,
             genesis_wait_said: None,
+            genesis_wait_since: None,
             late_banked_for: None,
             delayed_certs: Vec::new(),
             releasing_certs: false,
@@ -2038,6 +2046,7 @@ impl TableRun {
             overlong: Vec::new(),
             voided_recent: (0, None),
             named_after_give_up: std::collections::BTreeSet::new(),
+            settlement_vetoes: std::collections::BTreeMap::new(),
             cheats: std::collections::BTreeMap::new(),
             equivocators: std::collections::BTreeMap::new(),
             back_from_restart: std::collections::BTreeMap::new(),
@@ -4618,6 +4627,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = events.send(NodeEvent::TableStopped { stop: None }).await;
             }
             $t.genesis_wait_said = None;
+            $t.genesis_wait_since = None;
             $t.late_cert_said = None;
             $t.late_banked_for = None;
             $t.unsettled_abort_here = None;
@@ -4819,6 +4829,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.next_early.clear();
             $t.pending_repair = None;
             $t.genesis_wait_said = None;
+            $t.genesis_wait_since = None;
             $t.late_banked_for = None;
             $t.hand_reported = false;
             $t.deck_reported = None;
@@ -4906,6 +4917,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.overlong.clear();
             $t.voided_recent = (0, None);
             $t.named_after_give_up.clear();
+            $t.settlement_vetoes.clear();
             $t.cheats.clear();
             $t.equivocators.clear();
             $t.back_from_restart.clear();
@@ -13275,6 +13287,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning(note)).await;
                         }
                     }
+                    // `G5`, told: a loser that kept its settlement back.
+                    for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
+                        for seat in h.settlement_vetoed_by() {
+                            let Some(key) = h.key_of(seat) else { continue };
+                            let entry = t.settlement_vetoes.entry(key).or_insert_with(|| (seat, Default::default()));
+                            if entry.1.insert(h.hand_id()) {
+                                let floor = h.hand_id().saturating_sub(16);
+                                entry.1.retain(|k| *k >= floor);
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "hand #{}: seat {seat} lost it and kept its settlement back -- the table called the hand off and gave its losses back (G5)",
+                                        h.hand_id()
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
                     // `S1-LN`: a hand given up for want of a frame and then named
                     // for a later stage of it -- the running one or the retained.
                     for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
@@ -14927,7 +14956,36 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if h.slot().sequence == 0 {
                         if let Some((g, seats)) = h.foreign_genesis_named() {
                             let counted = h.counted_at_stage_zero();
-                            if wait_at_boundary(seats.len(), counted.len()) {
+                            // `S1-LQ`: a wait for a genesis no majority of the
+                            // hand signed ends after the repair window -- three
+                            // rogues held every honest seat at this wait for
+                            // good on a parent they derived from a round they
+                            // kept from completing.
+                            let since = match t.genesis_wait_since {
+                                Some((hid, at)) if hid == h.hand_id() => at,
+                                _ => {
+                                    let now_i = std::time::Instant::now();
+                                    t.genesis_wait_since = Some((h.hand_id(), now_i));
+                                    now_i
+                                }
+                            };
+                            let repair_over = !crate::table::hand::control("s1lq")
+                                && seats.len() * 2 <= h.required().len()
+                                && since.elapsed() >= std::time::Duration::from_millis(WAIT_FOR_REPAIR_MS);
+                            if repair_over && t.genesis_wait_said == Some(h.hand_id()) {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "hand #{}: no certificate repaired it in {} s, and seat(s) {:?} at genesis {} are no majority of the hand -- hand #{} is dealt here (S1-LQ)",
+                                        h.hand_id(),
+                                        WAIT_FOR_REPAIR_MS / 1_000,
+                                        seats,
+                                        short_hash(&g),
+                                        h.hand_id().saturating_add(1)
+                                    )))
+                                    .await;
+                                t.genesis_wait_said = Some(u64::MAX);
+                            }
+                            if wait_at_boundary(seats.len(), counted.len()) && !repair_over {
                                 if t.genesis_wait_said != Some(h.hand_id()) {
                                     t.genesis_wait_said = Some(h.hand_id());
                                     let _ = events
@@ -17083,6 +17141,21 @@ fn group_locked_words(peer_limit: Option<u16>, password: bool) -> String {
 /// make the table not safe.
 const NAMED_AFTER_GIVE_UP_LIMIT: usize = 2;
 
+/// `G5`, told: a seat whose settlement vetoes hold two hands within the last
+/// ten -- the first such seat, if any.
+fn settlement_vetoer(
+    vetoes: &std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
+    hand_now: u64,
+) -> Option<u8> {
+    if hand_now == 0 {
+        return None;
+    }
+    vetoes
+        .values()
+        .find(|(_, hands)| hands.iter().filter(|k| **k <= hand_now && hand_now - **k < 10).count() >= 2)
+        .map(|(seat, _)| *seat)
+}
+
 /// `S1-LN`: whether `named` holds `NAMED_AFTER_GIVE_UP_LIMIT` hands within the
 /// last five of the running one, `hand_now` -- nothing without a running hand,
 /// or the window asked about hands long past (a rejoin, a seat outside).
@@ -17628,6 +17701,14 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
                 ));
             }
         }
+    }
+    // `G5`, told: a seat that kept its settlement back in two hands it lost
+    // within the last ten.
+    if let Some(seat) = settlement_vetoer(&t.settlement_vetoes, hand_now) {
+        return Some(format!(
+            "{} kept its settlement back in two of the hands it lost lately: the table called those hands off and gave its losses back. A player may be undoing the hands it loses -- the table is not safe to play your chips at.",
+            seat_called(t, seat)
+        ));
     }
     // `S1-LN`: twice within the last five hands this client ended a hand the
     // table went on with, and was counted absent for a later stage of it.
@@ -19160,6 +19241,11 @@ fn quiet_on_counts(most_elsewhere: usize, required: usize, at_mine: usize, deriv
 fn wait_at_boundary(named_elsewhere: usize, counted_here_without_me: usize) -> bool {
     named_elsewhere > counted_here_without_me + 1
 }
+
+/// `S1-LQ`: how long the boundary waits for a certificate's late copy where the
+/// genesis named elsewhere is no majority of the hand -- past `S1-BS`'s measured
+/// 20-51 s, the completers saying every copy again over 75 s (`D-099` point 3).
+const WAIT_FOR_REPAIR_MS: u64 = 60_000;
 
 /// The voice of a re-open: muted once it was muted. `S1-LP`: a seat that
 /// signed the hand at the genesis it is re-derived from speaks at the new one --
@@ -25009,6 +25095,20 @@ mod late_roster_tests {
             "a hand behind belongs to the late-certificate arm, not to this buffer"
         );
         assert_eq!(keep_for_next_hand(None, 8, 7), Keep::No, "unreadable");
+    }
+
+    /// `G5`, told: two vetoes within ten hands name the seat; one, or two far
+    /// apart, do not.
+    #[test]
+    fn two_settlement_vetoes_within_ten_hands_are_told() {
+        let mut v: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)> =
+            std::collections::BTreeMap::new();
+        v.insert([1; 32], (3, [5u64].into_iter().collect()));
+        assert_eq!(settlement_vetoer(&v, 6), None, "one veto");
+        v.get_mut(&[1; 32]).unwrap().1.insert(9);
+        assert_eq!(settlement_vetoer(&v, 10), Some(3), "two within ten hands");
+        assert_eq!(settlement_vetoer(&v, 20), None, "long ago");
+        assert_eq!(settlement_vetoer(&v, 0), None, "no hand running");
     }
 
     /// A seat muted on a hand never signs it; `S1-LP`: one that signed it at the
