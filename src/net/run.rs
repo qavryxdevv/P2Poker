@@ -15277,7 +15277,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         // Quiet if two seats already signed this hand at one
                         // other genesis and none at this one (`S1-BS`).
-                        let voice = quiet_if_contested(&opening, &t.next_inits);
+                        let candidates = t.previous.as_ref().map(|p| p.candidate_geneses()).unwrap_or_default();
+                        let voice = quiet_if_contested(&opening, &t.next_inits, &candidates);
                         // `S1-LC`: the relays asked for in the hand before carry over.
                         let relay_seats = relay_members(&t.relays, opening.hand_id);
                         // `G11-R` phase D2b: a provisional journal vouches first.
@@ -19095,13 +19096,20 @@ fn stash_for_resume(
 /// signed this hand at one genesis that is not the one this client derived,
 /// and no seat has signed it at this client's: the parent is contested
 /// before the open, so this client's own signature waits for the table or
-/// for a certificate (`S1-BS`).
+/// for a certificate (`S1-BS`). `S1-LP`: and only at a genesis the table
+/// demonstrably holds -- signed by more than half of the hand's required seats
+/// (this client counted), or one this client derives itself with a round of a
+/// hand before that it gave up voted in taken as complete (`candidates`: the hand
+/// a missed certificate's copy would re-derive it to). Two rogues signing the next hand
+/// at a parent nobody derives silenced every honest seat at every opening, and
+/// no card was dealt again.
 fn quiet_if_contested(
     o: &crate::table::hand::Opening,
     inits: &[(u8, Vec<u8>)],
+    candidates: &[crate::poker::state::Hash],
 ) -> crate::table::hand::Voice {
     use crate::protocol::messages::EventType;
-    use crate::table::hand::{Voice, FOREIGN_GENESIS_FLOOR, FRAME_CAP};
+    use crate::table::hand::{Voice, FRAME_CAP};
     let seat_of = |key: &[u8; 32]| o.seats.iter().find(|(_, k, _)| k == key).map(|(s, _, _)| *s);
     let mut foreign: std::collections::BTreeMap<crate::poker::state::Hash, std::collections::BTreeSet<u8>> =
         std::collections::BTreeMap::new();
@@ -19128,11 +19136,22 @@ fn quiet_if_contested(
         }
     }
     let most = foreign.values().map(|s| s.len()).max().unwrap_or(0);
-    if most >= FOREIGN_GENESIS_FLOOR && at_mine.is_empty() {
+    let derivable = foreign.iter().any(|(g, s)| s.len() == most && candidates.contains(g));
+    if quiet_on_counts(most, o.required.len(), at_mine.len(), derivable) {
         Voice::Quiet
     } else {
         Voice::Speak
     }
+}
+
+/// `S1-LP`: Quiet on these counts -- at least `FOREIGN_GENESIS_FLOOR` seats at
+/// one other genesis and none at this client's own, where those seats are more
+/// than half of the hand's `required` (this client among them) or the genesis
+/// is one this client derives (`derivable`). The control
+/// (`P2P_POKER_CONTROL=s1lp`) keeps the floor alone, as before.
+fn quiet_on_counts(most_elsewhere: usize, required: usize, at_mine: usize, derivable: bool) -> bool {
+    let shown = most_elsewhere * 2 > required || derivable || crate::table::hand::control("s1lp");
+    most_elsewhere >= crate::table::hand::FOREIGN_GENESIS_FLOOR && shown && at_mine == 0
 }
 
 /// Whether the boundary waits: more roster seats signed this hand at one
@@ -19142,12 +19161,16 @@ fn wait_at_boundary(named_elsewhere: usize, counted_here_without_me: usize) -> b
     named_elsewhere > counted_here_without_me + 1
 }
 
-/// The voice of a re-open: muted once this seat has signed the hand, or
-/// once it was muted — a muted hand re-opened again must not speak, or one
-/// seat would sign one hand twice on the second certificate.
+/// The voice of a re-open: muted once it was muted. `S1-LP`: a seat that
+/// signed the hand at the genesis it is re-derived from speaks at the new one --
+/// a re-open is always at another genesis, and two openings at two geneses are
+/// two branches, never two versions (`D-100`); the signing journal refuses a
+/// second body at one genesis anyway. Muted, it sat the hand out and was
+/// certified absent at the next. The control (`P2P_POKER_CONTROL=s1lp`) keeps
+/// the old rule.
 fn reopen_voice(spoke: bool, was: crate::table::hand::Voice) -> crate::table::hand::Voice {
     use crate::table::hand::Voice;
-    if spoke || was == Voice::Muted {
+    if was == Voice::Muted || (spoke && crate::table::hand::control("s1lp")) {
         Voice::Muted
     } else {
         Voice::Speak
@@ -19166,9 +19189,10 @@ fn purge_hand_from_said(said: &mut Vec<Vec<u8>>, hand_id: u64) {
 
 /// `S1-BS`: re-open the running hand at a re-derived opening — the same hand
 /// id, a corrected genesis. Only from a stage 0 this client never left, and
-/// only when the derivation names a different genesis; muted when this
-/// client already signed the hand at the old one, so no seat ever signs one
-/// hand twice. The held copies and the readmission set carry over. On any
+/// only when the derivation names a different genesis; muted only where the
+/// hand was muted -- `S1-LP`: a seat that signed the hand at the old genesis
+/// signs it at the new one, two branches (`D-100`), and its journal refuses a
+/// second body at one genesis. The held copies and the readmission set carry over. On any
 /// refusal the old hand stays exactly as it was. Returns whether it re-opened.
 async fn reopen_hand(
     mut opening: crate::table::hand::Opening,
@@ -19217,8 +19241,14 @@ async fn reopen_hand(
         *hand = Some(old);
         return false;
     }
+    // `S1-LP` (`REFUTE_S1LP_v2` S2): not where the re-derived genesis is signed
+    // by the floor of seats and by at least as many as the genesis named -- a junk
+    // genesis named as often must not refuse the table's.
     if let Some((g, seats)) = old.foreign_genesis_named() {
-        if g != opening.genesis {
+        if g != opening.genesis
+            && (old.foreign_signers_at(&opening.genesis) < crate::table::hand::FOREIGN_GENESIS_FLOOR.max(seats.len())
+                || crate::table::hand::control("s1lp"))
+        {
             let _ = events
                 .send(NodeEvent::Warning(format!(
                     "a certificate about hand #{} re-derives hand #{} at genesis {}, but seat(s) {:?} hold {}: a certificate the table has is still missing here; not re-opening",
@@ -19277,7 +19307,7 @@ async fn reopen_hand(
                     was.1,
                     match voice {
                         Voice::Muted => "muted: this seat signed the hand once already and follows the corrected one silently, rejoining at the next hand",
-                        _ => "speaking: this seat signs the hand for the first time here",
+                        _ => "speaking: this seat signs the hand at this genesis",
                     }
                 )))
                 .await;
@@ -19352,7 +19382,7 @@ async fn begin_hand_with(
             if voice == Voice::Quiet {
                 let _ = events
                     .send(NodeEvent::Warning(format!(
-                        "hand #{}: two seats or more signed it at another genesis before this client opened it, and none at this one — this client's own HAND_INIT is withheld until the table is counted here or a certificate re-derives the hand",
+                        "hand #{}: more than half its seats, or two seats at a genesis this client derives from a round it voted in, signed it at another genesis before this client opened it, and none at this one — this client's own HAND_INIT is withheld until the table is counted here or a certificate re-derives the hand (S1-LP)",
                         h.hand_id()
                     )))
                     .await;
@@ -24981,14 +25011,31 @@ mod late_roster_tests {
         assert_eq!(keep_for_next_hand(None, 8, 7), Keep::No, "unreadable");
     }
 
-    /// A seat that signed a hand, or was muted on it, never signs it again.
+    /// A seat muted on a hand never signs it; `S1-LP`: one that signed it at the
+    /// genesis it is re-derived from speaks at the new one (two branches, D-100).
     #[test]
-    fn a_re_open_speaks_only_for_a_seat_that_never_signed_the_hand() {
+    fn a_re_open_speaks_unless_the_hand_was_muted() {
         use crate::table::hand::Voice;
-        assert_eq!(reopen_voice(true, Voice::Speak), Voice::Muted);
+        assert_eq!(reopen_voice(true, Voice::Speak), Voice::Speak, "signed at the other genesis: two branches");
         assert_eq!(reopen_voice(false, Voice::Muted), Voice::Muted);
+        assert_eq!(reopen_voice(true, Voice::Muted), Voice::Muted);
         assert_eq!(reopen_voice(false, Voice::Quiet), Voice::Speak);
         assert_eq!(reopen_voice(false, Voice::Speak), Voice::Speak, "a non-member that never signed");
+    }
+
+    /// `S1-LP`: **Quiet only at a genesis the table demonstrably holds** -- two
+    /// seats of four or five at a genesis this client cannot derive (two rogues)
+    /// silence nobody; three of five do; two at a genesis it derives (a round it
+    /// voted in, complete elsewhere) do; one at its own genesis, never.
+    #[test]
+    fn quiet_takes_a_majority_or_a_genesis_it_derives() {
+        assert!(!quiet_on_counts(2, 5, 0, false), "two of five at a parent nobody derives");
+        assert!(quiet_on_counts(3, 5, 0, false), "three of five: the table is elsewhere");
+        assert!(!quiet_on_counts(2, 4, 0, false), "half is no majority");
+        assert!(quiet_on_counts(2, 5, 0, true), "two at a genesis this client derives");
+        assert!(quiet_on_counts(2, 3, 0, false), "two of three");
+        assert!(!quiet_on_counts(3, 5, 1, true), "one at this client's own genesis");
+        assert!(!quiet_on_counts(1, 5, 0, true), "below the floor");
     }
 
     /// `S1-BM`: a return's evidence is two halves by two roads, the first copy

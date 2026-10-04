@@ -2601,6 +2601,14 @@ pub struct Hand {
     /// cause is fixed with the first; `D-066`'s long-gone and `D-084`'s cheat
     /// cause excepted.
     voted_about: BTreeSet<SeatIdx>,
+    /// `S1-LP`: the seats of every round this client voted in during the hand,
+    /// one entry a stage -- for the geneses it can derive with a round taken as
+    /// complete that it never saw complete (`candidate_geneses`).
+    rounds_voted: Vec<Vec<SeatIdx>>,
+    /// `S1-LP` (`REVIEW_S1LP_v3` S1): the waited-on seats this client cast a
+    /// counting vote about at the stage now open -- never a voter named silent,
+    /// whose set takes a veto and no seat out of the roster.
+    round_subjects: BTreeSet<SeatIdx>,
     /// `D-051`: the seats a banked certificate named with `CAUSE_FLOOD`: every
     /// voter's client cut them off for flooding the group.
     flood_named: BTreeSet<SeatIdx>,
@@ -3257,11 +3265,33 @@ impl Hand {
         // or muted hand is a member like any other — its own copy is in its
         // own stage, so the stage completes the moment the table's copies
         // land — and only the wire is withheld.
-        let (sends, own_init) = match (speaks, voice) {
+        let (mut sends, own_init) = match (speaks, voice) {
             (true, Voice::Speak) => (vec![Send::Broadcast(bytes)], None),
             (true, Voice::Quiet) => (Vec::new(), Some(bytes)),
             (true, Voice::Muted) | (false, _) => (Vec::new(), None),
         };
+        // fault-harness, `S1-LP`: a rogue signs the next hand's opening at a
+        // genesis nobody derives -- one every rogue of the table names alike --
+        // and, past its first such hand, says it instead of its own
+        // (`junk-genesis`): still in the roster (it took part in the hand before),
+        // at no genesis an honest seat holds, so no honest seat ever counts it.
+        if speaks && voice == Voice::Speak && rogue("junk-genesis", o.hand_id) {
+            if rogue("junk-genesis", o.hand_id.saturating_sub(1)) {
+                sends.clear();
+            }
+            let mut parts = b"p2p-poker junk genesis".to_vec();
+            parts.extend_from_slice(&o.table_id);
+            parts.extend_from_slice(&(o.hand_id + 1).to_be_bytes());
+            let at = Slot {
+                table_id: o.table_id,
+                hand_id: o.hand_id + 1,
+                sequence: 0,
+                previous_event_hash: *blake3::hash(&parts).as_bytes(),
+            };
+            if let Ok(junk) = chained::seal(EventType::HandInit, &at, &mine, key, now_ms, next_deadline_ms, HAND_INIT_CAP) {
+                sends.push(Send::Broadcast(junk));
+            }
+        }
         let opened_at_ms = now_ms;
         let mut opened = (
             Hand {
@@ -3338,6 +3368,8 @@ impl Hand {
                 turn_heard_ms: opened_at_ms,
                 taken_up_ms: if restoring { now_ms } else { 0 },
                 foreign_genesis: BTreeMap::new(),
+                rounds_voted: Vec::new(),
+                round_subjects: BTreeSet::new(),
                 genesis_note: None,
                 genesis_said: false,
                 late_roster: false,
@@ -9812,6 +9844,12 @@ impl Hand {
         self.certifying = None;
         self.votes.clear();
         self.voted.clear();
+        // `S1-LP`: kept for the hand, a round a stage -- its waited-on subjects
+        // alone, each round once.
+        let round: Vec<SeatIdx> = std::mem::take(&mut self.round_subjects).into_iter().collect();
+        if !round.is_empty() && !self.rounds_voted.contains(&round) && self.rounds_voted.len() < 64 {
+            self.rounds_voted.push(round);
+        }
         self.voted_about.clear();
         self.own_vote_at = None;
         self.quiet_vote_at = None;
@@ -10370,6 +10408,7 @@ impl Hand {
             )?;
             self.voted.insert(digest);
             self.voted_about.insert(seat);
+            self.round_subjects.insert(seat);
             // `S1-LM`: a vote here, for the turn after it.
             self.asked_here = true;
             // **`S1-BB`: the carrier, sampled where the accusation is made.**
@@ -13261,6 +13300,12 @@ impl Hand {
             .max_by_key(|(_, seats)| seats.len())
     }
 
+    /// `S1-LP`: how many seats of the roster signed this hand's opening at
+    /// `genesis` (not this client's own) -- for the re-open guard.
+    pub fn foreign_signers_at(&self, genesis: &Hash) -> usize {
+        self.foreign_genesis.values().filter(|g| *g == genesis).count()
+    }
+
     /// The once-per-hand foreign-genesis line, taken rather than read.
     pub fn take_genesis_note(&mut self) -> Option<String> {
         self.genesis_note.take()
@@ -13754,6 +13799,49 @@ impl Hand {
     /// parent is `TERMINAL(k)`, and the required emitter set is `P(k)` — the
     /// seats this client accepted an event from this hand.
     pub fn next_hand(&self) -> Option<Opening> {
+        let (terminal, stacks) = self.terminal_and_stacks()?;
+        self.next_hand_with(terminal, stacks)
+    }
+
+    /// `S1-LP`: the geneses of the next hand this client derives with one round
+    /// of this hand it voted in taken as complete -- the hand a seat that missed
+    /// that round's certificate would be told to by the table (`S1-BS`): the
+    /// one foreign genesis a Quiet open may wait at without a majority of the
+    /// hand there. Never this client's own genesis; none after a settlement.
+    pub fn candidate_geneses(&self) -> Vec<Hash> {
+        // `REVIEW_S1LP_v3` M1: from a hand given up and not settled alone -- the
+        // one terminal a late certificate's copy still re-derives the next hand
+        // from (`late_roster`). After a settlement no copy moves the roster, and a
+        // candidate there was a parent two rogues could sign at for good: hold a
+        // frame until every honest vote about it is out, then send it.
+        if self.aborted().is_none() || self.settled() {
+            return Vec::new();
+        }
+        let Some((terminal, stacks)) = self.terminal_and_stacks() else {
+            return Vec::new();
+        };
+        let own = self.next_hand_with(terminal, stacks.clone()).map(|o| o.genesis);
+        let mut rounds = self.rounds_voted.clone();
+        if !self.round_subjects.is_empty() {
+            let round: Vec<SeatIdx> = self.round_subjects.iter().copied().collect();
+            if !rounds.contains(&round) {
+                rounds.push(round);
+            }
+        }
+        let mut out: Vec<Hash> = Vec::new();
+        for round in rounds {
+            if let Some(g) = self.next_hand_inner(terminal, stacks.clone(), &round).map(|o| o.genesis) {
+                if Some(g) != own && !out.contains(&g) {
+                    out.push(g);
+                }
+            }
+        }
+        out
+    }
+
+    /// `TERMINAL(k)` and the stacks every seat holds at it -- [`Hand::next_hand`]'s
+    /// inputs.
+    fn terminal_and_stacks(&self) -> Option<(Hash, Vec<Chips>)> {
         // **`TERMINAL(k)` comes from one place**, [`Hand::terminal`], which
         // §4.10's boundary window also opens at. The two used to derive it
         // separately and came apart on the abort-settle race; the match below
@@ -13782,7 +13870,7 @@ impl Hand {
             // exhaustive without a wildcard that could swallow a new phase.
             _ => return None,
         };
-        self.next_hand_with(terminal, stacks)
+        Some((terminal, stacks))
     }
 
     /// `S1-FL`: `R(k+1)` as [`Hand::next_hand_with`] derives it, read alone --
@@ -13988,6 +14076,12 @@ impl Hand {
 
     /// Hand `k+1` from a terminal and the stacks everybody holds at it.
     fn next_hand_with(&self, terminal: Hash, stacks: Vec<Chips>) -> Option<Opening> {
+        self.next_hand_inner(terminal, stacks, &[])
+    }
+
+    /// [`Hand::next_hand_with`], with `also_out` taken as certified out of this
+    /// hand besides what this client banked (`S1-LP`'s candidate geneses).
+    fn next_hand_inner(&self, terminal: Hash, stacks: Vec<Chips>, also_out: &[SeatIdx]) -> Option<Opening> {
         // `D-047`: a seat certified absent with `MAX_RETURNS` returns behind it
         // is out of the table for good. Its chips leave the table here, so it
         // is busted in every rule below -- not dealt in, no blinds, no return
@@ -14069,7 +14163,7 @@ impl Hand {
         // branches below differ in more than the predicate.
         let by_certificate = self.open.required.len() >= 3;
         let took_part = |me: &Self, seat: usize| -> bool {
-            me.took_part(seat as SeatIdx)
+            me.took_part(seat as SeatIdx) && !(by_certificate && also_out.contains(&(seat as SeatIdx)))
         };
         for seat in 0..n {
             if !alive.get(seat).copied().unwrap_or(false) {
@@ -28063,6 +28157,44 @@ mod tests {
         }
         flood_among(&mut hands, &keys, &mut said, pending);
         (hands, keys, said)
+    }
+
+    /// `S1-LP`: **the genesis a missed certificate would re-derive the next
+    /// hand to** -- a round this client voted in, taken as complete: seat 2 out
+    /// of the next hand's roster; never this client's own genesis.
+    #[test]
+    fn a_round_voted_in_gives_a_candidate_genesis() {
+        let (mut hands, keys, _) = n_seats_to_the_bet(3);
+        hands[0].rounds_voted.push(vec![2]);
+        let _ = hands[0].abort_now(Abort::Told { cause: 1 }, &keys[0], NOW).unwrap();
+        let own = hands[0].next_hand().expect("a next hand").genesis;
+        let candidates = hands[0].candidate_geneses();
+        assert_eq!(candidates.len(), 1, "one round, one candidate");
+        assert_ne!(candidates[0], own, "never this client's own genesis");
+        let (terminal, stacks) = hands[0].terminal_and_stacks().unwrap();
+        let without = hands[0].next_hand_inner(terminal, stacks, &[2]).expect("two seats play on");
+        assert_eq!(candidates[0], without.genesis);
+        assert!(!without.required.contains(&2), "seat 2 taken as certified out");
+    }
+
+    /// `S1-LP` (`REVIEW_S1LP_v3` M1): **a hand that settled gives no candidate**
+    /// -- no late copy re-derives the next hand after a settlement, so a parent
+    /// derived from a round voted in there would be one rogues sign at for good.
+    #[test]
+    fn a_settled_hand_gives_no_candidate_genesis() {
+        let (mut hands, keys, mut said) = n_seats_to_the_bet(3);
+        for _ in 0..64 {
+            let Some(turn) = hands.iter().find_map(|h| h.turn()) else {
+                break;
+            };
+            let s = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[s].act(action, &keys[s], NOW).unwrap();
+            flood_among(&mut hands, &keys, &mut said, vec![(s, sends)]);
+        }
+        assert!(hands[0].settled(), "the hand settled");
+        hands[0].rounds_voted.push(vec![2]);
+        assert!(hands[0].candidate_geneses().is_empty(), "no candidate after a settlement");
     }
 
     /// `S1-KV`: **a big blind that busts leaves the next small blind dead on
