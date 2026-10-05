@@ -785,6 +785,13 @@ pub struct Trouble {
     /// Distinct from [`rejoins`](Self::rejoins): this is the library saying so,
     /// that is this client noticing silence.
     pub join_fails: AtomicU64,
+    /// `S1-KH`: seconds a joiner's table has held no copy of the group and no
+    /// join in progress, on the Tox network -- since it last held one. Zero
+    /// where it holds one, and on a founder's table.
+    pub kept_out_s: AtomicU64,
+    /// `S1-KH`: seconds the founder's friendship has been up without a break;
+    /// zero while it is down, and on a founder's table.
+    pub founder_up_s: AtomicU64,
 }
 
 /// `D-051`: one member this client cut off from a table's group.
@@ -1227,6 +1234,27 @@ const LONE_OFFERS_ANYWAY_AFTER: Duration = Duration::from_secs(180);
 /// already holds, and the library swallows the offer.
 const QUIET_MISSING_AFTER: Duration = Duration::from_secs(30);
 
+/// `S1-KH`: how long a seat of the game may be missing from the copy the table
+/// plays in -- read missing after `QUIET_MISSING_AFTER`, so about two minutes
+/// after it went -- before a member offers it that copy while the founder is at
+/// the hands; and how long a seat back from a restart may be kept out of the
+/// group by a founder whose friendship is up before it takes the record road
+/// (`net::run`). Past the honest founder road's returns (13 to 33 s measured
+/// for a restart) and past `JOIN_GRACE` with room: a founder whose invitation
+/// lands has brought the seat back long before.
+pub const KEPT_OUT_AFTER: Duration = Duration::from_secs(90);
+
+/// `S1-KH`: the same for a founder whose friendship never came up -- toxcore can
+/// keep trying a restarted friend's old address for over two minutes
+/// (`Tox::forget_friend`), and an honest founder offers the group on the
+/// friendship's up-edge.
+pub const KEPT_OUT_UNREACHED_AFTER: Duration = Duration::from_secs(240);
+
+/// `S1-KH`: how long a member whose invitation led to a join that did not
+/// complete within `JOIN_GRACE` is not taken again -- forgotten sooner on the
+/// edge that refreshes `MAX_REJOINS`. Never the founder.
+const STALLED_INVITER_FOR: Duration = Duration::from_secs(300);
+
 /// `D-049`: how often a member says its sitting-out status in the group again,
 /// changed or not. The library broadcasts a status losslessly and exchanges it
 /// with every peer a member connects to; this bounds what any gap in that
@@ -1430,6 +1458,20 @@ struct TableState {
     /// `S1-KP` (`D-103`): and outside them since the first such hand -- a copy
     /// held empty takes a counted seat's invitation.
     founder_outside: bool,
+    /// `S1-KH`: since when this joiner has held no copy of the group and no join
+    /// in progress while on the Tox network (`Trouble::kept_out_s`).
+    kept_out_since: Option<Instant>,
+    /// `S1-KH`: since when the founder's friendship has been up without a break.
+    founder_up_since: Option<Instant>,
+    /// `S1-KH`: since when each seat of the game, by its line, has been missing
+    /// from this copy (`seats_heard`) -- a member offers the copy the table plays
+    /// in to one missing `KEPT_OUT_AFTER` while the founder is at the hands.
+    missing_since: HashMap<[u8; 32], Instant>,
+    /// `S1-KH`: the line whose invitation the join now in progress was taken on.
+    accepted_from: Option<[u8; 32]>,
+    /// `S1-KH`: members whose invitation led to a join that did not complete,
+    /// and when -- not taken again for `STALLED_INVITER_FOR`.
+    stalled_from: HashMap<[u8; 32], Instant>,
     out: tokio::sync::mpsc::Receiver<Vec<u8>>,
     inbox: tokio::sync::mpsc::Sender<FromTable>,
     chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
@@ -2083,6 +2125,44 @@ fn sweep_table(
             }
         }
     }
+    // `S1-KH`: and while the founder is at the hands, from the copy the table plays
+    // in alone -- the founder a confirmed member of it, heard within
+    // `QUIET_MISSING_AFTER`; never a lone copy -- to a seat of the game missing from
+    // it for `KEPT_OUT_AFTER` whose friendship with this member is up: one back from
+    // a restart whose founder does not bring it in. The founder's own line is left
+    // to `S1-FE`'s offers; the rest is `D-103`'s rule, one seat a sweep, every
+    // `REINVITE_EVERY`.
+    if let (false, Some(g), Some(founder)) = (founder_away(t), t.group, founder_app(t)) {
+        if let (true, Some(mine)) = (t.self_joined && t.settled, t.setup.binder.as_ref().map(|k| k.verifying_key().to_bytes())) {
+            let present = seats_heard(tox, g, t);
+            let missing = missing_lines(&t.seat_lines, &mine, &t.in_game, &present, &t.barred, &t.barred_lines, &t.roster);
+            t.missing_since.retain(|line, _| missing.contains(line));
+            for line in &missing {
+                t.missing_since.entry(*line).or_insert_with(Instant::now);
+            }
+            let offers = present.contains(&founder) && !held_empty(t) && t.in_game_from_hand && t.in_game.contains(&mine);
+            let due = missing
+                .into_iter()
+                .filter(|line| offers && !founder_line(t, line))
+                .filter(|line| t.missing_since.get(line).is_some_and(|at| at.elapsed() >= KEPT_OUT_AFTER))
+                .filter_map(|line| friend_number(friends, &line).map(|n| (line, n)))
+                .filter(|(line, n)| {
+                    connected.contains(n) && t.seat_offered.get(line).is_none_or(|at| at.elapsed() >= REINVITE_EVERY)
+                })
+                .min_by_key(|(line, _)| t.seat_offered.get(line).copied());
+            if let Some((line, n)) = due {
+                if tox.invite(g, n).is_ok() {
+                    t.seat_offered.insert(line, Instant::now());
+                    t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else {
+            // Read missing without a break only while this copy is settled.
+            t.missing_since.clear();
+        }
+    } else {
+        t.missing_since.clear();
+    }
     t.trouble
         .confirmed_peers
         .store(t.confirmed.len() as u64, Ordering::Relaxed);
@@ -2154,8 +2234,12 @@ fn sweep_table(
     if can_be_invited && !t.was_reachable {
         t.rejoins = 0;
         t.trouble.rejoins.store(0, Ordering::Relaxed);
+        // `S1-KH`: and the members whose join stalled are forgotten on the same
+        // edge -- a stall the line made was nobody's.
+        t.stalled_from.clear();
     }
     t.was_reachable = can_be_invited;
+    t.stalled_from.retain(|_, at| at.elapsed() < STALLED_INVITER_FOR);
     // `S1-KO`: and since when, for a lone copy's patience (`member_offers`).
     if can_be_invited {
         t.reachable_since.get_or_insert_with(Instant::now);
@@ -2171,17 +2255,74 @@ fn sweep_table(
             || (matches!(t.setup.role, Role::Host) && t.own_chat.is_some()))
     {
         if let Some(since) = t.accepted_at {
-            if since.elapsed() >= JOIN_GRACE && t.rejoins < MAX_REJOINS {
+            // `S1-KH`: a join taken on a member's invitation is left whatever the
+            // budget, and that member is not taken again for `STALLED_INVITER_FOR`
+            // -- the stalls are bounded by the inviters, and none of them is the
+            // founder's, which the budget counts as before. On a road with the
+            // founder outside (the record road, `REVIEW_S1KH_v2` M1) a stalled
+            // founder join is left whatever the budget too -- and the founder is
+            // never refused for it.
+            let by_member = by_a_member(&t.setup.role, t.accepted_from.as_ref());
+            if since.elapsed() >= JOIN_GRACE && (by_member || t.founder_outside || t.rejoins < MAX_REJOINS) {
                 if let Some(g) = t.group.take() {
                     let _ = tox.leave(g);
                 }
                 t.accepted_at = None;
                 t.settled = false;
                 t.confirmed.clear();
-                t.rejoins += 1;
-                t.trouble.rejoins.store(t.rejoins as u64, Ordering::Relaxed);
+                match t.accepted_from.take().filter(|_| by_member) {
+                    Some(line) => {
+                        t.stalled_from.insert(line, Instant::now());
+                    }
+                    None => {
+                        t.rejoins += 1;
+                        t.trouble.rejoins.store(t.rejoins as u64, Ordering::Relaxed);
+                    }
+                }
             }
         }
+    }
+    // `S1-KH`: how long a joiner has been kept out of the group -- no copy and no
+    // join in progress, on the Tox network -- and how long its founder's
+    // friendship has been up, for the node's reading of a founder road that does
+    // not bring a seat back from a restart.
+    // `REVIEW_S1KH_v2` M1: in the group is a copy joined that holds another member;
+    // a join still within `JOIN_GRACE` is not counted (and starts nothing over), and
+    // one stalled past it is counted -- a founder whose invitations land and whose
+    // joins stall keeps the seat out as surely as one that offers nothing.
+    let mut joining = false;
+    match &t.setup.role {
+        Role::Joiner { founder, .. } => {
+            if friend_number(friends, founder).is_some_and(|n| connected.contains(&n)) {
+                t.founder_up_since.get_or_insert_with(Instant::now);
+            } else {
+                t.founder_up_since = None;
+            }
+            let in_group = t.group.is_some() && t.self_joined && !held_empty(t);
+            joining = t.group.is_some() && !t.self_joined && t.accepted_at.is_some_and(|at| at.elapsed() < JOIN_GRACE);
+            if in_group || self_connection == 0 {
+                t.kept_out_since = None;
+            } else {
+                t.kept_out_since.get_or_insert_with(Instant::now);
+            }
+        }
+        _ => {
+            t.founder_up_since = None;
+            t.kept_out_since = None;
+        }
+    }
+    let kept_out = if joining { 0 } else { t.kept_out_since.map_or(0, |at| at.elapsed().as_secs()) };
+    t.trouble.kept_out_s.store(kept_out, Ordering::Relaxed);
+    t.trouble.founder_up_s.store(t.founder_up_since.map_or(0, |at| at.elapsed().as_secs()), Ordering::Relaxed);
+}
+
+/// `S1-KH`: whether the join a joiner's table now makes was taken on a member's
+/// invitation -- a line not its founder's. A founder back (`Role::Back`) or the
+/// founder itself has no member to count apart.
+fn by_a_member(role: &Role, accepted_from: Option<&[u8; 32]>) -> bool {
+    match role {
+        Role::Joiner { founder, .. } => accepted_from.is_some_and(|k| k != founder),
+        _ => false,
     }
 }
 
@@ -2328,6 +2469,11 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             waiting_on: HashMap::new(),
                             founder_away_by_hands: false,
                             founder_outside: false,
+                            kept_out_since: None,
+                            founder_up_since: None,
+                            missing_since: HashMap::new(),
+                            accepted_from: None,
+                            stalled_from: HashMap::new(),
                             out,
                             inbox,
                             chat,
@@ -2876,6 +3022,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                     if let Some(t) = by_group(&mut tables, g) {
                         t.self_joined = true;
                         t.accepted_at = None;
+                        t.accepted_from = None;
                     }
                 }
                 Event::GroupJoinFail { group: g, reason } => {
@@ -2889,6 +3036,14 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         t.settled = false;
                         t.confirmed.clear();
                         t.trouble.join_fails.fetch_add(1, Ordering::Relaxed);
+                        // `S1-KH`: a member's invitation that failed so is not
+                        // taken again for a while, as one whose join stalled.
+                        if by_a_member(&t.setup.role, t.accepted_from.as_ref()) {
+                            if let Some(line) = t.accepted_from {
+                                t.stalled_from.insert(line, Instant::now());
+                            }
+                        }
+                        t.accepted_from = None;
                         let _ = reason;
                     }
                 }
@@ -3549,9 +3704,12 @@ fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {
         // from a seat this client's hand, or its record, counts as playing (G1).
         // `REFUTE_S1KP_impl_groups` I1: and with no copy at all -- the copy held
         // empty is left for the invitation one turn, and taken without it the next.
+        // `S1-KH`: never a member whose last invitation led to a join that did not
+        // complete, for `STALLED_INVITER_FOR` -- never the founder.
         (Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => {
             k == *founder
-                || ((founder_away(t) || (t.founder_outside && (held_empty(t) || t.group.is_none())))
+                || (!t.stalled_from.contains_key(&k)
+                    && (founder_away(t) || (t.founder_outside && (held_empty(t) || t.group.is_none())))
                     && in_game_line(t, &k)
                     && counted_line(t, &k))
         }
@@ -3612,6 +3770,12 @@ fn take_invitation(
         Some(t) => {
             t.group = Some(joined);
             t.accepted_at = Some(Instant::now());
+            // `S1-KH`: whose invitation it was, for a join that stalls -- and no
+            // longer kept out to the node's reading until the sweep says otherwise
+            // (`REVIEW_S1KH_v2`: a reading five seconds old could end a join just
+            // begun).
+            t.accepted_from = from;
+            t.trouble.kept_out_s.store(0, Ordering::Relaxed);
             t.self_joined = false;
             // `D-051`: named with this seat's binding before the first handshake.
             t.named = None;
@@ -3748,6 +3912,20 @@ fn founder_away(t: &TableState) -> bool {
 /// held empty orders above every member's (`REFUTE_S1KP_v1_groups` G3).
 fn founder_line_away(t: &TableState, line: &[u8; 32]) -> bool {
     t.founder_away_by_hands && matches!(&t.setup.role, Role::Joiner { founder, .. } if founder == line)
+}
+
+/// `S1-KH`: a member's founder's application key, read through the seats' lines
+/// -- `None` on a founder's own table, or before the seats' lines are known.
+fn founder_app(t: &TableState) -> Option<[u8; 32]> {
+    match &t.setup.role {
+        Role::Joiner { founder, .. } => t.seat_lines.iter().find(|(_, l)| l == founder).map(|(a, _)| *a),
+        _ => None,
+    }
+}
+
+/// `S1-KH`: whether `line` is this member's founder's.
+fn founder_line(t: &TableState, line: &[u8; 32]) -> bool {
+    matches!(&t.setup.role, Role::Joiner { founder, .. } if founder == line)
 }
 
 /// `S1-KP` (`D-103`): the founder's application key while it is away by the
@@ -4491,8 +4669,8 @@ mod tests {
         // `S1-KP` (`D-103`): or away from the hands by the node's reading -- and from
         // a seat counted as playing only.
         assert!(
-            code.contains("Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => { k == *founder || ((founder_away(t) || (t.founder_outside && (held_empty(t) || t.group.is_none()))) && in_game_line(t, &k) && counted_line(t, &k)) }"),
-            "a seat of the game's invitation, once the founder is out or away"
+            code.contains("Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => { k == *founder || (!t.stalled_from.contains_key(&k) && (founder_away(t) || (t.founder_outside && (held_empty(t) || t.group.is_none()))) && in_game_line(t, &k) && counted_line(t, &k)) }"),
+            "a seat of the game's invitation, once the founder is out or away -- and not one whose last join stalled (S1-KH)"
         );
         let sweep = code.find("fn sweep_table(").expect("the sweep");
         let offers = sweep + code[sweep..].find("if let (true, Some(g)) = (founder_away(t), t.group) {").expect("a member's offer");
@@ -4592,6 +4770,65 @@ mod tests {
         // A second invitation in one turn waits a turn.
         assert!(code.contains("left_one = true; left_this_turn.insert(*id);"));
         assert!(code.contains("if left_one || deferred_table { invites_deferred.push((friend, invite)); } else { take_invitation(&mut tox, &mut tables, &friends, friend, &invite); }"));
+    }
+
+    /// `S1-KH`: a seat back from a restart that its founder, at the hands, does
+    /// not bring into the group is brought in by the members -- from the copy the
+    /// table plays in alone (the founder a confirmed member of it, heard; never a
+    /// lone copy), to a seat of the game missing `KEPT_OUT_AFTER` whose friendship
+    /// is up, never the founder's own line. A join taken on a member's
+    /// invitation that stalls is left whatever the budget, and that member is not
+    /// taken again for `STALLED_INVITER_FOR` -- forgotten sooner on the edge that
+    /// refreshes the budget; the founder is never refused so. And the driver says
+    /// how long a joiner has been kept out of the group, for the node.
+    #[test]
+    fn a_seat_kept_out_by_its_founder_is_brought_back_by_the_members() {
+        let founder = [7u8; 32];
+        let joiner = Role::Joiner { founder, chat_id: Some([1u8; 32]) };
+        assert!(!by_a_member(&joiner, None), "nothing taken");
+        assert!(!by_a_member(&joiner, Some(&founder)), "the founder's invitation is no member's");
+        assert!(by_a_member(&joiner, Some(&[8u8; 32])), "another seat's is");
+        assert!(!by_a_member(&Role::Host, Some(&[8u8; 32])), "a founder has no founder to count apart");
+        assert!(!by_a_member(&Role::Back { chat_id: Some([1u8; 32]) }, Some(&[8u8; 32])));
+        // Past the honest founder road and a stalled join's grace; a friendship
+        // that never came up given longer; a staller forgotten after minutes.
+        assert!(KEPT_OUT_AFTER >= Duration::from_secs(90) && KEPT_OUT_AFTER > JOIN_GRACE * 3);
+        assert!(KEPT_OUT_UNREACHED_AFTER > Duration::from_secs(122) + JOIN_GRACE * 2 && KEPT_OUT_UNREACHED_AFTER > KEPT_OUT_AFTER);
+        assert!(STALLED_INVITER_FOR > JOIN_GRACE * 4);
+
+        let src = include_str!("table.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The members' offer while the founder is at the hands.
+        let sweep = code.find("fn sweep_table(").expect("the sweep");
+        let offer = sweep
+            + code[sweep..]
+                .find("if let (false, Some(g), Some(founder)) = (founder_away(t), t.group, founder_app(t)) {")
+                .expect("an offer with the founder at the hands");
+        let body = &code[offer..offer + code[offer..].find("} else { t.missing_since.clear(); }").expect("its end")];
+        assert!(
+            body.contains("let offers = present.contains(&founder) && !held_empty(t) && t.in_game_from_hand && t.in_game.contains(&mine);"),
+            "from the copy the founder is heard in, never a lone one, by a member its own hand counts"
+        );
+        assert!(body.contains(".filter(|line| offers && !founder_line(t, line))"), "never the founder's own line");
+        assert!(body.contains(".filter(|line| t.missing_since.get(line).is_some_and(|at| at.elapsed() >= KEPT_OUT_AFTER))"));
+        assert!(body.contains("connected.contains(n) && t.seat_offered.get(line).is_none_or(|at| at.elapsed() >= REINVITE_EVERY)"));
+        assert!(body.contains("t.missing_since.retain(|line, _| missing.contains(line));"), "missing without a break");
+        // A stalled member join: left whatever the budget, the member set aside.
+        assert!(code.contains(
+            "let by_member = by_a_member(&t.setup.role, t.accepted_from.as_ref()); if since.elapsed() >= JOIN_GRACE && (by_member || t.founder_outside || t.rejoins < MAX_REJOINS) {"
+        ), "a member's, or anybody's on a road with the founder outside, whatever the budget");
+        assert!(code.contains("match t.accepted_from.take().filter(|_| by_member) { Some(line) => { t.stalled_from.insert(line, Instant::now()); } None => { t.rejoins += 1;"));
+        assert!(code.contains("t.rejoins = 0; t.trouble.rejoins.store(0, Ordering::Relaxed); // `S1-KH`: and the members whose join stalled are forgotten on the same // edge -- a stall the line made was nobody's. t.stalled_from.clear();"));
+        assert!(code.contains("t.stalled_from.retain(|_, at| at.elapsed() < STALLED_INVITER_FOR);"));
+        assert!(code.contains("t.accepted_from = from; t.trouble.kept_out_s.store(0, Ordering::Relaxed);"), "an invitation taken reads as no longer kept out at once");
+        // And how long a joiner is kept out, for the node: out of the group -- a
+        // stalled join counted, one within its grace not yet.
+        assert!(code.contains("let in_group = t.group.is_some() && t.self_joined && !held_empty(t);"));
+        assert!(code.contains("joining = t.group.is_some() && !t.self_joined && t.accepted_at.is_some_and(|at| at.elapsed() < JOIN_GRACE);"));
+        assert!(code.contains("if in_group || self_connection == 0 { t.kept_out_since = None; } else { t.kept_out_since.get_or_insert_with(Instant::now); }"));
+        assert!(code.contains("let kept_out = if joining { 0 } else { t.kept_out_since.map_or(0, |at| at.elapsed().as_secs()) };"));
+        assert!(code.contains("if friend_number(friends, founder).is_some_and(|n| connected.contains(&n)) { t.founder_up_since.get_or_insert_with(Instant::now); } else { t.founder_up_since = None; }"));
     }
 
     /// `S1-KL`: the node's own count of this client's returns belongs to one

@@ -1653,6 +1653,13 @@ struct TableRun {
     /// this client's own excepted -- a friendship with one up holds the record
     /// road's clock open (`REFUTE_S1KP_v1_node` N2).
     record_counted_lines: Vec<[u8; 32]>,
+    /// `S1-KH`: the founder answered the founder road's rejoin *already seated*
+    /// -- since when this seat has waited for it to bring the seat back.
+    held_since: Option<tokio::time::Instant>,
+    /// `S1-KH`: the record road was taken because the founder road kept the seat
+    /// out of the table's group although the founder answered: it keeps the
+    /// founder road's open-ended wait, with no ten-minute give-up.
+    kept_out_road: bool,
     /// `S1-KF` (`D-088`): the stacks the hand this client holds, and the one
     /// retained before it, hold by its own derivation, on the last stall tick
     /// -- what the session record keeps for a client started again.
@@ -2220,6 +2227,8 @@ impl TableRun {
             record_road_answered: false,
             record_road_tox: None,
             record_counted_lines: Vec::new(),
+            held_since: None,
+            kept_out_road: false,
             stacks_held: None,
             rejoin_away: false,
             split_said_hand: 0,
@@ -5151,6 +5160,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.record_road_answered = false;
             $t.record_road_tox = None;
             $t.record_counted_lines.clear();
+            $t.held_since = None;
+            $t.kept_out_road = false;
             $t.stacks_held = None;
             $t.rejoin_away = false;
             $t.split_said_hand = 0;
@@ -5749,9 +5760,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // (its driver re-offers the group on the ask, `Seat::Back`), and the members
     // that read it away take its part. True where the road was taken; false
     // leaves the founder road's failure to the caller, the record kept.
+    // `S1-KH`: `kept_out` -- taken because the founder road keeps the seat out of
+    // the table's group although the founder answered *already seated*: the
+    // founder is asked no more, and the road keeps the founder road's open-ended
+    // wait (no ten-minute give-up, the record kept).
     macro_rules! back_by_record {
-        ($t:ident, $why:expr) => {{
+        ($t:ident, $why:expr) => {
+            back_by_record!($t, $why, false)
+        };
+        ($t:ident, $why:expr, $kept_out:expr) => {{
             let why: String = $why;
+            let kept_out: bool = $kept_out;
             let mut taken = false;
             let record = $t.resume.clone().filter(|r| $t.resuming && r.founder_seed == [0u8; 32] && !r.roster_list.is_empty());
             let ad = record.as_ref().and_then(|r| super::advert::from_body_bytes(&r.advert).ok());
@@ -5802,33 +5821,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if !founder_out && !out_apps.contains(&me) && !members.is_empty() && counted_other {
                     let table_key = r.table_key;
                     let now = super::node::now_unix_ms();
-                    // What the founder road built goes; the record stays.
-                    $t.tox_sink.clear();
-                    $t.tox_group_said = false;
-                    $t.table_announces = 0;
-                    join_pending.retain(|_, slot| *slot != $t.slot);
-                    let started = ad.founder_tox_key.map(|founder_tox| {
-                        $t.tox_sink.start(
-                            &profile_dir,
-                            super::toxsink::Role::Joiner { founder: founder_tox, chat_id: ad.tox_chat_id },
-                            &ad.table_name,
-                            &nickname,
-                            members.clone(),
-                            Some(app_key.clone()),
-                        )
-                    });
-                    $t.record_road_tox = match &started {
-                        Some(Ok(k)) => *k,
-                        _ => None,
-                    };
-                    $t.out_keys.clear();
-                    $t.tox_sink.tell(super::toxsink::Seat::InGame { apps: in_game.clone(), present: present.clone(), from_hand: false });
-                    $t.in_game_told = Some(((in_game, present), false));
-                    // Away and outside until a hand of its own reads it again.
-                    $t.founder_absence = FounderAbsence { since: None, outside: true, away: true, seeded: true };
-                    $t.tox_sink.tell(super::toxsink::Seat::FounderAway { away: true, outside: true });
-                    $t.founder_absence_told = Some((true, true));
-                    restore_recorded_out!($t, table_key);
+                    // `S1-KH` (`REFUTE_S1KH_v1` Q3): the table rebuilt from the record
+                    // first -- where it cannot be, nothing the founder road holds is
+                    // touched, its Tox table and its wait included.
                     match Formation::joined_back(
                         app_key.clone(),
                         ad.clone(),
@@ -5839,6 +5834,33 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         now,
                     ) {
                         Ok((f, sends)) => {
+                            // What the founder road built goes; the record stays.
+                            $t.tox_sink.clear();
+                            $t.tox_group_said = false;
+                            $t.table_announces = 0;
+                            join_pending.retain(|_, slot| *slot != $t.slot);
+                            let started = ad.founder_tox_key.map(|founder_tox| {
+                                $t.tox_sink.start(
+                                    &profile_dir,
+                                    super::toxsink::Role::Joiner { founder: founder_tox, chat_id: ad.tox_chat_id },
+                                    &ad.table_name,
+                                    &nickname,
+                                    members.clone(),
+                                    Some(app_key.clone()),
+                                )
+                            });
+                            $t.record_road_tox = match &started {
+                                Some(Ok(k)) => *k,
+                                _ => None,
+                            };
+                            $t.out_keys.clear();
+                            $t.tox_sink.tell(super::toxsink::Seat::InGame { apps: in_game.clone(), present: present.clone(), from_hand: false });
+                            $t.in_game_told = Some(((in_game, present), false));
+                            // Away and outside until a hand of its own reads it again.
+                            $t.founder_absence = FounderAbsence { since: None, outside: true, away: true, seeded: true };
+                            $t.tox_sink.tell(super::toxsink::Seat::FounderAway { away: true, outside: true });
+                            $t.founder_absence_told = Some((true, true));
+                            restore_recorded_out!($t, table_key);
                             let topic = joinrpc::table_topic(&table_key);
                             let _ = subscribe_scored(&mut swarm, &topic);
                             $t.table_topic = Some(topic.clone());
@@ -5859,15 +5881,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             $t.back_by_record = true;
                             $t.record_road_asked = Some(tokio::time::Instant::now());
                             $t.record_counted_lines = counted_lines;
+                            $t.record_road_answered = kept_out;
+                            $t.kept_out_road = kept_out;
                             let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "rejoining {} (seat {}, stack {}, last at hand #{}) from the session record, through the other seats: {why}; it is asked again every {} s, and the seats that read it away take its part in the table's group (S1-KP)",
-                                    ad.table_name,
-                                    r.my_seat,
-                                    r.my_stack,
-                                    r.hand_id,
-                                    REASK_AGAIN.as_secs()
-                                )))
+                                .send(NodeEvent::Warning(if kept_out {
+                                    format!(
+                                        "rejoining {} (seat {}, stack {}, last at hand #{}) from the session record, through the other seats: {why}; the seats of the game offer this seat the table's group as the founder does, and it waits for either for as long as it takes (S1-KH)",
+                                        ad.table_name, r.my_seat, r.my_stack, r.hand_id
+                                    )
+                                } else {
+                                    format!(
+                                        "rejoining {} (seat {}, stack {}, last at hand #{}) from the session record, through the other seats: {why}; it is asked again every {} s, and the seats that read it away take its part in the table's group (S1-KP)",
+                                        ad.table_name,
+                                        r.my_seat,
+                                        r.my_stack,
+                                        r.hand_id,
+                                        REASK_AGAIN.as_secs()
+                                    )
+                                }))
                                 .await;
                             if let Some(f) = $t.table.as_ref() {
                                 report_roster(&events, f).await;
@@ -5882,17 +5913,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             taken = true;
                         }
                         Err(e) => {
-                            // The record does not rebuild: the founder road's failure
-                            // stands, as before.
-                            $t.tox_sink.clear();
-                            $t.tox_group_said = false;
-                            $t.table_announces = 0;
-                            $t.in_game_told = None;
-                            $t.founder_absence = FounderAbsence::default();
-                            $t.founder_absence_told = None;
+                            // The record does not rebuild: the founder road stands as
+                            // it was -- its failure where it failed, its wait where it
+                            // waits -- nothing of it touched.
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
-                                    "the founder did not answer, and the seat's record does not rebuild the table ({e:?}): no road through the other seats (S1-KP)"
+                                    "{why}, and the seat's record does not rebuild the table ({e:?}): no road through the other seats (S1-KP)"
                                 )))
                                 .await;
                         }
@@ -6964,6 +6990,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             == crate::table::join::RejectReason::AlreadySeated
                                                 .code() =>
                                     {
+                                        // `S1-KH`: and since when -- a founder that answers so and
+                                        // does not bring the seat into the group leaves it to the
+                                        // record road (`seat_kept_out`).
+                                        t.held_since.get_or_insert_with(tokio::time::Instant::now);
                                         let _ = events
                                             .send(NodeEvent::Warning(
                                                 "this table already holds a seat for us; waiting for its roster"
@@ -13083,7 +13113,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // taken up -- none of the other seats is left to take it back, or
                     // none has; the session alone can come over the mesh to a seat in
                     // no group -- and it leaves the table, its record with it.
-                    if t.resuming && back_through_the_seats(t) && !t.hand_since_resume && t.hand.is_none() {
+                    // `S1-KH`: never on the record road a founder that answered left the
+                    // seat to (`kept_out_road`): the founder road had no give-up, and a
+                    // founder whose invitation comes late still brings the seat back.
+                    if t.resuming && back_through_the_seats(t) && !t.kept_out_road && !t.hand_since_resume && t.hand.is_none() {
                         let now = super::node::now_unix_ms();
                         // In the table's group with another seat, it is being taken
                         // back, however long the hand takes to come: the clock runs
@@ -13111,6 +13144,37 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
                             leave_table_now!(t, why);
+                        }
+                    }
+                    // `S1-KH`: a seat back from a restart whose founder answered *already
+                    // seated* and has not brought it into the table's group -- its Tox table
+                    // open, no copy and no join for `KEPT_OUT_AFTER`, the founder's
+                    // friendship up all that time or none for `KEPT_OUT_UNREACHED_AFTER`
+                    // (`seat_kept_out`) -- takes the record road, the founder's invitation
+                    // still taken first there, and the seats of the game offering the group
+                    // as the founder does (`tox::table`'s `S1-KH` offers).
+                    // The founder's answer is one restart's: a seat that holds a hand
+                    // again is not waiting on it.
+                    if t.hand.is_some() {
+                        t.held_since = None;
+                    }
+                    if !t.back_by_record
+                        && t.resuming
+                        && t.hand.is_none()
+                        && seat_kept_out(t.held_since.is_some(), t.tox_sink.kept_out())
+                    {
+                        let secs = t.tox_sink.kept_out().map_or(0, |(out, _)| out);
+                        let why = format!(
+                            "the founder answered that this seat is still at the table and has not brought it into the table's group in {secs} s"
+                        );
+                        t.held_since = None;
+                        if !back_by_record!(t, why, true) {
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "the founder keeps this seat waiting, and its session record has no road through the other seats: it waits for the founder (S1-KH)"
+                                        .into(),
+                                ))
+                                .await;
                         }
                     }
                     // `S1-KP` (`D-103`): the record road asks its founder again, every
@@ -17271,6 +17335,19 @@ fn forget_the_resumed_record(profile_dir: &std::path::Path, resume: Option<&crat
 /// `S1-KO`: whether this slot holds a table taken up from its own session record
 /// through the other seats -- a seat's record, not the founder's, whose founder
 /// the table put out for good, its roster kept -- rather than through a founder.
+/// `S1-KH`: whether a seat back from a restart, its founder having answered
+/// *already seated* (`answered`), is kept out of the table's group by the
+/// founder road -- on the Tox network with no copy of the group and no join in
+/// progress for `KEPT_OUT_AFTER`, and either the founder's friendship up all that
+/// time with no invitation of its landing, or no copy for
+/// `KEPT_OUT_UNREACHED_AFTER` whatever the friendship did. Read from the driver
+/// (`TableSink::kept_out`); with no Tox table open nothing is kept out.
+fn seat_kept_out(answered: bool, kept_out: Option<(u64, u64)>) -> bool {
+    let after = crate::tox::table::KEPT_OUT_AFTER.as_secs();
+    let unreached = crate::tox::table::KEPT_OUT_UNREACHED_AFTER.as_secs();
+    answered && kept_out.is_some_and(|(out, up)| out >= after && (up >= after || out >= unreached))
+}
+
 fn back_through_the_seats(t: &TableRun) -> bool {
     match (t.resume.as_ref(), t.table.as_ref()) {
         (Some(r), Some(f)) => {
@@ -27557,8 +27634,9 @@ mod a_joiner_before_the_first_hand {
         let held_here = join + code[join..].find("if let Some(f) = t.table.as_ref() {").expect("a slot that holds a table");
         assert!(quiet < held_here, "before a held table refuses it");
         // It gives up as a rejoin does: ten minutes with no hand of the table taken
-        // up and no other seat of its group seen.
-        assert!(code.contains("if t.resuming && back_through_the_seats(t) && !t.hand_since_resume && t.hand.is_none() {"));
+        // up and no other seat of its group seen -- `S1-KH`: but not on a road a
+        // founder that answered left the seat to.
+        assert!(code.contains("if t.resuming && back_through_the_seats(t) && !t.kept_out_road && !t.hand_since_resume && t.hand.is_none() {"));
         assert!(code.contains("if t.tox_sink.group_seen().0 > 0 { t.resume_last_peer_ms = Some(now); }"));
         assert!(code.contains("let since = t.resume_last_peer_ms.map_or(t.resume_since_ms, |p| p.max(t.resume_since_ms)); if now.saturating_sub(since) >= crate::protocol::constants::RESUME_GIVE_UP_MS {"));
         // A seat out for good has no word: neither a leave nor, the founder, a list;
@@ -28544,6 +28622,49 @@ mod answer_rotation_tests {
         // Forgotten with the table.
         let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
         assert!(code[leave..].contains("$t.founder_absence = FounderAbsence::default(); $t.founder_absence_told = None; $t.back_by_record = false;"));
+    }
+
+    /// `S1-KH`: a seat back from a restart whose founder answered *already
+    /// seated* and has not brought it into the table's group -- its Tox table
+    /// open, no copy and no join for `KEPT_OUT_AFTER`, the founder's friendship up
+    /// all that time or never for `KEPT_OUT_UNREACHED_AFTER` -- takes the record
+    /// road, the founder asked no more and no ten-minute give-up on it; the table
+    /// is rebuilt from the record before the founder road's Tox table is touched,
+    /// so a record that does not rebuild changes nothing of that road.
+    #[test]
+    fn a_seat_its_founder_keeps_out_takes_the_road_through_the_seats() {
+        assert!(!seat_kept_out(false, Some((600, 600))), "never before the founder answered");
+        assert!(!seat_kept_out(true, None), "never without a Tox table");
+        assert!(!seat_kept_out(true, Some((89, 600))), "kept out under the window");
+        assert!(seat_kept_out(true, Some((90, 90))), "a reachable founder silent for the window");
+        assert!(!seat_kept_out(true, Some((90, 89))), "its friendship up for less");
+        assert!(!seat_kept_out(true, Some((239, 0))), "a friendship that never came up: the longer window");
+        assert!(seat_kept_out(true, Some((240, 0))));
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The founder's answer remembered on the founder road.
+        assert!(code.contains(
+            "{ // `S1-KH`: and since when -- a founder that answers so and // does not bring the seat into the group leaves it to the // record road (`seat_kept_out`). t.held_since.get_or_insert_with(tokio::time::Instant::now);"
+        ));
+        // The trigger.
+        assert!(code.contains(
+            "if !t.back_by_record && t.resuming && t.hand.is_none() && seat_kept_out(t.held_since.is_some(), t.tox_sink.kept_out()) {"
+        ));
+        assert!(code.contains("t.held_since = None; if !back_by_record!(t, why, true) {"));
+        assert!(code.contains("if t.hand.is_some() { t.held_since = None; }"), "one restart's answer");
+        // The road so taken: the founder asked no more, no give-up.
+        let road = code.find("macro_rules! back_by_record {").expect("the record road");
+        let end = road + code[road..].find("taken }}; }").expect("its end");
+        let body = &code[road..end];
+        let rebuilt = body.find("match Formation::joined_back(").expect("the table from the record");
+        let cleared = body.find("$t.tox_sink.clear();").expect("the founder road's Tox table");
+        assert!(rebuilt < cleared, "rebuilt before anything of the founder road is touched");
+        assert!(body.contains("$t.record_road_answered = kept_out; $t.kept_out_road = kept_out;"));
+        assert!(!body[body.find("Err(e) => {").expect("a record that does not rebuild")..].contains("tox_sink"), "nothing touched then");
+        assert!(code.contains("if t.resuming && back_through_the_seats(t) && !t.kept_out_road && !t.hand_since_resume && t.hand.is_none() {"));
+        let leave = code.find("macro_rules! leave_the_table {").expect("the leave");
+        assert!(code[leave..].contains("$t.held_since = None; $t.kept_out_road = false;"));
     }
 
     /// `S1-LN` (`REVIEW_S1LN_v2` B1): the hand this client ended by an abort is

@@ -547,6 +547,27 @@ impl TableSink {
         }
     }
 
+    /// `S1-KH`: `(kept_out, founder_up)` in seconds -- how long this joiner's
+    /// table has held no copy of the group and no join in progress while on the
+    /// Tox network, and how long its founder's friendship has been up without a
+    /// break. `None` with no Tox table open: nothing is kept out that never asked.
+    pub fn kept_out(&self) -> Option<(u64, u64)> {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            self.inner.as_ref().map(|t| {
+                (
+                    t.trouble().kept_out_s.load(Ordering::Relaxed),
+                    t.trouble().founder_up_s.load(Ordering::Relaxed),
+                )
+            })
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            None
+        }
+    }
+
     /// `S1-KI`: the other seats the group holds -- a seat once, however many
     /// entries its binding names -- and what it wanted. `group_seen` counts
     /// members, which is what says one arrived; whether the group holds every
