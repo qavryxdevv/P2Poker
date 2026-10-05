@@ -13798,6 +13798,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                                     "this seat's previous life signed it; without its card material it can only follow and fold (D-033)"
                                                                 } else if member {
                                                                     "this seat signed it and is dealt in"
+                                                                } else if h.start_stack_of(seat).unwrap_or(0) == 0 {
+                                                                    // `S1-LU`: a seat out of chips has nothing to sit in with.
+                                                                    "it holds no chips and only watches"
                                                                 } else {
                                                                     "it asks to sit in at this hand's boundary"
                                                                 }
@@ -15790,11 +15793,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 };
                                 t.return_short = (count, Some(h.hand_id()));
                             }
+                            // `S1-LU`: unless the hand left fewer than two seats holding
+                            // chips by its own terminal -- then no seat has a next hand
+                            // (`next_hand`'s first condition, read from the stacks every
+                            // seat holds alike, no derivation of this client's), and the
+                            // copies it would wait for never come: the tournament is over
+                            // here as everywhere. A seat that busted while following the
+                            // table by its copies waited for them, and was asked at the end
+                            // about a table nobody at could be reached (`run103954-4`).
+                            let over = h.fewer_than_two_hold_chips();
                             let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "hand #{}: still outside the roster at the boundary; the next hand is adopted from the table's copies, not derived",
-                                    h.hand_id()
-                                )))
+                                .send(NodeEvent::Warning(if over {
+                                    "the table has no next hand to deal".to_string()
+                                } else {
+                                    format!(
+                                        "hand #{}: still outside the roster at the boundary; the next hand is adopted from the table's copies, not derived",
+                                        h.hand_id()
+                                    )
+                                }))
                                 .await;
                             // `S1-KA`: and its word for good, before it goes -- never on a
                             // borrowed settlement's own sets (`S1-LA`, `REVIEW_S1LA_S1LN` v2).
@@ -15808,6 +15824,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // `S1-LN` (`REVIEW_S1LN_v2` B1): the hand let go, kept for the count where it ended by an abort.
                             keep_for_the_count(&mut t.gave_up_watch, t.previous.take(), &t.named_after_give_up);
                             t.previous = t.hand.take();
+                            // `D-042`, as the derivation's end does: the group is left once
+                            // the terminal message has had time to arrive everywhere.
+                            if over && t.table_over_at.is_none() {
+                                t.table_over_at = Some(std::time::Instant::now());
+                            }
                             continue;
                         }
                         t.resuming = false;
@@ -26055,6 +26076,32 @@ mod late_roster_tests {
             "a hand behind belongs to the late-certificate arm, not to this buffer"
         );
         assert_eq!(keep_for_next_hand(None, 8, 7), Keep::No, "unreadable");
+    }
+
+    /// `S1-LU`: a resumed client outside the roster -- following the table by its
+    /// copies -- reads the tournament's end at a boundary where the hand left fewer
+    /// than two seats holding chips, and leaves the group as the derivation's end
+    /// does (`D-042`); before, a seat that busted while it followed so waited for
+    /// copies of a next hand that never came (`run103954-4`).
+    #[test]
+    fn a_seat_following_by_the_copies_sees_the_tables_end() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let branch = code
+            .find("if !h.required().contains(&me) && !h.returned().contains(&me) { // `S1-JR`: kept out while it asks to be dealt in again")
+            .expect("the resumed client's boundary");
+        let end = branch + code[branch..].find("continue; }").expect("its end");
+        let body = &code[branch..end];
+        let over = body.find("let over = h.fewer_than_two_hold_chips();").expect("read from the hand's own terminal");
+        let taken = body.find("t.previous = t.hand.take();").expect("the hand goes behind");
+        let closed = body
+            .find("if over && t.table_over_at.is_none() { t.table_over_at = Some(std::time::Instant::now()); }")
+            .expect("the table's end, as the derivation's");
+        assert!(over < taken && taken < closed, "read before the hand goes, the end after");
+        assert!(body.contains("\"the table has no next hand to deal\".to_string()"), "said as the derivation says it");
+        // And the adoption says what a seat without chips does.
+        assert!(code.contains("} else if h.start_stack_of(seat).unwrap_or(0) == 0 { // `S1-LU`: a seat out of chips has nothing to sit in with. \"it holds no chips and only watches\""));
     }
 
     /// Batch 4 (`D-102`): the reference moves to a later hand, within a hand

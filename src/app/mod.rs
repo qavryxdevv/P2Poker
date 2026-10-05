@@ -3521,6 +3521,14 @@ impl AppState {
                 ));
             } else if self.opponent_gone.as_ref().is_some_and(|g| g.alone) {
                 match self.floor_at_table() {
+                    // `S1-LU`: a player whose own place is said has nothing to
+                    // wait for -- out of chips, the table's last hands are no
+                    // longer its to follow (a seat following by the others'
+                    // copies cannot take up a heads-up hand at a larger table:
+                    // two signers are no majority of its seats).
+                    _ if self.finished.is_some() => self.note(format!(
+                        "nobody at the table has been reachable for {secs} s; your own tournament is over, so there is nothing to wait for: you can leave the table"
+                    )),
                     Some((named, on)) if on > 0 => self.note(format!(
                         "{named} seat(s) have been unreachable for {secs} s, and the {} on the line cannot certify them out yet (D-036: more voters than seats named); once they have been gone {} min they can (D-066): wait for them, or leave the table",
                         on + 1,
@@ -5757,6 +5765,37 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         s.apply(NodeEvent::SeatLeftTable { seat: 1 });
         assert!(s.opponent_left && s.opponent_out, "the opponent left: the game is over, said as at two seats");
+    }
+
+    /// `S1-LU`: a player whose own place is said, alone at the table, is told
+    /// there is nothing to wait for -- not asked to wait for players whose last
+    /// hands its seat no longer follows (`run103954-4`, `run110407-4`).
+    #[test]
+    fn a_player_out_of_the_tournament_alone_is_told_there_is_nothing_to_wait_for() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 2 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "a".into(), 1_000), (1, "b".into(), 1_000), (2, "me".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::HandBegan { hand_id: 9, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::Finished { hand_id: 9, seat: 2, place: 3, tied: false, players_left: 2, over: false });
+        for seat in [0u8, 1] {
+            s.apply(NodeEvent::SeatLink { seat, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        }
+        for seat in [0u8, 1] {
+            s.apply(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: Some(25), away: false });
+        }
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.alone), "everybody off: the question");
+        s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
+        s.tick_opponent();
+        let line = s.log.back().unwrap().clone();
+        assert!(line.contains("your own tournament is over") && line.contains("nothing to wait for"), "{line}");
+        assert!(!line.contains("wait for them"), "{line}");
+        // And the felt's window: the same words, and leaving alone offered.
+        assert!(s.table_view().opponent_alone_done, "the window is told");
+        let gui = include_str!("../gui/table/mod.rs");
+        assert!(gui.contains("if !out && !view.opponent_alone_done && ui.add(egui::Button::new(RichText::new(\"Wait\")"), "no Wait");
+        assert!(gui.contains("\"Your own tournament is over: there is nothing to wait for.\""));
     }
 
     /// `S1-EI`: at a bigger table the seats off the line are listed with what happens

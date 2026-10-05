@@ -223,6 +223,8 @@ impl AppState {
             rejoin: self.rejoin_view(),
             waits: self.wait_views(),
             opponent_alone: self.opponent_gone.as_ref().is_some_and(|g| g.alone),
+            // `S1-LU`: the node's word on this player's place, and nobody here.
+            opponent_alone_done: self.opponent_gone.as_ref().is_some_and(|g| g.alone) && self.finished.is_some(),
             chat: self
                 .table_chat
                 .iter()

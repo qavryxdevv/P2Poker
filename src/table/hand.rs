@@ -24923,6 +24923,25 @@ mod tests {
         assert!(matches!(out, Err(Failed::Elsewhere { seat: 1, .. })), "{out:?}");
     }
 
+    /// `S1-LU`: whether fewer than two seats hold chips is read from the hand's
+    /// own terminal -- the stacks every seat holds alike at the boundary, a
+    /// bystander's too -- and not from a derivation: two players and a busted
+    /// bystander hold chips in two seats after a hand of checks and calls.
+    #[test]
+    fn fewer_than_two_holding_chips_is_read_at_the_terminal() {
+        let (hands, _, _, _) = a_settled_hand_with_a_bystander_holding(0);
+        for (i, h) in hands.iter().enumerate() {
+            let holding = (0..3u8).filter(|s| h.stack_at_boundary(*s) > 0).count();
+            assert_eq!(holding, 2, "seat {i}: the two players, not the busted bystander");
+            assert!(!h.fewer_than_two_hold_chips(), "seat {i}: two seats hold chips");
+        }
+        // Before stage 0 closes there is no terminal: the start stacks are read.
+        let mut o = opening3(0);
+        o.seats[2].2 = 0;
+        let (opened, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        assert!(!opened.fewer_than_two_hold_chips(), "two seats start with chips");
+    }
+
     /// A busted seat cannot return: the roster is `∩ ALIVE(k+1)`.
     #[test]
     fn a_busted_seat_cannot_return() {

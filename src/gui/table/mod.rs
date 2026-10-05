@@ -322,6 +322,9 @@ pub struct TableView {
     pub waits: Vec<WaitView>,
     /// `S1-EI`: the question is about everybody else, not one opponent.
     pub opponent_alone: bool,
+    /// `S1-LU`: ...and the player's own place is said: its tournament is over,
+    /// and there is nobody to wait for -- the window offers leaving alone.
+    pub opponent_alone_done: bool,
     /// PokerTH's *Game: N*: which game of this client's session the table is.
     pub game_no: u32,
     /// The table's history, PokerTH's *Log* panel.
@@ -1794,6 +1797,10 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                     ui.label(RichText::new("The game is over.").color(style::PANEL_MUTED));
                 } else if out {
                     ui.label(RichText::new("That is their fourth absence. Three returns are the limit: the game ends here.").color(style::PANEL_MUTED));
+                } else if view.opponent_alone_done {
+                    // `S1-LU`: out of chips, the player follows the table's last
+                    // hands no more -- there is nobody to wait for.
+                    ui.label(RichText::new("Your own tournament is over: there is nothing to wait for.").color(style::PANEL_MUTED));
                 } else {
                     ui.label(
                         RichText::new(if view.opponent_alone {
@@ -1808,7 +1815,7 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                     ui.label("Wait for them to come back, or end the game and leave the table.");
                 }
                 ui.horizontal(|ui| {
-                    if !out && ui.add(egui::Button::new(RichText::new("Wait").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
+                    if !out && !view.opponent_alone_done && ui.add(egui::Button::new(RichText::new("Wait").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
                         action = Some(TableAction::KeepWaiting);
                     }
                     if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
@@ -2391,6 +2398,7 @@ impl TableView {
             rejoin: None,
             waits: Vec::new(),
             opponent_alone: false,
+            opponent_alone_done: false,
             game_no: 1,
             log: vec![
                 LogLine { kind: LogKind::Header, text: "## Game: 1 | Hand: 128 ##".into() },
