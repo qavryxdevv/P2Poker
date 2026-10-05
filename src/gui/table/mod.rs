@@ -174,6 +174,9 @@ pub enum LogKind {
     Winner,
     SitOut,
     GameWin,
+    /// `S1-LW`: a seat caught cheating -- not PokerTH's, whose server keeps
+    /// cheats off its tables; bold red, the one line the player must not miss.
+    Cheat,
 }
 
 /// A line of the table's log, in PokerTH's wording.
@@ -207,6 +210,10 @@ pub struct SeatView {
     /// `D-035`: the seat's client left the table's group; drawn dim, with
     /// *left the table* where its cards were, and no clock.
     pub left: bool,
+    /// `S1-LW`: the table put the seat out for cheating: ringed in red from the
+    /// node's word -- while it plays its hand out, too -- and *caught cheating*
+    /// where *left the table* would be.
+    pub cheated: bool,
     /// `D-058`: on its way back to the table -- it asked to sit in, or the seats
     /// vote on its return: *coming back* where its cards were, the only place the
     /// return is said while a hand is played.
@@ -1162,6 +1169,11 @@ fn seat_box(
     if at_turn {
         style::turn_glow(p, rect, s, if hero { 2.0 } else { 1.0 }, now);
     }
+    // `S1-LW`: a seat the table put out for cheating, ringed in red from the
+    // node's word on -- the rest of its hand included.
+    if seat.cheated {
+        p.rect_stroke(rect, 6.0 * s, Stroke::new((2.0 * s).max(1.5), crate::gui::theme::DANGER), egui::StrokeKind::Outside);
+    }
 
     // The top row: the round avatar and the two cards.
     let o = rect.min;
@@ -1199,14 +1211,25 @@ fn seat_box(
     }
     if out || seat.left {
         // `D-058`: a seat on its way back says so here, and nowhere over the hand.
-        let (words, tint) = if seat.coming_back {
+        // `S1-LW`: a seat put out for cheating says that, not that it left.
+        let (words, tint) = if seat.cheated {
+            ("caught cheating", crate::gui::theme::DANGER)
+        } else if seat.coming_back {
             ("coming back", crate::gui::theme::WARN)
         } else if seat.left {
             ("left the table", style::faded(style::TEXT_2, 0.9))
         } else {
             ("sitting out", style::faded(style::TEXT_2, 0.9))
         };
-        style::text(p, cards_area.center(), Align2::CENTER_CENTER, words, (11.0 * s).max(9.0), Weight::Medium, tint);
+        // `S1-LW`: a word too wide for the box is set smaller rather than past
+        // its edge (*caught cheating* went over it at the window's smallest).
+        let room = 2.0 * (rect.right() - 3.0 * s - cards_area.center().x);
+        let mut size = (11.0 * s).max(9.0);
+        let wide = style::text_width(p, words, size, Weight::Medium);
+        if room > 0.0 && wide > room {
+            size = (size * room / wide).max(7.0);
+        }
+        style::text(p, cards_area.center(), Align2::CENTER_CENTER, words, size, Weight::Medium, tint);
     }
 
     // The info bar: the name, the stars under it, the stack on the right.
@@ -2206,7 +2229,9 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                         ui.label(RichText::new(format!("{}", i + 1)).color(style::PANEL_TEXT_2));
                         ui.label(RichText::new(&s.name).color(colour));
                         ui.label(RichText::new(format!("${}", s.stack)).color(style::COLOR_ACCENT));
-                        let state_word = if s.coming_back {
+                        let state_word = if s.cheated {
+                            "caught cheating"
+                        } else if s.coming_back {
                             "coming back"
                         } else if s.left {
                             "left the table"

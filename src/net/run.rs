@@ -1556,6 +1556,9 @@ struct TableRun {
     /// hold, by application key -- the seat, the cause, and whether this
     /// client's own check found it.
     cheats: std::collections::BTreeMap<[u8; 32], (u8, u16, bool)>,
+    /// `S1-LW`: the seats the window was told the table put out for cheating
+    /// (`NodeEvent::SeatCheated`), by application key -- once a table.
+    cheat_told: std::collections::BTreeSet<[u8; 32]>,
     /// `S1-JR`: the seats seen sending two different copies of one stage, by
     /// application key -- the seat and the hands it was seen in.
     equivocators: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
@@ -2201,6 +2204,7 @@ impl TableRun {
             own_floor: None,
             floor_episode: None,
             cheats: std::collections::BTreeMap::new(),
+            cheat_told: std::collections::BTreeSet::new(),
             equivocators: std::collections::BTreeMap::new(),
             back_from_restart: std::collections::BTreeMap::new(),
             stands: None,
@@ -4561,6 +4565,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
         }};
     }
+    // `S1-LW`: the window is told of every seat a cheat certificate put out here,
+    // once a table, with what it signed in plain words -- at the bank, from the
+    // stall tick, and at the latest at the boundary, before the seat is shown
+    // gone: a seat proven mid-hand plays the hand out, and until this the felt
+    // showed a seat that left and the log a place it finished in (the owner,
+    // 2026-10-05: *so the player sees that it cheats*). Nothing but the event.
+    macro_rules! tell_cheats {
+        ($t:ident, $h:expr) => {{
+            let proven = $h.proven_seats();
+            for seat in $h.cheat_out() {
+                let Some(app) = $h.key_of(seat) else { continue };
+                if !$t.cheat_told.insert(app) {
+                    continue;
+                }
+                let what = proven
+                    .iter()
+                    .find(|(s, _)| *s == seat)
+                    .map_or("a move that does not check out", |(_, cause)| {
+                        crate::table::cheatwire::cause_in_plain_words(*cause)
+                    });
+                let _ = events.send(NodeEvent::SeatCheated { seat, what: what.to_string() }).await;
+            }
+        }};
+    }
     // `S1-KR`: a seat a cheat certificate put out of the table for good here --
     // two seats' word and this client's own judgement of its card share. Out of
     // the table's group by the table's word and never invited again; its chips
@@ -4571,6 +4599,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     macro_rules! cheat_out_by_the_word {
         ($t:ident, $h:expr) => {{
             if $h.over() {
+                tell_cheats!($t, $h);
                 for seat in $h.cheat_out() {
                     let entry = $t.table.as_ref().and_then(|f| {
                         f.roster()
@@ -4770,6 +4799,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )
                         }))
                         .await;
+                    // `S1-LW`: a seat every voter named with the cheat cause is said
+                    // as one caught cheating, before it is shown gone.
+                    if cheated && !resigned && $t.cheat_told.insert(app) {
+                        let _ = events
+                            .send(NodeEvent::SeatCheated { seat, what: "a shuffle proof that does not check out".to_string() })
+                            .await;
+                    }
                     let _ = events.send(NodeEvent::SeatLeft { seat, quit: true, removed: !resigned }).await;
                 }
             }
@@ -5134,6 +5170,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.own_floor = None;
             $t.floor_episode = None;
             $t.cheats.clear();
+            $t.cheat_told.clear();
             $t.equivocators.clear();
             $t.back_from_restart.clear();
             $t.stands = None;
@@ -13946,6 +13983,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if let Some(p) = t.previous.as_mut() {
                         vote_on_cheats!(t, p);
+                    }
+                    // `S1-LW`: and the window told of a seat a certificate banked
+                    // here put out -- mid-hand, while the seat plays the hand out.
+                    if let Some(h) = t.hand.as_ref() {
+                        tell_cheats!(t, h);
+                    }
+                    if let Some(p) = t.previous.as_ref() {
+                        tell_cheats!(t, p);
                     }
                     // `S1-BS`: the retained hand replays what it holds, and a
                     // certificate that banked there re-derives the running hand.

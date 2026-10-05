@@ -391,6 +391,7 @@ pub struct TableApp {
     pub show_choice: Option<(u64, std::time::Instant)>,
     pub out_flooded: bool,
     pub out_cheated: bool,
+    pub cheated: std::collections::BTreeMap<u8, String>,
     pub unsafe_note: Option<(String, u64)>,
     pub unsafe_stuck: Option<PlayMark>,
     pub split_note: Option<(String, u64)>,
@@ -570,6 +571,9 @@ pub struct AppState {
     /// against `D-047`'s fourth absence.
     pub out_flooded: bool,
     pub out_cheated: bool,
+    /// `S1-LW`: the seats the table put out for cheating, with what each signed
+    /// in plain words, as the node said it -- the log's line and the seat's word.
+    pub cheated: std::collections::BTreeMap<u8, String>,
     /// `D-051`: why this table is not safe, as the node last said it, with a
     /// serial the window closes by -- the question comes back when the node
     /// says it again.
@@ -1100,6 +1104,7 @@ impl AppState {
         std::mem::swap(&mut self.show_choice, &mut other.show_choice);
         std::mem::swap(&mut self.out_flooded, &mut other.out_flooded);
         std::mem::swap(&mut self.out_cheated, &mut other.out_cheated);
+        std::mem::swap(&mut self.cheated, &mut other.cheated);
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
         std::mem::swap(&mut self.unsafe_stuck, &mut other.unsafe_stuck);
         std::mem::swap(&mut self.split_note, &mut other.split_note);
@@ -1513,7 +1518,9 @@ impl AppState {
                 if removed {
                     self.left_for_good.insert(seat);
                 }
-                self.note(if removed {
+                self.note(if removed && self.cheated.contains_key(&seat) {
+                    format!("seat {seat} is out of the table for good: removed by the table's word for cheating (S1-LW)")
+                } else if removed {
                     format!("seat {seat} is out of the table for good: removed by the table's word")
                 } else if quit {
                     format!("seat {seat} left the table's group -- the carrier says on purpose, which a client rejoining the group says too")
@@ -2337,6 +2344,23 @@ impl AppState {
                 self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
                 self.note(line);
             }
+            // `S1-LW`: a seat the table proved cheating and put out for good -- said
+            // in the table's log, in the words for what it signed, and at its seat;
+            // never as a seat that left or finished (the owner, 2026-10-05: *so the
+            // player sees that it cheats*). Never the player's own seat.
+            NodeEvent::SeatCheated { seat, what } => {
+                if self.seated.as_ref().and_then(|s| s.seat) == Some(seat) {
+                    return;
+                }
+                if self.cheated.insert(seat, what.clone()).is_none() {
+                    let name = self.seat_name(seat);
+                    let line = format!(
+                        "{name} was caught cheating: {what}. The other players' clients proved it, and {name} is out of the table for good."
+                    );
+                    self.log_table(crate::gui::table::LogKind::Cheat, line.clone());
+                    self.note(line);
+                }
+            }
             // `D-051`: the table is not safe, or safe again.
             NodeEvent::TableUnsafe { why, stuck, ask } => {
                 // `S1-JR`: the node's word that the running hand stands holds
@@ -2637,6 +2661,7 @@ impl AppState {
         self.show_choice = None;
         self.out_flooded = false;
         self.out_cheated = false;
+        self.cheated.clear();
         self.unsafe_note = None;
         self.unsafe_stuck = None;
         self.split_note = None;
@@ -2701,6 +2726,10 @@ impl AppState {
                 let game = self.seated.as_ref().map(|s| s.game_no).unwrap_or(0).max(1);
                 self.log_table(crate::gui::table::LogKind::GameWin, format!("{name} wins game {game}!"));
             }
+        } else if Some(seat) != me && self.cheated.contains_key(&seat) {
+            // `S1-LW`: out of the game for cheating, not out of chips: its chips
+            // left the table with it, and no place is said of it.
+            self.log_table(crate::gui::table::LogKind::Cheat, format!("{name} is out of the game: caught cheating"));
         } else {
             self.log_table(crate::gui::table::LogKind::SitOut, format!("{name} finished {said}"));
         }

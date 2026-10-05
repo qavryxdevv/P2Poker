@@ -585,6 +585,13 @@ pub enum NodeEvent {
     OutForGood { key: [u8; 32], why: String, flooded: bool, cheated: bool },
     /// `D-051`: this client cut a seat off for flooding the table's group.
     SeatFlooded { seat: u8 },
+    /// `S1-LW`: a seat this client holds proven of cheating and the table put out
+    /// for good -- a cheat certificate (`S1-KR`) banked here, or every voter's
+    /// word with the cheat cause (`D-084`) -- and what it signed, in plain words.
+    /// Said once a table, at the bank: a seat proven mid-hand plays the hand
+    /// out, and the players are told meanwhile (the owner, 2026-10-05: *so the
+    /// player sees that it cheats*). `SeatLeft` still follows at the boundary.
+    SeatCheated { seat: u8, what: String },
     /// `D-051`: this table is not safe, and why -- flooders the table cannot put
     /// out, or strangers let in again and again; `S1-JR`: or a table that
     /// cannot go on -- or `None` once it is safe again. The window recommends
@@ -826,6 +833,7 @@ impl NodeEvent {
             | Self::SeatReleased { .. }
             | Self::OutForGood { .. }
             | Self::SeatFlooded { .. }
+            | Self::SeatCheated { .. }
             | Self::TableUnsafe { .. }
             | Self::TableSplit { .. }
             | Self::FloorOffer { .. }

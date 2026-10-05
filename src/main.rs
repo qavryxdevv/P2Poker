@@ -227,7 +227,8 @@ fn main() {
     // `--preview-waits` the table waiting on a seat, `--preview-waits-gap` the
     // table going on without it and `--preview-waits-back` that seat on its way
     // back (D-058); `--preview-stopped` the table stopped on a disagreement
-    // about a hand's result and `--preview-ended` the game ended on it (S1-IX).
+    // about a hand's result and `--preview-ended` the game ended on it (S1-IX);
+    // `--preview-caught` two seats the table put out for cheating (S1-LW).
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -2043,6 +2044,32 @@ fn preview_table(args: &[String]) {
     if has("--preview-cheated") {
         view.out_for_good = Some("certified out for a proof that does not hold (hand 128)".into());
         view.out_cheated = true;
+    }
+    // `S1-LW`: other seats the table put out for cheating -- seat 3 playing its
+    // hand out, seat 4 gone from the table -- and the log's line about seat 4.
+    if has("--preview-caught") {
+        let mut named = String::new();
+        for s in view.seats.iter_mut() {
+            match s.seat {
+                3 => s.cheated = true,
+                4 => {
+                    s.cheated = true;
+                    s.left = true;
+                    s.cards = [Facing::Empty, Facing::Empty];
+                    s.stack = 0;
+                    s.bet = 0;
+                    s.act = None;
+                    named = s.name.clone();
+                }
+                _ => {}
+            }
+        }
+        view.log.push(table::LogLine {
+            kind: table::LogKind::Cheat,
+            text: format!(
+                "{named} was caught cheating: a betting move the rules do not allow. The other players' clients proved it, and {named} is out of the table for good."
+            ),
+        });
     }
     if has("--preview-unsafe") {
         view.unsafe_note = Some((

@@ -104,6 +104,8 @@ impl AppState {
                     win: hand.and_then(|h| win_at(h, *n)),
                     muted: self.muted.contains(n),
                     left: self.gone.contains(n),
+                    // `S1-LW`: put out for cheating, by the node's word.
+                    cheated: self.cheated.contains_key(n),
                     // `D-058`: on its way back, said at its seat and not over the hand.
                     coming_back: self.waits.get(n).is_some_and(|w| w.returning()),
                     link: self.links.get(n).map(|(rtt, group, quiet, at)| Link {
@@ -1115,6 +1117,43 @@ mod tests {
         s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for a proof".into(), flooded: false, cheated: true });
         let v = s.table_view();
         assert!(v.out_for_good.is_some() && v.out_cheated && !v.out_flooded);
+    }
+
+    /// `S1-LW`, the owner's word (2026-10-05, *so the player sees that it
+    /// cheats*): a seat the table put out for cheating is said as that -- one
+    /// bold red line in the table's log with what it signed, the seat ringed and
+    /// *caught cheating* at it while it plays its hand out and after it is gone
+    /// -- and never as a seat that finished in a place. Never the player's own
+    /// seat: its own word is `OutForGood`.
+    #[test]
+    fn a_seat_caught_cheating_is_said_as_that_in_the_log_and_at_its_seat() {
+        use crate::gui::table::LogKind;
+        let what = "a betting move the rules do not allow";
+        let caught = |s: &AppState| {
+            s.table_view()
+                .log
+                .iter()
+                .filter(|l| l.kind == LogKind::Cheat && l.text.contains("Carol was caught cheating") && l.text.contains(what))
+                .count()
+        };
+        let carol = |s: &AppState| s.table_view().seats.into_iter().find(|v| v.seat == 2).expect("seat 2");
+        let mut s = seated(0);
+        s.apply(NodeEvent::SeatCheated { seat: 2, what: what.into() });
+        assert_eq!(caught(&s), 1, "{:?}", s.table_view().log);
+        assert!(carol(&s).cheated && !carol(&s).left, "ringed while it plays the hand out");
+        s.apply(NodeEvent::SeatCheated { seat: 2, what: what.into() });
+        assert_eq!(caught(&s), 1, "said once");
+        s.apply(NodeEvent::SeatLeft { seat: 2, quit: true, removed: true });
+        assert!(carol(&s).cheated && carol(&s).left, "gone, and still said as caught");
+        s.apply(NodeEvent::Finished { hand_id: 4, seat: 2, place: 3, tied: false, players_left: 2, over: false });
+        let log = s.table_view().log;
+        assert!(log.iter().any(|l| l.kind == LogKind::Cheat && l.text == "Carol is out of the game: caught cheating"), "{log:?}");
+        assert!(!log.iter().any(|l| l.text.contains("Carol finished")), "no place said of a cheat: {log:?}");
+        assert!(s.table_view().seats.iter().all(|v| v.seat == 2 || !v.cheated), "nobody else");
+        let mut s = seated(1);
+        s.apply(NodeEvent::SeatCheated { seat: 1, what: what.into() });
+        assert!(s.table_view().log.iter().all(|l| l.kind != LogKind::Cheat), "the own seat's word is OutForGood");
+        assert!(s.table_view().seats.iter().all(|v| !v.cheated));
     }
 
     /// `S1-IX`, section 6.4: a table stopped on a disagreement about a hand's

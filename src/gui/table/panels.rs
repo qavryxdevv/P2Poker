@@ -226,6 +226,7 @@ fn log(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) {
                             LogKind::Winner => (style::LOG_WINNER, Weight::Regular, false),
                             LogKind::SitOut => (style::LOG_BOARD, Weight::Regular, true),
                             LogKind::GameWin => (style::PANEL_TEXT, Weight::Bold, true),
+                            LogKind::Cheat => (crate::gui::theme::DANGER, Weight::Bold, false),
                         };
                         let mut job = LayoutJob::default();
                         job.wrap.max_width = width - 14.0;

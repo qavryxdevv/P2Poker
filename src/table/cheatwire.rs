@@ -94,6 +94,21 @@ pub fn cause_known(cause: u16) -> bool {
     matches!(cause, CAUSE_REVEAL | CAUSE_SHUFFLE | CAUSE_KEY | CAUSE_ACTION | CAUSE_MONEY | CAUSE_EQUIVOCATION)
 }
 
+/// `S1-LW`: what a seat proven of `cause` signed, in the words the player is
+/// told at the table -- the window's, not the protocol's: the client's log
+/// keeps those (`Hand::note_proven`). A cause the band does not know reads as
+/// a card share, as there.
+pub fn cause_in_plain_words(cause: u16) -> &'static str {
+    match cause {
+        CAUSE_KEY => "a deck key that does not check out",
+        CAUSE_SHUFFLE => "a shuffle that does not check out",
+        CAUSE_ACTION => "a betting move the rules do not allow",
+        CAUSE_MONEY => "a payout the cards do not give",
+        CAUSE_EQUIVOCATION => "two different versions of one move",
+        _ => "card data that does not check out",
+    }
+}
+
 impl CheatVote {
     /// The name every vote about one subject of one hand hashes to.
     pub fn subject_digest(&self) -> Hash {
