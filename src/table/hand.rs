@@ -1715,6 +1715,21 @@ const SAID_AGAIN_MAX: usize = 256;
 /// them -- a bound, not a rate: the node drains after every frame and tick.
 const SAID_AGAIN_CAP: usize = 64;
 
+/// `S1-LZ`: how long a copy of a betting stage's certificate held here -- this
+/// client's own or another voter's -- binds this client to that certificate:
+/// the named seat's own action at the stage held, not taken, while the rest of
+/// the copies come. They come within a round trip of the last vote (hand 18 of
+/// 2026-10-06: 0.15 s); a set not whole by then is one a voter will never
+/// complete, having taken the action before any copy existed. Half the betting
+/// budget at most ([`Hand::bound_for_ms`]): the silent-voter vote comes a whole
+/// budget after the seal, and the hold must be over by then.
+const BOUND_FOR_MS: u64 = 6_000;
+
+/// `S1-FS`: the least time a turn that reaches this client late leaves its
+/// player, from the moment the client can show it -- the node's own clock for
+/// its own turn (`own_clock_began_ms`), and `S1-LZ`'s turn given after a hold.
+pub(crate) const LATE_TURN_LEFT_MS: u64 = 10_000;
+
 /// And the bytes, because a slot without a ceiling is a `FRAME_CAP` slot.
 ///
 /// Twice the pre-open buffer's budget: `begin_hand_with` pours both pre-open
@@ -2677,6 +2692,16 @@ pub struct Hand {
     /// cause is fixed with the first; `D-066`'s long-gone and `D-084`'s cheat
     /// cause excepted.
     voted_about: BTreeSet<SeatIdx>,
+    /// `S1-LZ`: the seats whose own action this client holds at the stage now
+    /// open while the certificate naming them may close, each with when it was
+    /// first held and the digest of the one frame held -- told once to the log
+    /// when held and once when taken.
+    bound_told: BTreeMap<SeatIdx, (u64, Hash)>,
+    /// `S1-LZ`: when this client first held a copy of the certificate stage
+    /// open at this stage -- its own, sealed here, or another voter's (or its
+    /// own of a previous life, said again by the table) -- which every copy
+    /// that makes the set whole follows within a round trip.
+    copy_since: Option<u64>,
     /// `S1-LP`: the seats of every round this client voted in during the hand,
     /// one entry a stage -- for the geneses it can derive with a round taken as
     /// complete that it never saw complete (`candidate_geneses`).
@@ -3410,6 +3435,8 @@ impl Hand {
                 long_gone: BTreeSet::new(),
                 line_down_recently: false,
                 voted_about: BTreeSet::new(),
+                bound_told: BTreeMap::new(),
+                copy_since: None,
                 flood_named: BTreeSet::new(),
                 disproved: BTreeSet::new(),
                 cheaters: BTreeSet::new(),
@@ -5831,6 +5858,52 @@ impl Hand {
                 what: "a betting stage took a frame of another type",
             });
         }
+        // `S1-LZ`: this client holds a copy of the certificate naming the seat at
+        // this very stage -- every voter has voted, and the copies that make it
+        // whole may still come: the seat's own action is held, not taken. A
+        // sealed voter that took it stood on the subject's branch when the set
+        // became whole here, and the table on the certificate's (`R4`, the
+        // owner's hand 18 of 2026-10-06). Replayed as any held frame: a stage
+        // left once the certificate applied, taken as before once the first copy
+        // is `bound_for_ms` old. Never before a copy -- a voter that takes the
+        // action then never makes its own, and no set about the seat can be
+        // whole anywhere. Only a frame the stage would take is held, and one
+        // frame a seat: other bytes from it meanwhile -- another version, or the
+        // same signed again -- are answered with nothing, and a frame the stage
+        // would refuse goes on to be refused, as before.
+        let bound = self.bound_against(seat, now_ms);
+        if bound && self.would_take(bytes, &opened, kind, seat) {
+            let digest = *blake3::hash(bytes).as_bytes();
+            match self.bound_told.get(&seat) {
+                Some((_, held)) if *held != digest => return Err(Failed::Ignored),
+                Some(_) => {}
+                None => {
+                    self.bound_told.insert(seat, (now_ms, digest));
+                    self.cert_note.push(format!(
+                        "seat {seat}'s own action came after the certificate naming it was sealed: held while the \
+                         copies come, {} ms at most (S1-LZ)",
+                        self.bound_for_ms()
+                    ));
+                }
+            }
+            return Err(Failed::NotYet);
+        }
+        // Released by the held frame itself (or the same bytes again), never by
+        // another frame of the seat that arrives first and is then refused.
+        let released = match self.bound_told.get(&seat) {
+            Some((since, held)) if !bound && *held == *blake3::hash(bytes).as_bytes() => {
+                let since = *since;
+                self.bound_told.remove(&seat);
+                Some(since)
+            }
+            _ => None,
+        };
+        if released.is_some() {
+            self.cert_note.push(format!(
+                "seat {seat}'s own action is taken: the certificate naming it was not whole {} ms after its first copy (S1-LZ)",
+                self.bound_for_ms()
+            ));
+        }
         // `D-034`: the turn this action gives begins when the action was made.
         self.last_stamp_ms = opened.envelope.emitted_at_unix_ms;
         self.note_signed(seat);
@@ -5890,7 +5963,71 @@ impl Hand {
         // taken as a call, and a writer that signed its call under another
         // kept it from being said again).
         self.took_action = Some(seat);
+        // `S1-LZ`: taken after a hold, the stage it opens is timed from when the
+        // action first came -- when the seats that took it at once opened theirs
+        // -- so that this client's votes there fall with theirs. A turn it gives
+        // this client is shown as late as `S1-FS`'s floor still lets its own
+        // clock run out before theirs: now on a table of thirty seconds, from
+        // when the action came on one of five.
+        if let Some(since) = released.map(|s| s.min(now_ms)) {
+            self.mark_stage(since);
+            if self.turn_heard_ms == now_ms {
+                let timeout = u64::from(self.open.action_timeout_ms);
+                let latest = since
+                    .saturating_add(timeout)
+                    .saturating_add(u64::from(self.open.action_grace_ms))
+                    .saturating_sub(LATE_TURN_LEFT_MS.min(timeout));
+                self.turn_heard_ms = since.max(now_ms.min(latest));
+            }
+        }
         Ok(out)
+    }
+
+    /// `S1-LZ`: whether `on_action` would take this frame of `seat`'s now --
+    /// within its kind's ceiling (what the node holds), its body decoding, at
+    /// the seat's own turn and slot, and legal by the engine -- read without
+    /// taking anything.
+    fn would_take(&self, bytes: &[u8], opened: &chained::Opened, kind: EventType, seat: SeatIdx) -> bool {
+        if bytes.len() > frame_ceiling(kind) {
+            return false;
+        }
+        let Ok((head, action)) = action_of(opened, kind) else {
+            return false;
+        };
+        let Phase::Playing { play, .. } = &self.phase else {
+            return false;
+        };
+        matches!(play.step, Step::Acting { to_act } if to_act == seat)
+            && head.seat == seat
+            && street_from_code(head.street) == Some(play.street)
+            && head.action_index == play.actions
+            && play.round.clone().apply(seat, action).is_ok()
+    }
+
+    /// `S1-LZ`: whether the certificate stage open here names `seat` and still
+    /// binds this client -- a copy of it held here less than
+    /// [`Hand::bound_for_ms`] ago, its own or another voter's -- so that the
+    /// seat's own action is held rather than taken (what the stage would take of
+    /// it: [`Hand::would_take`]). A set this client refuses never opens the stage
+    /// (`on_timeout_cert`). Never in the harness's control
+    /// (`P2P_POKER_CONTROL=s1lz`).
+    fn bound_against(&self, seat: SeatIdx, now_ms: u64) -> bool {
+        if control("s1lz") {
+            return false;
+        }
+        let Some(since) = self.copy_since else {
+            return false;
+        };
+        let names = self.certifying.as_ref().is_some_and(|c| c.subject.subject_seats.contains(&seat));
+        names && now_ms.saturating_sub(since) < self.bound_for_ms()
+    }
+
+    /// `S1-LZ`: how long a held copy binds -- [`BOUND_FOR_MS`], or half the
+    /// betting budget on a table whose clock is shorter: the hold is over
+    /// before the silent-voter vote a whole budget after the seal
+    /// (`vote_on_silent_voters`) could name a voter that took the action.
+    fn bound_for_ms(&self) -> u64 {
+        BOUND_FOR_MS.min(u64::from(self.next_deadline_for(EventType::ActionFold)) / 2)
     }
 
     /// Apply an action that has been checked into place, and move the hand on.
@@ -10105,6 +10242,8 @@ impl Hand {
             self.rounds_voted.push(round);
         }
         self.voted_about.clear();
+        self.bound_told.clear();
+        self.copy_since = None;
         self.own_vote_at = None;
         self.quiet_vote_at = None;
         self.sealed_at = None;
@@ -10788,6 +10927,13 @@ impl Hand {
         let Some(voted_at) = self.quiet_vote_at else {
             return Ok(Vec::new());
         };
+        // `S1-LZ`: none while this client holds the round's subject's own
+        // action under a copy -- a voter that took that action before it sealed
+        // is no silent voter, and the hold is over within its bound; a voter
+        // read as gone from the group would be named at once, inside it.
+        if self.bound_told.keys().any(|s| self.bound_against(*s, now_ms)) {
+            return Ok(Vec::new());
+        }
         let waiting = self.waiting_for();
         // The round: the seats this client voted about that the stage still
         // waits on.
@@ -11152,6 +11298,8 @@ impl Hand {
             )
             .ok_or(Failed::NotInThisStage)?;
             self.certifying = Some(Certifying { subject: subject.clone(), stage });
+            // `S1-LZ`: a stage about another set binds from its own first copy.
+            self.copy_since = None;
         }
         if self
             .certifying
@@ -11177,6 +11325,8 @@ impl Hand {
         self.note_own_certificate(hash, &bytes, &subject);
         // `D-065`: a voter's missing copy is measured from here.
         self.sealed_at = Some(now_ms);
+        // `S1-LZ`: and a copy is held here from now, if none was before.
+        self.copy_since.get_or_insert(now_ms);
         let complete = match self.certifying.as_mut() {
             Some(c) => {
                 c.stage.hear(self.open.my_seat, hash);
@@ -12626,6 +12776,8 @@ impl Hand {
             let stage = Collective::closed(target.subject_sequence, EventType::TimeoutCert.code(), &voters)
                 .ok_or(Failed::NotInThisStage)?;
             self.certifying = Some(Certifying { subject: target.clone(), stage });
+            // `S1-LZ`: a stage about another set binds from its own first copy.
+            self.copy_since = None;
         }
         let tk: SetKey = (target.subject_sequence, target.parent_event_hash, target.digest());
         if tk != k {
@@ -12646,6 +12798,9 @@ impl Hand {
                     if copy.subject.kind == 1 && self.transcript_seen.insert(digest) {
                         self.transcript.push(copy.raw.clone());
                     }
+                    // `S1-LZ`: a copy held here, a voter's or this client's own
+                    // of a previous life -- the stage may close from now on.
+                    self.copy_since.get_or_insert(now_ms);
                 }
                 Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat: copy.emitter }),
                 Heard::Uninvited => {}
@@ -14437,6 +14592,11 @@ impl Hand {
         rebase_opt(&mut self.own_vote_at, by_ms);
         rebase_opt(&mut self.quiet_vote_at, by_ms);
         rebase_opt(&mut self.sealed_at, by_ms);
+        // `S1-LZ`: the bound a held copy sets, and when each held action came.
+        rebase_opt(&mut self.copy_since, by_ms);
+        for (since, _) in self.bound_told.values_mut() {
+            rebase(since, by_ms);
+        }
         rebase(&mut self.stage_at_ms, by_ms);
         rebase(&mut self.opened_at_ms, by_ms);
         rebase_opt(&mut self.showdown_opened_ms, by_ms);
@@ -18935,9 +19095,10 @@ mod tests {
     /// `S1-LA` (`REVIEW_S1LA_S1LN` v2, A-L1), at a betting stage. Four seats at
     /// the first bet, the seat to act quiet past its turn; the other three vote
     /// about it, and every copy they seal is held back. The seat acts after all
-    /// and its action is taken everywhere; then the copies come -- the set is
-    /// whole at every seat, off position, while the hand goes on -- and the hand
-    /// is played to its settlement. A set whole off position counts only at an
+    /// and its action is taken everywhere -- once the copies stay back past the
+    /// bound a sealed copy holds it for (`S1-LZ`); then the copies come -- the
+    /// set is whole at every seat, off position, while the hand goes on -- and
+    /// the hand is played to its settlement. A set whole off position counts only at an
     /// abort terminal (`D-099` point 2): every seat opens hand 2 with that seat
     /// in it, at one genesis, with no strike. Before `S1-LF` each voter banked
     /// its own copy as it sealed it and dealt hand 2 without the seat (the
@@ -18966,18 +19127,28 @@ mod tests {
         for (i, h) in hands.iter().enumerate() {
             assert!(h.took_part(quiet as SeatIdx), "seat {i}: seat {quiet} still in the hand -- no voter took it out on its own copy");
         }
-        // The quiet seat acts after all, and its action is taken everywhere.
+        // The quiet seat acts after all. Every voter sealed its copy, so each
+        // holds the action while the copies may come (`S1-LZ`); they are held
+        // back past that bound, and the action is then taken everywhere.
         let turn = hands[quiet].turn().expect("still its turn");
         let action = if turn.legal.can_check { Action::Check } else { Action::Call };
         let sends = hands[quiet].act(action, &keys[quiet], t1).unwrap();
         pump_cheat_at(&mut hands, &keys, vec![(quiet, sends)], &hold_certs, &mut refused, t1);
+        let t2 = t1 + BOUND_FOR_MS;
+        let mut released = Vec::new();
+        for &s in &voters {
+            assert_eq!(hands[s].turn().map(|t| usize::from(t.seat)), Some(quiet), "seat {s}: held under its seal");
+            let (sends, _) = hands[s].replay_early(&keys[s], t2);
+            released.push((s, sends));
+        }
+        pump_cheat_at(&mut hands, &keys, released, &hold_certs, &mut refused, t2);
         // Then the copies: the set is whole at every seat, off position.
         let copies: Vec<Vec<u8>> = std::mem::take(&mut *held.borrow_mut());
         for (to, h) in hands.iter_mut().enumerate() {
             for c in &copies {
-                let _ = h.on_event(c, &keys[to], t1 + 1_000);
+                let _ = h.on_event(c, &keys[to], t2 + 1_000);
             }
-            let _ = h.replay_early(&keys[to], t1 + 1_000);
+            let _ = h.replay_early(&keys[to], t2 + 1_000);
             assert!(!h.take_newly_whole().is_empty(), "seat {to}: the set is whole here");
             assert!(h.aborted().is_none(), "seat {to}: and the hand goes on");
         }
@@ -18991,8 +19162,8 @@ mod tests {
             };
             let s = usize::from(turn.seat);
             let action = if turn.legal.can_check { Action::Check } else { Action::Call };
-            let sends = hands[s].act(action, &keys[s], t1).unwrap();
-            pump_cheat_at(&mut hands, &keys, vec![(s, sends)], &hold_certs, &mut refused, t1);
+            let sends = hands[s].act(action, &keys[s], t2).unwrap();
+            pump_cheat_at(&mut hands, &keys, vec![(s, sends)], &hold_certs, &mut refused, t2);
         }
         for (i, h) in hands.iter().enumerate() {
             assert!(h.betting_over() && h.checkpoint8().is_some(), "seat {i} settled: {refused:?}");
@@ -20798,6 +20969,413 @@ mod tests {
             }
             assert_eq!(hand.strikes_against(up), 1, "and it counts as one strike");
         }
+    }
+
+    /// `S1-LZ`: `sends` delivered to `to` at `now`, a frame the hand holds back
+    /// kept as the node keeps it.
+    fn deliver_at(to: &mut Hand, sends: &[Send], key: &SigningKey, now: u64) -> Vec<Send> {
+        let mut out = Vec::new();
+        for Send::Broadcast(bytes) in sends {
+            match to.on_event(bytes, key, now) {
+                Ok(mut more) => out.append(&mut more),
+                Err(Failed::NotYet) => {
+                    let _ = to.hold(bytes.clone());
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        out
+    }
+
+    /// `S1-LZ`: the slot a hand stands at -- the stage and the branch.
+    fn standing(h: &Hand) -> (u64, Hash) {
+        (h.slot().sequence, h.slot().previous_event_hash)
+    }
+
+    /// `S1-LZ`: **a voter that has sealed its copy of the certificate about a
+    /// seat holds that seat's own action, arriving after the seal, while the
+    /// other copies come** -- and so stands with the other voters when the set
+    /// is whole. Taken, the action put it a stage past them on the subject's
+    /// branch: `R4`, the owner's hand 18 of 2026-10-06, where seat 1 sealed at
+    /// 09:35:00.528, took seat 3's fold after it, and the copies made the set
+    /// whole off position there at 00.680 -- and the two seats it had voted
+    /// with then certified it out of the hand with seat 3.
+    ///
+    /// **To make this fail**: delete the `bound_against` check in `on_action`,
+    /// or run with `P2P_POKER_CONTROL=s1lz` -- the fold is taken, and the first
+    /// voter is off the second's branch when the copy comes.
+    #[test]
+    fn a_sealed_copy_binds_its_voter_to_the_certificate() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let voters: Vec<usize> = (0..3).filter(|s| *s != up).collect();
+        let (first, second) = (voters[0], voters[1]);
+        let late = NOW + 30_000;
+
+        // The seat folds inside its turn, and the wire brings the fold late.
+        let fold = hands[up].act(Action::Fold, &keys[up], NOW + 10_000).expect("a fold is legal");
+        // Both voters' clocks run out; each votes, and each seals its copy as
+        // the other's vote comes -- the copies still on the wire.
+        let first_vote = hands[first].vote_on_timeouts(&keys[first], late, 0).unwrap();
+        let second_vote = hands[second].vote_on_timeouts(&keys[second], late + 500, 0).unwrap();
+        assert_eq!((first_vote.len(), second_vote.len()), (1, 1), "both vote");
+        let first_copy = deliver_at(&mut hands[first], &second_vote, &keys[first], late + 600);
+        let second_copy = deliver_at(&mut hands[second], &first_vote, &keys[second], late + 600);
+        assert!(!first_copy.is_empty() && !second_copy.is_empty(), "both sealed");
+        let stage = standing(&hands[first]);
+
+        // The fold reaches the first voter after its seal: held, not taken.
+        for Send::Broadcast(b) in &fold {
+            assert!(
+                matches!(hands[first].on_event(b, &keys[first], late + 700), Err(Failed::NotYet)),
+                "a sealed voter took the action of the seat its copy names"
+            );
+            let _ = hands[first].hold(b.clone());
+        }
+        assert_eq!(standing(&hands[first]), stage, "still at the stage its copy is about");
+
+        // The copies come: the set is whole at both, in position.
+        let _ = deliver_at(&mut hands[first], &second_copy, &keys[first], late + 800);
+        let _ = deliver_at(&mut hands[second], &first_copy, &keys[second], late + 800);
+
+        // The held fold, replayed: a frame of a stage this hand has left.
+        let (_, failures) = hands[first].replay_early(&keys[first], late + 900);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(hands[first].early.is_empty(), "nothing is held any more");
+        for &v in &voters {
+            assert!(hands[v].folded()[up], "seat {v}: the certificate folded the seat");
+            assert_eq!(hands[v].strikes_against(up as SeatIdx), 1, "seat {v}: a strike, by the certificate");
+            assert!(hands[v].proven.is_empty(), "seat {v}: an honest fold proves nothing");
+            assert!(hands[v].forked.is_none(), "seat {v}: no fork");
+        }
+        assert!(standing(&hands[first]).0 > stage.0, "past the stage the certificate closed");
+        assert_eq!(standing(&hands[first]), standing(&hands[second]), "the voters stand on one branch");
+    }
+
+    /// `S1-LZ`: **and only a sealed copy binds, for a moment.** A voter that has
+    /// only voted takes the seat's late action as it always did -- it then never
+    /// seals there, so no set about the seat can be whole anywhere -- and a
+    /// voter that sealed waits its bound out and takes the action too: the
+    /// voters stand together on the seat's own branch, nobody struck. A hand
+    /// waits that long on the binding and no longer.
+    ///
+    /// **To make this fail**: take the bound out of `bound_against` -- the
+    /// sealed voter holds the fold for good, and the hand with it; or bind from
+    /// the vote, as `S1-LZ`'s first design did -- the first voter holds too.
+    #[test]
+    fn a_voter_that_only_voted_takes_the_action_and_a_sealed_one_waits_its_bound() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let voters: Vec<usize> = (0..3).filter(|s| *s != up).collect();
+        let (first, second) = (voters[0], voters[1]);
+        let late = NOW + 30_000;
+
+        let check = action_frame(&hands[up], &keys[up], EventType::ActionCheck);
+        let fold = hands[up].act(Action::Fold, &keys[up], NOW + 10_000).expect("a fold is legal");
+        let first_vote = hands[first].vote_on_timeouts(&keys[first], late, 0).unwrap();
+        let second_vote = hands[second].vote_on_timeouts(&keys[second], late + 500, 0).unwrap();
+        // The second voter has both votes and seals; the first has its own only.
+        let second_copy = deliver_at(&mut hands[second], &first_vote, &keys[second], late + 600);
+        assert!(!second_copy.is_empty(), "the second voter sealed");
+
+        // The fold reaches the first voter before the second's vote: taken.
+        let _ = deliver_at(&mut hands[first], &fold, &keys[first], late + 700);
+        assert!(hands[first].folded()[up], "a voter that only voted takes the action");
+        // The second's vote and copy come to a stage it has left: no copy here.
+        assert!(
+            deliver_at(&mut hands[first], &second_vote, &keys[first], late + 800).is_empty(),
+            "a copy sealed at a stage left"
+        );
+        let _ = deliver_at(&mut hands[first], &second_copy, &keys[first], late + 800);
+
+        // The fold reaches the sealed voter: held while its seal binds ...
+        let _ = deliver_at(&mut hands[second], &fold, &keys[second], late + 900);
+        let bound = hands[second].bound_for_ms();
+        assert_eq!(bound, BOUND_FOR_MS, "the default table's clock is long enough for the whole bound");
+        let _ = hands[second].replay_early(&keys[second], late + 600 + bound - 1);
+        assert!(!hands[second].folded()[up], "taken while the seal still bound");
+        // ... and taken once the seal is that old -- by the held frame itself:
+        // another frame of the seat's, arriving first and refused, releases
+        // nothing (the refuter's fourth round).
+        let refused = hands[second].on_event(&check, &keys[second], late + 600 + bound);
+        assert!(matches!(refused, Err(Failed::Illegal { .. })), "{refused:?}");
+        let (_, failures) = hands[second].replay_early(&keys[second], late + 600 + bound);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(hands[second].folded()[up], "the fold is taken");
+        assert!(hands[second].early.is_empty(), "nothing is held any more");
+        assert_eq!(hands[second].stage_at_ms, late + 900, "the next stage timed from when the fold came");
+        for &v in &voters {
+            assert_eq!(hands[v].strikes_against(up as SeatIdx), 0, "seat {v}: no certificate, no strike");
+            assert!(hands[v].forked.is_none(), "seat {v}: no fork");
+        }
+        assert_eq!(standing(&hands[first]), standing(&hands[second]), "the voters stand on one branch");
+    }
+
+    /// `S1-LZ`: **one event of a seat is held under a copy, and another version
+    /// of its turn is answered with nothing meanwhile** -- a rogue subject cannot
+    /// fill the early queue with versions of one turn while the certificate
+    /// forms (the refuter's finding 4) -- and the pair still proves its writer
+    /// once the held one is judged (`G11`).
+    #[test]
+    fn a_second_version_under_a_copy_is_not_held_and_proves_its_writer() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let voters: Vec<usize> = (0..3).filter(|s| *s != up).collect();
+        let (first, second) = (voters[0], voters[1]);
+        let late = NOW + 30_000;
+
+        let other = action_frame(&hands[up], &keys[up], EventType::ActionCall);
+        let fold = hands[up].act(Action::Fold, &keys[up], NOW + 10_000).expect("a fold is legal");
+        let first_vote = hands[first].vote_on_timeouts(&keys[first], late, 0).unwrap();
+        let second_vote = hands[second].vote_on_timeouts(&keys[second], late + 500, 0).unwrap();
+        let first_copy = deliver_at(&mut hands[first], &second_vote, &keys[first], late + 600);
+        let second_copy = deliver_at(&mut hands[second], &first_vote, &keys[second], late + 600);
+        let _ = deliver_at(&mut hands[first], &fold, &keys[first], late + 700);
+        assert_eq!(hands[first].on_event(&other, &keys[first], late + 750), Err(Failed::Ignored));
+        assert_eq!(hands[first].early.len(), 1, "one version held");
+
+        let _ = deliver_at(&mut hands[first], &second_copy, &keys[first], late + 800);
+        let _ = deliver_at(&mut hands[second], &first_copy, &keys[second], late + 800);
+        let (_, failures) = hands[first].replay_early(&keys[first], late + 900);
+        assert_eq!(failures, vec![Failed::Equivocation { seat: up as SeatIdx }], "the pair proves its writer");
+        assert_eq!(standing(&hands[first]), standing(&hands[second]), "the voters stand on one branch");
+    }
+
+    /// `S1-LZ`: **a frame the stage would refuse is refused under a copy, as
+    /// before, and takes no place of the seat's own** -- held first, a bad
+    /// version kept the genuine action out for the whole bound and was then
+    /// refused, the voter stranded at the stage (the refuter's third round,
+    /// finding 1).
+    #[test]
+    fn a_frame_the_stage_would_refuse_is_not_held_under_a_copy() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let voters: Vec<usize> = (0..3).filter(|s| *s != up).collect();
+        let (first, second) = (voters[0], voters[1]);
+        let late = NOW + 30_000;
+        assert!(hands[up].turn().unwrap().to_call > 0, "facing the big blind");
+
+        let check = action_frame(&hands[up], &keys[up], EventType::ActionCheck);
+        let fold = hands[up].act(Action::Fold, &keys[up], NOW + 10_000).expect("a fold is legal");
+        let first_vote = hands[first].vote_on_timeouts(&keys[first], late, 0).unwrap();
+        let second_vote = hands[second].vote_on_timeouts(&keys[second], late + 500, 0).unwrap();
+        let first_copy = deliver_at(&mut hands[first], &second_vote, &keys[first], late + 600);
+        let second_copy = deliver_at(&mut hands[second], &first_vote, &keys[second], late + 600);
+        // A check facing a bet: refused, as it always was -- not held.
+        let refused = hands[first].on_event(&check, &keys[first], late + 650);
+        assert!(matches!(refused, Err(Failed::Illegal { .. })), "{refused:?}");
+        assert!(hands[first].early.is_empty(), "nothing held for it");
+        // The genuine action after it is held.
+        let _ = deliver_at(&mut hands[first], &fold, &keys[first], late + 700);
+        assert_eq!(hands[first].early.len(), 1, "the fold held");
+
+        let _ = deliver_at(&mut hands[first], &second_copy, &keys[first], late + 800);
+        let _ = deliver_at(&mut hands[second], &first_copy, &keys[second], late + 800);
+        let _ = hands[first].replay_early(&keys[first], late + 900);
+        assert!(hands[first].early.is_empty(), "nothing is held any more");
+        assert_eq!(standing(&hands[first]), standing(&hands[second]), "the voters stand on one branch");
+    }
+
+    /// `S1-LZ`'s race simulation: a generator the same in the control and in the
+    /// fix, so that both see the same trials, timed the same until they part.
+    struct RaceRng(u64);
+
+    impl RaceRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// `S1-LZ`: what one trial of the race ended in, at the voters.
+    #[derive(Default, Debug)]
+    struct RaceOutcome {
+        /// The voters stand on two branches of the hand -- `R4`.
+        two_branches: bool,
+        /// Some voter reported the fork (`judge_set` kind 1).
+        forked_note: bool,
+        /// The certificate acted for the subject.
+        certified: bool,
+        /// The subject's own action stood, and no certificate.
+        acted: bool,
+        /// Some voter is still at the subject's stage when the trial ends.
+        stuck: bool,
+        /// Actions held under a sealed copy, and taken once its bound ran out.
+        held: usize,
+        taken_after_bound: usize,
+    }
+
+    /// `S1-LZ`: one trial. Four seats at the first bet, the node's own roads
+    /// played over the engine: each seat's 2 s stall tick at its own phase (the
+    /// held frames replayed, then the votes), every accepted frame followed by a
+    /// replay, what the hand gives to say again (`S1-KB`) and the copies of a set
+    /// newly whole (`S1-LF`) said to every seat. Each link has its own latency,
+    /// each message a jitter, one in ten a slow delivery of up to 3 s. The
+    /// subject's line is down until it acts -- it hears nothing, so it acts on its
+    /// own clock whatever the table did -- somewhere from 1 s before the voters'
+    /// deadline to 4 s after it, and its line comes back one seat at a time: each
+    /// of its messages up to 2.5 s late on each link (the owner's hand 18).
+    /// Nobody acts after it. `S1LZ_SHORT` plays a 5 s table with no grace.
+    fn race_trial(seed: u64) -> RaceOutcome {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut rng = RaceRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let short = std::env::var("S1LZ_SHORT").is_ok();
+        let n = 4usize;
+        let keys: Vec<SigningKey> = (0..n as u8).map(|s| key(10 + s)).collect();
+        let mut hands: Vec<Hand> = Vec::new();
+        let mut opened: Vec<(usize, Vec<Send>)> = Vec::new();
+        for seat in 0..n as u8 {
+            let mut o = opening_n(n as u8, seat);
+            if short {
+                o.action_timeout_ms = 5_000;
+                o.action_grace_ms = 0;
+            }
+            let (h, from) = Hand::open(hashed_opening(o), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            opened.push((usize::from(seat), from));
+        }
+        let mut flooded: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
+        flood_among(&mut hands, &keys, &mut flooded, opened);
+        let budget: u64 = if short { 5_000 } else { 25_000 };
+        let x = usize::from(hands[0].turn().expect("a seat to act").seat);
+        let stage = hands[0].slot().sequence;
+        let base: Vec<Vec<u64>> = (0..n).map(|_| (0..n).map(|_| 10 + rng.below(190)).collect()).collect();
+        let phase: Vec<u64> = (0..n).map(|_| rng.below(2_000)).collect();
+        let act_at = NOW + budget - 1_000 + rng.below(5_000);
+        let end = NOW + budget + 20_000;
+        // Events: (time, index) into `events`; kind 0 a delivery, 1 a tick, 2
+        // the subject's action.
+        let mut events: Vec<(u8, usize, Vec<u8>)> = Vec::new();
+        let mut queue: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
+        let at = |events: &mut Vec<(u8, usize, Vec<u8>)>, queue: &mut BinaryHeap<Reverse<(u64, usize)>>, t: u64, e: (u8, usize, Vec<u8>)| {
+            events.push(e);
+            queue.push(Reverse((t, events.len() - 1)));
+        };
+        for (seat, p) in phase.iter().enumerate() {
+            let mut t = (NOW + budget).saturating_sub(5_000) + p;
+            while t < end {
+                at(&mut events, &mut queue, t, (1, seat, Vec::new()));
+                t += 2_000;
+            }
+        }
+        at(&mut events, &mut queue, act_at, (2, x, Vec::new()));
+        let mut out = RaceOutcome::default();
+        while let Some(Reverse((now, i))) = queue.pop() {
+            if now >= end {
+                break;
+            }
+            let (kind, seat, bytes) = std::mem::take(&mut events[i]);
+            // The subject's line is down until it acts.
+            if seat == x && now < act_at && kind != 2 {
+                continue;
+            }
+            let mut said: Vec<Vec<u8>> = Vec::new();
+            let take = |sends: Vec<Send>, said: &mut Vec<Vec<u8>>| {
+                for Send::Broadcast(b) in sends {
+                    said.push(b);
+                }
+            };
+            match kind {
+                0 => match hands[seat].on_event(&bytes, &keys[seat], now) {
+                    Ok(sends) => {
+                        take(sends, &mut said);
+                        let (more, _) = hands[seat].replay_early(&keys[seat], now);
+                        take(more, &mut said);
+                    }
+                    Err(Failed::NotYet) => {
+                        let _ = hands[seat].hold(bytes);
+                    }
+                    Err(_) => {}
+                },
+                1 => {
+                    let (more, _) = hands[seat].replay_early(&keys[seat], now);
+                    take(more, &mut said);
+                    if let Ok(sends) = hands[seat].vote_on_timeouts(&keys[seat], now, 0) {
+                        take(sends, &mut said);
+                    }
+                }
+                _ => {
+                    if hands[seat].turn().map(|t| usize::from(t.seat)) == Some(seat) {
+                        if let Ok(sends) = hands[seat].act(Action::Fold, &keys[seat], now) {
+                            take(sends, &mut said);
+                        }
+                    }
+                }
+            }
+            said.extend(hands[seat].take_said_again());
+            for set in hands[seat].take_newly_whole() {
+                said.extend(set);
+            }
+            if let Some(note) = hands[seat].take_cert_note() {
+                out.held += note.matches("held while the").count();
+                out.taken_after_bound += note.matches("was not whole").count();
+            }
+            for b in said {
+                for to in (0..n).filter(|to| *to != seat) {
+                    let slow = if rng.below(10) == 0 { 200 + rng.below(2_800) } else { 0 };
+                    let back = if seat == x { rng.below(2_500) } else { 0 };
+                    let t = now + base[seat][to] + rng.below(30) + slow + back;
+                    at(&mut events, &mut queue, t, (0, to, b.clone()));
+                }
+            }
+        }
+        // The branch a voter left the subject's stage on: the parent of the
+        // betting stage after it -- the subject's own action, or the
+        // certificate stage's hash. A voter further on is not on another branch
+        // for that (a short clock plays on past the next stage).
+        let voters: Vec<usize> = (0..n).filter(|s| *s != x).collect();
+        let left_on: Vec<Option<Hash>> = voters.iter().map(|v| hands[*v].bet_stages.get(&(stage + 1)).map(|b| b.parent)).collect();
+        out.two_branches = left_on.iter().flatten().any(|h| Some(*h) != left_on.iter().flatten().next().copied());
+        out.forked_note = voters.iter().any(|v| hands[*v].forked.is_some());
+        out.certified = voters.iter().any(|v| hands[*v].strikes_against(x as SeatIdx) > 0);
+        out.acted = voters.iter().any(|v| hands[*v].folded()[x] && hands[*v].strikes_against(x as SeatIdx) == 0);
+        out.stuck = voters.iter().any(|v| hands[*v].slot().sequence == stage);
+        out
+    }
+
+    /// `S1-LZ`'s measurement over the engine itself: `S1LZ_TRIALS` trials (200
+    /// by default) of [`race_trial`], counted. Run once as the fix and once as
+    /// the control, from one build:
+    /// `cargo test --features fault-harness --lib -- --ignored s1lz_race --nocapture`,
+    /// then again with `P2P_POKER_CONTROL=s1lz`.
+    #[test]
+    #[ignore]
+    fn s1lz_race() {
+        let trials: u64 = std::env::var("S1LZ_TRIALS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(200);
+        let threads: u64 = 16;
+        let results: Vec<RaceOutcome> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    std::thread::Builder::new()
+                        .stack_size(32 << 20)
+                        .spawn_scoped(s, move || (0..trials).filter(|i| i % threads == t).map(race_trial).collect::<Vec<_>>())
+                        .expect("a thread")
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().expect("a trial")).collect()
+        });
+        let count = |f: &dyn Fn(&RaceOutcome) -> bool| results.iter().filter(|r| f(r)).count();
+        println!(
+            "s1lz_race control={} trials={} two_branches={} forked_note={} certified={} acted={} stuck={} held={} taken_after_bound={}",
+            control("s1lz"),
+            results.len(),
+            count(&|r| r.two_branches),
+            count(&|r| r.forked_note),
+            count(&|r| r.certified),
+            count(&|r| r.acted),
+            count(&|r| r.stuck),
+            results.iter().map(|r| r.held).sum::<usize>(),
+            results.iter().map(|r| r.taken_after_bound).sum::<usize>(),
+        );
     }
 
     /// Heads-up the mechanism is inert, which is the point rather than a gap.

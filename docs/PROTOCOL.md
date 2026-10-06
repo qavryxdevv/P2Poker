@@ -3856,6 +3856,16 @@ one. That rule put a wall-clock read back inside the chain-building rule, which
 D-006 and §8.2 forbid; `CERT_SETTLE_MS` is deleted from §13, and Q-04 is closed
 by this ruling (§12).
 
+**A copy binds for a moment (`S1-LZ`).** At a betting stage, once a copy of the
+certificate stage about the seat to act is held -- the receiver's own or another
+voter's -- the receiver takes no betting action of that seat's there until the stage
+closes, or until `min(6 s, half the betting budget)` after the first copy, when the
+action is taken as before; before any copy it takes the action at once. A copy
+exists only once every voter has voted, and a voter that took the action after its
+copy stood on the subject's branch when the set closed at the others; a voter that
+takes it before any copy never makes its own, and no set about the seat can be whole
+anywhere.
+
 **`0x0603 RETURN_VOTE`** — *the grow side of the roster (D-028, `S1-BM`)*
 
 *Direction:* single-writer, one per voter per subject. The voters are

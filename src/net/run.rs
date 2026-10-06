@@ -24129,8 +24129,8 @@ fn trusted_turn_began_ms(began_unix_ms: u64, heard_unix_ms: u64) -> u64 {
 /// player, from the moment the client can show it. A delivery a few seconds
 /// late takes its few seconds out of the thirty (`D-034`); a turn that comes
 /// with less than this left came through a line that was down, and that is no
-/// player deciding too slowly.
-const LATE_TURN_LEFT_MS: u64 = 10_000;
+/// player deciding too slowly. The hand's own, which `S1-LZ` reads too.
+const LATE_TURN_LEFT_MS: u64 = crate::table::hand::LATE_TURN_LEFT_MS;
 
 /// `D-034`, amended by `S1-FS`: where this client's own clock for its own turn
 /// starts, on the unix clock -- and the window's countdown with it.
