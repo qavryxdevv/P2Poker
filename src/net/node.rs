@@ -702,6 +702,11 @@ pub enum NodeEvent {
     /// `D-057`, `D-058`: a seat -- this client's own or another -- asked to sit
     /// in at the boundary of this hand.
     SitInAsked { seat: u8, hand_id: u64 },
+    /// `S1-LY`: another seat asked to be dealt in with three returns behind it by
+    /// the table's count -- every voter refuses a fourth (`D-032`), so it is out of
+    /// the game for the window, not *coming back*. Its chips stay where no majority
+    /// carried its fourth absence (`S1-KA`), and go with the blinds.
+    SeatDealtOut { seat: u8 },
     /// `D-058`: how the votes to act for a seat whose clock ran out stand.
     TimeoutVotes { seat: u8, held: u8, need: u8 },
     /// `D-058`: how the votes on a seat's return stand.
@@ -870,6 +875,7 @@ impl NodeEvent {
             // `D-057`: the way back over the felt.
             | Self::TableReach { .. }
             | Self::SitInAsked { .. }
+            | Self::SeatDealtOut { .. }
             // `D-058`: the wait on another seat over the felt.
             | Self::StageStands { .. }
             | Self::JoinNotStarted { .. }

@@ -106,6 +106,8 @@ impl AppState {
                     left: self.gone.contains(n),
                     // `S1-LW`: put out for cheating, by the node's word.
                     cheated: self.cheated.contains_key(n),
+                    // `S1-LY`: refused a fourth return, by the node's word.
+                    dealt_out: self.dealt_out.contains(n),
                     // `D-058`: on its way back, said at its seat and not over the hand.
                     coming_back: self.waits.get(n).is_some_and(|w| w.returning()),
                     link: self.links.get(n).map(|(rtt, group, quiet, at)| Link {
@@ -1106,6 +1108,33 @@ mod tests {
         assert_eq!(v.unsafe_note, None, "nothing warned of");
         s.apply(NodeEvent::BackWithChips { hand: 16, chips: 9_400, before: 9_500, missed: 0 });
         assert!(s.table_view().log.iter().any(|l| l.text == "Back at the table with 9400 chips (9500 before)."));
+    }
+
+    /// `S1-LY`, the owner's far machine: a seat refused a fourth return is *out of
+    /// the game* at its seat and once in the log, never *coming back*; and a
+    /// player whose own game is over -- out of chips -- is shown no way back, the
+    /// table's hands it follows as a watcher notwithstanding.
+    #[test]
+    fn a_seat_at_the_return_limit_is_out_and_a_finished_player_has_no_way_back() {
+        use crate::gui::table::LogKind;
+        let mut s = seated(0);
+        s.apply(NodeEvent::SitInAsked { seat: 2, hand_id: 18 });
+        assert!(s.table_view().seats.iter().any(|v| v.seat == 2 && v.coming_back), "an ordinary ask: coming back");
+        s.apply(NodeEvent::SeatDealtOut { seat: 2 });
+        let carol = s.table_view().seats.into_iter().find(|v| v.seat == 2).expect("seat 2");
+        assert!(carol.dealt_out && !carol.coming_back, "out of the game, not coming back");
+        s.apply(NodeEvent::SeatDealtOut { seat: 2 });
+        let said = s.table_view().log.iter().filter(|l| l.kind == LogKind::SitOut && l.text.starts_with("Carol is out of the game")).count();
+        assert_eq!(said, 1, "said once");
+        s.apply(NodeEvent::SeatDealtOut { seat: 0 });
+        assert!(s.table_view().seats.iter().all(|v| v.seat != 0 || !v.dealt_out), "never the player's own seat");
+        // Out of chips, the seat follows the table as a watcher: no way back is shown.
+        let mut s = seated(1);
+        s.apply(NodeEvent::SessionResumed { hand_id: 52, member: false });
+        assert!(s.table_view().rejoin.is_some(), "a seat on its way back is shown it");
+        s.apply(NodeEvent::Finished { hand_id: 52, seat: 1, place: 4, tied: false, players_left: 3, over: false });
+        s.apply(NodeEvent::SessionResumed { hand_id: 60, member: false });
+        assert!(s.table_view().rejoin.is_none(), "following hand #60 at a stack of 0: no way back");
     }
 
     /// `D-051`: the table not safe reaches the window with a serial the

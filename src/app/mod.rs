@@ -392,6 +392,7 @@ pub struct TableApp {
     pub out_flooded: bool,
     pub out_cheated: bool,
     pub cheated: std::collections::BTreeMap<u8, String>,
+    pub dealt_out: std::collections::BTreeSet<u8>,
     pub unsafe_note: Option<(String, u64)>,
     pub unsafe_stuck: Option<PlayMark>,
     pub split_note: Option<(String, u64)>,
@@ -574,6 +575,9 @@ pub struct AppState {
     /// `S1-LW`: the seats the table put out for cheating, with what each signed
     /// in plain words, as the node said it -- the log's line and the seat's word.
     pub cheated: std::collections::BTreeMap<u8, String>,
+    /// `S1-LY`: the seats that asked to come back with three returns behind them,
+    /// by the node's word -- out of the game here, never *coming back*.
+    pub dealt_out: std::collections::BTreeSet<u8>,
     /// `D-051`: why this table is not safe, as the node last said it, with a
     /// serial the window closes by -- the question comes back when the node
     /// says it again.
@@ -1105,6 +1109,7 @@ impl AppState {
         std::mem::swap(&mut self.out_flooded, &mut other.out_flooded);
         std::mem::swap(&mut self.out_cheated, &mut other.out_cheated);
         std::mem::swap(&mut self.cheated, &mut other.cheated);
+        std::mem::swap(&mut self.dealt_out, &mut other.dealt_out);
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
         std::mem::swap(&mut self.unsafe_stuck, &mut other.unsafe_stuck);
         std::mem::swap(&mut self.split_note, &mut other.split_note);
@@ -1374,6 +1379,21 @@ impl AppState {
                 w.asked = Some(hand_id);
                 if fresh {
                     self.log_table(crate::gui::table::LogKind::SitOut, format!("{name} asks to sit in after hand #{hand_id}"));
+                }
+            }
+            // `S1-LY`: another seat asking to come back that every voter refuses --
+            // three returns behind it (`D-032`): out of the game, said once in the
+            // table's log, and no longer waited on as one coming back.
+            NodeEvent::SeatDealtOut { seat } => {
+                if self.seated.as_ref().and_then(|s| s.seat) == Some(seat) {
+                    return;
+                }
+                self.waits.remove(&seat);
+                if self.dealt_out.insert(seat) {
+                    let name = self.seat_name(seat);
+                    let line = format!("{name} is out of the game: a fourth absence, after the three returns a table allows");
+                    self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
+                    self.note(format!("{line} (D-032, S1-LY)"));
                 }
             }
             NodeEvent::SitInAsked { hand_id, .. } => {
@@ -2674,6 +2694,7 @@ impl AppState {
         self.out_flooded = false;
         self.out_cheated = false;
         self.cheated.clear();
+        self.dealt_out.clear();
         self.unsafe_note = None;
         self.unsafe_stuck = None;
         self.split_note = None;
@@ -3274,6 +3295,12 @@ impl AppState {
     /// the one under way, and what it waits on.
     pub fn rejoin_view(&self) -> Option<crate::gui::table::RejoinView> {
         use crate::gui::table::StepState::{Done, Later, Now};
+        // `S1-LY`: no way back for a player whose game here is over -- out of
+        // chips, or out for good: a seat that only watches follows the table's
+        // hands, and the panel said *following hand #60* to a stack of 0.
+        if self.finished.is_some() || self.out_for_good.is_some() {
+            return None;
+        }
         let r = self.rejoin.as_ref()?;
         let back = r.back_at.is_some();
         // `S1-FY`: the seat given back before the table started, asked for again.

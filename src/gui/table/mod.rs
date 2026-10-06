@@ -214,6 +214,9 @@ pub struct SeatView {
     /// node's word -- while it plays its hand out, too -- and *caught cheating*
     /// where *left the table* would be.
     pub cheated: bool,
+    /// `S1-LY`: the seat asked to come back with three returns behind it, which
+    /// every voter refuses: *out of the game* where *coming back* would be.
+    pub dealt_out: bool,
     /// `D-058`: on its way back to the table -- it asked to sit in, or the seats
     /// vote on its return: *coming back* where its cards were, the only place the
     /// return is said while a hand is played.
@@ -1214,6 +1217,9 @@ fn seat_box(
         // `S1-LW`: a seat put out for cheating says that, not that it left.
         let (words, tint) = if seat.cheated {
             ("caught cheating", crate::gui::theme::DANGER)
+        } else if seat.dealt_out {
+            // `S1-LY`: refused a fourth return -- never on its way back.
+            ("out of the game", style::faded(style::TEXT_2, 0.9))
         } else if seat.coming_back {
             ("coming back", crate::gui::theme::WARN)
         } else if seat.left {
@@ -2231,6 +2237,8 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                         ui.label(RichText::new(format!("${}", s.stack)).color(style::COLOR_ACCENT));
                         let state_word = if s.cheated {
                             "caught cheating"
+                        } else if s.dealt_out {
+                            "out of the game"
                         } else if s.coming_back {
                             "coming back"
                         } else if s.left {

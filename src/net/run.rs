@@ -1706,6 +1706,10 @@ struct TableRun {
     /// `D-106`: the offer below the floor last taken without asking, until a hand
     /// is adopted -- said once, and the seat said back at the adoption itself.
     floor_taken: Option<crate::net::node::FloorOffer>,
+    /// `S1-LY`: this client's own seat is out of the game at its fourth absence in a
+    /// hand most seats did not carry (`dealt_out_at_the_limit`): it asks to be dealt
+    /// in no more.
+    dealt_out: bool,
     /// `S1-EH`: whether another seat was ever on the line here, and whether
     /// the last word about this client's own line was *nobody reachable*.
     ever_on_line: bool,
@@ -2220,6 +2224,7 @@ impl TableRun {
             heard_nobody_since: None,
             own_line_down_at: None,
             floor_taken: None,
+            dealt_out: false,
             voided_pending: (0, 0),
             alone_hand: None,
             own_returns: std::collections::BTreeMap::new(),
@@ -5188,6 +5193,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.heard_nobody_since = None;
             $t.own_line_down_at = None;
             $t.floor_taken = None;
+            $t.dealt_out = false;
             $t.voided_pending = (0, 0);
             $t.alone_hand = None;
             $t.own_returns.clear();
@@ -12948,12 +12954,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let why = if h.over() { Some(h) } else { t.previous.as_ref() };
                         let flooded = why.is_some_and(|p| p.named_for_flooding(me));
                         let cheated = why.is_some_and(|p| p.named_for_cheating(me));
-                        h.out_for_good_decided().contains(&me).then_some((me, flooded, cheated))
+                        // `S1-LY`: or its fourth absence in a hand no majority carried:
+                        // not out for good there (`S1-KA`), and never dealt in again.
+                        let limit = why.is_some_and(|p| dealt_out_at_the_limit(p, me));
+                        (h.out_for_good_decided().contains(&me) || limit).then_some((me, flooded, cheated, limit))
                     });
-                    if let Some((me, flooded, cheated)) = out_myself {
+                    if let Some((me, flooded, cheated, limit)) = out_myself {
+                        // `S1-LY`: no more asking to be dealt in, and no word about a
+                        // table that does not sign a return D-032 refuses.
+                        if limit && !t.dealt_out {
+                            t.dealt_out = true;
+                            t.done_here = true;
+                        }
                         if !t.out_told {
                             t.out_told = true;
-                            let why = if flooded {
+                            let why = if limit && !flooded && !cheated {
+                                format!(
+                                    "seat {me} -- this client -- is out of the game at its fourth absence: it came back {} times, and a table deals no seat in again after that (D-032, D-047); in a hand most seats did not carry, its chips stay at the table and go with the blinds",
+                                    crate::protocol::constants::MAX_RETURNS
+                                )
+                            } else if flooded {
                                 format!(
                                     "seat {me} -- this client -- is out of the table for good for flooding the table's group (D-051): every other voter's client cut it off"
                                 )
@@ -15602,7 +15622,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // Published and heard like the checkpoint: this client's own
                 // window records that its seat spoke, and `A` gets the seat the
                 // way it gets any other.
-                if !stay_out && phase1 {
+                // `S1-LY`: and not by a seat out of the game at the return limit.
+                if !stay_out && !t.dealt_out && phase1 {
                     let asked = match t.hand.as_mut() {
                         Some(h) => h.sit_in_request(&app_key, super::node::now_unix_ms()),
                         None => Ok(None),
@@ -18382,6 +18403,21 @@ const OWN_OUTAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(90)
 /// -- read from the moment `watch_progress` last saw it down.
 fn own_line_lately_down(down_at: Option<std::time::Instant>) -> bool {
     down_at.is_some_and(|at| at.elapsed() < OWN_OUTAGE_GRACE)
+}
+
+/// `S1-LY`: this client's own seat, certified out of a hand it held, with its own
+/// count of returns at the limit -- `D-047`'s fourth absence in a hand most seats
+/// did not carry (`S1-KA`): not out for good there, yet never dealt in again, for
+/// every voter's count is at least its own (`D-104`) and `D-032` refuses a fourth
+/// return. The owner's far machine asked to sit in at every boundary for ever, the
+/// table told it a player did not sign its return, and the other seats showed it
+/// *coming back*.
+fn dealt_out_at_the_limit(h: &crate::table::hand::Hand, me: u8) -> bool {
+    h.over()
+        && !h.late_close_open()
+        && !h.closed_on_a_borrowed_settlement()
+        && h.certified_seats().contains(&me)
+        && h.returns_seen().get(usize::from(me)).copied().unwrap_or(0) >= crate::protocol::constants::MAX_RETURNS
 }
 /// `S1-JR`: a seat seen sending two different copies of one stage in this
 /// many hands makes the table not safe. Not in one: a client back from a
@@ -23058,9 +23094,18 @@ async fn boundary_event(
                      the next hand's opening"
                 )))
                 .await;
-            // `D-057`, `D-058`: for the window's way back (this client's own)
-            // and its wait on another seat.
-            let _ = events.send(NodeEvent::SitInAsked { seat, hand_id }).await;
+            // `S1-LY`: another seat with three returns behind it by the table's
+            // count is refused by every voter (`D-032`): out of the game for the
+            // window, not on its way back.
+            let at_the_limit = seat != h.my_seat()
+                && h.returns().get(usize::from(seat)).copied().unwrap_or(0) >= crate::protocol::constants::MAX_RETURNS;
+            if at_the_limit {
+                let _ = events.send(NodeEvent::SeatDealtOut { seat }).await;
+            } else {
+                // `D-057`, `D-058`: for the window's way back (this client's own)
+                // and its wait on another seat.
+                let _ = events.send(NodeEvent::SitInAsked { seat, hand_id }).await;
+            }
         }
         WindowTook::Took(k) => {
             // Recorded and read by nobody yet, which is stated in the log rather
@@ -27530,6 +27575,26 @@ mod a_joiner_before_the_first_hand {
         assert!(code.contains("t.own_line_down_at = Some(std::time::Instant::now());"), "a machine asleep");
     }
 
+    /// `S1-LY`, the owner's far machine (2026-10-06): certified out at its fourth
+    /// absence in a hand most seats did not carry, a seat was neither out for good
+    /// nor ever dealt in again -- it asked at every boundary, was told a player did
+    /// not sign its return, and the other seats showed it coming back. Now it tells
+    /// its player it is out of the game and asks no more, and the others show it so.
+    #[test]
+    fn a_seat_at_the_return_limit_is_told_it_is_out_and_shown_out() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let limit = code.find("fn dealt_out_at_the_limit(h: &crate::table::hand::Hand, me: u8) -> bool {").expect("the reading");
+        let body = &code[limit..limit + 600];
+        assert!(body.contains("h.certified_seats().contains(&me)") && body.contains("h.returns_seen()"), "its own count, certified out");
+        assert!(!body.contains("carried_by_majority"), "whatever the majority carried");
+        assert!(code.contains("let limit = why.is_some_and(|p| dealt_out_at_the_limit(p, me));"), "read where out for good is");
+        assert!(code.contains("if limit && !t.dealt_out {\n                            t.dealt_out = true;\n                            t.done_here = true;"), "done here");
+        assert!(code.contains("if !stay_out && !t.dealt_out && phase1 {"), "and asks no more");
+        let asked = code.find("let at_the_limit = seat != h.my_seat()").expect("another seat at the limit");
+        assert!(code[asked..asked + 400].contains("NodeEvent::SeatDealtOut { seat }"), "shown out, not coming back");
+    }
+
     /// `S1-JR`: the hands called off while this client heard no other seat are
     /// held back -- every other seat's silence makes that reading, rogues'
     /// included -- and counted when the silence ends before the window asks
@@ -27600,7 +27665,10 @@ mod a_joiner_before_the_first_hand {
             "the group's word for good, once the hand is over -- never a borrowed settlement's (S1-LA)"
         );
         assert!(code.contains("let resigned = $h.named_by_its_own_word(seat); let at_the_limit ="), "the word, the cheat and the flood alike");
-        assert!(code.contains("h.out_for_good_decided().contains(&me).then_some((me, flooded, cheated))"), "this client, once decided");
+        assert!(
+            code.contains("(h.out_for_good_decided().contains(&me) || limit).then_some((me, flooded, cheated, limit))"),
+            "this client, once decided -- or dealt out at the return limit (S1-LY)"
+        );
         assert!(code.contains("let why = if h.over() { Some(h) } else { t.previous.as_ref() };"), "and why, from the hand that decided it");
         let behind = code.find("// Retained, not dropped: a certificate about this hand that").expect("the deal");
         assert!(
