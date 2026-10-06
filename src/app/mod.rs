@@ -2409,6 +2409,18 @@ impl AppState {
                     }
                 }
             },
+            // `D-106`: back with what the table offered, taken without asking --
+            // said in plain words, no question and no warning (the owner,
+            // 2026-10-06: the blinds of an absence are no alarm).
+            NodeEvent::BackWithChips { hand, chips, before, missed } => {
+                let line = if missed > 0 {
+                    format!("Back at the table with {chips} chips ({before} before): the table played {missed} hand(s) without you.")
+                } else {
+                    format!("Back at the table with {chips} chips ({before} before).")
+                };
+                self.log_table(crate::gui::table::LogKind::Normal, line.clone());
+                self.note(format!("{line} Taken at hand #{hand} (D-106)."));
+            }
             NodeEvent::TableSplit { why } => match why {
                 None => self.split_note = None,
                 Some(w) => {

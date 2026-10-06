@@ -1087,6 +1087,27 @@ mod tests {
         assert_eq!(s.table_view().floor_offer, None, "answered, or dealt in again");
     }
 
+    /// `D-106` (the owner, 2026-10-06): a seat back below its own floor, the
+    /// offer taken without asking, is said in the table's log in plain words --
+    /// both numbers, the hands missed -- and nothing is asked or warned of.
+    #[test]
+    fn a_seat_back_below_its_floor_is_said_plainly_and_nothing_asked() {
+        use crate::gui::table::LogKind;
+        let mut s = seated(0);
+        s.apply(NodeEvent::BackWithChips { hand: 15, chips: 9_500, before: 9_800, missed: 4 });
+        let v = s.table_view();
+        assert!(
+            v.log.iter().any(|l| l.kind == LogKind::Normal
+                && l.text == "Back at the table with 9500 chips (9800 before): the table played 4 hand(s) without you."),
+            "{:?}",
+            v.log
+        );
+        assert_eq!(v.floor_offer, None, "nothing asked");
+        assert_eq!(v.unsafe_note, None, "nothing warned of");
+        s.apply(NodeEvent::BackWithChips { hand: 16, chips: 9_400, before: 9_500, missed: 0 });
+        assert!(s.table_view().log.iter().any(|l| l.text == "Back at the table with 9400 chips (9500 before)."));
+    }
+
     /// `D-051`: the table not safe reaches the window with a serial the
     /// window's *Stay* closes -- a second word from the node is a second
     /// question -- and goes when the node says the table is safe again; out

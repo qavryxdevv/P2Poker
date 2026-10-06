@@ -1292,7 +1292,8 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     }
                     // Batch 4 (`D-102`): a headless client has nobody to ask -- it
                     // takes the offer, unless the harness says to ask (and so take
-                    // nothing).
+                    // nothing). `D-106`: the node takes an offer above 0 itself now;
+                    // one reaches here only at 0, or under `P2P_POKER_CONTROL=d102`.
                     if let NodeEvent::FloorOffer { offer: Some(o) } = &event {
                         if o.offered == 0 {
                             println!("floor: hand #{} names this seat at 0 chips, below the {} of its own signatures: nothing to take", o.hand, o.floor);

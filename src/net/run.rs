@@ -1699,6 +1699,13 @@ struct TableRun {
     /// out of its group, or cut off -- the only time a word in a lobby answer
     /// about it being out for good is taken.
     heard_nobody_since: Option<std::time::Instant>,
+    /// `S1-LX`: the last moment the stall tick saw this client's own line down
+    /// (`own_line_down`): the table read within `OWN_OUTAGE_GRACE` of it is no
+    /// reading of the table.
+    own_line_down_at: Option<std::time::Instant>,
+    /// `D-106`: the offer below the floor last taken without asking, until a hand
+    /// is adopted -- said once, and the seat said back at the adoption itself.
+    floor_taken: Option<crate::net::node::FloorOffer>,
     /// `S1-EH`: whether another seat was ever on the line here, and whether
     /// the last word about this client's own line was *nobody reachable*.
     ever_on_line: bool,
@@ -2211,6 +2218,8 @@ impl TableRun {
             forming_since: None,
             return_short: (0, None),
             heard_nobody_since: None,
+            own_line_down_at: None,
+            floor_taken: None,
             voided_pending: (0, 0),
             alone_hand: None,
             own_returns: std::collections::BTreeMap::new(),
@@ -5177,6 +5186,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.forming_since = None;
             $t.return_short = (0, None);
             $t.heard_nobody_since = None;
+            $t.own_line_down_at = None;
+            $t.floor_taken = None;
             $t.voided_pending = (0, 0);
             $t.alone_hand = None;
             $t.own_returns.clear();
@@ -11771,6 +11782,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         for t in tables.iter_mut() {
                             if t.hand.is_some() || t.resuming {
                                 t.line_down_at = Some(tick_at);
+                                // `S1-LX` (the review): a machine asleep is this
+                                // client's own outage, as a line down is.
+                                if !crate::table::hand::control("s1lx") {
+                                    t.own_line_down_at = Some(std::time::Instant::now());
+                                }
                             }
                         }
                     }
@@ -13690,7 +13706,33 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .max();
                                         if let Some((hand, _, offered)) = refused.filter(|(_, _, o)| *o < fl.stack) {
                                             let ask = crate::net::node::FloorOffer { hand, offered, floor: fl.stack, since: fl.hand };
-                                            if t.floor_episode != Some(ask) {
+                                            // `D-106` (the owner, 2026-10-06: *take that warning away*):
+                                            // an offer above 0 is taken without asking, as a headless
+                                            // client always took it -- the blinds of the hands missed,
+                                            // and whatever this seat had in the hand it dropped out of,
+                                            // are honest returns' every time -- and the window says the
+                                            // seat is back with both numbers. The question stays for 0,
+                                            // and for the beds under `P2P_POKER_CONTROL=d102`.
+                                            if offered > 0 && !crate::table::hand::control("d102") {
+                                                t.own_floor = Some(OwnFloor { hand: hand.saturating_sub(1), stack: offered });
+                                                if t.floor_episode.take().is_some() {
+                                                    let _ = events.send(NodeEvent::FloorOffer { offer: None }).await;
+                                                }
+                                                // Said once an offer (the review): a journal read at the
+                                                // next pick can put the floor up again, and the same offer
+                                                // is taken again -- silently. The seat is said back at
+                                                // the adoption, with what it adopted.
+                                                if t.floor_taken != Some(ask) {
+                                                    t.floor_taken = Some(ask);
+                                                    let _ = events
+                                                        .send(NodeEvent::Warning(format!(
+                                                            "the table offers this seat hand #{hand} with {offered} chips, below the {} its own signatures allow it, {} hand(s) after it was last dealt in: taken without asking (D-106)",
+                                                            fl.stack,
+                                                            ask.hands_missed()
+                                                        )))
+                                                        .await;
+                                                }
+                                            } else if t.floor_episode != Some(ask) {
                                                 t.floor_episode = Some(ask);
                                                 let _ = events
                                                     .send(NodeEvent::Warning(format!(
@@ -13727,6 +13769,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 // it (a Take's below the floor, the count's at or above).
                                                 if let Some(start_me) = o.seats.iter().find(|(s, _, _)| *s == o.my_seat).map(|(_, _, st)| *st) {
                                                     t.own_floor = floor_moved(t.own_floor, hid.saturating_sub(1), start_me);
+                                                    // `D-106`: an offer taken without asking -- the seat
+                                                    // said back here, at the hand it took and its stack there.
+                                                    if let Some(tk) = t.floor_taken.take().filter(|tk| start_me < tk.floor) {
+                                                        let _ = events
+                                                            .send(NodeEvent::BackWithChips {
+                                                                hand: hid,
+                                                                chips: start_me,
+                                                                before: tk.floor,
+                                                                missed: hid.saturating_sub(tk.since.saturating_add(1)),
+                                                            })
+                                                            .await;
+                                                    }
                                                 }
                                                 if t.floor_episode.take().is_some() {
                                                     let _ = events.send(NodeEvent::FloorOffer { offer: None }).await;
@@ -14824,7 +14878,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             &h.table_for_the_count(),
                             h.my_seat(),
                             id,
-                            t.adrift.is_some(),
+                            // `S1-LX`: half the table ahead is no split while this client
+                            // is adrift -- or just back from its own line's outage, and
+                            // catching up by the copies (`D-038`) as it was meant to.
+                            t.adrift.is_some() || own_line_lately_down(t.own_line_down_at),
                         );
                         // Once said, a seat stays apart until it is heard in a later
                         // hand of this client's own, or is out for good: evidence that
@@ -15894,9 +15951,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if !h.required().contains(&me) && !h.returned().contains(&me) {
                             // `S1-JR`: kept out while it asks to be dealt in again --
                             // the seat a withheld return vote keeps out is this one.
+                            // `S1-LX`: not a boundary its own line was down near: its
+                            // asking may not have been heard.
                             if t.return_short.1 != Some(h.hand_id()) {
+                                let line_was_down = own_line_lately_down(t.own_line_down_at);
                                 let count = if h.kept_out() && !stay_out {
-                                    t.return_short.0.saturating_add(1)
+                                    t.return_short.0.saturating_add(u32::from(!line_was_down))
                                 } else {
                                     t.return_short.0
                                 };
@@ -16002,10 +16062,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if t.return_short.1 != Some(h.hand_id()) {
                         let me = h.my_seat();
                         let dealt_next = next.as_ref().is_some_and(|o| o.required.contains(&me));
+                        // `S1-LX`: a boundary near this client's own outage is not
+                        // counted -- its asking may not have been heard.
+                        let line_was_down = own_line_lately_down(t.own_line_down_at);
                         let count = if dealt_next {
                             0
                         } else if h.kept_out() && !stay_out {
-                            t.return_short.0.saturating_add(1)
+                            t.return_short.0.saturating_add(u32::from(!line_was_down))
                         } else {
                             t.return_short.0
                         };
@@ -18306,6 +18369,20 @@ const FORMING_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 /// `S1-JR`: this many boundaries in a row at which this client asked to be
 /// dealt in again and was not make the table not safe for it.
 const RETURN_SHORT_LIMIT: u32 = 3;
+/// `S1-LX`: how long after this client's own line was last down -- the library's
+/// verdict, or no other seat of the table heard -- what the table seems to do is
+/// no reading of it: a hand that stood while the line was down, a boundary it was
+/// kept out at while its asking could not be heard, half the table ahead of a
+/// client still catching up (`D-038`). Wifi switched off and on again three times
+/// in two minutes told the owner, at the far machine, that the table was not safe
+/// and had split -- three windows of four in one game, each about its own line.
+const OWN_OUTAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// `S1-LX`: whether this client's own line was down within [`OWN_OUTAGE_GRACE`]
+/// -- read from the moment `watch_progress` last saw it down.
+fn own_line_lately_down(down_at: Option<std::time::Instant>) -> bool {
+    down_at.is_some_and(|at| at.elapsed() < OWN_OUTAGE_GRACE)
+}
 /// `S1-JR`: a seat seen sending two different copies of one stage in this
 /// many hands makes the table not safe. Not in one: a client back from a
 /// restart in the middle of a hand could do it once.
@@ -18379,6 +18456,14 @@ fn apart_from_this_game(
 ) -> Vec<u8> {
     let mut apart: std::collections::BTreeSet<u8> =
         heard.iter().filter(|(s, hands)| **s != me && hands.len() >= 2).map(|(s, _)| *s).collect();
+    // `S1-LX`: a game of their own takes two seats. One seat heard alone in two
+    // later hands is a seat back from its own outage playing its own steps of
+    // hands nobody else deals -- the owner's far machine, told as a split at
+    // every other seat each time its wifi came back -- and no game (the
+    // harness's control `s1lx` reads it as before).
+    if apart.len() < 2 && !crate::table::hand::control("s1lx") {
+        apart.clear();
+    }
     // The half this client's game put out that did not take its certificate:
     // it opens hands of its own, two at least and `SPLIT_OPEN_SPAN` apart --
     // a half that was away takes it and comes back by the copies instead.
@@ -18614,6 +18699,12 @@ fn watch_progress(t: &mut TableRun) {
         t.voided_pending = (0, 0);
     }
     t.heard_nobody_since = if alone { Some(t.heard_nobody_since.unwrap_or(now)) } else { None };
+    // `S1-LX`: the last moment this client's own line was down -- what the
+    // table did meanwhile is read once the line has been up a while. Never
+    // noted in the harness's control (`P2P_POKER_CONTROL=s1lx`): as before.
+    if own_line_down(t) && !crate::table::hand::control("s1lx") {
+        t.own_line_down_at = Some(now);
+    }
     // `S1-JR`: resuming with no hand of the table's -- at a table that was set,
     // while this client hears another seat of it and its own line is up: the
     // copies it would adopt from are the others' to send, and nobody's line
@@ -18640,6 +18731,9 @@ fn watch_progress(t: &mut TableRun) {
         if hand_stuck(t, now)
             && t.frozen.is_none()
             && !own_line_down(t)
+            // `S1-LX` (the review): not a turn that stood through this client's own
+            // outage, read the moment another seat was heard again.
+            && !own_line_lately_down(t.own_line_down_at)
             && !t.overlong.iter().any(|(k, s, _)| (*k, *s) == (hand, stage))
         {
             t.overlong.push((hand, stage, now));
@@ -18801,6 +18895,10 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
         } else {
             STANDS_LIMIT
         };
+        // `S1-LX`: and stood that long with this client's own line up -- a hand
+        // that stood while it was down stood for want of this client, and was
+        // told the moment the line came back.
+        let since = t.own_line_down_at.map_or(since, |down| down.max(since));
         if now.duration_since(since) >= limit && t.frozen.is_none() && !own_line_down(t) {
             let waiting: Vec<String> = h.waiting_for().into_iter().map(|s| seat_called(t, s)).collect();
             let minutes = limit.as_secs().div_ceil(60);
@@ -25246,8 +25344,12 @@ mod tests {
         let apart = |heard: &BTreeMap<u8, BTreeMap<u64, std::time::Instant>>, ahead: &HashMap<u8, u64>, table: &[u8], adrift: bool| {
             apart_from_this_game(heard, &e, &c, &[], ahead, table, 0, 10, adrift)
         };
-        assert!(apart(&heard(&[(2, &[12])]), &none, &four, false).is_empty(), "one hand");
-        assert_eq!(apart(&heard(&[(2, &[12, 13])]), &none, &four, false), vec![2], "two hands");
+        assert!(apart(&heard(&[(2, &[12]), (3, &[12])]), &none, &four, false).is_empty(), "one hand");
+        assert_eq!(apart(&heard(&[(2, &[12, 13]), (3, &[12, 14])]), &none, &four, false), vec![2, 3], "two hands, two seats");
+        // `S1-LX`: one seat alone in two later hands is a seat back from its own
+        // outage on a branch of its own, and no game.
+        assert!(apart(&heard(&[(2, &[12, 13])]), &none, &four, false).is_empty(), "one seat alone");
+        assert!(apart(&heard(&[(2, &[12, 13]), (3, &[12])]), &none, &four, false).is_empty(), "and one seat beside one heard once");
         assert!(apart(&heard(&[(0, &[12, 13])]), &none, &four, false).is_empty(), "never this client");
         let ahead: HashMap<u8, u64> = [(2, 12), (3, 13)].into_iter().collect();
         assert_eq!(apart(&BTreeMap::new(), &ahead, &four, false), vec![2, 3], "half the table ahead");
@@ -27382,6 +27484,50 @@ mod a_joiner_before_the_first_hand {
         assert!(!code.contains("may_ask_to_sit_in() && !stay_out"), "not only where it could ask");
         // A table of three seats or more in the game, whatever the hand deals in.
         assert!(!code.contains("h.required().len() >= 3") && !code.contains("h.required().len() < 3"), "never the hand's roster");
+    }
+
+    /// `S1-LX`, the owner's wifi switched off and on at the far machine: what the
+    /// table seemed to do while this client's own line was down, and for
+    /// `OWN_OUTAGE_GRACE` after, is no reading of the table -- a hand standing
+    /// is timed from the line's return, a boundary it was kept out at is not
+    /// counted, half the table ahead is no split while it catches up -- and
+    /// (`D-106`) an offer below its own floor above 0 is taken without asking.
+    #[test]
+    fn this_clients_own_outage_is_no_reading_of_the_table() {
+        let now = std::time::Instant::now();
+        assert!(!own_line_lately_down(None));
+        assert!(own_line_lately_down(Some(now)));
+        assert!(own_line_lately_down(Some(now - OWN_OUTAGE_GRACE + std::time::Duration::from_secs(5))));
+        assert!(!own_line_lately_down(Some(now - OWN_OUTAGE_GRACE - std::time::Duration::from_secs(1))));
+        // The tick notes the moment the line is down, and keeps it once it is up.
+        let dir = std::env::temp_dir();
+        let mut t = TableRun::new(0, &dir, None, super::super::toxsink::TableSink::none());
+        watch_progress(&mut t);
+        assert_eq!(t.own_line_down_at, None, "a line never down");
+        t.tox_down_at = Some(tokio::time::Instant::now());
+        watch_progress(&mut t);
+        let down = t.own_line_down_at.expect("the library said offline a moment ago");
+        t.tox_down_at = None;
+        watch_progress(&mut t);
+        assert_eq!(t.own_line_down_at, Some(down), "kept: the grace runs from the last moment down");
+        // Every reading is wired to it.
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let stall = code.find("let since = t.own_line_down_at.map_or(since, |down| down.max(since));").expect("the stand timed from the line's return");
+        assert!(code[stall..stall + 200].contains("if now.duration_since(since) >= limit"), "and read so");
+        assert_eq!(code.matches("saturating_add(u32::from(!line_was_down))").count(), 2, "both boundaries count no kept-out near an outage");
+        assert_eq!(code.matches("let line_was_down = own_line_lately_down(t.own_line_down_at);").count(), 2);
+        assert!(code.contains("t.adrift.is_some() || own_line_lately_down(t.own_line_down_at),"), "half the table ahead read as a split only with the line up");
+        let take = code.find("if offered > 0 && !crate::table::hand::control(\"d102\") {").expect("D-106: taken without asking");
+        let ask = code.find("} else if t.floor_episode != Some(ask) {").expect("and the question for the rest");
+        assert!(take < ask && code[take..ask].contains("t.own_floor = Some(OwnFloor { hand: hand.saturating_sub(1), stack: offered });"), "taken as a Take is");
+        assert!(code[take..ask].contains("if t.floor_taken != Some(ask) {"), "said once an offer");
+        assert!(!code[take..ask].contains("NodeEvent::BackWithChips {"), "the seat is not said back before it is");
+        let adopted = code.find("if let Some(tk) = t.floor_taken.take().filter(|tk| start_me < tk.floor) {").expect("said back at the adoption");
+        assert!(code[adopted..adopted + 400].contains("NodeEvent::BackWithChips {"), "with what it adopted");
+        // The overlong turn and a machine asleep read the outage too.
+        assert!(code.contains("&& !own_line_lately_down(t.own_line_down_at)\n            && !t.overlong.iter()"), "a turn that stood through the outage");
+        assert!(code.contains("t.own_line_down_at = Some(std::time::Instant::now());"), "a machine asleep");
     }
 
     /// `S1-JR`: the hands called off while this client heard no other seat are

@@ -612,6 +612,11 @@ pub enum NodeEvent {
     /// the newest such offer; `None` once it is answered or this client is
     /// dealt in again. The window asks to take the offer or to leave.
     FloorOffer { offer: Option<FloorOffer> },
+    /// `D-106`: the table's offer below this seat's own floor was taken without
+    /// asking (the owner, 2026-10-06): the seat is back in hand `hand` with `chips`,
+    /// `before` by its own signatures, after `missed` hands played without it.
+    /// The table's log says so in plain words; nothing is asked.
+    BackWithChips { hand: u64, chips: u64, before: u64, missed: u64 },
     /// `S1-IX`, `PROTOCOL.md` §6.3 and §6.4: this table has stopped at a
     /// hand's boundary, because other seats finished that hand with a
     /// different result from this client's own -- and, once it has, the game
@@ -837,6 +842,7 @@ impl NodeEvent {
             | Self::TableUnsafe { .. }
             | Self::TableSplit { .. }
             | Self::FloorOffer { .. }
+            | Self::BackWithChips { .. }
             // `S1-IX`: the table stopped, or the game ended, over the felt.
             | Self::TableStopped { .. }
             // The lobby list and the counters above it.
