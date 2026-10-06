@@ -1544,8 +1544,13 @@ struct TableRun {
     /// settlement for that seat while this client's own settlement had it lose.
     settlement_vetoes: std::collections::BTreeMap<[u8; 32], (u8, std::collections::BTreeSet<u64>)>,
     /// `G5`, told: vetoes seen and not yet known to have stood -- the hand, the
-    /// seat's key and number, and what the seat started that hand with.
-    settlement_seen: Vec<(u64, [u8; 32], u8, crate::poker::state::Chips)>,
+    /// seat's key and number, what the seat started that hand with, and
+    /// (`S1-MB`) whether the seat had gone quiet at the table lately.
+    settlement_seen: Vec<(u64, [u8; 32], u8, crate::poker::state::Chips, bool)>,
+    /// `S1-MB`: when each seat was last unheard in the table's group
+    /// (`seats_unheard`), read at every stall tick -- a seat whose settlement
+    /// never came because its line dropped had gone quiet there.
+    unheard_at: std::collections::BTreeMap<u8, std::time::Instant>,
     /// `S1-MA`: the hands given up at their settlement while this client's own
     /// line was down or just back -- the copies it lacked were its line's doing,
     /// so they name no seat as keeping its settlement back. The last eight.
@@ -2219,6 +2224,7 @@ impl TableRun {
             gave_up_watch: None,
             settlement_vetoes: std::collections::BTreeMap::new(),
             settlement_seen: Vec::new(),
+            unheard_at: std::collections::BTreeMap::new(),
             settlement_outage: Vec::new(),
             silence_armed: false,
             own_floor: None,
@@ -5190,6 +5196,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.gave_up_watch = None;
             $t.settlement_vetoes.clear();
             $t.settlement_seen.clear();
+            $t.unheard_at.clear();
             $t.settlement_outage.clear();
             $t.silence_armed = false;
             $t.own_floor = None;
@@ -14168,7 +14175,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         for seat in h.settlement_vetoed_by() {
                             let (Some(key), Some(start)) = (h.key_of(seat), h.start_stack_of(seat)) else { continue };
                             if !t.settlement_seen.iter().any(|(k, s, ..)| *k == h.hand_id() && *s == key) {
-                                t.settlement_seen.push((h.hand_id(), key, seat, start));
+                                // `S1-MB`: and whether its line had gone quiet here.
+                                let quiet = t.unheard_at.get(&seat).is_some_and(|at| at.elapsed() < UNHEARD_LATELY);
+                                t.settlement_seen.push((h.hand_id(), key, seat, start, quiet));
                             }
                         }
                     }
@@ -14178,25 +14187,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         let next = h.hand_id();
-                        let stood: Vec<(u64, [u8; 32], u8)> = t
+                        let stood: Vec<(u64, [u8; 32], u8, bool)> = t
                             .settlement_seen
                             .iter()
-                            .filter(|(k, key, _, start)| {
+                            .filter(|(k, key, _, start, _)| {
                                 k.saturating_add(1) == next && settlement_veto_stood(*start, h.start_stack_of_key(key))
                             })
-                            .map(|(k, key, seat, _)| (*k, *key, *seat))
+                            .map(|(k, key, seat, _, quiet)| (*k, *key, *seat, *quiet))
                             .collect();
                         t.settlement_seen.retain(|(k, ..)| k.saturating_add(1) != next);
-                        for (k, key, seat) in stood {
+                        for (k, key, seat, quiet) in stood {
                             let entry = t.settlement_vetoes.entry(key).or_insert_with(|| (seat, Default::default()));
                             if entry.1.insert(k) {
                                 let floor = k.saturating_sub(16);
                                 entry.1.retain(|x| *x >= floor);
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "hand #{k}: seat {seat} lost it and kept its settlement back -- the table called the hand off and gave its losses back (G5)"
-                                    )))
-                                    .await;
+                                let _ = events.send(NodeEvent::Warning(settlement_missing_words(k, seat, quiet))).await;
                             }
                         }
                     }
@@ -18299,6 +18304,28 @@ fn settlement_veto_stood(start_at_veto: crate::poker::state::Chips, start_next: 
     start_next == Some(start_at_veto)
 }
 
+/// `S1-MB`: how lately a seat must have been unheard in the table's group for a
+/// settlement of it that never came to read as its line's -- the settlement
+/// stage's own budget and the certificate that voided the hand, with room.
+const UNHEARD_LATELY: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `G5`, told (`S1-MB`, the owner: "zmírni to hlášení"): what is known and no
+/// more. A settlement that never came is the same on the wire whether the
+/// seat's line dropped or its player kept it back (`S1-LR`), so the line names
+/// no intent -- and says, where the seat had gone quiet at the table, that its
+/// line had. It read "seat 3 lost it and kept its settlement back" about the
+/// owner's far machine, whose wifi was off.
+fn settlement_missing_words(hand: u64, seat: u8, quiet: bool) -> String {
+    let line = if quiet {
+        "its line had gone quiet at the table"
+    } else {
+        "though it was heard at the table"
+    };
+    format!(
+        "hand #{hand}: seat {seat}'s settlement never came here, {line} -- it was losing the hand, so the table called the hand off and gave its losses back (G5)"
+    )
+}
+
 /// `G5`, told: a seat whose settlement vetoes hold two hands within the last
 /// ten -- the first such seat, if any.
 fn settlement_vetoer(
@@ -18772,6 +18799,13 @@ fn watch_progress(t: &mut TableRun) {
             let others: Vec<u8> = f.roster().seats().iter().map(|e| e.seat).filter(|s| Some(*s) != me).collect();
             f.session().is_some() && !others.is_empty() && others.iter().all(|s| unheard.contains(s))
         });
+    // `S1-MB`: when each seat was last unheard in the table's group -- read by
+    // `G5`'s word about a settlement that never came.
+    if let Some(f) = t.table.as_ref() {
+        for s in seats_unheard(f, &t.tox_sink) {
+            t.unheard_at.insert(s, now);
+        }
+    }
     // Another seat of the table heard: a reading the library's verdict does
     // not make either way.
     let heard_someone = t.table.as_ref().is_some_and(|f| {
@@ -18968,11 +19002,12 @@ fn no_progress_reason(t: &TableRun, now: std::time::Instant) -> Option<String> {
             }
         }
     }
-    // `G5`, told: a seat that kept its settlement back in two hands it lost
-    // within the last ten.
+    // `G5`, told: a seat whose settlement never came in two hands it lost
+    // within the last ten -- `S1-MB`: a line failing at the end of a hand looks
+    // the same, and is said beside it.
     if let Some(seat) = settlement_vetoer(&t.settlement_vetoes, hand_now) {
         return Some(format!(
-            "{} kept its settlement back in two of the hands it lost lately: the table called those hands off and gave its losses back. A player may be undoing the hands it loses -- the table is not safe to play your chips at.",
+            "the settlement of {} never came in two of the hands it lost lately, and the table called those hands off and gave its losses back: its line may keep failing at the end of a hand -- or a player may be undoing the hands it loses, and then the table is not safe to play your chips at.",
             seat_called(t, seat)
         ));
     }
@@ -26562,6 +26597,34 @@ mod late_roster_tests {
         assert!(!settlement_veto_stood(1_500, None), "the seat is not in the next hand");
     }
 
+    /// `S1-MB`, the owner (2026-10-06, "zmírni to hlášení"): **a settlement that
+    /// never came names no intent** -- the same on the wire whether the seat's
+    /// line dropped or its player kept it back (`S1-LR`). The word says what is
+    /// known: that it never came, and whether the seat had gone quiet at the
+    /// table; it read "seat 3 lost it and kept its settlement back" about the
+    /// owner's far machine with its wifi off. Two such hands are still a reason
+    /// the table may not be safe, beside the line that may keep failing.
+    #[test]
+    fn a_settlement_that_never_came_names_no_intent() {
+        let quiet = settlement_missing_words(17, 3, true);
+        let heard = settlement_missing_words(17, 3, false);
+        for w in [&quiet, &heard] {
+            assert!(w.starts_with("hand #17: seat 3's settlement never came here"), "{w}");
+            assert!(w.contains("gave its losses back (G5)"), "{w}");
+            assert!(!w.contains("kept its settlement back") && !w.contains("undoing"), "no intent named: {w}");
+        }
+        assert!(quiet.contains("its line had gone quiet at the table"), "{quiet}");
+        assert!(heard.contains("though it was heard at the table"), "{heard}");
+        assert!(UNHEARD_LATELY >= std::time::Duration::from_secs(60), "the settlement's budget and the voiding behind it");
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert!(!code.contains("kept its settlement back in two"), "the window's reason names no intent either");
+        assert!(code.contains("its line may keep failing at the end of a hand -- or a player may be undoing the hands it loses"), "both readings, the line's first");
+        let read = code.find("let quiet = t.unheard_at.get(&seat).is_some_and(|at| at.elapsed() < UNHEARD_LATELY);").expect("read at the veto");
+        assert!(code[read..read + 300].contains("t.settlement_seen.push((h.hand_id(), key, seat, start, quiet));"), "and kept with it");
+        assert!(code.contains("for s in seats_unheard(f, &t.tox_sink) {\n            t.unheard_at.insert(s, now);"), "noted at every stall tick");
+    }
+
     /// `G5`, told: two vetoes within ten hands name the seat; one, or two far
     /// apart, do not.
     #[test]
@@ -27669,7 +27732,7 @@ mod a_joiner_before_the_first_hand {
         assert!(code[watch..watch + 160].contains("t.own_line_down_at = Some(std::time::Instant::now());"), "as the line down");
         assert!(code[..watch].rfind("_ = away_tick.tick() => {").is_some_and(|a| watch - a < 1_200), "on the away tick");
         let veto = code.find("if own_line_lately_down(t.own_line_down_at) && !crate::table::hand::control(\"s1ma\") {").expect("G5 reads the outage");
-        let told = code.find("\"hand #{k}: seat {seat} lost it and kept its settlement back").expect("the word");
+        let told = code.find("let _ = events.send(NodeEvent::Warning(settlement_missing_words(k, seat, quiet))).await;").expect("the word");
         assert!(veto < told && code[veto..told].contains("if t.settlement_outage.contains(&h.hand_id()) {"), "no veto recorded from such a hand");
         assert!(code[veto..told].contains("&& !read_before &&"), "and none read with the line up taken back");
         // The driver keeps the joint silence's peak four times a second, by the
