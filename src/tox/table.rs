@@ -582,6 +582,12 @@ pub struct Trouble {
     /// `S1-EB`: how many times an emptied copy of a table's group was left
     /// here so the group's fresh offer could be taken.
     pub left_empty: AtomicU64,
+    /// `S1-MA`: the longest every other confirmed member of the group -- two at
+    /// least -- has gone unheard at once, in seconds, since the node last took
+    /// it: read by the driver on every turn of its loop, where the sweep's
+    /// `quiet` map is five seconds old at worst and an outage of a quarter of a
+    /// minute holds the reading a second or two.
+    pub joint_quiet_peak: AtomicU64,
     /// **Which seats the carrier is mid-delivery with, one bit per seat.**
     ///
     /// Set while `gcc_recv_pending` reports messages from that seat sitting in
@@ -1117,6 +1123,11 @@ const MAX_TICK: Duration = Duration::from_millis(50);
 
 /// How often stalled reassemblies are swept.
 const SWEEP_EVERY: Duration = Duration::from_secs(5);
+
+/// `S1-MA`: how often the driver reads every other member's silence at once
+/// (`joint_quiet_secs`): one library call a member each time, so that an
+/// outage holding the reading a second is caught, which the sweep is not.
+const JOINT_READ_EVERY: Duration = Duration::from_millis(250);
 
 /// How often the founder offers the group again to seats that are not in it.
 ///
@@ -2352,6 +2363,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
     let mut connected: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut tables: HashMap<TableId, TableState> = HashMap::new();
     let mut last_sweep = Instant::now();
+    // `S1-MA`: when the members' joint silence was last read.
+    let mut last_joint_read = Instant::now();
     let mut stopping = false;
     // `S1-EB`: invitations taken one turn after the emptied copy of their
     // group was left, once the library has let go of the chat.
@@ -3457,6 +3470,16 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                 flush(&mut tox, g, &mut t.pending, &mut t.next_id, &t.trouble);
             }
         }
+        // `S1-MA`: every other member unheard at once, four times a second --
+        // a silence window of a second is caught, the sweep's five seconds not.
+        if last_joint_read.elapsed() >= JOINT_READ_EVERY {
+            last_joint_read = Instant::now();
+            for t in tables.values() {
+                if let Some(q) = t.group.and_then(|g| joint_quiet_secs(&tox, t, g)) {
+                    t.trouble.joint_quiet_peak.fetch_max(q, Ordering::Relaxed);
+                }
+            }
+        }
         // Tables that are closing go once what they held is said, or once
         // their turns are spent.
         let done: Vec<TableId> = tables
@@ -4471,6 +4494,29 @@ fn scan_pairs(tox: &Tox, t: &TableState, group: u32) -> Vec<(u32, [u8; 32])> {
 
 /// `S1-KI`: the peer number the group holds this group key at, if any -- a scan,
 /// then the members seen past it (see `scan_pairs`).
+/// `S1-MA`: how long every other confirmed member of the table's group has gone
+/// unheard at once -- the least of their quiet times, a seat as quiet as its
+/// most recent entry -- with two seats at least; `None` with fewer, or with one
+/// that has no reading. By the peers the driver holds, one call of the library
+/// a member and no scan (`peer_of`'s scan a member a turn was the lock storm
+/// `Nudge` records).
+fn joint_quiet_secs(tox: &Tox, t: &TableState, group: u32) -> Option<u64> {
+    let mut least: Option<u64> = None;
+    let mut seats: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for (peer, group_key) in t.peer_keys.iter() {
+        if !t.confirmed.contains(peer) {
+            continue;
+        }
+        let Some(app_key) = t.known_as.get(group_key) else {
+            continue;
+        };
+        let q = tox.peer_quiet_secs(group, group_key)?;
+        least = Some(least.map_or(q, |l| l.min(q)));
+        seats.insert(*app_key);
+    }
+    least.filter(|_| seats.len() >= 2)
+}
+
 fn peer_of(tox: &Tox, t: &TableState, group: u32, group_key: &[u8; 32]) -> Option<u32> {
     (0..Tox::PEER_SCAN)
         .find(|p| tox.peer_key(group, *p).ok().as_ref() == Some(group_key))

@@ -1546,6 +1546,13 @@ struct TableRun {
     /// `G5`, told: vetoes seen and not yet known to have stood -- the hand, the
     /// seat's key and number, and what the seat started that hand with.
     settlement_seen: Vec<(u64, [u8; 32], u8, crate::poker::state::Chips)>,
+    /// `S1-MA`: the hands given up at their settlement while this client's own
+    /// line was down or just back -- the copies it lacked were its line's doing,
+    /// so they name no seat as keeping its settlement back. The last eight.
+    settlement_outage: Vec<u64>,
+    /// `S1-MA`: every other seat unheard at once, as last read -- said once an
+    /// outage.
+    silence_armed: bool,
     /// Batch 4 (`D-102`): the reference the floor of the table's copies is read
     /// from (`OwnFloor`).
     own_floor: Option<OwnFloor>,
@@ -2212,6 +2219,8 @@ impl TableRun {
             gave_up_watch: None,
             settlement_vetoes: std::collections::BTreeMap::new(),
             settlement_seen: Vec::new(),
+            settlement_outage: Vec::new(),
+            silence_armed: false,
             own_floor: None,
             floor_episode: None,
             cheats: std::collections::BTreeMap::new(),
@@ -5181,6 +5190,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.gave_up_watch = None;
             $t.settlement_vetoes.clear();
             $t.settlement_seen.clear();
+            $t.settlement_outage.clear();
+            $t.silence_armed = false;
             $t.own_floor = None;
             $t.floor_episode = None;
             $t.cheats.clear();
@@ -11518,6 +11529,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // is read here; whether the seat is on the line stays the stall
             // tick's, and a seat off the line is never said to sit out.
             _ = away_tick.tick() => {
+                // `S1-MA`: every other seat of the set table unheard in the group
+                // at once for `OWN_SILENCE_S` is this client's own line too, before
+                // the library says so or `QUIET_LIMIT_S` reads it alone -- an outage
+                // of a quarter of a minute left `S1-LX`'s grace unarmed, and the
+                // table's game read as split, its settlements as kept back (the
+                // node bed of 2026-10-06). Read four times a second: such an outage
+                // holds the reading a second or two, which the stall tick missed.
+                for t in tables.iter_mut() {
+                    if silent_all_others(t) && !crate::table::hand::control("s1ma") {
+                        t.own_line_down_at = Some(std::time::Instant::now());
+                        if !t.silence_armed {
+                            t.silence_armed = true;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "every other seat of the table has been unheard for {OWN_SILENCE_S} s or more at once: this client's own line is down (S1-MA)"
+                                )))
+                                .await;
+                        }
+                    } else {
+                        t.silence_armed = false;
+                    }
+                }
                 // fault-harness, `S1-IB`/`S1-ID`: the harness's outage over
                 // both lines -- the lobby's transport dark with the table's
                 // line (`tox::table::both_lines_dark`): every connection closed
@@ -14111,7 +14144,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // here, and counted once the next hand gives its loss back. A
                     // copy that only came late closes the hand, or has this client
                     // take a next hand dealt on the settled money: never counted.
+                    // `S1-MA`: nor a hand first given up while this client's own line
+                    // was down or just back -- the copies it lacked were its line's,
+                    // and the seats it would name had settled (the node bed of
+                    // 2026-10-06: two honest seats named at a return). One read with
+                    // the line up stands: an outage after it takes nothing back.
+                    if own_line_lately_down(t.own_line_down_at) && !crate::table::hand::control("s1ma") {
+                        for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
+                            let id = h.hand_id();
+                            let read_before = t.settlement_seen.iter().any(|(k, ..)| *k == id);
+                            if !h.settlement_vetoed_by().is_empty() && !read_before && !t.settlement_outage.contains(&id) {
+                                t.settlement_outage.push(id);
+                                if t.settlement_outage.len() > 8 {
+                                    t.settlement_outage.remove(0);
+                                }
+                            }
+                        }
+                    }
                     for h in [t.hand.as_ref(), t.previous.as_ref()].into_iter().flatten() {
+                        if t.settlement_outage.contains(&h.hand_id()) {
+                            continue;
+                        }
                         for seat in h.settlement_vetoed_by() {
                             let (Some(key), Some(start)) = (h.key_of(seat), h.start_stack_of(seat)) else { continue };
                             if !t.settlement_seen.iter().any(|(k, s, ..)| *k == h.hand_id() && *s == key) {
@@ -17584,6 +17637,27 @@ fn own_line_suspect(t: &TableRun) -> bool {
 fn library_down(t: &TableRun) -> bool {
     (t.ever_on_line && t.tox_sink.is_on_tox() && t.tox_sink.tox_connection() == 0)
         || t.tox_down_at.is_some_and(|at| at.elapsed().as_secs() < QUIET_LIMIT_S)
+}
+
+/// `S1-MA`: how long every other seat of a set table stays unheard in the
+/// table's group together before this client reads its own line as down. The
+/// group pings each member every 12 s (`GC_PING_TIMEOUT`) whatever the game
+/// says, so a live member is heard within that and its latency; every other
+/// seat unheard for longer, at once, is this client's own line -- below
+/// `QUIET_LIMIT_S`'s 20 s, which an outage of a quarter of a minute never
+/// reached (the node bed of 2026-10-06: silences of 16-17 s, all at once).
+const OWN_SILENCE_S: u64 = 15;
+
+/// `S1-MA`: whether every other confirmed member of the set table's group --
+/// two at least -- went unheard there for `OWN_SILENCE_S` or more at once since
+/// the last read: the driver keeps the longest such silence on every turn of
+/// its loop (`take_joint_quiet_peak`), where the sweep's per-seat map is five
+/// seconds old at worst. One seat silent is that seat; all of them together is
+/// this client's own line.
+fn silent_all_others(t: &TableRun) -> bool {
+    let set = t.table.as_ref().is_some_and(|f| f.session().is_some());
+    let peak = t.tox_sink.take_joint_quiet_peak();
+    set && peak >= OWN_SILENCE_S
 }
 
 fn own_line_down(t: &TableRun) -> bool {
@@ -27573,6 +27647,38 @@ mod a_joiner_before_the_first_hand {
         // The overlong turn and a machine asleep read the outage too.
         assert!(code.contains("&& !own_line_lately_down(t.own_line_down_at)\n            && !t.overlong.iter()"), "a turn that stood through the outage");
         assert!(code.contains("t.own_line_down_at = Some(std::time::Instant::now());"), "a machine asleep");
+    }
+
+    /// `S1-MA`, the node bed of 2026-10-06 (one seat's line down 15 s every 50 s):
+    /// an outage that short never reached `QUIET_LIMIT_S`, the library said nothing,
+    /// and the client back from it read the table that had dealt on without it as
+    /// half the table ahead -- a split -- and the settlements it had missed as two
+    /// honest seats keeping theirs back (`G5`). Every other seat silent at once for
+    /// `OWN_SILENCE_S` is now this client's own line, and a hand given up while it
+    /// was down or just back names nobody as keeping its settlement back.
+    #[test]
+    fn a_short_own_outage_arms_the_grace_and_names_no_settlement_withheld() {
+        assert!(OWN_SILENCE_S > 12, "above the group's own ping interval: a live member is heard within it");
+        assert!(OWN_SILENCE_S < QUIET_LIMIT_S, "and below the reading that missed a quarter-minute outage");
+        let dir = std::env::temp_dir();
+        let t = TableRun::new(0, &dir, None, super::super::toxsink::TableSink::none());
+        assert!(!silent_all_others(&t), "no table, no reading");
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let watch = code.find("if silent_all_others(t) && !crate::table::hand::control(\"s1ma\") {").expect("the quarter-second tick reads it");
+        assert!(code[watch..watch + 160].contains("t.own_line_down_at = Some(std::time::Instant::now());"), "as the line down");
+        assert!(code[..watch].rfind("_ = away_tick.tick() => {").is_some_and(|a| watch - a < 1_200), "on the away tick");
+        let veto = code.find("if own_line_lately_down(t.own_line_down_at) && !crate::table::hand::control(\"s1ma\") {").expect("G5 reads the outage");
+        let told = code.find("\"hand #{k}: seat {seat} lost it and kept its settlement back").expect("the word");
+        assert!(veto < told && code[veto..told].contains("if t.settlement_outage.contains(&h.hand_id()) {"), "no veto recorded from such a hand");
+        assert!(code[veto..told].contains("&& !read_before &&"), "and none read with the line up taken back");
+        // The driver keeps the joint silence's peak four times a second, by the
+        // peers it holds -- no scan of the library a member (the lock storm).
+        let driver = include_str!("../tox/table.rs");
+        assert!(driver.contains("t.trouble.joint_quiet_peak.fetch_max(q, Ordering::Relaxed);"), "the peak kept");
+        let joint = &driver[driver.find("fn joint_quiet_secs(").expect("the reading")..];
+        let joint = &joint[..joint.find("\n}\n").expect("its end")];
+        assert!(joint.contains("t.peer_keys.iter()") && !joint.contains("peer_of("), "no scan a member");
     }
 
     /// `S1-LY`, the owner's far machine (2026-10-06): certified out at its fourth

@@ -1122,6 +1122,24 @@ impl TableSink {
         }
     }
 
+    /// `S1-MA`: the longest every other confirmed member of the table's group
+    /// went unheard at once since the last call, in seconds -- taken, so the next
+    /// call starts again. Zero without a Tox carrier.
+    pub fn take_joint_quiet_peak(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().joint_quiet_peak.swap(0, Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
     /// **Which seats the carrier is still delivering from, one bit per seat.**
     ///
     /// Refreshed by the driver whenever `nudge` asks about a seat, which the
